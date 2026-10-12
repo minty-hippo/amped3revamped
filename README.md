@@ -10,6 +10,7 @@ Features:
 
 What's been tested:
  - Northstar and Snowbird have been extensively tested, but I've yet to have tried the other parts of the game. Amped 3 Revamped includes a level and cutscene menu to replay completed story missions and cutscenes, as well as any that haven't been unlocked through normal gameplay.
+ - It runs well on my Intel i7 358H laptop with 32gb of ram, around 60fps at a 50% resolution scale at 1080p or at 1440p with XESS.
  - The game runs via proton in SteamOS on a Ryzen 7700, 9070xt machine well, and less well but still functional on an Ayn Odin 3 running Armada.
 
 WIP Features:
