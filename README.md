@@ -1,5 +1,5 @@
 ![alt text](https://github.com/minty-hippo/amped3revamped/blob/0785842a9e1518827f71296c0910ea0e25d44390/Amped3Revamped%20logo.png "Amped 3 Revamped")
-# amped3revamped
+# Amped 3 Revamped
 This is a recompilation of Amped 3 that has made use of ReXGlue and Claude to port the Xbox 360 code to modern platforms.
 
 Features:
