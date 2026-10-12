@@ -1,0 +1,74 @@
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..b0f1a89 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -358,6 +358,20 @@ class Presenter {
+   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
+                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
++
++  // Amped 3 (patch 0008): an application-supplied guest output. While
++  // external, RefreshGuestOutput calls (from the emulated GPU's swap) are
++  // ignored and the application refreshes the guest output itself with
++  // RefreshGuestOutputExternal, from any one thread.
++  void SetGuestOutputExternal(bool external) {
++    guest_output_external_.store(external, std::memory_order_release);
++  }
++  bool IsGuestOutputExternal() const {
++    return guest_output_external_.load(std::memory_order_acquire);
++  }
++  bool RefreshGuestOutputExternal(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
++                                  uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
++                                  std::function<bool(GuestOutputRefreshContext& context)> refresher);
+   // The implementation must be callable from any thread, including from
+   // multiple at the same time, and it should acquire the latest guest output
+   // image via ConsumeGuestOutput.
+@@ -976,6 +990,13 @@ class Presenter {
+   // Accessible only by refreshing, whether the last refresh contained an image
+   // rather than being blank.
+   bool guest_output_active_last_refresh_ = false;
++  // Patch 0008: see SetGuestOutputExternal. The mutex keeps the emulated and
++  // the external producer from refreshing at the same time while switching.
++  std::atomic<bool> guest_output_external_{false};
++  std::mutex guest_output_refresh_mutex_;
++  bool RefreshGuestOutputLocked(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
++                                uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
++                                std::function<bool(GuestOutputRefreshContext& context)> refresher);
+ 
+   // Ordered by the Z order, and then by the time of addition.
+   // Note: All the iteration logic involving this Z ordering must be the same as
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..861830d 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -550,6 +550,30 @@ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  if (IsGuestOutputExternal()) {
++    return false;
++  }
++  std::lock_guard<std::mutex> refresh_lock(guest_output_refresh_mutex_);
++  if (IsGuestOutputExternal()) {
++    return false;
++  }
++  return RefreshGuestOutputLocked(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                  display_aspect_ratio_y, std::move(refresher));
++}
++
++bool Presenter::RefreshGuestOutputExternal(
++    uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++    uint32_t display_aspect_ratio_y,
++    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  std::lock_guard<std::mutex> refresh_lock(guest_output_refresh_mutex_);
++  return RefreshGuestOutputLocked(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                  display_aspect_ratio_y, std::move(refresher));
++}
++
++bool Presenter::RefreshGuestOutputLocked(
++    uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++    uint32_t display_aspect_ratio_y,
++    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+   GuestOutputProperties& writable_properties =
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;

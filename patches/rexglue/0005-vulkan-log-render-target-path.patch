@@ -1,0 +1,30 @@
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..a344ec4 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -206,9 +206,12 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+       device_properties.fragmentStoresAndAtomics && device_properties.sampleRateShading &&
+       device_properties.standardSampleLocations &&
+       shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers;
+-  if (REXCVAR_GET(render_target_path_vulkan) == "fsi") {
++  const auto requested_rt_path = REXCVAR_GET(render_target_path_vulkan);
++  if (requested_rt_path == "fsi") {
+     path_ = Path::kPixelShaderInterlock;
+   } else {
++    // "fbo" or empty (Automatic). Host render targets: much faster, and
++    // forcing interlock on Intel didn't fix anything in Amped 3.
+     path_ = Path::kHostRenderTargets;
+   }
+   // Fragment shader interlock is a feature implemented by pretty advanced GPUs,
+@@ -237,6 +240,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+       path_ = Path::kHostRenderTargets;
+     }
+   }
++  REXGPU_INFO(
++      "VulkanRenderTargetCache: requested path '{}', vendor 0x{:04X}, interlock {}; using {}",
++      requested_rt_path, device_properties.vendorID,
++      fsi_path_supported ? "supported" : "unsupported",
++      path_ == Path::kPixelShaderInterlock ? "fragment shader interlock" : "host render targets");
+ 
+   // Format support.
+   constexpr VkFormatFeatureFlags kUsedDepthFormatFeatures =

@@ -1,0 +1,372 @@
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..eda82f2 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -96,7 +96,11 @@ if(REXGLUE_USE_D3D12)
+         ${REXGPU_XENOS_D3D12_SOURCES})
+ endif()
+ 
++# Display-locked guest vblank (amped3 patch 0007).
++list(APPEND REXGPU_XENOS_SOURCES display_vblank_win.cpp)
++
+ add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
++set_source_files_properties(display_vblank_win.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+ add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+ 
+ set_target_properties(rexgpu-xenos PROPERTIES
+diff --git a/src/graphics/display_vblank.h b/src/graphics/display_vblank.h
+new file mode 100644
+index 0000000..c1fd85e
+--- /dev/null
++++ b/src/graphics/display_vblank.h
+@@ -0,0 +1,40 @@
++/**
++ * @file        display_vblank.h
++ * @brief       Waits for the real vertical blank of the monitor showing the game
++ *              (amped3 patch 0007). Windows only; elsewhere Init() fails and the
++ *              guest vblank stays on the timer.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <memory>
++
++namespace rex::graphics {
++
++class DisplayVblank {
++ public:
++  DisplayVblank();
++  ~DisplayVblank();
++  DisplayVblank(const DisplayVblank&) = delete;
++  DisplayVblank& operator=(const DisplayVblank&) = delete;
++
++  // Picks the monitor the game window is on and measures its refresh rate.
++  // Fails if there is no window yet, no DXGI output, or waiting fails.
++  bool Init();
++  // Blocks until the next vertical blank of that monitor.
++  bool Wait();
++  // Refresh rate in Hz: measured by Init(), then tracked by Wait().
++  double refresh_hz() const { return refresh_hz_; }
++  // Whether Init() found the game window (it may not exist yet at start-up).
++  bool window_found() const;
++  // True when the game window has moved to another monitor since Init().
++  bool MonitorChanged() const;
++
++ private:
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++  double refresh_hz_ = 0.0;
++};
++
++}  // namespace rex::graphics
+diff --git a/src/graphics/display_vblank_win.cpp b/src/graphics/display_vblank_win.cpp
+new file mode 100644
+index 0000000..677143f
+--- /dev/null
++++ b/src/graphics/display_vblank_win.cpp
+@@ -0,0 +1,170 @@
++/**
++ * @file        display_vblank_win.cpp
++ * @brief       DXGI-based wait for the game monitor's vertical blank
++ *              (amped3 patch 0007).
++ */
++
++#include "display_vblank.h"
++
++#include <rex/logging.h>
++
++#if defined(_WIN32)
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <dxgi.h>
++
++#include <algorithm>
++#include <chrono>
++#include <vector>
++
++#pragma comment(lib, "dxgi.lib")
++
++namespace rex::graphics {
++
++namespace {
++
++struct FindWindowData {
++  DWORD pid;
++  HWND best;
++  LONG best_area;
++};
++
++BOOL CALLBACK FindProcessWindow(HWND hwnd, LPARAM lparam) {
++  auto* data = reinterpret_cast<FindWindowData*>(lparam);
++  DWORD pid = 0;
++  GetWindowThreadProcessId(hwnd, &pid);
++  if (pid != data->pid || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER)) {
++    return TRUE;
++  }
++  RECT rect;
++  if (!GetWindowRect(hwnd, &rect)) return TRUE;
++  LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
++  if (area > data->best_area) {
++    data->best = hwnd;
++    data->best_area = area;
++  }
++  return TRUE;
++}
++
++HWND FindGameWindow() {
++  FindWindowData data{GetCurrentProcessId(), nullptr, 0};
++  EnumWindows(FindProcessWindow, reinterpret_cast<LPARAM>(&data));
++  return data.best;
++}
++
++}  // namespace
++
++struct DisplayVblank::Impl {
++  IDXGIOutput* output = nullptr;
++  HMONITOR monitor = nullptr;
++  HWND window = nullptr;
++  double period_s = 0.0;
++  std::chrono::steady_clock::time_point last{};
++  ~Impl() {
++    if (output) output->Release();
++  }
++};
++
++DisplayVblank::DisplayVblank() = default;
++DisplayVblank::~DisplayVblank() = default;
++
++bool DisplayVblank::Init() {
++  impl_ = std::make_unique<Impl>();
++  impl_->window = FindGameWindow();
++  if (!impl_->window) return false;
++  impl_->monitor = MonitorFromWindow(impl_->window, MONITOR_DEFAULTTOPRIMARY);
++
++  IDXGIFactory1* factory = nullptr;
++  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
++    return false;
++  }
++  IDXGIAdapter1* adapter = nullptr;
++  for (UINT a = 0; !impl_->output && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND;
++       ++a) {
++    IDXGIOutput* output = nullptr;
++    for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
++      DXGI_OUTPUT_DESC desc;
++      if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == impl_->monitor) {
++        impl_->output = output;
++        break;
++      }
++      output->Release();
++    }
++    adapter->Release();
++  }
++  factory->Release();
++  if (!impl_->output) return false;
++
++  // Measure the real refresh rate. WaitForVBlank sometimes returns early
++  // (seen with a Direct3D 12 device active), so use the median interval of
++  // many waits instead of the average.
++  if (FAILED(impl_->output->WaitForVBlank())) return false;
++  constexpr int kSamples = 41;
++  std::vector<double> intervals;
++  intervals.reserve(kSamples);
++  auto previous = std::chrono::steady_clock::now();
++  for (int i = 0; i < kSamples; ++i) {
++    if (FAILED(impl_->output->WaitForVBlank())) return false;
++    const auto now = std::chrono::steady_clock::now();
++    intervals.push_back(std::chrono::duration<double>(now - previous).count());
++    previous = now;
++  }
++  std::nth_element(intervals.begin(), intervals.begin() + kSamples / 2, intervals.end());
++  const double median = intervals[kSamples / 2];
++  if (median <= 0.0) return false;
++  impl_->period_s = median;
++  impl_->last = previous;
++  refresh_hz_ = 1.0 / median;
++  return true;
++}
++
++bool DisplayVblank::Wait() {
++  if (!impl_ || !impl_->output) return false;
++  // Ignore early returns (less than half a refresh since the last vblank) so a
++  // spurious wake-up never produces an extra guest vblank.
++  for (int attempt = 0; attempt < 4; ++attempt) {
++    if (FAILED(impl_->output->WaitForVBlank())) return false;
++    const auto now = std::chrono::steady_clock::now();
++    const double since = std::chrono::duration<double>(now - impl_->last).count();
++    if (since >= 0.35 * impl_->period_s || attempt == 3) {
++      impl_->last = now;
++      // Track the refresh rate as it runs: laptop panels with Windows'
++      // dynamic refresh rate switch between 60 and 120 Hz on the fly.
++      if (since < 3.0 * impl_->period_s) {
++        impl_->period_s = 0.9 * impl_->period_s + 0.1 * since;
++        refresh_hz_ = 1.0 / impl_->period_s;
++      }
++      return true;
++    }
++  }
++  return true;
++}
++
++bool DisplayVblank::window_found() const { return impl_ && impl_->window; }
++
++bool DisplayVblank::MonitorChanged() const {
++  if (!impl_ || !impl_->window || !IsWindow(impl_->window)) return true;
++  return MonitorFromWindow(impl_->window, MONITOR_DEFAULTTOPRIMARY) != impl_->monitor;
++}
++
++}  // namespace rex::graphics
++
++#else  // !_WIN32
++
++namespace rex::graphics {
++struct DisplayVblank::Impl {};
++DisplayVblank::DisplayVblank() = default;
++DisplayVblank::~DisplayVblank() = default;
++bool DisplayVblank::Init() { return false; }
++bool DisplayVblank::Wait() { return false; }
++bool DisplayVblank::MonitorChanged() const { return false; }
++bool DisplayVblank::window_found() const { return false; }
++}  // namespace rex::graphics
++
++#endif
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..47e08de 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -31,10 +31,22 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#include <cmath>
++
++#include "display_vblank.h"
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_STRING(vblank_source, "display", "GPU",
++                      "Where the guest vertical blank comes from. display: the real refresh of "
++                      "the monitor showing the game, so every frame lands on its own refresh "
++                      "(falls back to timer when the monitor's rate does not divide to the "
++                      "video mode rate). timer: a fixed clock at the video mode rate.")
++    .allowed({"display", "timer"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+@@ -158,7 +170,106 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++
++        // Display-locked vblank (vblank_source = display): wait for the
++        // monitor's real vertical blank instead of a free-running clock, which
++        // drifts against the display and repeats or drops a frame every few
++        // seconds. A monitor at a multiple of the guest rate (120 Hz for 60)
++        // marks every Nth refresh.
++        DisplayVblank display;
++        bool use_display = false;
++        bool display_pending = REXCVAR_GET(vblank_source) == "display";
++        uint32_t display_divider = 1, display_phase = 0, display_checks = 0;
++        uint32_t display_retry = 0;
++        uint32_t display_attempts = 0;
++        if (!display_pending) {
++          REXGPU_INFO("vblank: using the timer at {:.3f} Hz (vblank_source = {})", refresh_rate_hz,
++                      REXCVAR_GET(vblank_source));
++        } else if (!REXCVAR_GET(vsync)) {
++          REXGPU_INFO("vblank: vsync is off, so the monitor is not followed");
++        }
++        auto try_display = [&]() {
++          use_display = false;
++          ++display_attempts;
++          if (!display.Init()) {
++            // No window yet: try again shortly. Anything else: stay on the timer.
++            display_pending = !display.window_found();
++            if (!display_pending) {
++              REXGPU_INFO("vblank: monitor timing unavailable, using the timer");
++            } else if (display_attempts == 1 || display_attempts % 20 == 0) {
++              REXGPU_INFO("vblank: game window not found yet (attempt {}), using the timer meanwhile",
++                          display_attempts);
++            }
++            return;
++          }
++          display_pending = false;
++          const double hz = display.refresh_hz();
++          const uint32_t divider =
++              std::max<uint32_t>(1, uint32_t(std::lround(hz / refresh_rate_hz)));
++          const double effective = hz / divider;
++          if (std::abs(effective - refresh_rate_hz) > 0.75) {
++            REXGPU_INFO(
++                "vblank: monitor runs at {:.2f} Hz, which does not divide to {:.2f} Hz; "
++                "using the timer",
++                hz, refresh_rate_hz);
++            return;
++          }
++          display_divider = divider;
++          display_phase = 0;
++          use_display = true;
++          REXGPU_INFO("vblank: following the monitor at {:.3f} Hz (every {} refresh -> {:.3f} Hz)",
++                      hz, divider, effective);
++        };
++
+         while (vsync_worker_running_) {
++          if (display_pending && REXCVAR_GET(vsync) && display_retry-- == 0) {
++            display_retry = 500;  // about every half second on the timer loop
++            try_display();
++            last_frame_time = chrono::Clock::QueryGuestTickCount();
++          }
++          if (use_display && REXCVAR_GET(vsync)) {
++            if (!display.Wait()) {
++              REXGPU_WARN("vblank: waiting for the monitor failed, using the timer");
++              use_display = false;
++              last_frame_time = chrono::Clock::QueryGuestTickCount();
++              continue;
++            }
++            if (++display_phase >= display_divider) {
++              display_phase = 0;
++              MarkVblank();
++            }
++            last_frame_time = chrono::Clock::QueryGuestTickCount();
++            if (++display_checks % 120 == 0) {
++              // The monitor's rate can change while running (dynamic refresh
++              // rate). Re-derive the divider from the tracked rate.
++              const double hz = display.refresh_hz();
++              const uint32_t divider =
++                  std::max<uint32_t>(1, uint32_t(std::lround(hz / refresh_rate_hz)));
++              if (std::abs(hz / divider - refresh_rate_hz) > 0.75) {
++                REXGPU_INFO("vblank: monitor changed to {:.2f} Hz, using the timer", hz);
++                use_display = false;
++                display_pending = true;
++                display_retry = 2000;  // look again in about 2 s
++                continue;
++              }
++              if (divider != display_divider) {
++                REXGPU_INFO("vblank: monitor changed to {:.3f} Hz (every {} refresh -> {:.3f} Hz)",
++                            hz, divider, hz / divider);
++                display_divider = divider;
++                display_phase = 0;
++              }
++            }
++            if (display_checks >= 600) {
++              display_checks = 0;
++              if (display.MonitorChanged()) {
++                REXGPU_INFO("vblank: game window moved to another monitor");
++                use_display = false;
++                display_pending = true;
++                display_retry = 0;
++              }
++            }
++            continue;
++          }
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;

@@ -1,0 +1,18 @@
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..df5bcdc 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -336,8 +336,12 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
+                                        VkAccessFlags& access_mask) const {
+   switch (usage) {
+     case Usage::kComputeWrite:
++      // Resolves write guest memory from a compute shader. The barrier after
++      // them must make those writes available (SHADER_WRITE), otherwise the
++      // texture loads that read the resolved image can see stale cache lines -
++      // short horizontal streaks on Intel GPUs.
+       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+-      access_mask = VK_ACCESS_SHADER_READ_BIT;
++      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+       return;
+     case Usage::kTransferDestination:
+       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;

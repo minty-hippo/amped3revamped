@@ -1,0 +1,52 @@
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251..c6b8604 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -17,11 +17,17 @@
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/shader/translator.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_tfetch1d_keep_y, true, "GPU/Shader",
++                    "Sample tfetch1D as 2D when its source swizzle selects a distinct second "
++                    "coordinate (fixes broken UI in 545407D4 Amped 3)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics {
+ 
+ using namespace ucode;
+@@ -1056,6 +1062,20 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
+   instr.opcode = op.opcode();
+   instr.opcode_name = opcode_info.name;
+   instr.dimension = op.dimension();
++  // Some titles (545407D4 Amped 3: menus, HUD, map) issue tfetch1D with an
++  // explicitly encoded second coordinate (src swizzle .xyz) against a 2D fetch
++  // constant, and the hardware samples it in 2D. Discarding Y samples only the
++  // first row of the texture. 1D and 2D fetches share a 2D array binding, so
++  // treat such a fetch as 2D; for a real 1D texture (height 1) the Y coordinate
++  // can only ever select row 0. A plain scalar tfetch1D (swizzle components
++  // replicated) is left alone.
++  if (op.opcode() == FetchOpcode::kTextureFetch &&
++      op.dimension() == xenos::FetchOpDimension::k1D && REXCVAR_GET(gpu_tfetch1d_keep_y)) {
++    uint32_t src_swizzle = op.src_swizzle();
++    if (((src_swizzle >> 2) & 0x3) != (src_swizzle & 0x3)) {
++      instr.dimension = xenos::FetchOpDimension::k2D;
++    }
++  }
+   instr.is_predicated = op.is_predicated();
+   instr.predicate_condition = op.predicate_condition();
+ 
+@@ -1075,7 +1095,7 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
+   src_op.is_absolute_value = false;
+   src_op.component_count = opcode_info.override_component_count
+                                ? opcode_info.override_component_count
+-                               : xenos::GetFetchOpDimensionComponentCount(op.dimension());
++                               : xenos::GetFetchOpDimensionComponentCount(instr.dimension);
+   uint32_t swizzle = op.src_swizzle();
+   for (uint32_t j = 0; j < src_op.component_count; ++j, swizzle >>= 2) {
+     src_op.components[j] = GetSwizzleFromComponentIndex(swizzle & 0x3);

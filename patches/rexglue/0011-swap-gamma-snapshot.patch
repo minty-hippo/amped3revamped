@@ -1,0 +1,55 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -135,6 +135,18 @@
+     return host_drawing_enabled_.load(std::memory_order_acquire);
+   }
+ 
++  // Amped 3 (patch 0011): the gamma ramp as it was at the last swap packet
++  // (DC_LUT_30_COLOR and DC_LUT_PWL_DATA values; pwl as [128][3]), copied on
++  // the command processor thread, so another thread reads a consistent ramp
++  // that matches the frame instead of one being rewritten. Returns the swap
++  // count (0: no swap yet).
++  uint64_t GetSwapGammaRamp(uint32_t table[256], uint32_t pwl[128 * 3]) const {
++    std::lock_guard<std::mutex> lock(swap_gamma_mutex_);
++    std::memcpy(table, swap_gamma_table_, sizeof(swap_gamma_table_));
++    std::memcpy(pwl, swap_gamma_pwl_, sizeof(swap_gamma_pwl_));
++    return swap_gamma_count_;
++  }
++
+   bool is_paused() const { return paused_; }
+   void Pause();
+   void Resume();
+@@ -257,6 +269,11 @@
+   std::vector<uint32_t> me_bin_;
+ 
+   uint32_t counter_ = 0;
++  // Patch 0011: see GetSwapGammaRamp.
++  mutable std::mutex swap_gamma_mutex_;
++  uint32_t swap_gamma_table_[256] = {};
++  uint32_t swap_gamma_pwl_[128 * 3] = {};
++  uint64_t swap_gamma_count_ = 0;
+   // Patch 0009: see SetHostDrawingEnabled.
+   std::atomic<bool> host_drawing_requested_{true};
+   std::atomic<bool> host_drawing_enabled_{true};
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -961,6 +961,17 @@
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
++  {
++    // Patch 0011: the ramp this frame is shown with (GetSwapGammaRamp).
++    std::lock_guard<std::mutex> lock(swap_gamma_mutex_);
++    for (uint32_t i = 0; i < 256; ++i) {
++      swap_gamma_table_[i] = gamma_ramp_256_entry_table_[i].value;
++    }
++    for (uint32_t i = 0; i < 128; ++i) {
++      for (uint32_t c = 0; c < 3; ++c) swap_gamma_pwl_[i * 3 + c] = gamma_ramp_pwl_rgb_[i][c].value;
++    }
++    ++swap_gamma_count_;
++  }
+   if (IsHostDrawingEnabled()) {
+     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+   }

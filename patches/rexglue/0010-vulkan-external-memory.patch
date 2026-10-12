@@ -1,0 +1,29 @@
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -199,6 +199,10 @@
+     bool ext_1_3_KHR_maintenance4 = false;  // #414
+     // Has optional features not implied by this being true.
+     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
++    // Amped 3 (patch 0010): importing images another Vulkan device rendered
++    // (the native renderer's output), on presentation devices.
++    bool ext_KHR_external_memory_win32 = false;  // #74
++    bool ext_KHR_external_memory_fd = false;     // #75
+   };
+ 
+   const Extensions& extensions() const { return extensions_; }
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -201,6 +201,11 @@
+   if (with_swapchain) {
+     // #2.
+     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
++    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
++      // Amped 3 (patch 0010): #74 / #75 (VK_KHR_external_memory is core in 1.1).
++      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_memory_win32)
++      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_memory_fd)
++    }
+   }
+ 
+   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;

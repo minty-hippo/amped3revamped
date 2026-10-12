@@ -1,0 +1,113 @@
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index b0f1a89..ba19413 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -50,6 +50,10 @@
+ namespace rex {
+ namespace ui {
+ 
++// Whether the guest output is shown integer-scaled with nearest sampling
++// (present_effect = integer).
++bool PresentIntegerScaling();
++
+ class Presenter;
+ class Window;
+ 
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 861830d..cbc657b 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -42,8 +42,8 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
+ 
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
+-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
++                      "Guest output effect: bilinear, integer, cas, fsr, fsr2, fsr3")
++    .allowed({"bilinear", "integer", "cas", "fsr", "fsr2", "fsr3"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
+@@ -72,8 +72,9 @@ REXCVAR_DEFINE_STRING(
+     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ #else
+-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
+-    .allowed({"bilinear"})
++REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
++                      "Guest output effect: bilinear, integer")
++    .allowed({"bilinear", "integer"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ #endif
+ 
+@@ -85,6 +86,17 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
+                     "Allow overscan cutoff based on safe area settings")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++namespace rex::ui {
++// present_effect = integer: the guest output is shown at the largest whole
++// multiple of its size that fits the window, centered, with nearest-neighbour
++// sampling (the presenters pick the point sampler at initialization).
++bool PresentIntegerScaling() {
++  std::string v = REXCVAR_GET(present_effect);
++  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return char(std::tolower(c)); });
++  return v == "integer";
++}
++}  // namespace rex::ui
++
+ namespace {
+ using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+ 
+@@ -997,6 +1009,20 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
+   }
+ 
++  // Integer scaling: the largest whole multiple of the guest output that fits
++  // the surface, centered (falls back to the fit above when even 1x doesn't).
++  if (PresentIntegerScaling() && properties.frontbuffer_width && properties.frontbuffer_height) {
++    const uint32_t scale =
++        std::min(surface_width_in_paint_connection_ / properties.frontbuffer_width,
++                 surface_height_in_paint_connection_ / properties.frontbuffer_height);
++    if (scale >= 1) {
++      output_width = properties.frontbuffer_width * scale;
++      output_height = properties.frontbuffer_height * scale;
++      flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
++      flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
++    }
++  }
++
+   // Convert the location from surface pixels (which have 1:1 aspect ratio
+   // relatively to the physical display) to render target pixels (the render
+   // target size may be arbitrary with any aspect ratio, but if it's different
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..cce5b3e 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -2282,8 +2282,11 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+   guest_output_image_sampler_bindings[0].descriptorCount = 1;
+   guest_output_image_sampler_bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+   guest_output_image_sampler_bindings[0].pImmutableSamplers = nullptr;
++  // Integer scaling shows whole texels: nearest sampling.
+   const VkSampler sampler_linear_clamp =
+-      ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
++      ui_samplers_->samplers()[PresentIntegerScaling()
++                                   ? UISamplers::kSamplerIndexNearestClampToEdge
++                                   : UISamplers::kSamplerIndexLinearClampToEdge];
+   guest_output_image_sampler_bindings[1].binding = 1;
+   guest_output_image_sampler_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+   guest_output_image_sampler_bindings[1].descriptorCount = 1;
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..b4e606c 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -1234,7 +1234,9 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+       D3D12_SHADER_VISIBILITY_PIXEL;
+   // Bilinear sampler.
+   D3D12_STATIC_SAMPLER_DESC guest_output_paint_root_sampler;
+-  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++  // Integer scaling shows whole texels: nearest sampling.
++  guest_output_paint_root_sampler.Filter =
++      PresentIntegerScaling() ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+   guest_output_paint_root_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+   guest_output_paint_root_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+   guest_output_paint_root_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;

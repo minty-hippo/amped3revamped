@@ -1,0 +1,502 @@
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index ba19413..038765e 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -50,8 +50,9 @@
+ namespace rex {
+ namespace ui {
+ 
+-// Whether the guest output is shown integer-scaled with nearest sampling
+-// (present_effect = integer).
++// Whether present_effect is "integer": the guest output shown at a whole
++// multiple of its size with nearest sampling (GuestOutputPaintConfig::Effect
++// kInteger).
+ bool PresentIntegerScaling();
+ 
+ class Presenter;
+@@ -216,6 +217,9 @@ class Presenter {
+    public:
+     enum class Effect {
+       kBilinear,
++      // The largest whole multiple of the guest output that fits, centered,
++      // with nearest sampling (bilinear fit when even 1x doesn't fit).
++      kInteger,
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+       kCas,
+       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
+@@ -445,6 +449,8 @@ class Presenter {
+   enum class GuestOutputPaintEffect {
+     kBilinear,
+     kBilinearDither,
++    // The bilinear shader with a nearest sampler (integer scaling).
++    kNearest,
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+     kCasSharpen,
+     kCasSharpenDither,
+@@ -461,6 +467,7 @@ class Presenter {
+   static constexpr bool CanGuestOutputPaintEffectBeIntermediate(GuestOutputPaintEffect effect) {
+     switch (effect) {
+       case GuestOutputPaintEffect::kBilinear:
++      case GuestOutputPaintEffect::kNearest:
+       // Dithering is never performed in intermediate passes because it may be
+       // interpreted as features by the subsequent passes.
+       case GuestOutputPaintEffect::kBilinearDither:
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index cbc657b..ca47f10 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -43,15 +43,13 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                       "Guest output effect: bilinear, integer, cas, fsr, fsr2, fsr3")
+-    .allowed({"bilinear", "integer", "cas", "fsr", "fsr2", "fsr3"})
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++    .allowed({"bilinear", "integer", "cas", "fsr", "fsr2", "fsr3"});
+ 
+ REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
+                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
+                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
+     .range(rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMin,
+-           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax)
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax);
+ 
+ REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
+                      rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
+@@ -63,8 +61,7 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
+                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionDefault,
+                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
+     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
+-           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax);
+ 
+ REXCVAR_DEFINE_STRING(
+     present_fsr_quality_mode, "auto", "UI/Presenter",
+@@ -74,13 +71,11 @@ REXCVAR_DEFINE_STRING(
+ #else
+ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                       "Guest output effect: bilinear, integer")
+-    .allowed({"bilinear", "integer"})
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++    .allowed({"bilinear", "integer"});
+ #endif
+ 
+ REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
+-                    "Enable output dithering in the final present pass")
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++                    "Enable output dithering in the final present pass");
+ 
+ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
+                     "Allow overscan cutoff based on safe area settings")
+@@ -104,6 +99,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
+   std::string lowered = effect_name;
+   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                  [](unsigned char c) { return char(std::tolower(c)); });
++  if (lowered == "integer") {
++    return GuestOutputPaintConfig::Effect::kInteger;
++  }
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+   if (lowered == "cas") {
+     return GuestOutputPaintConfig::Effect::kCas;
+@@ -263,6 +261,14 @@ void LogTemporalFsrQualityModeInputLimitOnce() {
+ }
+ #endif  // defined(REX_HAS_FIDELITYFX_SDK)
+ 
++// Settings that rebuild the paint configuration when changed at runtime.
++constexpr const char* kLivePaintConfigCVars[] = {
++    "present_effect", "present_dither",
++#if defined(REX_HAS_FIDELITYFX_SDK)
++    "present_cas_additional_sharpness", "present_fsr_sharpness_reduction",
++#endif
++};
++
+ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+   GuestOutputPaintConfig config;
+   GuestOutputPaintConfig::Effect parsed_effect = ParsePresentEffect(REXCVAR_GET(present_effect));
+@@ -295,6 +301,7 @@ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsib
+ }
+ 
+ Presenter::~Presenter() {
++  for (const char* name : kLivePaintConfigCVars) rex::cvar::UnregisterChangeCallbacks(name);
+   // No intrusive lifetime management must be performed from UI drawers - defer
+   // it if needed.
+   assert_false(is_executing_ui_drawers_);
+@@ -827,6 +834,14 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+     guest_output_paint_config_ = BuildGuestOutputPaintConfigFromCVar();
+   }
+ 
++  // The output effect and its settings apply live: changing one rebuilds the
++  // paint configuration (all effects' pipelines exist from initialization).
++  for (const char* name : kLivePaintConfigCVars) {
++    rex::cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
++      SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
++    });
++  }
++
+   // Initialize UI frame rate limiting.
+ #if REX_PLATFORM_WIN32
+   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
+@@ -1011,7 +1026,9 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+ 
+   // Integer scaling: the largest whole multiple of the guest output that fits
+   // the surface, centered (falls back to the fit above when even 1x doesn't).
+-  if (PresentIntegerScaling() && properties.frontbuffer_width && properties.frontbuffer_height) {
++  bool integer_scaled = false;
++  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kInteger &&
++      properties.frontbuffer_width && properties.frontbuffer_height) {
+     const uint32_t scale =
+         std::min(surface_width_in_paint_connection_ / properties.frontbuffer_width,
+                  surface_height_in_paint_connection_ / properties.frontbuffer_height);
+@@ -1020,6 +1037,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+       output_height = properties.frontbuffer_height * scale;
+       flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
+       flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
++      integer_scaled = true;
+     }
+   }
+ 
+@@ -1221,6 +1239,11 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     flow.effect_output_sizes[flow.effect_count] = std::make_pair(output_width, output_height);
+     flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+   }
++  // Integer scaling: the single stretch samples whole texels.
++  if (integer_scaled && flow.effect_count == 1 &&
++      flow.effects[0] == GuestOutputPaintEffect::kBilinear) {
++    flow.effects[0] = GuestOutputPaintEffect::kNearest;
++  }
+ 
+   assert_not_zero(flow.effect_count);
+ 
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index 56ee43b..58651f0 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -230,6 +230,8 @@ class VulkanPresenter final : public Presenter {
+ 
+   enum GuestOutputPaintPipelineLayoutIndex : size_t {
+     kGuestOutputPaintPipelineLayoutIndexBilinear,
++    // The bilinear shader with descriptor sets whose sampler is nearest.
++    kGuestOutputPaintPipelineLayoutIndexNearest,
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+     kGuestOutputPaintPipelineLayoutIndexCasSharpen,
+     kGuestOutputPaintPipelineLayoutIndexCasResample,
+@@ -246,6 +248,8 @@ class VulkanPresenter final : public Presenter {
+       case GuestOutputPaintEffect::kBilinear:
+       case GuestOutputPaintEffect::kBilinearDither:
+         return kGuestOutputPaintPipelineLayoutIndexBilinear;
++      case GuestOutputPaintEffect::kNearest:
++        return kGuestOutputPaintPipelineLayoutIndexNearest;
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+       case GuestOutputPaintEffect::kCasSharpen:
+       case GuestOutputPaintEffect::kCasSharpenDither:
+@@ -375,6 +379,9 @@ class VulkanPresenter final : public Presenter {
+     VkDescriptorPool guest_output_descriptor_pool = VK_NULL_HANDLE;
+     // Descriptors are updated while painting if they're out of date.
+     VkDescriptorSet guest_output_descriptor_sets[kGuestOutputDescriptorSetCount];
++    // The guest output images again, with the nearest sampler (kNearest,
++    // which is only ever the single effect reading the guest output).
++    VkDescriptorSet guest_output_nearest_descriptor_sets[kGuestOutputMailboxSize];
+ 
+     // Refreshed and cleaned up during guest output painting. The first is the
+     // paint submission index in which the guest output image (and its
+@@ -452,6 +459,7 @@ class VulkanPresenter final : public Presenter {
+   // main target (can be destroyed only after awaiting main target usage
+   // completion).
+   VkDescriptorSetLayout guest_output_paint_image_descriptor_set_layout_ = VK_NULL_HANDLE;
++  VkDescriptorSetLayout guest_output_paint_image_nearest_descriptor_set_layout_ = VK_NULL_HANDLE;
+   std::array<VkPipelineLayout, kGuestOutputPaintPipelineLayoutCount>
+       guest_output_paint_pipeline_layouts_ = {};
+   VkShaderModule guest_output_paint_vs_ = VK_NULL_HANDLE;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index cce5b3e..1294bd4 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -247,6 +247,8 @@ VulkanPresenter::~VulkanPresenter() {
+   }
+   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                              guest_output_paint_image_descriptor_set_layout_);
++  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
++                             guest_output_paint_image_nearest_descriptor_set_layout_);
+ }
+ 
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+@@ -1716,6 +1718,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         guest_output_image_descriptor_write.pBufferInfo = nullptr;
+         guest_output_image_descriptor_write.pTexelBufferView = nullptr;
+         dfn.vkUpdateDescriptorSets(device, 1, &guest_output_image_descriptor_write, 0, nullptr);
++        guest_output_image_descriptor_write.dstSet =
++            paint_context_.guest_output_nearest_descriptor_sets[guest_output_image_paint_ref_index];
++        dfn.vkUpdateDescriptorSets(device, 1, &guest_output_image_descriptor_write, 0, nullptr);
+       }
+ 
+       // Make sure intermediate textures of the needed size are available, and
+@@ -2011,7 +2016,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+           dfn.vkCmdBindDescriptorSets(
+               draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+               guest_output_paint_pipeline_layout, 0, 1,
+-              &paint_context_.guest_output_descriptor_sets[effect_src_descriptor_set], 0, nullptr);
++              (effect == GuestOutputPaintEffect::kNearest && !i)
++                  ? &paint_context_.guest_output_nearest_descriptor_sets
++                        [guest_output_image_paint_ref_index]
++                  : &paint_context_.guest_output_descriptor_sets[effect_src_descriptor_set],
++              0, nullptr);
+ 
+           GuestOutputPaintRectangleConstants effect_rect_constants;
+           float effect_x_to_ndc = 2.0f / guest_output_viewport.width;
+@@ -2035,7 +2044,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+ #endif
+           } effect_constants;
+           switch (guest_output_paint_pipeline_layout_index) {
+-            case kGuestOutputPaintPipelineLayoutIndexBilinear: {
++            case kGuestOutputPaintPipelineLayoutIndexBilinear:
++            case kGuestOutputPaintPipelineLayoutIndexNearest: {
+               effect_constants_size = sizeof(effect_constants.bilinear);
+               effect_constants.bilinear.Initialize(guest_output_flow, i);
+             } break;
+@@ -2282,11 +2292,8 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+   guest_output_image_sampler_bindings[0].descriptorCount = 1;
+   guest_output_image_sampler_bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+   guest_output_image_sampler_bindings[0].pImmutableSamplers = nullptr;
+-  // Integer scaling shows whole texels: nearest sampling.
+   const VkSampler sampler_linear_clamp =
+-      ui_samplers_->samplers()[PresentIntegerScaling()
+-                                   ? UISamplers::kSamplerIndexNearestClampToEdge
+-                                   : UISamplers::kSamplerIndexLinearClampToEdge];
++      ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+   guest_output_image_sampler_bindings[1].binding = 1;
+   guest_output_image_sampler_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+   guest_output_image_sampler_bindings[1].descriptorCount = 1;
+@@ -2304,6 +2311,18 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+   if (dfn.vkCreateDescriptorSetLayout(
+           device, &guest_output_paint_image_descriptor_set_layout_create_info, nullptr,
+           &guest_output_paint_image_descriptor_set_layout_) != VK_SUCCESS) {
++    REXLOG_ERROR(
++        "VulkanPresenter: Failed to create the guest output painting image "
++        "and sampler descriptor set layout");
++    return false;
++  }
++  // The same with the nearest sampler (integer scaling).
++  const VkSampler sampler_nearest_clamp =
++      ui_samplers_->samplers()[UISamplers::kSamplerIndexNearestClampToEdge];
++  guest_output_image_sampler_bindings[1].pImmutableSamplers = &sampler_nearest_clamp;
++  if (dfn.vkCreateDescriptorSetLayout(
++          device, &guest_output_paint_image_descriptor_set_layout_create_info, nullptr,
++          &guest_output_paint_image_nearest_descriptor_set_layout_) != VK_SUCCESS) {
+     REXLOG_ERROR(
+         "VulkanPresenter: Failed to create the guest output image descriptor "
+         "set layout");
+@@ -2335,6 +2354,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+   for (size_t i = 0; i < size_t(kGuestOutputPaintPipelineLayoutCount); ++i) {
+     switch (GuestOutputPaintPipelineLayoutIndex(i)) {
+       case kGuestOutputPaintPipelineLayoutIndexBilinear:
++      case kGuestOutputPaintPipelineLayoutIndexNearest:
+         guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
+         break;
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+@@ -2355,6 +2375,10 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+         assert_unhandled_case(GuestOutputPaintPipelineLayoutIndex(i));
+         continue;
+     }
++    guest_output_paint_pipeline_layout_create_info.pSetLayouts =
++        i == kGuestOutputPaintPipelineLayoutIndexNearest
++            ? &guest_output_paint_image_nearest_descriptor_set_layout_
++            : &guest_output_paint_image_descriptor_set_layout_;
+     guest_output_paint_pipeline_layout_create_info.pushConstantRangeCount =
+         1 + uint32_t(guest_output_paint_push_constant_range_ffx.size != 0);
+     if (dfn.vkCreatePipelineLayout(device, &guest_output_paint_pipeline_layout_create_info, nullptr,
+@@ -2385,6 +2409,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+     GuestOutputPaintEffect guest_output_paint_effect = GuestOutputPaintEffect(i);
+     switch (guest_output_paint_effect) {
+       case GuestOutputPaintEffect::kBilinear:
++      case GuestOutputPaintEffect::kNearest:
+         shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_ps);
+         shader_module_create_info.pCode = shaders::guest_output_bilinear_ps;
+         break;
+@@ -2521,20 +2546,20 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+   VkDescriptorPoolSize guest_output_paint_descriptor_pool_sizes[2];
+   guest_output_paint_descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+   guest_output_paint_descriptor_pool_sizes[0].descriptorCount =
+-      PaintContext::kGuestOutputDescriptorSetCount;
++      PaintContext::kGuestOutputDescriptorSetCount + kGuestOutputMailboxSize;
+   // Required even when using immutable samplers, otherwise failing to allocate
+   // descriptor sets (tested on AMD Software: Adrenalin Edition 22.3.2 on
+   // Windows 10 on AMD Radeon RX Vega 10 with Vulkan validation enabled).
+   guest_output_paint_descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+   guest_output_paint_descriptor_pool_sizes[1].descriptorCount =
+-      PaintContext::kGuestOutputDescriptorSetCount;
++      PaintContext::kGuestOutputDescriptorSetCount + kGuestOutputMailboxSize;
+   VkDescriptorPoolCreateInfo guest_output_paint_descriptor_pool_create_info;
+   guest_output_paint_descriptor_pool_create_info.sType =
+       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+   guest_output_paint_descriptor_pool_create_info.pNext = nullptr;
+   guest_output_paint_descriptor_pool_create_info.flags = 0;
+   guest_output_paint_descriptor_pool_create_info.maxSets =
+-      PaintContext::kGuestOutputDescriptorSetCount;
++      PaintContext::kGuestOutputDescriptorSetCount + kGuestOutputMailboxSize;
+   guest_output_paint_descriptor_pool_create_info.poolSizeCount =
+       uint32_t(rex::countof(guest_output_paint_descriptor_pool_sizes));
+   guest_output_paint_descriptor_pool_create_info.pPoolSizes =
+@@ -2569,6 +2594,20 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+         "descriptor sets");
+     return false;
+   }
++  VkDescriptorSetLayout guest_output_paint_nearest_set_layouts[kGuestOutputMailboxSize];
++  std::fill(guest_output_paint_nearest_set_layouts,
++            guest_output_paint_nearest_set_layouts + kGuestOutputMailboxSize,
++            guest_output_paint_image_nearest_descriptor_set_layout_);
++  guest_output_paint_descriptor_set_allocate_info.descriptorSetCount = kGuestOutputMailboxSize;
++  guest_output_paint_descriptor_set_allocate_info.pSetLayouts = guest_output_paint_nearest_set_layouts;
++  if (dfn.vkAllocateDescriptorSets(device, &guest_output_paint_descriptor_set_allocate_info,
++                                   paint_context_.guest_output_nearest_descriptor_sets) !=
++      VK_SUCCESS) {
++    REXLOG_ERROR(
++        "VulkanPresenter: Failed to allocate the guest output nearest-sampling "
++        "descriptor sets");
++    return false;
++  }
+ 
+   return InitializeCommonSurfaceIndependent();
+ }
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 83d09f7..6a2e501 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -132,6 +132,8 @@ class D3D12Presenter final : public Presenter {
+ 
+   enum GuestOutputPaintRootSignatureIndex : size_t {
+     kGuestOutputPaintRootSignatureIndexBilinear,
++    // The bilinear shader with a point static sampler (integer scaling).
++    kGuestOutputPaintRootSignatureIndexNearest,
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+     kGuestOutputPaintRootSignatureIndexCasSharpen,
+     kGuestOutputPaintRootSignatureIndexCasResample,
+@@ -148,6 +150,8 @@ class D3D12Presenter final : public Presenter {
+       case GuestOutputPaintEffect::kBilinear:
+       case GuestOutputPaintEffect::kBilinearDither:
+         return kGuestOutputPaintRootSignatureIndexBilinear;
++      case GuestOutputPaintEffect::kNearest:
++        return kGuestOutputPaintRootSignatureIndexNearest;
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+       case GuestOutputPaintEffect::kCasSharpen:
+       case GuestOutputPaintEffect::kCasSharpenDither:
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index b4e606c..11ee867 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -956,7 +956,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+ #endif
+           } effect_constants;
+           switch (guest_output_paint_root_signature_index) {
+-            case kGuestOutputPaintRootSignatureIndexBilinear: {
++            case kGuestOutputPaintRootSignatureIndexBilinear:
++            case kGuestOutputPaintRootSignatureIndexNearest: {
+               effect_constants_size = sizeof(effect_constants.bilinear);
+               effect_constants.bilinear.Initialize(guest_output_flow, i);
+             } break;
+@@ -1234,9 +1235,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+       D3D12_SHADER_VISIBILITY_PIXEL;
+   // Bilinear sampler.
+   D3D12_STATIC_SAMPLER_DESC guest_output_paint_root_sampler;
+-  // Integer scaling shows whole texels: nearest sampling.
+-  guest_output_paint_root_sampler.Filter =
+-      PresentIntegerScaling() ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+   guest_output_paint_root_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+   guest_output_paint_root_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+   guest_output_paint_root_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+@@ -1271,6 +1270,21 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear]
+           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
+   }
++  // The same with a point sampler (integer scaling).
++  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
++  {
++    ID3D12RootSignature* guest_output_paint_root_signature =
++        util::CreateRootSignature(provider_, guest_output_paint_root_signature_desc);
++    if (!guest_output_paint_root_signature) {
++      REXLOG_ERROR(
++          "D3D12Presenter: Failed to create the guest output nearest "
++          "filtering presentation root signature");
++      return false;
++    }
++    *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexNearest]
++          .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
++  }
++  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+   // EASU (needs the sampler).
+   guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
+@@ -1355,6 +1369,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+     GuestOutputPaintEffect guest_output_paint_effect = GuestOutputPaintEffect(i);
+     switch (guest_output_paint_effect) {
+       case GuestOutputPaintEffect::kBilinear:
++      case GuestOutputPaintEffect::kNearest:
+         guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_bilinear_ps;
+         guest_output_paint_pipeline_desc.PS.BytecodeLength =
+             sizeof(shaders::guest_output_bilinear_ps);
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 47e08de..446a110 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -44,8 +44,7 @@ REXCVAR_DEFINE_STRING(vblank_source, "display", "GPU",
+                       "the monitor showing the game, so every frame lands on its own refresh "
+                       "(falls back to timer when the monitor's rate does not divide to the "
+                       "video mode rate). timer: a fixed clock at the video mode rate.")
+-    .allowed({"display", "timer"})
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++    .allowed({"display", "timer"});
+ 
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+@@ -221,7 +220,42 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+                       hz, divider, effective);
+         };
+ 
++        // The setting applies live: switching to the monitor looks for it
++        // again, switching to the timer leaves it. The new value comes
++        // through a change callback (the string isn't safe to read while
++        // another thread assigns it).
++        struct SourceChange {
++          std::mutex mutex;
++          std::string value;
++          std::atomic<bool> pending{false};
++        };
++        auto source_change = std::make_shared<SourceChange>();
++        rex::cvar::RegisterChangeCallback(
++            "vblank_source", [source_change](std::string_view, std::string_view value) {
++              std::lock_guard lock(source_change->mutex);
++              source_change->value = std::string(value);
++              source_change->pending = true;
++            });
+         while (vsync_worker_running_) {
++          if (source_change->pending.exchange(false)) {
++            std::string source;
++            {
++              std::lock_guard lock(source_change->mutex);
++              source = source_change->value;
++            }
++            if (source == "display") {
++              display_pending = true;
++              display_retry = 0;
++              display_attempts = 0;
++              REXGPU_INFO("vblank: vblank_source changed to display");
++            } else {
++              display_pending = false;
++              use_display = false;
++              REXGPU_INFO("vblank: vblank_source changed to {}, using the timer at {:.3f} Hz",
++                          source, refresh_rate_hz);
++            }
++            last_frame_time = chrono::Clock::QueryGuestTickCount();
++          }
+           if (display_pending && REXCVAR_GET(vsync) && display_retry-- == 0) {
+             display_retry = 500;  // about every half second on the timer loop
+             try_display();
+@@ -279,6 +313,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+           }
+           rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
++        rex::cvar::UnregisterChangeCallbacks("vblank_source");
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
