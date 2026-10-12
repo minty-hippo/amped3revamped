@@ -1,0 +1,39 @@
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org/>
+
+--------------------------------------------------------------------------------
+
+Scope: this dedication covers this project's own files. It does not cover
+third-party code, which keeps its own license and copyright notices:
+
+  third_party/        miniz, stb, Vulkan headers, AMD FidelityFX API headers
+                      (see the license file in each folder)
+  patches/rexglue/    adapted from 3on3NHL-recomp (MIT, see
+                      LICENSE-3on3NHL-recomp.txt)
+
+nor anything the build downloads or uses (the ReXGlue SDK, Intel XeSS, AMD
+FidelityFX runtime, Real-ESRGAN), listed with credits in README.md under
+"Credits". Amped 3 and its logo are trademarks of their respective owners and
+are not part of this project; it contains no game code or data.

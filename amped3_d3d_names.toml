@@ -1,0 +1,175 @@
+# Names for the Direct3D functions identified in default.xex (see docs/d3d-map.md).
+# Opt-in: add "amped3_d3d_names.toml" to [entrypoint] includes in the manifest to
+# give these functions readable names in generated code, crash reports and hooks.
+# Naming only; it does not change behaviour. Needs a codegen re-run (full rebuild).
+
+[functions]
+"0x824A6D08" = { name = "Game_RenderDevice_Swap" }  # high
+"0x824A6FC0" = { name = "Game_CreateRenderDevice" }  # high
+"0x825931C0" = { name = "Direct3D_GetDeviceCaps" }  # medium
+"0x82593698" = { name = "D3DDevice_CreateQuery" }  # medium
+"0x82593778" = { name = "D3DQuery_Release" }  # medium
+"0x825938C0" = { name = "D3DQuery_Issue" }  # medium
+"0x82593A48" = { name = "D3DQuery_GetData" }  # medium
+"0x825971C8" = { name = "D3D_SetTextureHeader" }  # medium
+"0x825974B0" = { name = "D3DTexture_GetSurfaceLevel" }  # medium
+"0x82597570" = { name = "D3DCubeTexture_GetCubeMapSurface" }  # medium
+"0x82597620" = { name = "D3DVolumeTexture_GetVolumeLevel" }  # low
+"0x825976C8" = { name = "D3DDevice_CreateTexture" }  # medium
+"0x825977E8" = { name = "D3DDevice_CreateSurface" }  # medium
+"0x82597AF0" = { name = "D3DBaseTexture_GetLevelDesc" }  # low
+"0x82597B70" = { name = "D3DSurface_GetDesc" }  # low
+"0x82597BD8" = { name = "D3DDevice_SetTexture" }  # high
+"0x825997D8" = { name = "D3DPixelShader_Release" }  # medium
+"0x82599890" = { name = "D3DVertexShader_Release" }  # medium
+"0x82599998" = { name = "D3DDevice_SetPixelShader" }  # high
+"0x82599BB0" = { name = "D3D_BindVertexShaderForDeclaration" }  # medium
+"0x82599D08" = { name = "D3DDevice_SetVertexShader" }  # medium
+"0x82599D70" = { name = "D3DDevice_CreateVertexDeclaration" }  # medium
+"0x82599E30" = { name = "D3DVertexDeclaration_Release" }  # medium
+"0x8259AD80" = { name = "D3DDevice_CreatePixelShader" }  # medium
+"0x8259AE90" = { name = "D3DDevice_CreateVertexShader" }  # medium
+"0x8259AF88" = { name = "D3DDevice_SetVertexDeclaration" }  # high
+"0x8259B698" = { name = "D3DDevice_SetFVF" }  # medium
+"0x8259F710" = { name = "D3DDevice_SetScissorRect" }  # medium
+"0x8259F7D8" = { name = "D3DDevice_SetViewport" }  # high
+"0x8259F9C8" = { name = "D3DDevice_SetStreamSource" }  # high
+"0x8259FA68" = { name = "D3DDevice_SetIndices" }  # high
+"0x8259FAE8" = { name = "D3DDevice_GetRenderTarget" }  # medium
+"0x8259FB30" = { name = "D3DDevice_GetDepthStencilSurface" }  # medium
+"0x8259FB70" = { name = "D3DDevice_SetGammaRamp" }  # medium
+"0x8259FC90" = { name = "D3DDevice_SetClipPlane" }  # medium
+"0x8259FE70" = { name = "D3D_UpdateSurfaceState" }  # low
+"0x8259FF48" = { name = "D3DDevice_SetRenderTarget" }  # high
+"0x825A02E0" = { name = "D3DDevice_SetDepthStencilSurface" }  # high
+"0x825A0458" = { name = "D3D_SetTilePredication" }  # low
+"0x825A0528" = { name = "D3DDevice_BeginTiling" }  # medium
+"0x825A0850" = { name = "D3DDevice_EndTiling" }  # medium
+"0x825A0B60" = { name = "D3D_DrawVerticesUP_Internal" }  # medium
+"0x825A0E00" = { name = "D3DDevice_DrawVerticesUP" }  # medium
+"0x825A0E88" = { name = "D3D_DrawIndexedVerticesUP_Internal" }  # medium
+"0x825A1198" = { name = "D3DDevice_DrawIndexedVerticesUP" }  # medium
+"0x825A1278" = { name = "D3DDevice_DrawVertices" }  # high
+"0x825A14B8" = { name = "D3DDevice_DrawIndexedVertices" }  # high
+"0x825A1F30" = { name = "D3DDevice_ClearF" }  # high
+"0x825A25F0" = { name = "D3DDevice_Clear" }  # high
+"0x825A2980" = { name = "D3D_GraphicsInterruptCallback" }  # high
+"0x825A3550" = { name = "D3D_BlockOnFence" }  # high
+"0x825A37B8" = { name = "D3DResource_BlockUntilNotBusy" }  # medium
+"0x825A3818" = { name = "D3D_ReservePredicated" }  # medium
+"0x825A3BA0" = { name = "D3D_MakeSpace" }  # high
+"0x825A3DF0" = { name = "D3DDevice_BlockUntilIdle" }  # medium
+"0x825A3EC0" = { name = "D3D_InitializeRingBuffer" }  # high
+"0x825A4330" = { name = "D3D_DestroyDevice" }  # medium
+"0x825A43D8" = { name = "Direct3D_CreateDevice" }  # high
+"0x825A4500" = { name = "D3DResource_AddRef" }  # high
+"0x825A4618" = { name = "D3D_DestroyResource" }  # medium
+"0x825A4A80" = { name = "D3DResource_Release" }  # high
+"0x825A4B00" = { name = "D3DResource_GetDevice" }  # medium
+"0x825A4D80" = { name = "D3D_FreeEdram" }  # low
+"0x825A4DD0" = { name = "D3D_AllocateEdram" }  # low
+"0x825A6CA8" = { name = "D3DDevice_Resolve" }  # high
+"0x825A7E58" = { name = "D3D_WriteRegisterBlock" }  # medium
+"0x825A7F18" = { name = "D3D_WriteFetchConstants" }  # medium
+"0x825A8008" = { name = "D3D_WriteAluConstants" }  # medium
+"0x825A8130" = { name = "D3D_CommitVertexFetch" }  # medium
+"0x825A8C98" = { name = "D3D_CommitShaders" }  # high
+"0x825A8250" = { name = "D3D_PatchVertexShaderFetches" }  # high (dev, vs, microcode, decl)
+"0x825A8830" = { name = "D3D_LoadVertexShaderImmediate" }  # high (copies + patches microcode into the command buffer)
+"0x825A9268" = { name = "D3D_FlushDirtyState" }  # high
+"0x825AA940" = { name = "D3D_InitializeEngines" }  # high
+"0x825AAA00" = { name = "D3D_SetDefaultStates" }  # medium
+"0x825AAED8" = { name = "D3D_InitializeDevice" }  # high
+"0x825AB0F0" = { name = "D3D_ShutdownDevice" }  # high
+"0x825AB500" = { name = "D3D_WaitForPresentInterval" }  # low
+"0x825AB670" = { name = "D3DDevice_Swap" }  # high
+"0x825ABC50" = { name = "D3DDevice_Present" }  # high
+"0x825AF298" = { name = "D3DXAssembleShader" }  # medium
+"0x825AF9A8" = { name = "D3DX_ShaderBuildB" }  # low
+"0x8259D8E8" = { name = "D3DDevice_SetRenderState_D3DRS_ZENABLE" }  # table #2
+"0x8259D970" = { name = "D3DDevice_SetRenderState_D3DRS_ZFUNC" }  # table #3
+"0x8259D938" = { name = "D3DDevice_SetRenderState_D3DRS_ZWRITEENABLE" }  # table #4
+"0x8259D230" = { name = "D3DDevice_SetRenderState_D3DRS_FILLMODE" }  # table #5
+"0x8259D1F8" = { name = "D3DDevice_SetRenderState_D3DRS_CULLMODE" }  # table #6
+"0x8259D2B0" = { name = "D3DDevice_SetRenderState_D3DRS_ALPHABLENDENABLE" }  # table #7
+"0x8259D680" = { name = "D3DDevice_SetRenderState_D3DRS_SEPARATEALPHABLENDENABLE" }  # table #8
+"0x8259D7C8" = { name = "D3DDevice_SetRenderState_D3DRS_BLENDFACTOR" }  # table #9
+"0x8259D3E8" = { name = "D3DDevice_SetRenderState_D3DRS_SRCBLEND" }  # table #10
+"0x8259D480" = { name = "D3DDevice_SetRenderState_D3DRS_DESTBLEND" }  # table #11
+"0x8259D350" = { name = "D3DDevice_SetRenderState_D3DRS_BLENDOP" }  # table #12
+"0x8259D590" = { name = "D3DDevice_SetRenderState_D3DRS_SRCBLENDALPHA" }  # table #13
+"0x8259D608" = { name = "D3DDevice_SetRenderState_D3DRS_DESTBLENDALPHA" }  # table #14
+"0x8259D518" = { name = "D3DDevice_SetRenderState_D3DRS_BLENDOPALPHA" }  # table #15
+"0x8259D268" = { name = "D3DDevice_SetRenderState_D3DRS_ALPHATESTENABLE" }  # table #16
+"0x8259D720" = { name = "D3DDevice_SetRenderState_D3DRS_ALPHAREF" }  # table #17
+"0x8259D790" = { name = "D3DDevice_SetRenderState_D3DRS_ALPHAFUNC" }  # table #18
+"0x8259D9B8" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILENABLE" }  # table #19
+"0x8259DA08" = { name = "D3DDevice_SetRenderState_D3DRS_TWOSIDEDSTENCILMODE" }  # table #20
+"0x8259DA88" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILFAIL" }  # table #21
+"0x8259DAD0" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILZFAIL" }  # table #22
+"0x8259DB18" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILPASS" }  # table #23
+"0x8259DA50" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILFUNC" }  # table #24
+"0x8259DC50" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILREF" }  # table #25
+"0x8259DC78" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILMASK" }  # table #26
+"0x8259DCA0" = { name = "D3DDevice_SetRenderState_D3DRS_STENCILWRITEMASK" }  # table #27
+"0x8259DB88" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILFAIL" }  # table #28
+"0x8259DBD0" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILZFAIL" }  # table #29
+"0x8259DC18" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILPASS" }  # table #30
+"0x8259DB50" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILFUNC" }  # table #31
+"0x8259DCC8" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILREF" }  # table #32
+"0x8259DCF0" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILMASK" }  # table #33
+"0x8259DD18" = { name = "D3DDevice_SetRenderState_D3DRS_CCW_STENCILWRITEMASK" }  # table #34
+"0x8259DD40" = { name = "D3DDevice_SetRenderState_D3DRS_CLIPPLANEENABLE" }  # table #35
+"0x8259E088" = { name = "D3DDevice_SetRenderState_D3DRS_POINTSIZE" }  # table #36
+"0x8259E0E0" = { name = "D3DDevice_SetRenderState_D3DRS_POINTSIZE_MIN" }  # table #37
+"0x8259E078" = { name = "D3DDevice_SetRenderState_RS38" }  # table #38
+"0x8259E130" = { name = "D3DDevice_SetRenderState_D3DRS_POINTSIZE_MAX" }  # table #39
+"0x8259DEF0" = { name = "D3DDevice_SetRenderState_D3DRS_MULTISAMPLEANTIALIAS" }  # table #40
+"0x8259DF28" = { name = "D3DDevice_SetRenderState_D3DRS_MULTISAMPLEMASK" }  # table #41
+"0x8259FF38" = { name = "D3DDevice_SetRenderState_D3DRS_SCISSORTESTENABLE" }  # table #42
+"0x8259DD88" = { name = "D3DDevice_SetRenderState_D3DRS_SLOPESCALEDEPTHBIAS" }  # table #43
+"0x8259DE48" = { name = "D3DDevice_SetRenderState_D3DRS_DEPTHBIAS" }  # table #44
+"0x8259DF58" = { name = "D3DDevice_SetRenderState_D3DRS_COLORWRITEENABLE" }  # table #45
+"0x8259DFA0" = { name = "D3DDevice_SetRenderState_D3DRS_COLORWRITEENABLE1" }  # table #46
+"0x8259DFE8" = { name = "D3DDevice_SetRenderState_D3DRS_COLORWRITEENABLE2" }  # table #47
+"0x8259E030" = { name = "D3DDevice_SetRenderState_D3DRS_COLORWRITEENABLE3" }  # table #48
+"0x8259E510" = { name = "D3DDevice_SetRenderState_RS49" }  # table #49
+"0x8259EB70" = { name = "D3DDevice_SetRenderState_D3DRS_TESSELLATIONMODE" }  # table #50
+"0x8259EB10" = { name = "D3DDevice_SetRenderState_D3DRS_MINTESSELLATIONLEVEL" }  # table #51
+"0x8259EB40" = { name = "D3DDevice_SetRenderState_D3DRS_MAXTESSELLATIONLEVEL" }  # table #52
+"0x8259E180" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP0" }  # table #53
+"0x8259E1B0" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP1" }  # table #54
+"0x8259E1E0" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP2" }  # table #55
+"0x8259E210" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP3" }  # table #56
+"0x8259E240" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP4" }  # table #57
+"0x8259E270" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP5" }  # table #58
+"0x8259E2A0" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP6" }  # table #59
+"0x8259E2D0" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP7" }  # table #60
+"0x8259E2F8" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP8" }  # table #61
+"0x8259E328" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP9" }  # table #62
+"0x8259E358" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP10" }  # table #63
+"0x8259E388" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP11" }  # table #64
+"0x8259E3B8" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP12" }  # table #65
+"0x8259E3E8" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP13" }  # table #66
+"0x8259E418" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP14" }  # table #67
+"0x8259E448" = { name = "D3DDevice_SetRenderState_D3DRS_WRAP15" }  # table #68
+"0x8259E530" = { name = "D3DDevice_SetRenderState_D3DRS_VIEWPORTENABLE" }  # table #69
+"0x8259E590" = { name = "D3DDevice_SetRenderState_RS70" }  # table #70
+"0x8259E6F0" = { name = "D3DDevice_SetRenderState_RS71" }  # table #71
+"0x8259E850" = { name = "D3DDevice_SetRenderState_RS72" }  # table #72
+"0x8259E9B0" = { name = "D3DDevice_SetRenderState_RS73" }  # table #73
+"0x8259EBA0" = { name = "D3DDevice_SetRenderState_D3DRS_HALFPIXELOFFSET" }  # table #74
+"0x8259EBD8" = { name = "D3DDevice_SetRenderState_D3DRS_PRIMITIVERESETENABLE" }  # table #75
+"0x8259EC10" = { name = "D3DDevice_SetRenderState_D3DRS_PRIMITIVERESETINDEX" }  # table #76
+"0x8259EC38" = { name = "D3DDevice_SetRenderState_D3DRS_ALPHATOMASKENABLE" }  # table #77
+"0x8259EC70" = { name = "D3DDevice_SetRenderState_D3DRS_ALPHATOMASKOFFSETS" }  # table #78
+"0x8259ECB0" = { name = "D3DDevice_SetRenderState_D3DRS_GUARDBAND_X" }  # table #79
+"0x8259ECE0" = { name = "D3DDevice_SetRenderState_D3DRS_GUARDBAND_Y" }  # table #80
+"0x8259ED10" = { name = "D3DDevice_SetRenderState_D3DRS_DISCARDBAND_X" }  # table #81
+"0x8259ED40" = { name = "D3DDevice_SetRenderState_D3DRS_DISCARDBAND_Y" }  # table #82
+"0x8259ED70" = { name = "D3DDevice_SetRenderState_D3DRS_HIZENABLE" }  # table #83
+"0x8259EDA8" = { name = "D3DDevice_SetRenderState_D3DRS_HIZWRITEENABLE" }  # table #84
+"0x8259EDE0" = { name = "D3DDevice_SetRenderState_RS85" }  # table #85
+"0x8259EE18" = { name = "D3DDevice_SetRenderState_RS86" }  # table #86
+"0x8259EE40" = { name = "D3DDevice_SetRenderState_RS87" }  # table #87
+"0x8259EE50" = { name = "D3DDevice_SetRenderState_RS88" }  # table #88

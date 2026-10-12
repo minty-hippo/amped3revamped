@@ -1,0 +1,10 @@
+# Amped 3 Revamped - starting settings, copied next to amped3.exe on the first build.
+# The in-game options menu (Back+Start or F1) rewrites amped3.toml when you
+# change something, so edit it there rather than here once it exists.
+# Any setting can also be given on the command line, e.g. --resolution_scale=2
+
+# Windowed for the first boots: easier to watch the log and see crashes.
+fullscreen = false
+
+# 16x anisotropic filtering (cheap on any modern GPU).
+anisotropic_override = 5

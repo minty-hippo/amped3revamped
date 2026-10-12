@@ -1,0 +1,211 @@
+# Amped 3 - recompiler hints, included from amped3_manifest.toml.
+#
+# Empty to start. Codegen warnings and runtime crashes tell you what goes here:
+#
+# Functions the analysis misses or sizes wrongly (thunks, vtable-only leaves):
+# [functions]
+# "0x82123450" = { size = 0x2C }
+#
+# Code injection points for fixes and enhancements (see README):
+# [[midasm_hook]]
+# name = "Amped3_FrameLimiter"
+# address = 0x82123460
+# registers = ["r3"]
+
+# --- Fixes (implemented in src/game_patches.cpp) ---------------------------
+
+# Copyright-screen hang: set the render thread's quit event before the
+# shutdown code wakes it, so it can't go back to sleep and deadlock the join.
+[[midasm_hook]]
+name = "Amped3_FixRenderShutdownRace"
+address = 0x821854F8
+registers = ["r11"]
+
+# --- Diagnostics (src/audio_trace.cpp, setting trace_audio) -----------------
+# Each hook runs right after the function's opening "mflr r12", so r12 is the
+# caller's return address. They only log.
+
+# Queue a cue play request (r4 = request).
+[[midasm_hook]]
+name = "Amped3_TraceAudioPlay"
+address = 0x82414530
+registers = ["r12", "r4"]
+after_instruction = true
+
+# Queue a cue stop / command (r4 = command).
+[[midasm_hook]]
+name = "Amped3_TraceAudioCommand"
+address = 0x82414F58
+registers = ["r12", "r4"]
+after_instruction = true
+
+# Queue a category pause / resume (r4 = command).
+[[midasm_hook]]
+name = "Amped3_TraceAudioPause"
+address = 0x824146F8
+registers = ["r12", "r4"]
+after_instruction = true
+
+# Queue a category volume change (r4 = command).
+[[midasm_hook]]
+name = "Amped3_TraceAudioVolume"
+address = 0x82414978
+registers = ["r12", "r4"]
+after_instruction = true
+
+# Queue another category command (r4 = command).
+[[midasm_hook]]
+name = "Amped3_TraceAudioCategory"
+address = 0x82414B00
+registers = ["r12", "r4"]
+after_instruction = true
+
+# Loading music never stopping (src/game_patches.cpp): let a fade-out-and-stop
+# request replace a fade-in that is still running.
+[[midasm_hook]]
+name = "Amped3_FixFadeStop"
+address = 0x82423238
+registers = ["r3", "r4"]
+
+# Reset-boarder tip at high frame rates (src/game_patches.cpp): the "stuck"
+# distance threshold assumes 30 fps frames; scale it by the frame time.
+[[midasm_hook]]
+name = "Amped3_FixStuckTipFrameRate"
+address = 0x822136CC
+registers = ["f0", "f1", "f6", "r11"]
+
+
+# Turning a sled on the spot at the start of a run (src/game_patches.cpp):
+# the wait state rotates the sled by a fixed angle per frame and ignores dt.
+[[midasm_hook]]
+name = "Amped3_SledWaitDt"
+address = 0x82259090
+registers = ["f1"]
+
+[[midasm_hook]]
+name = "Amped3_FixSledWaitTurnFrameRate"
+address = 0x82259164
+registers = ["f1"]
+
+# Sled crash scoring (src/game_patches.cpp): the frame time, each contact's
+# hit value (scaled to its 30 fps size by fix_sled_crash_score_frame_rate) and
+# the scoring events (logged with trace_sled_crash).
+[[midasm_hook]]
+name = "Amped3_TraceSledCrashFrame"
+address = 0x823AC168
+registers = ["f29", "r23"]
+
+[[midasm_hook]]
+name = "Amped3_TraceSledCrashHit"
+address = 0x823AD818
+registers = ["f1", "r25"]
+
+[[midasm_hook]]
+name = "Amped3_TraceSledCrashScore"
+address = 0x823AD868
+registers = ["r22"]
+
+# Diagnostics: sled speed on the ground (src/game_patches.cpp, trace_sled_speed).
+[[midasm_hook]]
+name = "Amped3_TraceSledSpeed"
+address = 0x8225AE54
+registers = ["r11", "f24"]
+
+# In-engine cutscene animations running fast above 60 fps (src/game_patches.cpp):
+# the cutscene player steps its actors in 60 fps frames, and the first step
+# always runs to the next whole frame, even when this frame's target comes
+# before it. Clamp that step to the target. Runs at "fmr f31, f25" (the first
+# step), f31 = the current time and f30 = the target, both in 60 fps frames.
+[[midasm_hook]]
+name = "Amped3_FixCinematicFirstStep"
+address = 0x8257F9E0
+registers = ["r24", "r28", "f25", "f28", "f30", "f31"]
+
+# Diagnostics: the tuck (both triggers) handed to the rider's controls
+# (src/game_patches.cpp, trace_tuck). At "mtctr r5" before the delegate call:
+# r3 = the delegate (controls + 140), r4 = whether both triggers are held.
+[[midasm_hook]]
+name = "Amped3_TraceTuck"
+address = 0x82269B10
+registers = ["r3", "r4"]
+
+# --- Cutscene player (src/cutscenes.cpp) and challenge launcher
+# (src/challenges.cpp): start of the state machine tick (r1 / r13 for calling
+# the game's functions there) ----
+[[midasm_hook]]
+name = "Amped3_CutsceneTick"
+address = 0x8215B0D0
+registers = ["r1", "r13", "r31"]
+
+# --- Analog tuck (src/game_patches.cpp, setting analog_tuck): the game's
+# controller poll, after it stores the triggers (r31 = the controller) -----
+[[midasm_hook]]
+name = "Amped3_TuckTriggers"
+address = 0x82377E00
+registers = ["r31"]
+
+# The carve substate's animation step, at its end (r31 = the carve substate):
+# the partial tuck's crouch on the carving animation.
+[[midasm_hook]]
+name = "Amped3_TuckCrouch"
+address = 0x8224D52C
+registers = ["r31"]
+
+# --- Challenge launcher (src/challenges.cpp): the game's fade command
+# (sub_82203470, at its start: r3 = the HUD fader, r4 = the fade), to undo a
+# fade to black a replayed story mission leaves behind ----
+[[midasm_hook]]
+name = "Amped3_FadeCommand"
+address = 0x82203470
+registers = ["r3", "r4"]
+
+# --- The game's menus, patched in memory as they load (src/gui_patch.cpp) ---
+# Rui_ReadLuaFile (sub_821A0A70) just before it compiles a scene file it
+# read (bl sub_82718EE0, luaL_loadbuffer: r4 = bytes, r5 = size, r6 = name).
+[[midasm_hook]]
+name = "Amped3_GuiLuaLoad"
+address = 0x821A0BF0
+registers = ["r4", "r5", "r6"]
+
+# The string table loader (sub_821B16D0) once it has set up a table it read
+# (r30 = the table, r29 = its size).
+[[midasm_hook]]
+name = "Amped3_StringTableLoaded"
+address = 0x821B17F8
+registers = ["r29", "r30"]
+
+# --- The Graphics row in the pause menu's Options (src/options_graphics.cpp;
+# the menu is patched by src/gui_patch.cpp). The game's COptions class: its
+# activate (sub_822E6F68, r31 = COptions) after the switches are set, and the
+# start of ToggleHint (sub_822E76B8, r3 = COptions), which our row calls:
+# there it opens the port's Graphics panel and returns instead.
+[[midasm_hook]]
+name = "Amped3_OptionsActivate"
+address = 0x822E6FF0
+registers = ["r31"]
+
+[[midasm_hook]]
+name = "Amped3_OptionsGraphicsRow"
+address = 0x822E76B8
+registers = ["r3"]
+return_on_true = true
+
+# --- Diagnostics (src/rail_trace.cpp, trace_rail_blend): the rail substate's
+# two trick-pose retargets, just before "bl sub_823C5E58" (r3 = the animation
+# parameter, f1 = its new target) ----
+[[midasm_hook]]
+name = "Amped3_RailBlendA"
+address = 0x82267224
+registers = ["r3", "f1"]
+
+[[midasm_hook]]
+name = "Amped3_RailBlendB"
+address = 0x822676D0
+registers = ["r3", "f1"]
+
+# Diagnostics (trace_rail_blend): the start of the animation parameter step
+# (sub_823C5C10: r3 = the parameter, f1 = the time step it's given).
+[[midasm_hook]]
+name = "Amped3_AnimParamStep"
+address = 0x823C5C10
+registers = ["r3", "f1"]
