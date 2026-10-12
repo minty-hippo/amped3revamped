@@ -1,3 +1,4 @@
+![alt text](https://github.com/minty-hippo/amped3revamped/blob/c53b30d0c8b10f9b75d2b94623ab7c9efb844b0a/Amped3Revamped%20logo.png "Amped 3 Revamped")
 # Amped 3 Revamped
 
 Amped 3 (Xbox 360), running natively on Windows, with a new renderer and
