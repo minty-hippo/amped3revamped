@@ -78,7 +78,7 @@ class CaptureFiles : public amped3::native::FrameResources {
   }
   // Vertex and index data stay in memory, as the game's recorded blobs do.
   const std::vector<uint8_t>* Peek(const std::string& name) override {
-    if (name.rfind("tex_", 0) == 0 || name.rfind("ucode_", 0) == 0) return nullptr;
+    if (amped3::native::IsTextureResource(name) || name.rfind("ucode_", 0) == 0) return nullptr;
     auto it = blobs_.find(name);
     if (it == blobs_.end()) it = blobs_.emplace(name, ReadFile(resources_ / (name + ".bin"))).first;
     return &it->second;

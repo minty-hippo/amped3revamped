@@ -46,12 +46,14 @@ trace. For `perf_trace_seconds` (20 s) it writes to `logs/`:
   - `d3d`: inside Direct3D's draw, clear, resolve and tiling code (what the
     command bypass removes);
   - `flush_state`: `D3D_FlushDirtyState`, part of `d3d`;
-  - `record`: our recording for the native renderer;
+  - `record`: our recording for the native renderer, split for draws into
+    `rec_textures`, `rec_vertices`, `rec_indices` and `rec_state`;
   - `fence_wait`: `D3D_BlockOnFence`, `BlockUntilIdle`, `BlockUntilNotBusy`;
   - `make_space`: `D3D_MakeSpace`;
   - `swap`: inside `D3DDevice_Swap`;
   - `limiter`: the frame rate limiter's sleep;
-  plus the renderer worker's CPU time, the GPU time and frames presented.
+  plus the renderer worker's CPU time, the GPU time, frames presented and the
+  swapping thread's heap allocations.
 - `perf_<time>_threads.csv`: every thread's CPU time as a share of one core,
   average and busiest second.
 - `perf_<time>_summary.txt` (also in the log): percentiles, stutters, zone
@@ -59,3 +61,27 @@ trace. For `perf_trace_seconds` (20 s) it writes to `logs/`:
 
 Also in this stage: the F3 overlay's CPU frame time on Linux was the wall
 clock (waits included); it is now the thread's CPU time, as on Windows.
+
+## Results
+
+### PC, first traces (2026-10-13, Intel laptop, Direct3D 12 + native renderer, 60 fps)
+
+| | Trace 1 | Trace 2 |
+|---|---|---|
+| Frame time p50 / p99 | 16.65 / 19.41 ms | 16.69 / 18.90 ms |
+| Presents uneven | 3 | 84 (GPU 16.25 ms/frame: GPU-bound) |
+| Swapping thread CPU | 7.14 ms | 6.35 ms |
+| of which `record` | 5.34 ms | 4.81 ms |
+| of which `d3d` | 1.25 ms | 1.11 ms |
+| Renderer worker | 7.50 ms | 6.44 ms |
+| Busiest thread (game logic, XThread F800009C) | 65% of a core | 57% |
+| GPU Commands (emulated command processor) | 17% | 15% |
+| rex::thread::TimerQueue | 11% | 10% |
+
+- Our recording is about 75% of the swapping thread's CPU time: the largest
+  single cost we add to the game's critical path. On the Armada the log's
+  own breakdown showed 24 ms per frame (textures 12, vertex data 9.5).
+- The timer thread spun on an empty queue: SDK patch 0018.
+- Changes after these traces: short resource names that fit a string's
+  inline buffer (no heap allocation per copy); per-part recording zones and
+  allocation counts in the trace, to confirm where the rest goes.

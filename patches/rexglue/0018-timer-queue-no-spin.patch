@@ -1,0 +1,156 @@
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..ad606a5 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -12,17 +12,15 @@
+ #include <algorithm>
+ #include <forward_list>
+ 
+-#include <disruptorplus/multi_threaded_claim_strategy.hpp>
+-#include <disruptorplus/ring_buffer.hpp>
+-#include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+ #include <rex/thread/timer_queue.h>
+ 
+-namespace dp = disruptorplus;
+-
+ namespace rex::thread {
+ 
+ using WaitItem = TimerQueueWaitItem;
+@@ -33,56 +31,66 @@ class TimerQueue {
+   static_assert(clock::is_steady);
+ 
+  public:
+-  TimerQueue()
+-      : buffer_(kWaitCount),
+-        wait_strategy_(),
+-        claim_strategy_(kWaitCount, wait_strategy_),
+-        consumed_(wait_strategy_) {
+-    claim_strategy_.add_claim_barrier(consumed_);
++  TimerQueue() {
+     dispatch_thread_ =
+         std::jthread([this](std::stop_token stop_token) { TimerThreadMain(stop_token); });
+   }
+ 
+   ~TimerQueue() {
++    {
++      std::lock_guard lock(mutex_);
++      stopping_ = true;
++    }
++    cv_.notify_all();
+     dispatch_thread_.request_stop();
+-
+-    // Kick dispatch thread to check stop token
+-    auto wait_item = std::make_shared<WaitItem>(nullptr, nullptr, this, clock::time_point::min(),
+-                                                clock::duration::zero());
+-    wait_item->Disarm();
+-    QueueTimer(std::move(wait_item));
+-
+     // std::jthread auto-joins on destruction
+   }
+ 
++  // amped3 patch 0018: new timers come through a mutex and a condition
++  // variable instead of a spin-waiting ring buffer, which kept this thread
++  // busy (about 10% of a core) even with no timer queued. The thread sleeps
++  // until a new timer or the next one is nearly due, then polls for the last
++  // stretch, since a condition variable may wake late (Windows rounds its
++  // timeouts to the system timer tick) and a timer shouldn't.
+   void TimerThreadMain(std::stop_token stop_token) {
+-    dp::sequence_t next_sequence = 0;
+     const auto comp = [](const std::shared_ptr<WaitItem>& left,
+                          const std::shared_ptr<WaitItem>& right) {
+       return left->due_ < right->due_;
+     };
++#if defined(_WIN32)
++    constexpr auto kPollWindow = std::chrono::milliseconds(1);
++#else
++    constexpr auto kPollWindow = std::chrono::microseconds(200);
++#endif
+ 
+     set_current_thread_name("rex::thread::TimerQueue");
+ 
+     while (!stop_token.stop_requested()) {
+       {
+-        // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+-
+-        // Check for timeout
+-        if (available != next_sequence - 1) {
+-          std::forward_list<std::shared_ptr<WaitItem>> wait_items;
+-          do {
+-            wait_items.push_front(std::move(buffer_[next_sequence]));
+-          } while (next_sequence++ != available);
+-
+-          consumed_.publish(available);
+-
+-          wait_items.sort(comp);
+-          wait_queue_.merge(wait_items, comp);
++        // Consume new wait items and add them to the sorted wait queue.
++        const auto due =
++            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_;
++        std::forward_list<std::shared_ptr<WaitItem>> wait_items;
++        {
++          std::unique_lock lock(mutex_);
++          const auto ready = [this] { return !incoming_.empty() || stopping_; };
++          if (due == clock::time_point::max()) {
++            cv_.wait(lock, ready);
++          } else if (clock::now() < due - kPollWindow) {
++            cv_.wait_until(lock, due - kPollWindow, ready);
++          } else {
++            while (!ready() && clock::now() < due) {
++              lock.unlock();
++              std::this_thread::yield();
++              lock.lock();
++            }
++          }
++          if (stopping_) break;
++          for (auto& item : incoming_) wait_items.push_front(std::move(item));
++          incoming_.clear();
+         }
++        wait_items.sort(comp);
++        wait_queue_.merge(wait_items, comp);
+       }
+ 
+       {
+@@ -129,9 +137,11 @@ class TimerQueue {
+     // Mitigate callback flooding
+     wait_item->due_ = std::max(clock::now() - wait_item->interval_, wait_item->due_);
+ 
+-    auto sequence = claim_strategy_.claim_one();
+-    buffer_[sequence] = std::move(wait_item);
+-    claim_strategy_.publish(sequence);
++    {
++      std::lock_guard lock(mutex_);
++      incoming_.push_back(std::move(wait_item));
++    }
++    cv_.notify_one();
+ 
+     return wait_item_weak;
+   }
+@@ -139,12 +149,11 @@ class TimerQueue {
+   std::jthread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
+ 
+  private:
+-  // This ring buffer will be used to introduce timers queued by the public API
+-  static constexpr size_t kWaitCount = 512;
+-  dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Timers queued by the public API, not yet in wait_queue_.
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::vector<std::shared_ptr<WaitItem>> incoming_;
++  bool stopping_ = false;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread

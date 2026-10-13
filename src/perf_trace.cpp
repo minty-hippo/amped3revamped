@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
+#include <new>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -42,7 +44,40 @@ REXCVAR_DEFINE_INT32(perf_trace_seconds, 20, "Amped 3/Diagnostics",
                      "How long a performance trace records (seconds)")
     .range(2, 300);
 
+// Heap allocations per thread, for the trace (one thread-local increment per
+// operator new; plain malloc/free underneath, as the default ones).
+namespace {
+thread_local uint64_t t_allocations = 0;
+void* CountedNew(std::size_t size) {
+  ++t_allocations;
+  if (size == 0) size = 1;
+  void* p = std::malloc(size);
+  if (!p) throw std::bad_alloc();
+  return p;
+}
+}  // namespace
+
+void* operator new(std::size_t size) { return CountedNew(size); }
+void* operator new[](std::size_t size) { return CountedNew(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+  ++t_allocations;
+  return std::malloc(size ? size : 1);
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+  ++t_allocations;
+  return std::malloc(size ? size : 1);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+
 namespace amped3::trace {
+
+uint64_t ThreadAllocations() { return t_allocations; }
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -75,6 +110,7 @@ struct Row {
   double worker_ms = -1;  // native renderer worker, average over reports in the frame
   double gpu_ms = -1;
   int presents = 0;
+  uint64_t allocs = 0;  // heap allocations by the swapping thread over the frame
 };
 
 std::mutex g_mutex;  // rows, presents, thread ids
@@ -90,6 +126,7 @@ std::atomic<int> g_worker_count{0}, g_gpu_count{0}, g_present_count{0};
 // Swap thread only.
 bool t_have_prev = false;
 int64_t t_prev_ns = 0, t_prev_cpu_ns = 0;
+uint64_t t_prev_allocs = 0;
 std::array<int64_t, kZones> t_prev_zone{};
 
 // A trace's sampler thread runs detached (a process can end while one
@@ -247,11 +284,11 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
     std::ofstream f(base.string() + ".csv");
     f << "t_ms,frame_ms,swap_thread_cpu_ms";
     for (int z = 0; z < kZones; ++z) f << "," << ZoneName(Zone(z)) << "_ms";
-    f << ",worker_cpu_ms,gpu_ms,presents\n";
+    f << ",worker_cpu_ms,gpu_ms,presents,allocs\n";
     for (const Row& r : rows) {
       f << fmt::format("{:.2f},{:.3f},{:.3f}", r.t_ms, r.frame_ms, r.swap_cpu_ms);
       for (double z : r.zone_ms) f << fmt::format(",{:.3f}", z);
-      f << fmt::format(",{:.3f},{:.3f},{}\n", r.worker_ms, r.gpu_ms, r.presents);
+      f << fmt::format(",{:.3f},{:.3f},{},{}\n", r.worker_ms, r.gpu_ms, r.presents, r.allocs);
     }
   }
 
@@ -327,8 +364,10 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
         Percentile(frame, 0.99), Percentile(frame, 1.0), stutters, stutter_at);
     double cpu_total = 0;
     for (double v : cpu) cpu_total += v;
-    s += fmt::format("Swapping thread CPU: avg {:.2f} ms/frame, p95 {:.2f}\n", cpu_total / n,
-                     Percentile(cpu, 0.95));
+    double allocs_total = 0;
+    for (const Row& r : rows) allocs_total += double(r.allocs);
+    s += fmt::format("Swapping thread CPU: avg {:.2f} ms/frame, p95 {:.2f}; {:.0f} heap allocations/frame\n",
+                     cpu_total / n, Percentile(cpu, 0.95), allocs_total / n);
     s += "Zones (avg ms per frame, share of frame time):\n";
     for (int z = 0; z < kZones; ++z) {
       s += fmt::format("  {:<12} {:7.3f} ms  {:5.1f}%\n", ZoneName(Zone(z)), zone_sum[z] / n,
@@ -392,6 +431,10 @@ const char* ZoneName(Zone zone) {
     case Zone::kD3D: return "d3d";
     case Zone::kFlushState: return "flush_state";
     case Zone::kRecord: return "record";
+    case Zone::kRecTextures: return "rec_textures";
+    case Zone::kRecVertices: return "rec_vertices";
+    case Zone::kRecIndices: return "rec_indices";
+    case Zone::kRecState: return "rec_state";
     case Zone::kFenceWait: return "fence_wait";
     case Zone::kMakeSpace: return "make_space";
     case Zone::kSwap: return "swap";
@@ -470,6 +513,7 @@ void OnSwap() {
     if (worker_n) r.worker_ms = double(worker_us) * 1e-3 / worker_n;
     if (gpu_n) r.gpu_ms = double(gpu_us) * 1e-3 / gpu_n;
     r.presents = presents;
+    r.allocs = ThreadAllocations() - t_prev_allocs;
     std::lock_guard lock(g_mutex);
     g_rows.push_back(r);
     g_swap_tid = CurrentTid();
@@ -478,6 +522,7 @@ void OnSwap() {
   t_prev_ns = now;
   t_prev_cpu_ns = cpu;
   t_prev_zone = zone;
+  t_prev_allocs = ThreadAllocations();
 }
 
 void OnRenderFrame(double worker_ms) {

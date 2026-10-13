@@ -26,6 +26,10 @@ enum class Zone : int {
   kD3D,         // inside the game's Direct3D draw / clear / resolve / tiling code
   kFlushState,  // D3D_FlushDirtyState (part of kD3D): writing changed state as GPU commands
   kRecord,      // the native renderer recording the frame in our hooks
+  kRecTextures, // part of kRecord, draws: naming the bound textures
+  kRecVertices, // part of kRecord, draws: vertex memory
+  kRecIndices,  // part of kRecord, draws: indices and user-pointer data
+  kRecState,    // part of kRecord, draws: state changes since the last draw
   kFenceWait,   // D3D_BlockOnFence / BlockUntilIdle / BlockUntilNotBusy: waiting on the GPU
   kMakeSpace,   // D3D_MakeSpace: command buffer full, kicking and waiting
   kSwap,        // inside the game's D3DDevice_Swap (VdSwap)
@@ -70,5 +74,8 @@ void Install();
 
 // This thread's CPU time in nanoseconds (not counting time it waits).
 int64_t ThreadCpuNs();
+
+// Heap allocations (operator new) made by this thread so far.
+uint64_t ThreadAllocations();
 
 }  // namespace amped3::trace

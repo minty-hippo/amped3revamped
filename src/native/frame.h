@@ -80,6 +80,25 @@ struct GpuState {
   }
 };
 
+// Short resource names from the live recorder fit a std::string's inline
+// buffer (15 characters), so copying them per draw allocates nothing:
+//   T<6>_<7>  texture: fetch constant hash, then contents hash
+//   M<10>     vertex memory (physical address and size)
+//   I<10>     index buffer (address and size)
+// Capture files use the long forms (tex_<16>_<16>, mem_..., ib_...).
+inline std::string ShortName(char tag, uint64_t bits, int chars) {
+  static constexpr char kDigits[] =
+      "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-";
+  std::string s(size_t(chars) + 1, tag);
+  for (int i = chars; i >= 1; --i, bits >>= 6) s[size_t(i)] = kDigits[bits & 63];
+  return s;
+}
+
+// A texture resource (either form); "<name>.base" / ".mips" are its data.
+inline bool IsTextureResource(const std::string& name) {
+  return name.rfind("tex_", 0) == 0 || (name.size() >= 9 && name[0] == 'T' && name[7] == '_');
+}
+
 struct FrameTexture {
   uint32_t slot = 0;
   std::array<uint32_t, 6> raw{};

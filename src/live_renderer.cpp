@@ -37,6 +37,7 @@
 
 #include "live_present.h"
 #include "perf_overlay.h"
+#include "perf_trace.h"
 #include "thread_qos.h"
 #include "presenter_external.h"
 #include "native/frame.h"
@@ -641,7 +642,7 @@ void TrimTextureHashes() {
   }
 }
 
-std::string TextureName(const std::array<uint32_t, 6>& words) {
+const std::string& TextureName(const std::array<uint32_t, 6>& words) {
   const uint64_t key = Fnv1a(words.data(), sizeof(words));
   auto it = g_tex_names.find(key);
   if (it != g_tex_names.end()) return it->second;
@@ -656,9 +657,10 @@ std::string TextureName(const std::array<uint32_t, 6>& words) {
           TextureRangeHash(memory, ranges.mip_address, ranges.mip_size, &mips_changed);
     }
   }
-  std::string name = fmt::format("tex_{:016X}_{:016X}", key, h);
+  std::string name =
+      native::ShortName('T', key, 6) + "_" + native::ShortName('T', h, 7).substr(1);
   g_frame->textures[name] = words;
-  g_tex_names[key] = name;
+  const std::string& stored = g_tex_names.emplace(key, name).first->second;
   // Snapshot what changed (within a budget; the rest is read by the worker).
   auto snapshot = [&](const char* suffix, uint32_t address, uint32_t size) {
     if (!size || g_texture_snapshot_bytes + size > kTextureSnapshotBudget) return;
@@ -668,7 +670,7 @@ std::string TextureName(const std::array<uint32_t, 6>& words) {
   };
   if (base_changed) snapshot(".base", ranges.base_address, ranges.base_size);
   if (mips_changed) snapshot(".mips", ranges.mip_address, ranges.mip_size);
-  return name;
+  return stored;
 }
 
 // Changed state chunks since the previous draw, straight from guest memory.
@@ -770,7 +772,7 @@ class LiveResources : public native::FrameResources {
     auto it = f_.blobs.find(name);
     if (it != f_.blobs.end()) return it->second ? *it->second : std::vector<uint8_t>{};
     if (name.rfind("ucode_", 0) == 0) return FindMicrocode(name);
-    if (name.rfind("tex_", 0) == 0) {
+    if (native::IsTextureResource(name)) {
       const size_t dot = name.rfind('.');
       if (dot == std::string::npos) return {};
       auto t = f_.textures.find(name.substr(0, dot));
@@ -1585,7 +1587,13 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   if (!g_frame || !Room()) return;
   auto lap = [t = std::chrono::steady_clock::now()](int part) mutable {
     const auto now = std::chrono::steady_clock::now();
-    g_draw_ns[part] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count());
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+    g_draw_ns[part] += uint64_t(ns);
+    // F11 trace: textures, vertex memory, indices, state (part 4, storing, is small).
+    static constexpr trace::Zone kZones[] = {trace::Zone::kRecTextures,
+                                             trace::Zone::kRecVertices,
+                                             trace::Zone::kRecIndices, trace::Zone::kRecState};
+    if (part < 4) trace::Add(kZones[part], ns);
     t = now;
   };
   Draw d;
@@ -1639,7 +1647,7 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
       const uint64_t key = (uint64_t(address) << 32) | size;
       auto it = g_blob_names.find(key);
       if (it == g_blob_names.end()) {
-        std::string name = fmt::format("mem_{:08X}_{}", address, size);
+        std::string name = native::ShortName('M', (uint64_t(size) << 29) | address, 10);
         auto& blob = g_frame->blobs[name];
         if (!blob) blob = CachedVertexData(memory, name, address, size, &g_frame->versions[name]);
         it = g_blob_names.emplace(key, std::move(name)).first;
@@ -1660,7 +1668,7 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
         const uint64_t key = (uint64_t(address) << 32) | size | (1ull << 31);  // not physical
         auto it = g_blob_names.find(key);
         if (it == g_blob_names.end()) {
-          std::string name = fmt::format("ib_{:08X}_{}", address, size);
+          std::string name = native::ShortName('I', (uint64_t(size) << 32) | address, 10);
           // Index buffers are mostly static too: through the vertex cache
           // when they are in physical memory (as Direct3D allocates them).
           const uint32_t physical = memory->GetPhysicalAddress(address);
