@@ -1,13 +1,13 @@
 # Builds the launcher (launcher/) for Windows, Linux x86_64 and Linux arm64.
-# Every run keeps the three files as artifacts; a tag named launcher-v* also
-# publishes them as a release. The launcher holds nothing from the game: it
+# Every run keeps the three files as artifacts. On main they are also
+# published as the release launcher-v<launcher/VERSION> (made, or its files
+# replaced, by this workflow): raise VERSION for a new release. The launcher holds nothing from the game: it
 # downloads these sources and builds the game from the player's own disc image.
 name: Launcher
 
 on:
   push:
     paths: ['launcher/**', '.github/workflows/launcher.yml']
-    tags: ['launcher-v*']
   workflow_dispatch:
 
 permissions:
@@ -66,10 +66,14 @@ jobs:
           path: dist/${{ matrix.name }}
 
   release:
-    if: startsWith(github.ref, 'refs/tags/launcher-v')
+    if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        run: echo "tag=launcher-v$(tr -d '[:space:]' < launcher/VERSION)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -78,8 +82,12 @@ jobs:
         run: chmod +x dist/amped3-launcher-linux-*
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
-          name: Launcher ${{ github.ref_name }}
+          overwrite_files: true
+          make_latest: true
+          name: Launcher ${{ steps.version.outputs.tag }}
           body: |
             The Amped 3 Revamped launcher. Download the one for your system, run it, choose your
             Amped 3 (Xbox 360) disc image and select Build and install. It downloads this

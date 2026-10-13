@@ -157,7 +157,9 @@ and the mouse, and opens full screen in Steam's Game Mode. Its settings are in
 install or update beside them.
 
 To build the launcher yourself: `cmake -S launcher -B out/launcher` and
-`cmake --build out/launcher --config Release` (it fetches SDL3 and Dear ImGui).
+`cmake --build out/launcher --config Release` (it fetches SDL3 and Dear ImGui). A
+new release: raise `launcher/VERSION` on main; the Launcher workflow builds the
+three files and publishes them.
 
 ## Install from the ISO with the scripts
 
