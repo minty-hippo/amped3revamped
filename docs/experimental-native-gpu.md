@@ -271,3 +271,10 @@ Two changes follow:
 One trace also had a 128 ms frame during a scene change: the game's main
 thread was busy for 78 ms (loading), and new textures were hashed in the
 same frame.
+
+Result (PC, three traces): the GPU Commands thread went from 1.5-4.7% of a
+core to 1.5-3.1% (the busiest second from 9% to 6%); nothing looked
+different. The game's own threads now lead the list (main thread 19-22%,
+drawing thread 17-18% in a ride), with the recorder at 11-12% and the
+renderer worker at 10-12%. Frames over 25 ms in these traces were the game
+loading (main thread CPU 1 s in a 1.1 s frame when a challenge starts).
