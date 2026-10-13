@@ -52,6 +52,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          set -o pipefail
           cmake -S launcher -B build -A x64 2>&1 | tee configure.log
           cmake --build build --config Release 2>&1 | tee build.log
           test -f build/Release/amped3-launcher.exe
@@ -63,9 +64,11 @@ jobs:
         run: |
           for f in configure.log build.log; do
             [ -f "$f" ] || continue
-            grep -E "error" "$f" | head -20 | while IFS= read -r line; do
-              echo "::error::${line//%/%25}"
-            done
+            { grep -iE "error|fatal" "$f" | head -20; echo "-- last lines of $f:"; tail -n 15 "$f"; } |
+              while IFS= read -r line; do
+                line="${line//%/%25}"
+                echo "::error::${line//$'\r'/}"
+              done
           done
           exit 0
 
