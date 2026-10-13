@@ -81,6 +81,10 @@ bool Recording();
 // setting native_skip_state_writes is on. Game thread, every draw.
 bool SkipEmulatedStateWrites();
 
+// Draw calls skip writing their draw packets (setting native_skip_draw_commands,
+// only while SkipEmulatedStateWrites). Game thread, every draw.
+bool SkipEmulatedDrawCommands();
+
 // Direct3D's ring buffer was set up (D3D_InitializeRingBuffer returned): with
 // native_deferred_naming, starts the recorder thread and has the command
 // processor hold each fence until the recorder has named the draws before it

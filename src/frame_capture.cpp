@@ -71,6 +71,7 @@ REX_EXTERN(__imp__D3DDevice_CreateVertexShader);
 REX_EXTERN(__imp__D3DDevice_CreatePixelShader);
 REX_EXTERN(__imp__D3DXAssembleShader);
 REX_EXTERN(__imp__D3D_FlushDirtyState);
+REX_EXTERN(D3D_FlushDirtyState);
 REX_EXTERN(D3D_CommitVertexFetch);
 REX_EXTERN(D3D_CommitShaders);
 REX_EXTERN(__imp__D3D_BlockOnFence);
@@ -772,6 +773,21 @@ amped3::live::DrawCall LiveCall(amped3::live::DrawCall::Kind kind, uint32_t prim
   return c;
 }
 using LiveKind = amped3::live::DrawCall::Kind;
+
+// DrawVertices / DrawIndexedVertices (825A1288 / 825A14B8) without their
+// packets: what they do besides writing DRAW_INDX is note the base vertex
+// (device+11540, marking bit 61 of the +40 mask when it changes) and flush the
+// dirty state. Their other stores are the command write pointer and, while
+// tiling, the list of draw positions to patch per tile.
+void DrawWithoutCommands(PPCContext& ctx, uint8_t* base, uint32_t dev, uint32_t base_vertex) {
+  if (cap::U32(base, dev + 11540) != base_vertex) {
+    rex::memory::store_and_swap<uint32_t>(base + dev + 11540, base_vertex);
+    rex::memory::store_and_swap<uint64_t>(base + dev + 40,
+                                          cap::U64(base, dev + 40) | (1ull << 61));
+  }
+  ctx.r3.u64 = dev;
+  D3D_FlushDirtyState(ctx, base);
+}
 }  // namespace
 
 extern "C" REX_FUNC(D3DDevice_DrawVertices) {
@@ -781,7 +797,11 @@ extern "C" REX_FUNC(D3DDevice_DrawVertices) {
   const auto live_call = LiveCall(LiveKind::kVertices, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
   {
     amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
-    __imp__D3DDevice_DrawVertices(ctx, base);
+    if (amped3::live::SkipEmulatedDrawCommands() && !captured_draw) {
+      DrawWithoutCommands(ctx, base, dev, ctx.r5.u32);
+    } else {
+      __imp__D3DDevice_DrawVertices(ctx, base);
+    }
   }
   CAPTURE_DRAW_STATE(dev);
   LIVE_DRAW(dev, live_call);
@@ -795,7 +815,11 @@ extern "C" REX_FUNC(D3DDevice_DrawIndexedVertices) {
       LiveCall(LiveKind::kIndexed, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, ctx.r5.s32);
   {
     amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
-    __imp__D3DDevice_DrawIndexedVertices(ctx, base);
+    if (amped3::live::SkipEmulatedDrawCommands() && !captured_draw) {
+      DrawWithoutCommands(ctx, base, dev, ctx.r5.u32);
+    } else {
+      __imp__D3DDevice_DrawIndexedVertices(ctx, base);
+    }
   }
   CAPTURE_DRAW_STATE(dev);
   LIVE_DRAW(dev, live_call);

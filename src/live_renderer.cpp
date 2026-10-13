@@ -61,6 +61,10 @@ REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
+REXCVAR_DEFINE_BOOL(native_skip_draw_commands, true, "GPU",
+                    "Native renderer: while the emulated GPU doesn't draw (and "
+                    "native_skip_state_writes is on), DrawVertices and DrawIndexedVertices "
+                    "only update Direct3D's state and don't write their draw packets.");
 REXCVAR_DEFINE_BOOL(native_skip_state_writes, true, "GPU",
                     "Native renderer: while the emulated GPU doesn't draw, Direct3D's state "
                     "flush before each draw skips writing the changed registers and shader "
@@ -1711,6 +1715,10 @@ bool Recording() { return g_recording.load(std::memory_order_relaxed); }
 
 bool SkipEmulatedStateWrites() {
   return REXCVAR_GET(native_skip_state_writes) && !g_host_drawing_on.load(std::memory_order_relaxed);
+}
+
+bool SkipEmulatedDrawCommands() {
+  return REXCVAR_GET(native_skip_draw_commands) && SkipEmulatedStateWrites();
 }
 
 void RequestDump() {

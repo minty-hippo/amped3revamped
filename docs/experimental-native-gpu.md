@@ -222,3 +222,19 @@ thread as before (for comparing traces).
 
 60 fps with p99 frame time 17.6-17.7 ms, no stutters, at most one uneven
 present, and no fence waited for the recorder. Nothing broken in testing.
+
+## Stage 1, step 2: no draw packets
+
+`D3DDevice_DrawVertices` (`825A1288`) and `D3DDevice_DrawIndexedVertices`
+(`825A14B8`) do three things: note the base vertex (device+11540; when it
+changes, bit 61 of the +40 mask), flush the dirty state, and write the draw
+packet (`DRAW_INDX`, split when the count passes 65535, plus a per-tile patch
+list entry while tiling). With `native_skip_draw_commands` (on) and the
+emulated GPU not drawing, the hooks do the first two and skip the packet, so
+the command stream carries only shader loads, clears, resolves, fences and
+the swap. User-pointer draws (`DrawVerticesUP`, `BeginVertices`) still write
+theirs: their vertices live in the command buffer and the recording reads
+them there.
+
+What the command processor still does per frame then decides whether
+replacing it is worth it: the trace's GPU Commands thread share.
