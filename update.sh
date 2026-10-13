@@ -49,6 +49,19 @@ main() {
   # Runs a short Python 3 program over JSON on stdin (python3 is on SteamOS,
   # Armada and the distributions install.sh supports).
   py() { python3 -c "$1" "${@:2}"; }
+  # setup.sh's own test for the build tools (clang / clang++ 20+, CMake,
+  # Ninja, Git).
+  have_tools() {
+    local v c cxx m
+    command -v cmake >/dev/null && command -v ninja >/dev/null && command -v git >/dev/null || return 1
+    for v in 22 21 20 ''; do
+      c="clang${v:+-$v}"; cxx="clang++${v:+-$v}"
+      command -v "$c" >/dev/null && command -v "$cxx" >/dev/null || continue
+      m="$("$c" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)"
+      [ -n "$m" ] && [ "$m" -ge 20 ] && return 0
+    done
+    return 1
+  }
 
   local action="${1:-}"
   case "$action" in
@@ -93,6 +106,10 @@ for x in list(reversed(c.get("commits", [])))[:20]:
       exe_dir="$(cd "$exe_dir" && pwd)" || fail "No folder $3."
       local dev_build=0
       case "$exe_dir/" in "$project_dir/out/"*) dev_build=1 ;; esac
+      echo "Game folder: $exe_dir"
+      echo "Project folder: $project_dir"
+      [ "$dev_build" -eq 1 ] && echo 'This is the project'"'"'s own build (out/build): setup.sh rebuilds it.' ||
+        echo 'This is an installed copy: install.sh rebuilds and reinstalls it.'
 
       say step "Getting the $branch branch"
       if is_git; then
@@ -139,10 +156,17 @@ for i in z.infolist():
 
       local code=0
       if [ "$dev_build" -eq 1 ]; then
-        say step 'Building (setup.sh)'
         local args=()
         [ -f "$exe_dir/game.path" ] && args+=(--game-dir "$(head -n1 "$exe_dir/game.path")")
-        bash "$project_dir/setup.sh" "${args[@]}" 2>&1 || code=$?
+        # Without the build tools on the system (SteamOS, Armada), in the
+        # build container, as install.sh does.
+        if have_tools; then
+          say step 'Building (setup.sh)'
+          bash "$project_dir/setup.sh" "${args[@]}" 2>&1 || code=$?
+        else
+          say step 'Building in the container (setup.sh)'
+          bash "$project_dir/linux/container-build.sh" "${args[@]}" 2>&1 || code=$?
+        fi
       else
         say step 'Building and installing (install.sh)'
         local extra=()

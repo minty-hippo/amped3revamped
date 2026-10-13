@@ -93,12 +93,16 @@ fi
 
 # ---------------------------------------------------------------------------
 step 'Building - the first build takes a long time'
+# The same test setup.sh makes (clang and clang++ of one version, 20 or
+# newer), plus CMake, Ninja and Git; anything less builds in the container.
 have_tools() {
-  local c
-  for c in clang-22 clang-21 clang-20 clang; do
-    command -v "$c" >/dev/null || continue
-    local m; m="$("$c" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)"
-    [ -n "$m" ] && [ "$m" -ge 20 ] && command -v cmake >/dev/null && command -v ninja >/dev/null && command -v git >/dev/null && return 0
+  local v c cxx m
+  command -v cmake >/dev/null && command -v ninja >/dev/null && command -v git >/dev/null || return 1
+  for v in 22 21 20 ''; do
+    c="clang${v:+-$v}"; cxx="clang++${v:+-$v}"
+    command -v "$c" >/dev/null && command -v "$cxx" >/dev/null || continue
+    m="$("$c" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)"
+    [ -n "$m" ] && [ "$m" -ge 20 ] && return 0
   done
   return 1
 }
