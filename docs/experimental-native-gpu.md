@@ -99,3 +99,21 @@ clock (waits included); it is now the thread's CPU time, as on Windows.
   condition variable wait elsewhere.
 - GPU 15.7-15.9 ms per frame: this laptop is near its GPU limit at these
   settings; the presented-frame intervals stay even (1-6 uneven in 20 s).
+
+### PC, third traces (binding caches, fixed timer thread)
+
+| | Before (first traces) | Now |
+|---|---|---|
+| Swapping thread CPU | 6.4-7.8 ms | 5.6-6.3 ms |
+| `record` | 4.8-5.3 ms | 3.0-3.8 ms (textures 1.0-1.2, vertices 0.7-0.9) |
+| `d3d` | 1.1-1.4 ms | 1.0-1.2 ms |
+| Renderer worker | 6.4-7.7 ms | 5.4-6.3 ms |
+| rex::thread::TimerQueue | 10-11% of a core | 1.3-2.4% |
+| GPU Commands | 15-19% | 16-19% |
+
+The scenes differ between traces (GPU 7.5-8.2 ms now against 8-16 ms), so
+compare the CPU columns. On the Armada, about 5x slower per core, the
+swapping thread is the frame-rate limit: recording and Direct3D's command
+writing are the two parts we can remove there. The worker hands its image to
+the window through the CPU with Direct3D 12 (`present` 0.9 ms); with the
+Vulkan backend it stays on the GPU.
