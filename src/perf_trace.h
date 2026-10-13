@@ -69,6 +69,9 @@ void OnRenderFrame(double worker_ms);
 void OnGpuFrame(double gpu_ms);
 void OnPresented();
 
+// The thread issuing Direct3D draws (any draw hook), named in the thread list.
+void NoteDrawThread();
+
 // Registers the key and the setting watcher (UI thread, once).
 void Install();
 

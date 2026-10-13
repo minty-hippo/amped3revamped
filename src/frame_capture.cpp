@@ -1111,6 +1111,7 @@ void FlushDirtyStateNoCommands(PPCContext& ctx, uint8_t* base, uint32_t dev) {
 
 extern "C" REX_FUNC(D3D_FlushDirtyState) {
   amped3::trace::Scope scope(amped3::trace::Zone::kFlushState);
+  amped3::trace::NoteDrawThread();
   static bool skipping = false;  // game thread only
   const uint32_t dev = ctx.r3.u32;
   if (amped3::live::SkipEmulatedStateWrites()) {

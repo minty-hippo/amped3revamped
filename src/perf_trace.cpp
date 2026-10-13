@@ -118,6 +118,7 @@ std::vector<Row> g_rows;
 std::vector<int64_t> g_present_ns;
 int64_t g_start_ns = 0;
 uint64_t g_swap_tid = 0, g_worker_tid = 0;
+std::atomic<uint64_t> g_draw_tid{0};
 
 // Worker / GPU reports since the last swap.
 std::atomic<int64_t> g_worker_sum_us{0}, g_gpu_sum_us{0};
@@ -302,7 +303,9 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
       ThreadStat t;
       t.tid = tid;
       t.name = s.name;
-      if (tid == swap_tid) t.role = "game: calls D3DDevice_Swap";
+      if (tid == g_draw_tid.load()) t.role = "game: issues the draws";
+      if (tid == swap_tid) t.role = t.role.empty() ? "game: calls D3DDevice_Swap"
+                                                  : "game: draws and calls D3DDevice_Swap";
       if (tid == worker_tid) t.role = "native renderer worker";
       const auto it = first.find(tid);
       const int64_t start = it != first.end() ? it->second.cpu_ns : 0;
@@ -485,6 +488,7 @@ void Start() {
   g_worker_count = 0;
   g_gpu_count = 0;
   g_present_count = 0;
+  g_draw_tid = 0;
   REXLOG_INFO("Performance trace: recording {} s", REXCVAR_GET(perf_trace_seconds));
   g_active.store(true, std::memory_order_release);
   std::thread(RunTrace).detach();
@@ -537,6 +541,16 @@ void OnGpuFrame(double gpu_ms) {
   if (!Active() || gpu_ms < 0) return;
   g_gpu_sum_us.fetch_add(int64_t(gpu_ms * 1000.0), std::memory_order_relaxed);
   g_gpu_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDrawThread() {
+  if (!Active()) return;
+  thread_local bool noted = false;
+  thread_local uint64_t noted_in = 0;  // g_start_ns of the trace it was noted in
+  if (noted && noted_in == uint64_t(g_start_ns)) return;
+  noted = true;
+  noted_in = uint64_t(g_start_ns);
+  g_draw_tid.store(CurrentTid());
 }
 
 void OnPresented() {
