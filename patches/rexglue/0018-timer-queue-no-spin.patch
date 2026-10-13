@@ -1,5 +1,5 @@
 diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
-index 5cfea05..aeea98b 100644
+index 5cfea05..247e81a 100644
 --- a/src/core/timer_queue.cpp
 +++ b/src/core/timer_queue.cpp
 @@ -12,17 +12,28 @@
@@ -129,7 +129,7 @@ index 5cfea05..aeea98b 100644
 +            DWORD count = 1;
 +            if (due != clock::time_point::max() && hr_timer_) {
 +              LARGE_INTEGER rel;
-+              rel.QuadPart = -std::max<LONGLONG>(
++              rel.QuadPart = -(std::max<LONGLONG>)(
 +                  1, std::chrono::duration_cast<std::chrono::nanoseconds>(due - now).count() /
 +                         100);
 +              if (SetWaitableTimer(hr_timer_, &rel, 0, nullptr, nullptr, FALSE)) count = 2;
