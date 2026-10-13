@@ -303,5 +303,5 @@ deferred naming, three without.
   steadier with it, so it stays on.
 - **Two threads spun.** The Audio Worker used 98% of a core in every trace
   (SDK patch 0023: waits on several handles busy-looped on Linux), and the
-  GPU Commands thread 14% (patch 0024: it spun 500 times at every idle
-  moment). Both are fixed for the next build.
+  GPU Commands thread 14% (likely patch 0024's case: it spun 500 times at
+  every idle moment). Both are changed for the next build.
