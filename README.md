@@ -191,6 +191,41 @@ The exe uses the `game\` folder next to it. The build folder has none, so
 `setup.ps1 -Run` (and `-FixCrashes`) start it with `--game_data_root` pointing
 at the extracted game; the installer puts a `game\` folder in the install.
 
+## Launcher and updates
+
+When the game starts it shows a launcher before the game boots:
+
+- **Play** boots the game.
+- **Update branch** picks the branch Update gets (`main` or `experimental`;
+  the list comes from GitHub). Left / right changes it.
+- **Update** gets that branch and rebuilds this copy of the game, showing the
+  build's output as it runs (also saved to `logs/update_<time>.log`). Then
+  **Restart** starts the new version. It rebuilds from source, so it takes
+  as long as a normal rebuild: minutes to an hour on a PC, hours on a
+  handheld. It needs the same build tools as the first install.
+- **Check for updates** lists what's new on the branch since this build.
+- **Show launcher at start** off: the game boots at once. Hold LB / View on a
+  controller, or Shift, while it starts to see the launcher anyway. The same
+  switch is in the options menu (Enhancements > Startup).
+- The version this build was made from (branch, commit and date) is under
+  the title.
+
+Update runs `update.ps1` (Windows) or `update.sh` (Linux) from the project
+folder the game was built from (the installers note it in `source.path` next
+to the game):
+
+- In a git checkout it runs `git fetch` and `git checkout -f -B <branch>
+  origin/<branch>`. Local changes to tracked files are discarded.
+- Otherwise it downloads the branch from GitHub as a zip and copies it over
+  the project folder.
+- Then it rebuilds. An installed copy runs the installer again for its folder
+  (in its container on SteamOS / Armada); a build in `out/build` runs the
+  setup script.
+
+The running game's files are moved aside as `*.old` (Windows can't replace
+them while they're open); the next start deletes them. The scripts also work
+by hand, for example `.\update.ps1 -Action check -Branch experimental`.
+
 ## Graphics
 
 The game is drawn by the port's own Vulkan renderer (on by default; Options
@@ -323,6 +358,7 @@ hook plus a setting that switches it on:
 | `setup.ps1` | Builds the SDK and the port, with logs |
 | `src/amped3_app.*` | App hooks: GPU plugin, game path, menu hotkeys, input gating |
 | `src/options_menu.*` | The options menu |
+| `src/launcher.*`, `update.ps1`, `update.sh` | The launcher, and the update scripts it runs |
 | `src/pad_bridge.*` | Controller reads for the menu, and keeping the game's input idle while it's open |
 | `overlay/CMakeLists.txt` | Build file, copied in after `rexglue init` |
 | `amped3_functions.toml` | Your recompiler hints (loaded last, so they win) |

@@ -29,6 +29,48 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniz/miniz.
     COMPILE_DEFINITIONS "MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES")
 
 
+# The version the launcher shows (src/version.cpp): the git checkout's branch
+# and commit, or .amped3-source (written by update.ps1 / update.sh when they
+# fetch a branch's zip). Read at configure time, which every setup run does.
+set(AMPED3_VERSION_BRANCH "unknown")
+set(AMPED3_VERSION_COMMIT "unknown")
+set(AMPED3_VERSION_DATE "")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    foreach(_q "BRANCH;rev-parse;--abbrev-ref;HEAD" "COMMIT;rev-parse;HEAD" "DATE;log;-1;--format=%cs")
+        list(POP_FRONT _q _var)
+        execute_process(COMMAND ${GIT_EXECUTABLE} -c safe.directory=* ${_q}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE _out OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _rc ERROR_QUIET)
+        if(_rc EQUAL 0 AND _out)
+            set(AMPED3_VERSION_${_var} "${_out}")
+        endif()
+    endforeach()
+    # A new commit or checkout reconfigures.
+    foreach(_f HEAD packed-refs "refs/heads/${AMPED3_VERSION_BRANCH}")
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git/${_f}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/.git/${_f}")
+        endif()
+    endforeach()
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.amped3-source")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/.amped3-source" _lines)
+    foreach(_line IN LISTS _lines)
+        if(_line MATCHES "^(branch|commit|date)=(.*)$")
+            string(TOUPPER "${CMAKE_MATCH_1}" _key)
+            set(AMPED3_VERSION_${_key} "${CMAKE_MATCH_2}")
+        endif()
+    endforeach()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/.amped3-source")
+endif()
+message(STATUS "amped3: version ${AMPED3_VERSION_BRANCH} ${AMPED3_VERSION_COMMIT} ${AMPED3_VERSION_DATE}")
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/amped3_version.h.in
+    ${CMAKE_BINARY_DIR}/amped3_version/amped3_version.h @ONLY)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/version.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/amped3_version)
+
 if(WIN32)
     target_link_libraries(amped3 PRIVATE dbghelp pdh)  # crash reports; performance counters (F3)
 endif()

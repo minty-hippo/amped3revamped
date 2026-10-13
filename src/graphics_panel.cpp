@@ -169,6 +169,8 @@ ImFont* PanelFont(float px) {
 
 }  // namespace
 
+ImFont* UiFont(float px) { return PanelFont(px); }
+
 void LoadPanelFonts(ImFontAtlas* atlas) {
   // A clean, condensed sans like the game's menu text; fallbacks in order.
   // A clean, bold sans: Windows' own fonts there; on Linux the common

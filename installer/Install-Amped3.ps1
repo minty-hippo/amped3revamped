@@ -42,6 +42,8 @@ param(
   [switch]$Yes,
   # Launch the game when done.
   [switch]$Run,
+  # Don't offer a desktop shortcut (the launcher's Update, through update.ps1).
+  [switch]$NoShortcut,
   # Upscale the game's textures 4x on this PC with Real-ESRGAN (optional;
   # asked unless given). -UpscaleSet ui (menus, HUD, loading screens),
   # world (experimental) or all.
@@ -432,6 +434,19 @@ $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SetupScript
 & powershell.exe @setupArgs
 if ($LASTEXITCODE -ne 0) { Fail "The build failed (setup.ps1 exit $LASTEXITCODE). Its logs are in $LogDir." }
 
+# Copies over a file the running game may hold open (the launcher's Update):
+# Windows can't overwrite it, but can rename it; the game deletes *.old files
+# when it next starts.
+function Copy-Replacing([string]$from, [string]$to) {
+  try {
+    Copy-Item -LiteralPath $from -Destination $to -Force
+  } catch {
+    Remove-Item -LiteralPath "$to.old" -Force -ErrorAction SilentlyContinue
+    Move-Item -LiteralPath $to -Destination "$to.old" -Force
+    Copy-Item -LiteralPath $from -Destination $to -Force
+  }
+}
+
 # ---------------------------------------------------------------------------
 Step 'Putting the game together'
 $preset = if ($Config -eq 'Release') { 'win-amd64-release' } else { 'win-amd64-relwithdebinfo' }
@@ -443,7 +458,7 @@ $copied = 0
 foreach ($pattern in 'amped3.exe', '*.dll', '*LICENSE*.txt', 'amped3.pdb') {
   if ($pattern -eq 'amped3.pdb' -and $Config -eq 'Release') { continue }
   foreach ($file in Get-ChildItem -Path $buildDir -Filter $pattern -File -ErrorAction SilentlyContinue) {
-    Copy-Item -LiteralPath $file.FullName -Destination $InstallDir -Force
+    Copy-Replacing $file.FullName (Join-Path $InstallDir $file.Name)
     $copied++
   }
 }
@@ -469,6 +484,8 @@ if ((Test-Path $defaults) -and -not (Test-Path (Join-Path $InstallDir 'amped3.to
   Copy-Item $defaults (Join-Path $InstallDir 'amped3.toml') -Force
 }
 $installedExe = Join-Path $InstallDir 'amped3.exe'
+# Where the sources are, for the launcher's Update (update.ps1).
+[IO.File]::WriteAllText((Join-Path $InstallDir 'source.path'), "$ProjectDir`n")
 
 # Optional: the game's textures upscaled on this PC (installer\Upscale-Textures.ps1;
 # also "Upscale Textures.bat" to run it later). Not part of -Yes: it downloads
@@ -495,7 +512,7 @@ if ($upscale) {
   }
 }
 
-if (Ask '    Add a desktop shortcut?') {
+if (-not $NoShortcut -and (Ask '    Add a desktop shortcut?')) {
   $shell = New-Object -ComObject WScript.Shell
   $link = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Amped 3 Revamped.lnk'))
   $link.TargetPath = $installedExe

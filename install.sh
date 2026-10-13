@@ -7,6 +7,7 @@
 #   ./install.sh [--iso <image.iso>] [--game-dir <extracted game>]
 #                [--install-dir <folder>] [--config Release|RelWithDebInfo]
 #                [--container | --native] [--upscale-textures yes|no] [--yes]
+#                [--update]
 #
 #  1. Extracts the game from the ISO into <install folder>/game and checks it.
 #  2. Builds (setup.sh): natively when Clang 20+, CMake and Ninja are there,
@@ -14,11 +15,13 @@
 #  3. Puts the game together in the install folder (portable: move it
 #     anywhere), with a launcher and a desktop entry to add to Steam.
 #  4. Optionally upscales the game's textures (x86_64).
+# --update (the launcher's Update, through update.sh): rebuilds an existing
+# install without asking anything and without adding it to Steam again.
 # The build takes a long time the first time (hours on a handheld) and needs
 # about 40 GB free. Logs go to ./logs/.
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; YES=0
+ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; YES=0; UPDATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,6 +33,7 @@ while [ $# -gt 0 ]; do
     --native) MODE=native; shift ;;
     --upscale-textures) UPSCALE="$2"; shift 2 ;;
     --yes|-y) YES=1; shift ;;
+    --update) UPDATE=1; YES=1; shift ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
@@ -118,12 +122,16 @@ step 'Putting the game together'
 copied=0
 for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.*; do
   [ -e "$f" ] || continue
-  cp -a "$f" "$INSTALL_DIR"/; copied=$((copied + 1))
+  # A running game (the launcher's Update) has these mapped: replace the file
+  # rather than writing into it.
+  cp -a --remove-destination "$f" "$INSTALL_DIR"/; copied=$((copied + 1))
 done
 if [ -d "$BUILD_DIR/textures" ]; then
   mkdir -p "$INSTALL_DIR/textures"; cp -a "$BUILD_DIR/textures"/. "$INSTALL_DIR/textures"/
 fi
 [ -f "$INSTALL_DIR/amped3.toml" ] || cp "$PROJECT_DIR/amped3.defaults.toml" "$INSTALL_DIR/amped3.toml"
+# Where the sources are, for the launcher's Update (update.sh).
+printf '%s\n' "$PROJECT_DIR" > "$INSTALL_DIR/source.path"
 note "$copied file(s) copied"
 
 # A launcher (what Steam runs) and a desktop entry (Steam's "Add a Non-Steam
@@ -149,7 +157,7 @@ Categories=Game;
 EOF
 note "Launcher: $LAUNCHER"
 note "Desktop entry: $DESKTOP"
-if command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then
+if [ "$UPDATE" -eq 0 ] && command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then
   steamos-add-to-steam "$DESKTOP" || warn 'steamos-add-to-steam failed; add it from Steam (Games > Add a Non-Steam Game).'
 fi
 

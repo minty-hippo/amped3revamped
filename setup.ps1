@@ -591,6 +591,8 @@ Build-Game 'build'
 # restarted from the options menu): amped3 reads the game folder from
 # game.path next to it when there's no game\ folder there.
 [IO.File]::WriteAllText((Join-Path (Split-Path $Exe) 'game.path'), "$GameDir`n")
+# Where the sources are, for the launcher's Update (update.ps1).
+[IO.File]::WriteAllText((Join-Path (Split-Path $Exe) 'source.path'), "$ProjectDir`n")
 
 Write-Host "`nBuilt: $Exe" -ForegroundColor Green
 Write-Host 'In game: Back+Start (or F1) opens the options menu. F3 debug overlay, F4 every setting, ` console.'
