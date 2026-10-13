@@ -16,6 +16,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
+# Windows: the static C runtime for everything (SDL included), so the exe
+# needs no Visual C++ runtime installed and links against one CRT.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # SDL3, static, only what the launcher uses (window, renderer, controllers,
 # file dialogs).
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -57,7 +61,6 @@ target_link_libraries(amped3-launcher PRIVATE SDL3::SDL3-static)
 
 if(MSVC)
     target_compile_options(amped3-launcher PRIVATE /utf-8)
-    set_property(TARGET amped3-launcher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 elseif(UNIX AND NOT APPLE)
     # One file that runs on any distribution of the same architecture.
     target_link_options(amped3-launcher PRIVATE -static-libstdc++ -static-libgcc)
