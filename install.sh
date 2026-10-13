@@ -15,8 +15,8 @@
 #  3. Puts the game together in the install folder (portable: move it
 #     anywhere), with a launcher and a desktop entry to add to Steam.
 #  4. Optionally upscales the game's textures (x86_64).
-# --update (the launcher's Update, through update.sh): rebuilds an existing
-# install without asking anything and without adding it to Steam again.
+# --update (the launcher, and update.sh): installs or rebuilds without asking
+# anything, and leaves the menu entry and Steam to the launcher.
 # The build takes a long time the first time (hours on a handheld) and needs
 # about 40 GB free. Logs go to ./logs/.
 set -euo pipefail
@@ -147,9 +147,12 @@ cat > "$LAUNCHER" <<'EOF'
 cd "$(dirname "$0")" && exec ./amped3 "$@"
 EOF
 chmod +x "$LAUNCHER"
-DESKTOP="$HOME/.local/share/applications/amped3-revamped.desktop"
-mkdir -p "$(dirname "$DESKTOP")"
-cat > "$DESKTOP" <<EOF
+# The menu entry and Steam: with --update the launcher (amped3-launcher) makes
+# its own, pointing at itself.
+if [ "$UPDATE" -eq 0 ]; then
+  DESKTOP="$HOME/.local/share/applications/amped3-revamped.desktop"
+  mkdir -p "$(dirname "$DESKTOP")"
+  cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Amped 3 Revamped
@@ -159,10 +162,11 @@ Path=$INSTALL_DIR
 Terminal=false
 Categories=Game;
 EOF
-note "Launcher: $LAUNCHER"
-note "Desktop entry: $DESKTOP"
-if [ "$UPDATE" -eq 0 ] && command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then
-  steamos-add-to-steam "$DESKTOP" || warn 'steamos-add-to-steam failed; add it from Steam (Games > Add a Non-Steam Game).'
+  note "Launcher: $LAUNCHER"
+  note "Desktop entry: $DESKTOP"
+  if command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then
+    steamos-add-to-steam "$DESKTOP" || warn 'steamos-add-to-steam failed; add it from Steam (Games > Add a Non-Steam Game).'
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -37,8 +37,6 @@ class Amped3App : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   void OnConfigureFonts(ImFontAtlas* atlas) override;
   void OnShutdown() override;
-  // The launcher (launcher.h) before the game boots.
-  bool OnBeforeLaunchModule(std::function<void()> launch) override;
 
  private:
   // Opens the menu if closed, closes it if open. UI thread only.

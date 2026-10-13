@@ -27,7 +27,6 @@
 #include "frame_capture.h"
 #include "graphics_panel.h"
 #include "guest_waits.h"
-#include "launcher.h"
 #include "live_renderer.h"
 #include "options_graphics.h"
 #include "options_menu.h"
@@ -241,8 +240,15 @@ void Amped3App::MoveOldSaves(const std::filesystem::path& from, const std::files
 
 void Amped3App::OnPostInitLogging() {
   REXLOG_INFO("Amped 3 Revamped {}", amped3::version::Text());
-  // Files an update moved aside while the game ran (launcher's Update).
-  amped3::CleanUpAfterUpdate(rex::filesystem::GetExecutableFolder());
+  // Files a reinstall moved aside while the game ran (the installer renames
+  // what it can't replace).
+  {
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(rex::filesystem::GetExecutableFolder(), ec)) {
+      if (entry.path().extension() == ".old") std::filesystem::remove(entry.path(), ec);
+    }
+  }
   // Same folder the SDK writes amped3_NNN.log to.
   amped3::crash::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::capture::Install(rex::filesystem::GetExecutableFolder() / "logs");
@@ -389,14 +395,6 @@ void Amped3App::OnPostSetup() {
     stats.frame_count = rate.frame_count;
     return stats;
   });
-}
-
-bool Amped3App::OnBeforeLaunchModule(std::function<void()> launch) {
-  if (!imgui_drawer() || !amped3::LauncherWanted()) return true;
-  // The dialog deletes itself when it closes; Play calls `launch`.
-  new amped3::Launcher(imgui_drawer(), config_path_, std::move(launch),
-                       [this] { app_context().QuitFromUIThread(); });
-  return false;
 }
 
 void Amped3App::OnShutdown() {

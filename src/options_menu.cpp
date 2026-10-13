@@ -489,14 +489,6 @@ const std::vector<Tab>& Tabs() {
                 SliderI("perf_trace_seconds", "Trace length",
                         "How many seconds a performance trace records.", 5, 120, "%d s"),
             }},
-           {"Startup",
-            {
-                Toggle("show_launcher", "Show launcher at start",
-                       "The launcher comes up before the game boots: Play, Update (gets a "
-                       "branch from GitHub and rebuilds this copy), the branch to update to and "
-                       "the version this build was made from. Off: the game boots at once; hold "
-                       "LB / View or Shift while it starts to see the launcher anyway."),
-            }},
        }},
       {"Cutscenes", {},
        "Plays the game's story cutscenes on demand, for testing. A scene interrupts the ride "
