@@ -477,6 +477,16 @@ const std::vector<Tab>& Tabs() {
                         "frames will play too fast. Go back to 60 Hz if gameplay speeds up.",
                         {{"60", "60 Hz (original)"}, {"120", "120 Hz"}, {"144", "144 Hz"}}),
             }},
+           {"Performance",
+            {
+                Toggle("perf_trace", "Record performance trace",
+                       "Records where each frame's time goes for a while (perf_trace_seconds, "
+                       "20 s by default), then switches itself off and writes "
+                       "logs/perf_<time>.csv, _threads.csv and _summary.txt. Close this menu and "
+                       "play normally while it records. Also F11."),
+                SliderI("perf_trace_seconds", "Trace length",
+                        "How many seconds a performance trace records.", 5, 120, "%d s"),
+            }},
        }},
       {"Cutscenes", {},
        "Plays the game's story cutscenes on demand, for testing. A scene interrupts the ride "

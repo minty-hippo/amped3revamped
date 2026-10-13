@@ -32,6 +32,7 @@
 #include "options_menu.h"
 #include "pad_bridge.h"
 #include "perf_overlay.h"
+#include "perf_trace.h"
 #include "thread_qos.h"
 
 
@@ -262,6 +263,8 @@ bool Amped3App::OnWantShaderStorage() { return !lean_gpu_; }
 void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // F3: the performance overlay, in place of the SDK's debug overlay.
   amped3::perf::Install(drawer);
+  // F11: performance trace to logs (perf_trace.cpp).
+  amped3::trace::Install();
   // Keyboard shortcut; shows up (and can be rebound) in the F4 settings panel.
   rex::ui::RegisterBind(kMenuBind, "F1", "Open or close the Amped 3 Revamped options menu",
                         [this] { ToggleOptionsMenu(); });

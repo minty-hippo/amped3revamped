@@ -1,6 +1,7 @@
 // amped3 - performance overlay. See perf_overlay.h.
 
 #include "perf_overlay.h"
+#include "perf_trace.h"
 
 #include <algorithm>
 #include <array>
@@ -92,7 +93,9 @@ uint64_t ThreadCycles() {
   QueryThreadCycleTime(GetCurrentThread(), &c);
   return c;
 #else
-  return uint64_t(NowNs());
+  // The thread's own CPU time (waits don't count), like the cycle count on
+  // Windows. Used to be the wall clock, which counted the waits too.
+  return uint64_t(amped3::trace::ThreadCpuNs());
 #endif
 }
 
@@ -778,17 +781,22 @@ void OnSwapEnd() {
 }
 
 void ReportRenderFrame(double worker_ms) {
+  amped3::trace::OnRenderFrame(worker_ms);
   g_render_ms = worker_ms;
   g_render_at = NowNs();
 }
 
 void ReportGpuFrame(double gpu_ms) {
+  amped3::trace::OnGpuFrame(gpu_ms);
   if (gpu_ms < 0) return;
   g_gpu_ms = gpu_ms;
   g_gpu_at = NowNs();
 }
 
-void ReportPresented() { g_presented.fetch_add(1, std::memory_order_relaxed); }
+void ReportPresented() {
+  amped3::trace::OnPresented();
+  g_presented.fetch_add(1, std::memory_order_relaxed);
+}
 
 void SetGpuName(const std::string& name) {
   std::lock_guard lock(g_gpu_name_mutex);
