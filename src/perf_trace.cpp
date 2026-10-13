@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/ui/keybinds.h>
 
 #if defined(_WIN32)
@@ -263,6 +264,140 @@ struct ThreadStat {
   double cpu_ms = 0, avg_core_pct = 0, max_core_pct = 0;
 };
 
+// Command stream statistics (SDK patch 0020): the command processor reports
+// each packet header while a trace runs. One thread writes them.
+constexpr int kType0 = 128, kType1 = 129, kType2 = 130, kPacketKinds = 131;
+std::array<std::atomic<uint64_t>, kPacketKinds> g_packets{};
+std::array<std::atomic<uint64_t>, kPacketKinds> g_packet_dwords{};
+std::array<std::atomic<uint64_t>, 0x8000> g_reg_writes{};  // type-0 by first register
+
+void OnGpuPacket(uint32_t packet) {
+  if (packet == 0) return;
+  const uint32_t type = packet >> 30;
+  int kind;
+  uint32_t dwords = 1;
+  switch (type) {
+    case 0:
+      kind = kType0;
+      dwords += ((packet >> 16) & 0x3FFF) + 1;
+      g_reg_writes[packet & 0x7FFF].fetch_add(((packet >> 16) & 0x3FFF) + 1,
+                                              std::memory_order_relaxed);
+      break;
+    case 1:
+      kind = kType1;
+      dwords += 2;
+      break;
+    case 2:
+      kind = kType2;
+      break;
+    default:
+      kind = int((packet >> 8) & 0x7F);
+      dwords += ((packet >> 16) & 0x3FFF) + 1;
+      break;
+  }
+  g_packets[kind].fetch_add(1, std::memory_order_relaxed);
+  g_packet_dwords[kind].fetch_add(dwords, std::memory_order_relaxed);
+}
+
+const char* PacketName(int kind) {
+  switch (kind) {
+    case kType0: return "registers (type 0)";
+    case kType1: return "type 1";
+    case kType2: return "type 2 (nop)";
+    case 0x10: return "NOP";
+    case 0x21: return "REG_RMW";
+    case 0x22: return "DRAW_INDX";
+    case 0x23: return "VIZ_QUERY";
+    case 0x25: return "SET_STATE";
+    case 0x26: return "WAIT_FOR_IDLE";
+    case 0x27: return "IM_LOAD";
+    case 0x2b: return "IM_LOAD_IMMEDIATE";
+    case 0x2d: return "SET_CONSTANT";
+    case 0x2e: return "LOAD_CONSTANT_CONTEXT";
+    case 0x2f: return "LOAD_ALU_CONSTANT";
+    case 0x36: return "DRAW_INDX_2";
+    case 0x37: return "INDIRECT_BUFFER_PFD";
+    case 0x3b: return "INVALIDATE_STATE";
+    case 0x3c: return "WAIT_REG_MEM";
+    case 0x3d: return "MEM_WRITE";
+    case 0x3e: return "REG_TO_MEM";
+    case 0x3f: return "INDIRECT_BUFFER";
+    case 0x44: return "COND_EXEC";
+    case 0x45: return "COND_WRITE";
+    case 0x46: return "EVENT_WRITE";
+    case 0x48: return "ME_INIT";
+    case 0x4a: return "SET_SHADER_BASES";
+    case 0x4b: return "SET_BIN_BASE_OFFSET";
+    case 0x50: return "SET_BIN_MASK";
+    case 0x51: return "SET_BIN_SELECT";
+    case 0x54: return "INTERRUPT";
+    case 0x55: return "SET_CONSTANT2";
+    case 0x56: return "SET_SHADER_CONSTANTS";
+    case 0x58: return "EVENT_WRITE_SHD";
+    case 0x59: return "EVENT_WRITE_CFL";
+    case 0x5a: return "EVENT_WRITE_EXT";
+    case 0x5b: return "EVENT_WRITE_ZPD";
+    case 0x5e: return "CONTEXT_UPDATE";
+    case 0x60: return "SET_BIN_MASK_LO";
+    case 0x61: return "SET_BIN_MASK_HI";
+    case 0x62: return "SET_BIN_SELECT_LO";
+    case 0x63: return "SET_BIN_SELECT_HI";
+    case 0x64: return "XE_SWAP";
+    default: return nullptr;
+  }
+}
+
+std::string PacketSummary(double frames) {
+  struct Entry {
+    int kind;
+    uint64_t packets, dwords;
+  };
+  std::vector<Entry> entries;
+  uint64_t packets = 0, dwords = 0;
+  for (int k = 0; k < kPacketKinds; ++k) {
+    const uint64_t n = g_packets[k].load(std::memory_order_relaxed);
+    if (!n) continue;
+    const uint64_t d = g_packet_dwords[k].load(std::memory_order_relaxed);
+    entries.push_back({k, n, d});
+    packets += n;
+    dwords += d;
+  }
+  if (!packets) return "Command stream: no packets seen (SDK patch 0020 missing?)\n";
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry& a, const Entry& b) { return a.dwords > b.dwords; });
+  std::string s = fmt::format(
+      "Command stream (what the emulated GPU still executes): {:.0f} packets, {:.1f} KB per "
+      "frame\n",
+      double(packets) / frames, double(dwords) * 4.0 / 1024.0 / frames);
+  for (size_t i = 0; i < entries.size() && i < 12; ++i) {
+    const Entry& e = entries[i];
+    const char* name = PacketName(e.kind);
+    s += fmt::format("  {:<22} {:8.1f} packets {:8.1f} KB  {:5.1f}%\n",
+                     name ? std::string(name) : fmt::format("type 3 op {:02X}", e.kind),
+                     double(e.packets) / frames, double(e.dwords) * 4.0 / 1024.0 / frames,
+                     100.0 * double(e.dwords) / double(dwords));
+  }
+  std::vector<std::pair<uint64_t, uint32_t>> regs;
+  for (uint32_t r = 0; r < 0x8000; ++r) {
+    if (const uint64_t n = g_reg_writes[r].load(std::memory_order_relaxed)) regs.push_back({n, r});
+  }
+  std::sort(regs.rbegin(), regs.rend());
+  if (!regs.empty()) {
+    s += "  register writes by first register (per frame):";
+    for (size_t i = 0; i < regs.size() && i < 8; ++i) {
+      s += fmt::format(" {:04X}:{:.0f}", regs[i].second, double(regs[i].first) / frames);
+    }
+    s += "\n";
+  }
+  return s;
+}
+
+void ResetPacketStats() {
+  for (auto& v : g_packets) v.store(0, std::memory_order_relaxed);
+  for (auto& v : g_packet_dwords) v.store(0, std::memory_order_relaxed);
+  for (auto& v : g_reg_writes) v.store(0, std::memory_order_relaxed);
+}
+
 void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
                   const std::vector<int64_t>& sample_ns) {
   std::vector<Row> rows;
@@ -384,6 +519,7 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
                               : std::string("no frames (renderer off?)"));
     s += fmt::format("GPU: {}\n", gpu_n ? fmt::format("{:.2f} ms per frame", gpu_sum / gpu_n)
                                         : std::string("no timings"));
+    s += PacketSummary(n);
   }
   if (presents.size() >= 3) {
     std::vector<double> gaps;
@@ -425,6 +561,7 @@ void RunTrace() {
     sample_ns.push_back(NowNs());
   }
   g_active.store(false, std::memory_order_release);
+  rex::system::SetGpuPacketHook(nullptr);
   WriteResults(double(seconds), samples, sample_ns);
   rex::cvar::SetFlagByName("perf_trace", "false");
   g_running.store(false, std::memory_order_release);
@@ -495,6 +632,8 @@ void Start() {
   g_draw_tid = 0;
   g_record_allocs = 0;
   REXLOG_INFO("Performance trace: recording {} s", REXCVAR_GET(perf_trace_seconds));
+  ResetPacketStats();
+  rex::system::SetGpuPacketHook(&OnGpuPacket);
   g_active.store(true, std::memory_order_release);
   std::thread(RunTrace).detach();
 }

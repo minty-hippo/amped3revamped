@@ -1,0 +1,42 @@
+--- a/include/rex/system/gpu_plugin.h
++++ b/include/rex/system/gpu_plugin.h
+@@ -69,4 +69,11 @@
+ void SetGpuEventWriteHook(GpuEventWriteHook hook);
+ GpuEventWriteHook GetGpuEventWriteHook();
+ 
++// Called by the command processor with each packet header it executes (amped3
++// patch 0020: the performance trace counts what the command stream carries).
++// Null (the default) costs one atomic load per packet.
++using GpuPacketHook = void (*)(uint32_t packet);
++void SetGpuPacketHook(GpuPacketHook hook);
++GpuPacketHook GetGpuPacketHook();
++
+ }  // namespace rex::system
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -119,6 +119,14 @@
+   return g_event_write_hook.load(std::memory_order_acquire);
+ }
+ 
++namespace {
++std::atomic<GpuPacketHook> g_packet_hook{nullptr};
++}  // namespace
++
++void SetGpuPacketHook(GpuPacketHook hook) { g_packet_hook.store(hook); }
++
++GpuPacketHook GetGpuPacketHook() { return g_packet_hook.load(std::memory_order_relaxed); }
++
+ uint32_t GetDrawResolutionScaleCap() { return g_draw_resolution_scale_cap.load(); }
+ 
+ }  // namespace rex::system
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -673,6 +673,8 @@
+   if (packet == 0xCDCDCDCD) {
+     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+   }
++  // Patch 0020: packet statistics for the application.
++  if (auto hook = rex::system::GetGpuPacketHook()) hook(packet);
+ 
+   switch (packet_type) {
+     case 0x00:

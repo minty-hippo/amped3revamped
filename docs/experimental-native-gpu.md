@@ -237,4 +237,6 @@ theirs: their vertices live in the command buffer and the recording reads
 them there.
 
 What the command processor still does per frame then decides whether
-replacing it is worth it: the trace's GPU Commands thread share.
+replacing it is worth it: the trace's GPU Commands thread share, and a new
+summary section (SDK patch 0020) listing the packets it executed per frame
+by kind and size, with the busiest register blocks.
