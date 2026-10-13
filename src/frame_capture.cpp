@@ -593,14 +593,38 @@ std::unordered_map<uint64_t, std::string> g_bound_seen;  // object x checksum ->
 uint32_t g_last_ps = 0;
 
 // Saves the microcode (once) and returns its file stem, ucode_<kind>_<hash>.
+// A fast checksum of raw guest bytes (size a multiple of 4): four independent
+// multiply-xor lanes over 8-byte words, so it runs at memory speed. It runs on
+// the drawing thread whenever the bound shaders change.
+uint64_t QuickSum(const uint8_t* p, uint32_t n) {
+  constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
+  uint64_t a = 0x243F6A8885A308D3ull, b = 0x13198A2E03707344ull, c = 0xA4093822299F31D0ull,
+           d = 0x082EFA98EC4E6C89ull;
+  uint32_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    uint64_t w[4];
+    std::memcpy(w, p + i, 32);
+    a = (a ^ w[0]) * kMul;
+    b = (b ^ w[1]) * kMul;
+    c = (c ^ w[2]) * kMul;
+    d = (d ^ w[3]) * kMul;
+  }
+  for (; i + 4 <= n; i += 4) {
+    uint32_t w;
+    std::memcpy(&w, p + i, 4);
+    a = (a ^ w) * kMul;
+  }
+  const auto rot = [](uint64_t v, int r) { return (v << r) | (v >> (64 - r)); };
+  uint64_t h = a ^ rot(b, 17) ^ rot(c, 31) ^ rot(d, 47) ^ n;
+  h ^= h >> 29;
+  return h * kMul;
+}
+
 std::string SaveDrawnMicrocode(uint8_t* base, const char* kind, uint32_t object, uint32_t address,
                                uint32_t bytes, uint32_t decl) {
   if (!object || !address || !bytes || bytes > 0x10000 || (bytes & 3)) return {};
   // Cheap checksum first; the full hash only for new microcode.
-  uint64_t sum = 0;
-  for (uint32_t i = 0; i < bytes; i += 4) {
-    sum = sum * 31 + U32(base, address + i);
-  }
+  const uint64_t sum = QuickSum(base + address, bytes);
   const uint64_t key = sum ^ (uint64_t(object) << 32) ^ bytes ^ (kind[0] == 'v' ? 1ull << 63 : 0);
   {
     std::lock_guard lock(g_shader_mutex);

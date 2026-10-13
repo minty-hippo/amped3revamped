@@ -1,0 +1,86 @@
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -298,6 +298,16 @@
+ 
+   Shader* active_vertex_shader_ = nullptr;
+   Shader* active_pixel_shader_ = nullptr;
++  // Patch 0021: shader loads seen while host drawing is off, loaded when it
++  // comes back on (vertex, pixel). address 0: the last load was immediate (its
++  // microcode was in the command buffer and is gone).
++  struct DeferredShaderLoad {
++    bool pending = false;
++    uint32_t address = 0;
++    uint32_t dword_count = 0;
++  };
++  DeferredShaderLoad deferred_shader_loads_[2];
++  void LoadDeferredShaders();
+ 
+   bool paused_ = false;
+ 
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -979,8 +979,12 @@
+     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+   }
+   // Patch 0009: host drawing switches on or off between frames.
+-  host_drawing_enabled_.store(host_drawing_requested_.load(std::memory_order_acquire),
+-                              std::memory_order_release);
++  {
++    const bool was_enabled = IsHostDrawingEnabled();
++    host_drawing_enabled_.store(host_drawing_requested_.load(std::memory_order_acquire),
++                                std::memory_order_release);
++    if (!was_enabled && IsHostDrawingEnabled()) LoadDeferredShaders();
++  }
+ 
+   ++counter_;
+   return true;
+@@ -1540,6 +1544,22 @@
+   return true;
+ }
+ 
++void CommandProcessor::LoadDeferredShaders() {
++  for (uint32_t i = 0; i < 2; ++i) {
++    DeferredShaderLoad& load = deferred_shader_loads_[i];
++    if (!load.pending) continue;
++    load.pending = false;
++    const auto type = static_cast<xenos::ShaderType>(i);
++    Shader* shader = nullptr;
++    if (load.address) {
++      shader = LoadShader(type, load.address,
++                          memory_->TranslatePhysical<uint32_t*>(load.address), load.dword_count);
++    }
++    // An immediate load can't be repeated: no shader until the next load.
++    (i == 0 ? active_vertex_shader_ : active_pixel_shader_) = shader;
++  }
++}
++
+ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
+@@ -1553,6 +1573,12 @@
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+ 
++  // Patch 0021: no host drawing, no shader translation: remember the load.
++  if (!IsHostDrawingEnabled() && uint32_t(shader_type) < 2) {
++    deferred_shader_loads_[uint32_t(shader_type)] = {true, addr, size_dwords};
++    return true;
++  }
++
+   auto shader =
+       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+   switch (shader_type) {
+@@ -1583,6 +1609,13 @@
+   assert_true(start == 0);
+   assert_true(reader->read_count() >= size_dwords * 4);
+   assert_true(count - 2 >= size_dwords);
++  // Patch 0021: no host drawing, no shader translation (the microcode is in
++  // the command buffer, so it can't be loaded later).
++  if (!IsHostDrawingEnabled() && uint32_t(shader_type) < 2) {
++    deferred_shader_loads_[uint32_t(shader_type)] = {true, 0, 0};
++    reader->AdvanceRead(size_dwords * sizeof(uint32_t));
++    return true;
++  }
+   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
+                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+   switch (shader_type) {

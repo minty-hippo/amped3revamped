@@ -240,3 +240,34 @@ What the command processor still does per frame then decides whether
 replacing it is worth it: the trace's GPU Commands thread share, and a new
 summary section (SDK patch 0020) listing the packets it executed per frame
 by kind and size, with the busiest register blocks.
+
+### Step 2 results and what the command stream carries
+
+Draw packets are gone (the `DRAW_INDX` left, 60-150 a frame, come from
+clears, resolves and user-pointer draws). Per frame the command processor
+still executes 5,000-9,000 packets, 120-530 KB:
+
+| Packets | Per frame (light / busy scene) | Share of the bytes |
+|---|---|---|
+| `IM_LOAD_IMMEDIATE` (vertex shaders patched for a declaration, microcode in the command buffer) | 92 / 287, 61 / 434 KB | 51-83% |
+| `IM_LOAD` + `INVALIDATE_STATE` (shader binds) | 980 / 3,166 each | 11-16% |
+| Register writes (type 0) | 1,300-1,400 | 3-18% |
+| Everything else (bin masks, constants, events, waits, the swap) | a few hundred | < 10% |
+
+So the emulated GPU's remaining work is mostly shader loads, and on the
+console side writing them (the immediate loads copy the patched microcode
+into the command buffer). The recording needs that copy: the native renderer
+reads the patched vertex shader from it.
+
+Two changes follow:
+
+- SDK patch 0021: while host drawing is off, the command processor only
+  remembers the last shader load per stage instead of hashing and looking up
+  every one, and loads it when host drawing comes back on.
+- The recorder's check for "is this microcode new" (on the drawing thread at
+  every shader change) was a serial checksum over byte-swapped words; it is
+  now a 4-lane checksum over raw bytes.
+
+One trace also had a 128 ms frame during a scene change: the game's main
+thread was busy for 78 ms (loading), and new textures were hashed in the
+same frame.
