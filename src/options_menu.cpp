@@ -239,13 +239,15 @@ const std::vector<Tab>& Tabs() {
            {"Renderer",
             {
                 Choices("gpu_backend", "Graphics API",
-                        "Which API the Xbox 360 GPU emulation draws with. Direct3D 12 is the "
-                        "default; Vulkan can perform better on some drivers (and is what Linux "
-                        "uses). Falls back to the default if the chosen API isn't available.",
+                        "Which API the Xbox 360 GPU emulation and the window use. Automatic "
+                        "picks Vulkan while the native renderer draws (its picture then reaches "
+                        "the window without a trip through the CPU) and, on Windows, "
+                        "Direct3D 12 when the emulation draws. Falls back to the default if the "
+                        "chosen API isn't available.",
 #ifdef _WIN32
-                        {{"d3d12", "Direct3D 12"}, {"vulkan", "Vulkan"}}),
+                        {{"auto", "Automatic"}, {"d3d12", "Direct3D 12"}, {"vulkan", "Vulkan"}}),
 #else
-                        {{"vulkan", "Vulkan"}}),
+                        {{"auto", "Automatic"}, {"vulkan", "Vulkan"}}),
 #endif
                 Choices("render_target_path_vulkan", "Vulkan render path",
                         "How Vulkan emulates the console's on-chip framebuffer. Render targets "

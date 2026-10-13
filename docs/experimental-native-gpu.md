@@ -117,3 +117,12 @@ swapping thread is the frame-rate limit: recording and Direct3D's command
 writing are the two parts we can remove there. The worker hands its image to
 the window through the CPU with Direct3D 12 (`present` 0.9 ms); with the
 Vulkan backend it stays on the GPU.
+
+### PC, Vulkan for the emulated GPU and the window
+
+With `gpu_backend = vulkan` the native renderer's picture reaches the window
+through a shared image instead of the CPU: the worker's `present` went from
+0.90 ms to 0.07 ms, the worker thread from 36-43% to 27-35% of a core, and
+frame pacing stayed even (p99 18.4-19.0 ms, 1 uneven present in 20 s).
+`gpu_backend` now defaults to `auto`: Vulkan while the native renderer draws,
+Direct3D 12 on Windows when the emulation draws.

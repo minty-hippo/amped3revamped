@@ -36,16 +36,26 @@
 #include "thread_qos.h"
 
 
-// Direct3D 12 on Windows; Vulkan everywhere else (Linux: SteamOS, ARM handhelds).
-#ifdef _WIN32
-#define AMPED3_DEFAULT_GPU_BACKEND "d3d12"
-#else
-#define AMPED3_DEFAULT_GPU_BACKEND "vulkan"
-#endif
-REXCVAR_DEFINE_STRING(gpu_backend, AMPED3_DEFAULT_GPU_BACKEND, "GPU",
-                      "Graphics API for the GPU plugin: d3d12 (Windows) or vulkan")
-    .allowed({"d3d12", "vulkan"})
+// auto: Vulkan while the native renderer draws (its image then reaches the
+// window on the GPU; with Direct3D 12 it goes through the CPU), Direct3D 12 on
+// Windows when the emulation draws; Vulkan everywhere else.
+REXCVAR_DEFINE_STRING(gpu_backend, "auto", "GPU",
+                      "Graphics API for the GPU plugin: auto, d3d12 (Windows) or vulkan. Auto is "
+                      "Vulkan with the native renderer, Direct3D 12 on Windows without it")
+    .allowed({"auto", "d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+std::string EffectiveGpuBackend() {
+  const std::string value = REXCVAR_GET(gpu_backend);
+  if (value != "auto" && !value.empty()) return value;
+#ifdef _WIN32
+  return rex::cvar::GetFlagByName("native_renderer") == "true" ? "vulkan" : "d3d12";
+#else
+  return "vulkan";
+#endif
+}
+}  // namespace
 
 // The SDK's Vulkan presenter prefers IMMEDIATE (no sync, tears) whenever the
 // driver offers it. The game runs at a fixed 30/60 fps, so tearing buys
@@ -124,7 +134,7 @@ void Amped3App::OnPreSetup(rex::RuntimeConfig& config) {
   // Load it here with the API chosen in Options -> Display/Graphics instead;
   // if that fails (no Vulkan driver, say) fall back to the SDK's choice.
   if (!config.graphics) {
-    const std::string backend = REXCVAR_GET(gpu_backend);
+    const std::string backend = EffectiveGpuBackend();
     config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, backend);
     if (!config.graphics) {
       REXLOG_WARN("GPU backend '{}' unavailable; using the default", backend);
@@ -338,7 +348,7 @@ void Amped3App::OnPostSetup() {
         auto* graphics = runtime() ? runtime()->graphics_system() : nullptr;
         return graphics ? graphics->presenter() : nullptr;
       },
-      REXCVAR_GET(gpu_backend),
+      EffectiveGpuBackend(),
       [this](amped3::live::GammaRamp* ramp) {
         auto* graphics =
             static_cast<rex::graphics::GraphicsSystem*>(runtime() ? runtime()->graphics_system()
