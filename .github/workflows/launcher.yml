@@ -62,6 +62,7 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          set +e +o pipefail
           for f in configure.log build.log; do
             [ -f "$f" ] || continue
             { grep -iE "error|fatal" "$f" | head -20; echo "-- last lines of $f:"; tail -n 15 "$f"; } |
