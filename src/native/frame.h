@@ -188,8 +188,8 @@ struct Draw {
   // Microcode resource names: ucode_vs_<hash> / ucode_ps_<hash> in captures;
   // the live recorder uses short aliases (V<11> / P<11>, see live_renderer.cpp).
   std::string vs, ps;
-  SmallVector<FrameTexture, 6> textures;
-  SmallMap<uint32_t, std::string, 4> vmem;  // vertex fetch constant -> vertex memory resource
+  SmallVector<FrameTexture, 4> textures;
+  SmallMap<uint32_t, std::string, 2> vmem;  // vertex fetch constant -> vertex memory resource
   std::string index_data;                // index resource (ib_ / upi_)
   std::string up_vertices;               // user-pointer vertex resource (upv_)
   bool index_32bit = false;

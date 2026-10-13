@@ -175,3 +175,9 @@ the stems. The renderer's one check of shader identity by name (event icons)
 now compares microcode hashes. The trace counts the recorder's allocations.
 Frame dumps (F10) from the live renderer keep the aliases, so the replay
 tool's debug filters by shader hash don't match them.
+
+Result: recording made 4,000-5,900 heap allocations a frame even so (the
+per-frame name maps: a node per texture, buffer and version), and the larger
+`Draw` cost 0.85 ms a frame to move into the frame (`store`), eating the gain.
+Draws are now built in place (`emplace_back`), with 4 textures and 2 streams
+inline.

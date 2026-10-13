@@ -1681,7 +1681,10 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
     if (part < 4) trace::Add(kZones[part], ns);
     t = now;
   };
-  Draw d;
+  const uint32_t number = AddEvent(native::EventType::kDraw, uint32_t(g_frame->frame.draws.size()));
+  // Built in place: a Draw keeps its first textures and streams inline, so
+  // moving one in afterwards copied a few hundred bytes per draw.
+  Draw& d = g_frame->frame.draws.emplace_back();
   d.kind = Draw::Kind(int(call.kind));
   d.prim = call.prim;
   d.start = call.start;
@@ -1689,7 +1692,6 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   d.base_vertex = call.base_vertex;
   d.vs = MicrocodeAlias(vs_ucode, 'V');
   d.ps = MicrocodeAlias(ps_ucode, 'P');
-  const uint32_t number = AddEvent(native::EventType::kDraw, uint32_t(g_frame->frame.draws.size()));
   auto* memory = GuestMemory();
 
   // Textures: the fetch constants the shaders read (all bound ones if a
@@ -1806,7 +1808,6 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   lap(2);
   RecordStateDelta(base, dev, vs_use, ps_use);
   lap(3);
-  g_frame->frame.draws.push_back(std::move(d));
   lap(4);
 }
 
