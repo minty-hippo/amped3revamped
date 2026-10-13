@@ -3,7 +3,7 @@
 #pragma once
 
 #include <cstdlib>
-#include <map>
+#include <utility>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,8 +34,10 @@ class Json {
   // Missing members are null.
   const Json& operator[](const std::string& key) const {
     static const Json kNull;
-    auto it = members_.find(key);
-    return it == members_.end() ? kNull : it->second;
+    for (const auto& [k, v] : members_) {
+      if (k == key) return v;
+    }
+    return kNull;
   }
   const Json& operator[](size_t index) const {
     static const Json kNull;
@@ -124,7 +126,7 @@ class Json {
         ++i;
         Json v;
         if (!ParseValue(s, i, v)) return false;
-        out.members_[key] = std::move(v);
+        out.members_.emplace_back(std::move(key), std::move(v));
         SkipWs(s, i);
         if (i < s.size() && s[i] == ',') { ++i; continue; }
         if (i < s.size() && s[i] == '}') return ++i, true;
@@ -167,7 +169,7 @@ class Json {
   double num_ = 0;
   std::string str_;
   std::vector<Json> items_;
-  std::map<std::string, Json> members_;
+  std::vector<std::pair<std::string, Json>> members_;  // (vector: Json is incomplete here)
 };
 
 }  // namespace launcher
