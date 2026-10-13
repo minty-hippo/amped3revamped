@@ -63,13 +63,15 @@ jobs:
         shell: bash
         run: |
           set +e +o pipefail
+          # One annotation per log (they're limited in number): its error
+          # lines and its last lines.
           for f in configure.log build.log; do
             [ -f "$f" ] || continue
-            { grep -iE "error|fatal" "$f" | head -20; echo "-- last lines of $f:"; tail -n 15 "$f"; } |
-              while IFS= read -r line; do
-                line="${line//%/%25}"
-                echo "::error::${line//$'\r'/}"
-              done
+            text="$( { grep -E "CMake Error|error C[0-9]|error MSB|fatal error|: error" "$f" | head -25
+                       echo "-- last lines of $f:"; tail -n 25 "$f"; } | tr -d '\r')"
+            text="${text//'%'/'%25'}"
+            text="${text//$'\n'/'%0A'}"
+            echo "::error title=$f::$text"
           done
           exit 0
 
