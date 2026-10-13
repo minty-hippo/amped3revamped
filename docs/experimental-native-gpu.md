@@ -278,3 +278,30 @@ different. The game's own threads now lead the list (main thread 19-22%,
 drawing thread 17-18% in a ride), with the recorder at 11-12% and the
 renderer worker at 10-12%. Frames over 25 ms in these traces were the game
 loading (main thread CPU 1 s in a 1.1 s frame when a challenge starts).
+
+## Armada (AYN Odin 3, Adreno 830), first traces
+
+Five 20 s traces in a ride, scene at 1920x1080, frame limit 60: two with
+deferred naming, three without.
+
+| | Deferred naming on | Off |
+|---|---|---|
+| Game frames | 60 fps, p99 21.3-22.2 ms, 0 stutters | 56-60 fps, p99 21.8-23.3 ms, 4-8 stutters |
+| Presented | 50-52 fps, 0 uneven | 46-53 fps, 0-30 uneven |
+| Drawing thread | 64-75% of a core | 51-65% |
+| Recorder thread | 34-46% | - |
+| Renderer worker | 65-70% | 54-69% |
+| GPU | 18.8-19.3 ms per frame | 18.1-18.9 ms |
+
+- **GPU-bound.** The Adreno takes 18-19 ms for a 1080p scene, so about 52
+  frames reach the screen while the game runs at 60. Render scale 67-75%
+  should bring it under 16.7 ms. The renderer worker's own CPU time is
+  13-15 ms a frame (draws 7.5, vertex data 2.7, states 2.3), so once the GPU
+  is faster the worker is next: recording its draws in parallel (stage 4).
+- **Deferred naming** costs more CPU in total on this device (the recorder
+  plus a drawing thread that isn't lighter), but frame pacing is clearly
+  steadier with it, so it stays on.
+- **Two threads spun.** The Audio Worker used 98% of a core in every trace
+  (SDK patch 0023: waits on several handles busy-looped on Linux), and the
+  GPU Commands thread 14% (patch 0024: it spun 500 times at every idle
+  moment). Both are fixed for the next build.

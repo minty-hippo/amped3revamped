@@ -1,0 +1,17 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -219,9 +219,13 @@
+       // event is too high.
+       PrepareForWait();
+       uint32_t loop_count = 0;
++      // Patch 0024: while host drawing is off (the application draws), only
++      // fences and the swap need a quick answer, so spin far less before
++      // waiting (500 yields at every idle moment add up on a handheld).
++      const uint32_t spin_limit = IsHostDrawingEnabled() ? 500 : 32;
+       do {
+         // If we spin around too much, revert to a "low-power" state.
+-        if (loop_count > 500) {
++        if (loop_count > spin_limit) {
+           const int wait_time_ms = 5;
+           rex::thread::Wait(write_ptr_index_event_.get(), true,
+                             std::chrono::milliseconds(wait_time_ms));

@@ -1,0 +1,134 @@
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -275,6 +275,36 @@
+ }
+ #endif  // __APPLE__
+ 
++// amped3 patch 0023: WaitMultiple used to poll every handle with sleeps of up
++// to 1 ms, which became a busy loop when less than a millisecond was left
++// (the sleep rounded down to zero) - an alertable wait, which waits in 1 ms
++// slices, spun all the time (the audio worker kept a whole core busy). Now
++// every signal also bumps one process-wide generation counter, and
++// WaitMultiple sleeps on its condition variable until something is signaled
++// or its time is up.
++struct MultiWaitNotifier {
++  std::mutex mutex;
++  std::condition_variable cv;
++  std::atomic<uint64_t> generation{0};
++  std::atomic<int> waiters{0};
++};
++
++inline MultiWaitNotifier& GetMultiWaitNotifier() {
++  static MultiWaitNotifier* notifier = new MultiWaitNotifier();  // never destroyed
++  return *notifier;
++}
++
++// After a handle became signaled (its state already written).
++inline void NotifyMultiWaiters() {
++  auto& n = GetMultiWaitNotifier();
++  if (n.waiters.load(std::memory_order_seq_cst) == 0) return;
++  {
++    std::lock_guard<std::mutex> lock(n.mutex);
++    n.generation.fetch_add(1, std::memory_order_relaxed);
++  }
++  n.cv.notify_all();
++}
++
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+@@ -343,7 +373,16 @@
+                         ? std::chrono::steady_clock::time_point::max()
+                         : start_time + timeout;
+ 
++    auto& notifier = GetMultiWaitNotifier();
++    notifier.waiters.fetch_add(1, std::memory_order_seq_cst);
++    struct WaiterGuard {
++      MultiWaitNotifier& n;
++      ~WaiterGuard() { n.waiters.fetch_sub(1, std::memory_order_seq_cst); }
++    } waiter_guard{notifier};
++
+     while (true) {
++      // Read before checking the handles: a signal after the check changes it.
++      const uint64_t generation = notifier.generation.load(std::memory_order_acquire);
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+       bool condition_met = false;
+       bool all_locked = true;
+@@ -419,13 +458,14 @@
+         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+       }
+ 
+-      if (timeout == std::chrono::milliseconds::max()) {
+-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-      } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+-        std::this_thread::sleep_for(sleep_time);
+-      }
++      // Until a handle is signaled or the time is up (and at least every
++      // 50 ms, in case a signal path doesn't notify).
++      auto wake = now + std::chrono::milliseconds(50);
++      if (end_time < wake) wake = end_time;
++      std::unique_lock<std::mutex> wait_lock(notifier.mutex);
++      notifier.cv.wait_until(wait_lock, wake, [&] {
++        return notifier.generation.load(std::memory_order_acquire) != generation;
++      });
+     }
+   }
+ 
+@@ -458,6 +498,7 @@
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -495,6 +536,7 @@
+     }
+     count_ += release_count;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -503,6 +545,7 @@
+   inline void post_execution() override {
+     count_--;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+   }
+   uint32_t count_;
+   const uint32_t maximum_count_;
+@@ -527,6 +570,7 @@
+       // Free to be acquired by another thread
+       if (count_ == 0) {
+         cond_.notify_all();
++        NotifyMultiWaiters();
+       }
+       return true;
+     }
+@@ -559,6 +603,7 @@
+     std::lock_guard<std::mutex> lock(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -987,6 +1032,7 @@
+       exit_code_ = exit_code;
+       signaled_ = true;
+       cond_.notify_all();
++      NotifyMultiWaiters();
+     }
+     if (is_current_thread) {
+       if (thread_exit_jump_) {
+@@ -1471,6 +1517,7 @@
+     thread->handle_.exit_code_ = 0;
+     thread->handle_.signaled_ = true;
+     thread->handle_.cond_.notify_all();
++    NotifyMultiWaiters();
+   }
+ 
+   current_thread_ = nullptr;
