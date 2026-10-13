@@ -209,3 +209,16 @@ fence is let through only once every draw at or before it is named:
 A wait gives up after 2 s with a warning in the log, so a mistake shows up as
 a hitch rather than a hang. With the setting off, naming runs on the drawing
 thread as before (for comparing traces).
+
+### Results (PC, Vulkan, two 20 s rides)
+
+| | Before | After |
+|---|---|---|
+| Drawing thread (F800009C) | 41-43% of a core | 23-29% |
+| Recorder thread | (on the drawing thread) | 16-18% |
+| Heap allocations while recording | 4,000-5,900 a frame | 114-250 |
+| `d3d` | 0.62-0.85 ms | 0.34-0.44 ms |
+| GPU Commands thread | 4.6-6% | 2.7-3.7% |
+
+60 fps with p99 frame time 17.6-17.7 ms, no stutters, at most one uneven
+present, and no fence waited for the recorder. Nothing broken in testing.
