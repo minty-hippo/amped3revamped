@@ -269,11 +269,25 @@ struct ShaderUse {
 };
 std::unordered_map<std::string, ShaderUse> g_shader_use;
 
+// The last shader looked up per stage: consecutive draws mostly share their
+// shaders, so a string compare usually replaces the map lookup.
+struct ShaderUseCache {
+  std::string stem;
+  const ShaderUse* use = nullptr;
+};
+ShaderUseCache g_use_cache[2];
+
 const ShaderUse& UseOf(const std::string& stem, native::ShaderStage stage) {
   static const ShaderUse kUnknown;
   if (stem.empty()) return kUnknown;
+  ShaderUseCache& cache = g_use_cache[stage == native::ShaderStage::kVertex ? 0 : 1];
+  if (cache.use && cache.stem == stem) return *cache.use;
   auto it = g_shader_use.find(stem);
-  if (it != g_shader_use.end()) return it->second;
+  if (it != g_shader_use.end()) {
+    cache.stem = stem;
+    cache.use = &it->second;
+    return it->second;
+  }
   const auto bytes = FindMicrocode(stem);
   if (bytes.size() < 12) return kUnknown;  // not seen yet; try again next time
   ShaderUse use;
@@ -298,7 +312,10 @@ const ShaderUse& UseOf(const std::string& stem, native::ShaderStage stage) {
       }
     }
   }
-  return g_shader_use.emplace(stem, std::move(use)).first->second;
+  const ShaderUse& stored = g_shader_use.emplace(stem, std::move(use)).first->second;
+  cache.stem = stem;
+  cache.use = &stored;
+  return stored;
 }
 
 const std::vector<uint32_t>& VertexFetchSlots(const std::string& stem) {
@@ -324,6 +341,19 @@ std::array<uint8_t, kRawBytes> g_prev_raw{};
 std::unordered_map<uint64_t, std::string> g_tex_names;  // fetch words hash -> name (per frame)
 // Vertex / index ranges already copied this frame: (kind, address, size) -> name.
 std::unordered_map<uint64_t, std::string> g_blob_names;
+// What each texture slot and vertex fetch constant was named at the previous
+// draw this frame: draws in a row mostly keep their bindings, so comparing the
+// raw fetch words usually replaces hashing and the map lookups.
+struct SlotName {
+  std::array<uint32_t, 6> words{};
+  std::string name;
+  uint64_t frame = 0;  // g_record_frame it was set in (names are per frame)
+};
+struct VertexFetchName {
+  uint32_t w0 = 0, w1 = 0;
+  std::string name;
+  uint64_t frame = 0;
+};
 uint32_t g_events = 0;
 struct PendingVertices {
   uint32_t address = 0, size = 0;
@@ -1579,6 +1609,9 @@ bool RawTextureFetch(const std::array<uint32_t, 6>& words) {
   return (words[0] & 3) == 2 && (words[1] >> 12) != 0;
 }
 
+std::array<SlotName, kTextureSlots> g_slot_names;
+std::array<VertexFetchName, 96> g_vf_names;
+
 void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string& vs_ucode,
             const std::string& ps_ucode) {
   if (!Recording()) return;
@@ -1629,7 +1662,13 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
     native::FrameTexture t;
     t.slot = s;
     std::copy(words.begin(), words.end(), t.raw.begin());
-    t.data = TextureName(words);
+    SlotName& last = g_slot_names[s];
+    if (last.frame != g_record_frame || last.words != words) {
+      last.words = words;
+      last.name = TextureName(words);
+      last.frame = g_record_frame;
+    }
+    t.data = last.name;
     d.textures.push_back(std::move(t));
   }
 
@@ -1641,6 +1680,11 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
       const uint32_t w0 = U32(base, dev + kFetchConsts + vf * 8);
       const uint32_t w1 = U32(base, dev + kFetchConsts + vf * 8 + 4);
       if ((w0 & 3) != 3) continue;
+      VertexFetchName& last = g_vf_names[vf % 96];
+      if (last.frame == g_record_frame && last.w0 == w0 && last.w1 == w1) {
+        d.vmem[vf] = last.name;
+        continue;
+      }
       const uint32_t address = (w0 & ~3u) & 0x1FFFFFFF;
       const uint32_t size = ((w1 >> 2) & 0xFFFFFF) * 4;
       if (!address || !size || size > (64u << 20)) continue;
@@ -1653,6 +1697,10 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
         it = g_blob_names.emplace(key, std::move(name)).first;
       }
       d.vmem[vf] = it->second;
+      last.w0 = w0;
+      last.w1 = w1;
+      last.name = it->second;
+      last.frame = g_record_frame;
     }
   }
 

@@ -85,3 +85,17 @@ clock (waits included); it is now the thread's CPU time, as on Windows.
 - Changes after these traces: short resource names that fit a string's
   inline buffer (no heap allocation per copy); per-part recording zones and
   allocation counts in the trace, to confirm where the rest goes.
+
+### PC, second traces (after the first changes)
+
+- Recording: 4.1-5.1 ms per frame (textures 1.4-1.7, vertices 1.0-1.2,
+  indices 0.4, state 0.4-0.5); 18-20 heap allocations per frame on the
+  swapping thread, so allocations weren't the cost. Next: per-slot caches of
+  the previous draw's texture and vertex names (consecutive draws mostly keep
+  their bindings) and of the last shader looked up per stage.
+- The first 0018 polled the last millisecond before each timer; the kernel's
+  1 ms timestamp timer kept it polling: the timer thread at 99% of a core.
+  Fixed with a high-resolution waitable timer on Windows and a plain
+  condition variable wait elsewhere.
+- GPU 15.7-15.9 ms per frame: this laptop is near its GPU limit at these
+  settings; the presented-frame intervals stay even (1-6 uneven in 20 s).
