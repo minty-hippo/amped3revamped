@@ -21,7 +21,9 @@ WIP Features:
   - An x86/ARM Linux port, as I would like to test on a SteamOS desktop and on Armada on an AYN Odin 3. Proton works for both of these devices, but less translation would be preferable.
   - It seems like the launch Xbox 360 games might be single-threaded? Going to investigate further and see if multi-threading can be enabled to improve performance even further.
 
-*Amped 3 (Xbox 360), running natively on Windows, with a new renderer and
+# Claude generated output below...
+
+Amped 3 (Xbox 360), running natively on Windows, with a new renderer and
 enhancements.
 
 This project statically recompiles Amped 3's `default.xex` into C++ with the
@@ -326,4 +328,4 @@ respective owners; this project is not affiliated with or endorsed by them.
   time, not included here.
 - **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (ncnn-vulkan build)
   © Xintao Wang (BSD 3-Clause), for the optional texture upscaling. Downloaded
-  at install time, not included here.*
+  at install time, not included here.
