@@ -126,3 +126,26 @@ through a shared image instead of the CPU: the worker's `present` went from
 frame pacing stayed even (p99 18.4-19.0 ms, 1 uneven present in 20 s).
 `gpu_backend` now defaults to `auto`: Vulkan while the native renderer draws,
 Direct3D 12 on Windows when the emulation draws.
+
+## Stage 1, step 1: no state commands while the emulation doesn't draw
+
+`D3D_FlushDirtyState` (`825A9268`) runs before every draw. Its structure (from
+the recompiled code):
+
+| Mask (device+, 64-bit) | Bits | Call | Kind |
+|---|---|---|---|
+| +48 | 0x400 | `D3D_CommitVertexFetch` (`825A8130`): fetch constants from the streams and declaration, into the device shadow | CPU state (kept) |
+| +48 | 0x1E0 | `D3D_CommitShaders` (`825A8C98`): patches the vertex shader for the declaration, IM_LOAD | CPU state + commands (kept) |
+| +48 | high bits | `D3D_WriteRegisterBlock` x2 (regs 0x2300, 0x2380) | commands |
+| +16 / +24 | all | `D3D_WriteAluConstants` (0x4000 / 0x4400 from +1920 / +6016) | commands |
+| +32 | low 32 | `D3D_WriteFetchConstants` x2 (0x4800 from +1152) | commands |
+| +32 | 0x80000000 | stores 0xFFFFFFFFFF000000 at device+11440, then a block at 0x4900 | CPU state (kept) + commands |
+| +32 | high bits | block at 0x2000 | commands |
+| +40 | various | four register blocks (0x2100, 0x2180, 0x2200, 0x2280) | commands |
+
+Each mask is cleared after its part. With `native_skip_state_writes` (on) and
+the emulated GPU not drawing, the hook runs only the kept parts, in the same
+order, and clears the masks; the register and constant commands are never
+written, so neither Direct3D nor the command processor spends time on them.
+When the emulation draws again, all five masks are set once and the original
+flush writes the whole state.

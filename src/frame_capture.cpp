@@ -71,6 +71,8 @@ REX_EXTERN(__imp__D3DDevice_CreateVertexShader);
 REX_EXTERN(__imp__D3DDevice_CreatePixelShader);
 REX_EXTERN(__imp__D3DXAssembleShader);
 REX_EXTERN(__imp__D3D_FlushDirtyState);
+REX_EXTERN(D3D_CommitVertexFetch);
+REX_EXTERN(D3D_CommitShaders);
 REX_EXTERN(__imp__D3D_BlockOnFence);
 REX_EXTERN(__imp__D3DDevice_BlockUntilIdle);
 REX_EXTERN(__imp__D3DResource_BlockUntilNotBusy);
@@ -1070,8 +1072,56 @@ extern "C" REX_FUNC(D3DDevice_Swap) {
 
 // Timing only (F11 performance trace): where the game thread waits on the GPU
 // and what the command stream costs. See docs/d3d-map.md for these functions.
+// D3D_FlushDirtyState(pDevice), at the start of every draw: walks the dirty
+// masks at device+16..+48 (64-bit, big-endian) and writes each dirty register
+// block, the shader constants and the fetch constants as GPU commands (see
+// docs/d3d-map.md and docs/experimental-native-gpu.md). While the emulated GPU
+// doesn't draw, nothing reads those commands: only the two calls that change
+// CPU-side state the recording reads are kept (the vertex fetch constants built
+// from the streams, and the shader setup that patches the vertex shader for
+// the declaration), plus one shadow store, in the original order; the masks
+// are cleared as the original does. When the emulation draws again, every mask
+// is set once so the original writes the whole state.
+namespace {
+inline void Store64(uint8_t* base, uint32_t address, uint64_t v) {
+  rex::memory::store_and_swap<uint64_t>(base + address, v);
+}
+
+void FlushDirtyStateNoCommands(PPCContext& ctx, uint8_t* base, uint32_t dev) {
+  if (cap::U64(base, dev + 48)) {
+    if (cap::U64(base, dev + 48) & 0x400) {  // streams / declaration
+      ctx.r3.u64 = dev;
+      D3D_CommitVertexFetch(ctx, base);
+    }
+    if (cap::U64(base, dev + 48) & 0x1E0) {  // shaders
+      ctx.r3.u64 = dev;
+      D3D_CommitShaders(ctx, base);
+    }
+    Store64(base, dev + 48, 0);
+  }
+  if (cap::U64(base, dev + 16)) Store64(base, dev + 16, 0);  // vertex shader constants
+  if (cap::U64(base, dev + 24)) Store64(base, dev + 24, 0);  // pixel shader constants
+  if (const uint64_t fetch = cap::U64(base, dev + 32)) {     // fetch constants, misc
+    if (fetch & 0x80000000u) Store64(base, dev + 11440, 0xFFFFFFFFFF000000ull);
+    Store64(base, dev + 32, 0);
+  }
+  if (cap::U64(base, dev + 40)) Store64(base, dev + 40, 0);
+}
+}  // namespace
+
 extern "C" REX_FUNC(D3D_FlushDirtyState) {
   amped3::trace::Scope scope(amped3::trace::Zone::kFlushState);
+  static bool skipping = false;  // game thread only
+  const uint32_t dev = ctx.r3.u32;
+  if (amped3::live::SkipEmulatedStateWrites()) {
+    skipping = true;
+    FlushDirtyStateNoCommands(ctx, base, dev);
+    return;
+  }
+  if (skipping) {
+    skipping = false;
+    for (uint32_t off = 16; off <= 48; off += 8) Store64(base, dev + off, ~0ull);
+  }
   __imp__D3D_FlushDirtyState(ctx, base);
 }
 

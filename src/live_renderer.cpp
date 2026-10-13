@@ -58,6 +58,12 @@ REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
+REXCVAR_DEFINE_BOOL(native_skip_state_writes, true, "GPU",
+                    "Native renderer: while the emulated GPU doesn't draw, Direct3D's state "
+                    "flush before each draw skips writing the changed registers and shader "
+                    "constants as GPU commands (only the vertex fetch and shader setup the "
+                    "recording reads still run). Everything is written again when the "
+                    "emulation draws.");
 REXCVAR_DEFINE_BOOL(native_vertex_cache, true, "GPU",
                     "Native renderer: reuse vertex buffers the game hasn't written to since the "
                     "last frame (write-watched pages) instead of copying them every frame");
@@ -1592,6 +1598,10 @@ bool Enabled() { return REXCVAR_GET(native_renderer) && !g_failed.load(); }
 void SetHideInterface(bool hide) { g_hide_interface = hide; }
 
 bool Recording() { return g_recording.load(std::memory_order_relaxed); }
+
+bool SkipEmulatedStateWrites() {
+  return REXCVAR_GET(native_skip_state_writes) && !g_host_drawing_on.load(std::memory_order_relaxed);
+}
 
 void RequestDump() {
   if (REXCVAR_GET(native_renderer)) g_dump_requested = true;

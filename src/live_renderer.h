@@ -76,6 +76,11 @@ void SetHideInterface(bool hide);
 // A frame is being recorded: the hooks below do work only then.
 bool Recording();
 
+// Whether Direct3D's per-draw state flush may skip writing GPU commands: the
+// emulated GPU doesn't draw (the native renderer's image is up) and the
+// setting native_skip_state_writes is on. Game thread, every draw.
+bool SkipEmulatedStateWrites();
+
 // Direct3D hooks, called after the call (state flushed), on the game's
 // rendering thread.
 void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string& vs_ucode,
