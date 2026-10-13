@@ -6,6 +6,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <cctype>
 #include <string>
@@ -19,13 +20,15 @@
 #include <rex/input/input.h>
 #include <rex/ui/window.h>
 
+#include "frame_limit.h"
 #include "live_renderer.h"
 #include "options_menu.h"
 #include "pad_bridge.h"
 
 namespace amped3 {
 
-enum class RowKind { kToggle, kSlider, kChoice, kFullscreen };
+// kStops: a slider over a fixed list of values (`choices`), left to right.
+enum class RowKind { kToggle, kSlider, kChoice, kFullscreen, kStops };
 
 struct RowChoice {
   const char* value;
@@ -71,12 +74,24 @@ const std::vector<Tab>& Tabs() {
       {"Display",
        {
            {"fullscreen", "Fullscreen", Kind::kFullscreen},
+           {"frame_rate_limit", "Frame Rate", Kind::kStops, 0, 0, 0,
+            {{"30", "30 fps"},
+             {"40", "40 fps"},
+             {"50", "50 fps"},
+             {"60", "60 fps"},
+             {"72", "72 fps"},
+             {"90", "90 fps"},
+             {"120", "120 fps"},
+             {"144", "144 fps"},
+             {"0", "Unlocked"}}},
            {"resolution", "Display Resolution", Kind::kChoice, 0, 0, 0,
             {{"", "Native"}, {"1080p", "1920 x 1080"}, {"1440p", "2560 x 1440"}, {"4k", "3840 x 2160"}}},
            {"native_render_scale", "Render Resolution", Kind::kSlider, 25, 100, 5, {}, true},
+#ifdef _WIN32
            {"native_upscaler", "Upscaler", Kind::kChoice, 0, 0, 0,
             {{"off", "Off"}, {"xess", "Intel XeSS"}, {"fsr", "AMD FSR 3.1"}}},
            {"native_upscaler_sharpness", "FSR Sharpness", Kind::kSlider, 0.0, 1.0, 0.05},
+#endif
            {"native_sharp_fonts", "Sharp Fonts"},
            {"native_upscaled_textures", "Upscaled Textures"},
        }},
@@ -105,6 +120,26 @@ int ChoiceIndex(const Row& r) {
     if (v == r.choices[i].value) return int(i);
   }
   return 0;
+}
+
+// A stop slider's position: the stop matching the setting (auto counts as the
+// rate it stands for), else the nearest one (a rate typed into amped3.toml).
+int StopIndex(const Row& r) {
+  std::string v = GetString(r.cvar);
+  if (std::string_view(r.cvar) == "frame_rate_limit") v = frame_limit::Effective(v);
+  for (size_t i = 0; i < r.choices.size(); ++i) {
+    if (v == r.choices[i].value) return int(i);
+  }
+  const double want = std::atof(v.c_str());
+  int best = 0;
+  double best_d = DBL_MAX;
+  for (size_t i = 0; i < r.choices.size(); ++i) {
+    double c = std::atof(r.choices[i].value);
+    if (c == 0.0) c = 1e9;  // unlocked sits past the highest rate
+    const double d = std::abs(c - (want == 0.0 ? 1e9 : want));
+    if (d < best_d) best_d = d, best = int(i);
+  }
+  return best;
 }
 
 // The game's menu colors: gold titles and selection, white text.
@@ -136,14 +171,32 @@ ImFont* PanelFont(float px) {
 
 void LoadPanelFonts(ImFontAtlas* atlas) {
   // A clean, condensed sans like the game's menu text; fallbacks in order.
-  // The Windows fonts folder, wherever Windows is installed.
+  // A clean, bold sans: Windows' own fonts there; on Linux the common
+  // distribution fonts (SteamOS, Fedora, Debian and others), first found wins.
+  std::vector<std::string> files;
+#ifdef _WIN32
   const char* windir = std::getenv("WINDIR");
   const std::filesystem::path fonts =
       std::filesystem::path(windir && *windir ? windir : "C:\\Windows") / "Fonts";
-  const char* kFiles[] = {"bahnschrift.ttf", "segoeuib.ttf", "arialbd.ttf"};
+  for (const char* name : {"bahnschrift.ttf", "segoeuib.ttf", "arialbd.ttf"}) {
+    files.push_back((fonts / name).string());
+  }
+#else
+  for (const char* path : {
+           "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+           "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+           "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+           "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+           "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+           "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+           "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+           "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+       }) {
+    files.push_back(path);
+  }
+#endif
   static const ImWchar kRanges[] = {0x0020, 0x00FF, 0};
-  for (const char* name : kFiles) {
-    const std::string file = (fonts / name).string();
+  for (const std::string& file : files) {
     if (!std::filesystem::exists(file)) continue;
     for (size_t i = 0; i < sizeof(kFontSizes) / sizeof(kFontSizes[0]); ++i) {
       ImFontConfig config;
@@ -183,6 +236,12 @@ void GraphicsPanel::Change(const Row& r, int direction) {
       if (std::string_view(r.cvar) == "resolution") {
         ApplyOutputResolution(window_, r.choices[i].value);
       }
+      break;
+    }
+    case Kind::kStops: {
+      const int n = int(r.choices.size());
+      const int i = std::clamp(StopIndex(r) + direction, 0, n - 1);
+      rex::cvar::SetFlagByName(r.cvar, r.choices[i].value);
       break;
     }
     case Kind::kFullscreen: {
@@ -255,7 +314,9 @@ void GraphicsPanel::HandleInput(ImGuiIO& io) {
     if (direction == -2 || direction == 2) Change(*rows[cursor], direction > 0 ? 1 : -1);
   }
   if (count && ((pressed & xi::X_INPUT_GAMEPAD_A) || ImGui::IsKeyPressed(ImGuiKey_Enter, false))) {
-    if (rows[cursor]->kind != Kind::kSlider) Change(*rows[cursor], 1);
+    if (rows[cursor]->kind != Kind::kSlider && rows[cursor]->kind != Kind::kStops) {
+      Change(*rows[cursor], 1);
+    }
   }
   if ((pressed & (xi::X_INPUT_GAMEPAD_B | xi::X_INPUT_GAMEPAD_START)) ||
       ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -298,6 +359,10 @@ std::string GraphicsPanel::Hint(const Row& r) const {
                   : "Native renderer only (Options F1 > Native renderer).";
   }
   if (name == "revamped_graphics") return "Every enhancement at once.";
+  if (name == "frame_rate_limit") {
+    return "30 is the console's own pacing; Revamped Graphics starts at 60. The game plays "
+           "at normal speed at any rate.";
+  }
   return {};
 }
 
@@ -410,6 +475,22 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
 
     std::string value;
     bool arrows = false;
+    // A slider's bar: its room is sized for the widest value text, so the bar
+    // doesn't move as the value changes; the bar fills what's left between the
+    // label and the value (up to its usual length), and is left out if there's
+    // no room for it.
+    auto draw_bar = [&](float t, const char* widest, const std::string& text) {
+      const float room = std::max(f->CalcTextSizeA(text_px, FLT_MAX, 0.0f, widest).x,
+                                  f->CalcTextSizeA(text_px, FLT_MAX, 0.0f, text.c_str()).x);
+      const float bar1 = value_right - room - 12.0f * unit;
+      const float bar0 = std::max(bar1 - value_w, label_end + 14.0f * unit);
+      if (bar1 - bar0 >= 24.0f * unit) {
+        dl->AddRectFilled(ImVec2(bar0, cy - 2 * unit), ImVec2(bar1, cy + 2 * unit), kTrack, 2 * unit);
+        dl->AddRectFilled(ImVec2(bar0, cy - 2 * unit), ImVec2(bar0 + (bar1 - bar0) * t, cy + 2 * unit),
+                          color, 2 * unit);
+        dl->AddCircleFilled(ImVec2(bar0 + (bar1 - bar0) * t, cy), 5.0f * unit, color);
+      }
+    };
     switch (r.kind) {
       case Kind::kSlider: {
         const double v = GetDouble(r.cvar);
@@ -432,16 +513,18 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
         } else {
           value = fmt::format("{:.1f}", v);
         }
-        const float room = std::max(f->CalcTextSizeA(text_px, FLT_MAX, 0.0f, widest).x,
-                                    f->CalcTextSizeA(text_px, FLT_MAX, 0.0f, value.c_str()).x);
-        const float bar1 = value_right - room - 12.0f * unit;
-        const float bar0 = std::max(bar1 - value_w, label_end + 14.0f * unit);
-        if (bar1 - bar0 >= 24.0f * unit) {
-          dl->AddRectFilled(ImVec2(bar0, cy - 2 * unit), ImVec2(bar1, cy + 2 * unit), kTrack, 2 * unit);
-          dl->AddRectFilled(ImVec2(bar0, cy - 2 * unit), ImVec2(bar0 + (bar1 - bar0) * t, cy + 2 * unit),
-                            color, 2 * unit);
-          dl->AddCircleFilled(ImVec2(bar0 + (bar1 - bar0) * t, cy), 5.0f * unit, color);
+        draw_bar(t, widest, value);
+        break;
+      }
+      case Kind::kStops: {
+        const int index = StopIndex(r);
+        const int n = int(r.choices.size());
+        value = r.choices[index].label;
+        const char* widest = r.choices[0].label;
+        for (const RowChoice& c : r.choices) {
+          if (std::strlen(c.label) > std::strlen(widest)) widest = c.label;
         }
+        draw_bar(n > 1 ? float(index) / float(n - 1) : 0.0f, widest, value);
         break;
       }
       case Kind::kChoice:

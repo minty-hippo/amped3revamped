@@ -22,6 +22,10 @@ namespace amped3::crash {
 // Call once logging is up. `log_dir` receives amped3_crash_<time>.dmp.
 void Install(const std::filesystem::path& log_dir);
 
+// Call once the runtime is set up (Linux: reports faults no SDK handler
+// claims, so it must come after the SDK's own; Windows: nothing to do).
+void InstallFaultHandler();
+
 // Call when the user is quitting, so the normal exit() isn't reported.
 void MarkCleanShutdown();
 

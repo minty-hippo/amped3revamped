@@ -20,10 +20,11 @@
 #endif
 #endif
 
-REXCVAR_DEFINE_STRING(frame_rate_limit, "30", "Display",
-                      "Frame rate cap: 30, 40, 60, 90, 120, or 0 for unlocked. 30 is the "
-                      "console's own pacing (gameplay at 30, menus at 60, following the "
-                      "monitor); the others pace the game on the PC.");
+REXCVAR_DEFINE_STRING(frame_rate_limit, "auto", "Display",
+                      "Frame rate cap in fps (20 to 360), 0 for unlocked, or auto: 60 with "
+                      "Revamped Graphics, 30 without. 30 is the console's own pacing (gameplay "
+                      "at 30, menus at 60, following the monitor); the others pace the game on "
+                      "the PC.");
 
 namespace amped3::frame_limit {
 namespace {
@@ -82,7 +83,7 @@ void Apply(const std::string& value) {
     fps = std::stoi(value);
   } catch (...) {
   }
-  if (fps != 0 && fps != 30 && fps != 40 && fps != 60 && fps != 90 && fps != 120) fps = 30;
+  if (fps != 0) fps = std::clamp(fps, 20, 360);
   // 30: the console's own pacing (it runs gameplay at every second 60 Hz
   // vertical blank). Otherwise the vblank throttle is off and the cap (if
   // any) is ours.
@@ -98,6 +99,13 @@ void Apply(const std::string& value) {
 
 }  // namespace
 
+std::string Effective(const std::string& value) {
+  if (value != "auto" && !value.empty()) return value;
+  const bool revamped = rex::cvar::GetFlagByName("native_renderer") == "true" &&
+                        rex::cvar::GetFlagByName("revamped_graphics") == "true";
+  return revamped ? "60" : "30";
+}
+
 double FrameSeconds() { return g_frame_seconds.load(std::memory_order_relaxed); }
 
 void OnSwap() {
@@ -112,18 +120,10 @@ void OnSwap() {
     }
     g_last_swap = now;
   }
-  const std::string value = REXCVAR_GET(frame_rate_limit);
+  const std::string value = Effective(REXCVAR_GET(frame_rate_limit));
   if (value != g_applied) {
-    // First run with this setting: someone who had switched the vertical-blank
-    // throttle off (the old way to unlock the frame rate) stays unlocked.
-    if (g_applied.empty() && value == "30" && rex::cvar::GetFlagByName("vsync") == "false") {
-      rex::cvar::SetFlagByName("frame_rate_limit", "0");
-      g_applied = "0";
-      Apply("0");
-    } else {
-      g_applied = value;
-      Apply(value);
-    }
+    g_applied = value;
+    Apply(value);
   }
   if (g_fps <= 0) return;
   const auto interval = std::chrono::duration_cast<Clock::duration>(

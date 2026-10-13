@@ -36,7 +36,8 @@ executable. On top of the plain recompile it adds:
 - **An in-game options menu** that you can drive entirely with a controller
   (**Back + Start**, or **F1**):
   - **Display:** fullscreen, output resolution (up to 4K), 16:9 letterbox,
-    frame rate limit (30 console, 40, 60, 90, 120 or unlocked), render scale (1–3×),
+    frame rate limit (Auto: 60 with Revamped Graphics and 30 without; 30 console
+    pacing, 40 to 144, or unlocked), render scale (1–3×),
     integer scaling, CAS/FSR upscaling and sharpening.
   - **Graphics:** anisotropic filtering (up to 16×), background shader
     compilation, GPU readback accuracy.
@@ -132,6 +133,40 @@ Options (run from PowerShell, or append them to the .bat):
 Logs go to `logs\install-*.log`. Running it again skips the extraction and
 rebuilds only what changed.
 
+## Linux: SteamOS, Armada and other distributions (experimental)
+
+The same port builds for Linux on x86_64 (Steam Deck / SteamOS, desktop
+distributions) and aarch64 (Armada and other Snapdragon handhelds), drawing
+with Vulkan. In a terminal (Desktop Mode on a handheld), in the project folder:
+
+```sh
+bash install.sh --iso "/path/to/Amped 3.iso"
+```
+
+It extracts the game (`linux/xiso.py`, plain Python), builds, and puts a
+portable folder together (default `~/Games/Amped 3 Revamped`) with
+`amped3-revamped.sh` and a desktop entry; on SteamOS it offers to add the game
+to Steam (elsewhere: Steam > Games > Add a Non-Steam Game). Game Mode,
+Steam Input and the Deck's controls work as an Xbox controller.
+
+- **No build tools needed on SteamOS / Armada.** Their system is read-only, so
+  `install.sh` builds inside a container (`linux/Containerfile`: Ubuntu 24.04
+  with Clang 20) with the podman both include; nothing is installed on the
+  system. With Clang 20+, CMake, Ninja and the X11 / Wayland / audio
+  development packages installed, it builds natively (`--native`), or run
+  `./setup.sh` directly.
+- **Build on the device itself.** It takes hours on a handheld the first time
+  (the recompiled game is large) and about 40 GB; jobs are limited by memory
+  (about one per 2.5 GB). Builds are per architecture: build the ARM version on
+  the ARM device.
+- **Not on Linux:** Intel XeSS and AMD FSR 3.1 (Windows-only runtimes; the
+  render scale still works, stretched) and the F9 hang report. Crashes are
+  written to `logs/amped3_crash_*.txt`.
+- **Texture upscaling** (`linux/upscale-textures.sh`, or the installer's
+  question) uses Real-ESRGAN's official Linux build, x86_64 only; on ARM pass
+  `--esrgan` with a build of
+  [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan).
+
 ## Build
 
 From a normal PowerShell window in the project folder:
@@ -161,6 +196,14 @@ at the extracted game; the installer puts a `game\` folder in the install.
 The game is drawn by the port's own Vulkan renderer (on by default; Options
 (F1) > Graphics > Native renderer switches back to the GPU emulation).
 
+The GPU emulation keeps running underneath (the game waits on it every
+frame) but stops drawing. When the native renderer is on at launch, the
+emulation also starts lean: it doesn't load its shader cache and ignores
+the resolution scale, for a faster start and less memory. Switching to the
+emulation mid-game still works (shaders compile as it goes, at 1x); restart
+for the full setup, or turn off **Lean emulation** (`emulated_gpu_lean`) if
+you switch often.
+
 **Revamped Graphics** turns all the visual enhancements on or off at once:
 motion blur, speed blur, distance fog, god rays, branch fade and the trail
 map clouds. Each keeps its own setting for when the switch is back on.
@@ -172,7 +215,8 @@ It has two tabs, switched with LB / RB:
 
 - **Effects:** Revamped Graphics, a switch for each enhancement and the
   motion blur strength.
-- **Display:** fullscreen, display resolution, render resolution (with the
+- **Display:** fullscreen, a frame rate slider (30 console pacing to 144 fps, or
+  unlocked), display resolution, render resolution (with the
   pixel size it gives), upscaler (Intel XeSS or AMD FSR 3.1) and FSR
   sharpness.
 

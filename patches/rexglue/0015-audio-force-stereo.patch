@@ -1,0 +1,69 @@
+diff --git a/include/rex/audio/flags.h b/include/rex/audio/flags.h
+index c2f70ba..f7562a1 100644
+--- a/include/rex/audio/flags.h
++++ b/include/rex/audio/flags.h
+@@ -14,4 +14,5 @@
+ #include <rex/cvar.h>
+ 
+ REXCVAR_DECLARE(bool, audio_mute);
++REXCVAR_DECLARE(bool, audio_force_stereo);
+ REXCVAR_DECLARE(bool, ffmpeg_verbose);
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..98cbe79 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -25,6 +25,10 @@
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_BOOL(audio_force_stereo, false, "Audio",
++                    "Fold the 5.1 mix into front left and right even when the output device "
++                    "reports more channels. For speakers that report 5.1 but only play the "
++                    "front pair, which loses the center channel (dialogue).");
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -178,6 +182,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   const StereoFold fold = GetStereoFold();
+   const SurroundMix mix = GetSurroundMix();
+   const float gain = GetOutputGain();
++  const bool force_stereo = REXCVAR_GET(audio_force_stereo);
++  float* stereo = nullptr;
++  if (force_stereo && driver->sdl_device_channels_ == 6) {
++    stereo = SDL_stack_alloc(float, channel_samples_ * 2);
++  }
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+@@ -204,8 +213,19 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+                                                             gain);
+             break;
+           case 6:
+-            conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
+-                                                            gain);
++            if (stereo) {
++              // The stereo fold, on the front pair of the 6-channel stream.
++              conversion::sequential_6_BE_to_interleaved_2_LE(stereo, buffer, channel_samples_,
++                                                              fold, gain);
++              std::memset(data, 0, len);
++              for (size_t i = 0; i < channel_samples_; ++i) {
++                data[i * 6] = stereo[i * 2];
++                data[i * 6 + 1] = stereo[i * 2 + 1];
++              }
++            } else {
++              conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
++                                                              gain);
++            }
+             break;
+           default:
+             assert_unhandled_case(driver->sdl_device_channels_);
+@@ -224,6 +244,9 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       additional_amount -= len;
+     }
+   }
++  if (stereo) {
++    SDL_stack_free(stereo);
++  }
+   SDL_stack_free(data);
+ }
+ 

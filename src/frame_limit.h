@@ -1,5 +1,6 @@
 // amped3 - frame rate cap (setting frame_rate_limit).
 //
+// The default, auto, is 60 with Revamped Graphics and 30 without.
 // 30 keeps the console's own pacing: gameplay at every second 60 Hz vertical
 // blank (menus at every one), following the monitor (vblank_source). Any
 // other choice turns that
@@ -9,7 +10,14 @@
 
 #pragma once
 
+#include <string>
+
 namespace amped3::frame_limit {
+
+// The cap a frame_rate_limit value means: "auto" (the default) is 60 with
+// Revamped Graphics on and 30 (the console's pacing) with it off; any other
+// value is returned as is.
+std::string Effective(const std::string& value);
 
 // Called by the D3DDevice_Swap hook on the game thread, before the swap:
 // applies a changed setting and waits until the frame's slot.

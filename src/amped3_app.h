@@ -7,6 +7,7 @@
 #include <atomic>
 #include <filesystem>
 #include <string>
+#include <vector>
 #include <memory>
 #include <thread>
 
@@ -30,6 +31,7 @@ class Amped3App : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override;
   void OnConfigurePaths(rex::PathConfig& paths) override;
   void OnPostInitLogging() override;
+  bool OnWantShaderStorage() override;
   void OnPostSetup() override;
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   void OnConfigureFonts(ImFontAtlas* atlas) override;
@@ -46,6 +48,10 @@ class Amped3App : public rex::ReXApp {
 
   std::filesystem::path config_path_;
   std::filesystem::path game_dir_;
+  bool lean_gpu_ = false;  // emulated GPU started lean (native renderer on at launch)
+  std::vector<std::string> game_search_;  // where FindGameDir looked, for the log
+  static std::filesystem::path FindGameDir(const std::filesystem::path& exe_dir,
+                                           std::vector<std::string>* searched);
   std::string saves_note_;  // what MoveOldSaves did, for the log
   void MoveOldSaves(const std::filesystem::path& from, const std::filesystem::path& to);
 

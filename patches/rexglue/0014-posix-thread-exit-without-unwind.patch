@@ -1,0 +1,55 @@
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..c3353c6 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -11,6 +11,7 @@
+ 
+ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+ 
++#include <setjmp.h>
+ #include <signal.h>
+ 
+ #include <atomic>
+@@ -208,6 +209,13 @@ void Sleep(std::chrono::microseconds duration) {
+ 
+ // TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
+ thread_local bool alertable_state_ = false;
++
++// Where a thread's own Exit()/Terminate() goes: back to ThreadStartRoutine.
++// pthread_exit() unwinds the stack instead, and that unwind aborts the
++// process (std::terminate) as soon as it meets a frame it can't unwind
++// through: a noexcept function, or recompiled guest code. Jumping back over
++// the frames matches ExitThread() on Windows, which doesn't unwind either.
++thread_local sigjmp_buf* thread_exit_jump_ = nullptr;
+ bool DispatchCurrentThreadUserCallback();
+ SleepResult AlertableSleep(std::chrono::microseconds duration) {
+   alertable_state_ = true;
+@@ -981,6 +989,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       cond_.notify_all();
+     }
+     if (is_current_thread) {
++      if (thread_exit_jump_) {
++        siglongjmp(*thread_exit_jump_, 1);
++      }
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+     } else {
+ #if REX_PLATFORM_ANDROID
+@@ -1437,7 +1448,18 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+                                        [thread] { return thread->handle_.suspend_count_ == 0; });
+   }
+ 
++  sigjmp_buf exit_jump;
++  if (sigsetjmp(exit_jump, 1) != 0) {
++    // The thread ended itself (Terminate() on its own thread), which already
++    // marked it finished and signaled its exit code.
++    thread_exit_jump_ = nullptr;
++    current_thread_ = nullptr;
++    current_thread_condition_ = nullptr;
++    return nullptr;
++  }
++  thread_exit_jump_ = &exit_jump;
+   start_routine();
++  thread_exit_jump_ = nullptr;
+ 
+   {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);

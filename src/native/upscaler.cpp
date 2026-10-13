@@ -474,6 +474,14 @@ void UpscaleJitter(uint32_t index, int phases, float* x, float* y) {
 }
 
 std::unique_ptr<Upscaler> Upscaler::Create(UpscalerKind kind, std::string* error) {
+#ifndef _WIN32
+  // XeSS's and FidelityFX's runtimes are Windows libraries (the test
+  // upscaler still works for the replayer).
+  if (kind == UpscalerKind::kXess || kind == UpscalerKind::kFsr) {
+    *error = "XeSS and FSR 3.1 are Windows only";
+    return nullptr;
+  }
+#endif
   if (kind == UpscalerKind::kXess) {
 #if AMPED3_HAVE_XESS
     auto u = std::make_unique<Xess>();

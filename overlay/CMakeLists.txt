@@ -33,6 +33,33 @@ if(WIN32)
     target_link_libraries(amped3 PRIVATE dbghelp pdh)  # crash reports; performance counters (F3)
 endif()
 
+# Linux (SteamOS, ARM handhelds): the folder is portable like on Windows: the
+# exe finds the SDK's shared libraries (GPU plugin, runtime) next to itself,
+# and carries its own C++ runtime so it doesn't depend on the distribution's.
+if(UNIX AND NOT APPLE)
+    set_target_properties(amped3 PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON)
+    target_link_options(amped3 PRIVATE -static-libstdc++ -static-libgcc)
+    target_link_libraries(amped3 PRIVATE ${CMAKE_DL_LIBS} pthread)
+    # The SDK stages its shared runtime next to the exe on Windows and macOS
+    # only; do it here (under the name the exe asks for) so the build folder
+    # runs as it is and the installer copies a complete set.
+    foreach(_lib rex::runtime rexruntime rex::TracyClient TracyClient)
+        if(TARGET ${_lib})
+            get_target_property(_type ${_lib} TYPE)
+            if(_type STREQUAL "SHARED_LIBRARY")
+                add_custom_command(TARGET amped3 POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_FILE:${_lib}>
+                        $<TARGET_FILE_DIR:amped3>/$<TARGET_SONAME_FILE_NAME:${_lib}>
+                    VERBATIM)
+            endif()
+        endif()
+    endforeach()
+endif()
+
 # GPU emulation (D3D12 / Vulkan) ships as the rexgpu-xenos plugin DLL.
 rexglue_setup_target(amped3 GPU_PLUGINS xenos)
 
@@ -109,6 +136,9 @@ add_executable(amped3-texture-upscale
 target_include_directories(amped3-texture-upscale PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+if(UNIX AND NOT APPLE)
+    target_link_options(amped3-texture-upscale PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 # Frame capture replayer (docs/native-replay.md): draws an F10 capture with
 # the native renderer's code paths through Vulkan and writes a PNG.

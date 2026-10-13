@@ -27,6 +27,11 @@ namespace amped3 {
 // renderer, resizes the window to it at once (windowed only). UI thread.
 void ApplyOutputResolution(rex::ui::Window* window, const std::string& value);
 
+// Whether the emulated GPU was started lean (setting emulated_gpu_lean, with
+// the native renderer on at launch). Set once by the app before the menus.
+void SetEmulatedGpuLean(bool lean);
+bool EmulatedGpuLean();
+
 class OptionsMenu final : public rex::ui::ImGuiDialog {
  public:
   OptionsMenu(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,

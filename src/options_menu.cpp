@@ -156,14 +156,20 @@ const std::vector<Tab>& Tabs() {
                 Toggle("present_letterbox", "Keep 16:9 aspect",
                        "Black bars instead of stretching when the window or monitor is not 16:9."),
                 Choices("frame_rate_limit", "Frame rate limit",
-                        "30 is the console's own pacing, locked to your monitor (gameplay at 30, "
-                        "menus at 60). The others pace the game on the PC; gameplay runs at "
-                        "normal speed at any frame rate. Unlocked runs as fast as your PC allows.",
-                        {{"30", "30 fps (console)"},
+                        "Auto is 60 fps with Revamped Graphics and 30 without. 30 is the "
+                        "console's own pacing, locked to your monitor (gameplay at 30, menus at "
+                        "60). The others pace the game on the PC; gameplay runs at normal speed "
+                        "at any frame rate. Unlocked runs as fast as your PC allows. Also a "
+                        "slider in the game's Pause > Options > Graphics (Display tab).",
+                        {{"auto", "Auto (60 with Revamped Graphics)"},
+                         {"30", "30 fps (console)"},
                          {"40", "40 fps"},
+                         {"50", "50 fps"},
                          {"60", "60 fps"},
+                         {"72", "72 fps"},
                          {"90", "90 fps"},
                          {"120", "120 fps"},
+                         {"144", "144 fps"},
                          {"0", "Unlocked"}}),
                 Choices("vblank_source", "Frame pacing",
                         "Monitor: the game's 60 Hz clock follows your monitor's real refresh, so "
@@ -187,7 +193,12 @@ const std::vector<Tab>& Tabs() {
                       "resolution. Leave the Upscaling filter on Bilinear. If the library is "
                       "missing (setup.ps1 fetches it) or the GPU can't run it, the picture is "
                       "simply stretched and the log says why. Native renderer only.",
+#ifdef _WIN32
                       {{"off", "Off"}, {"xess", "Intel XeSS"}, {"fsr", "AMD FSR 3.1"}});
+#else
+                      // Their runtimes are Windows libraries.
+                      {{"off", "Off (XeSS and FSR 3.1 are Windows only)"}});
+#endif
                   o.visible = NativeRendererOn;
                   return o;
                 }(),
@@ -231,7 +242,11 @@ const std::vector<Tab>& Tabs() {
                         "Which API the Xbox 360 GPU emulation draws with. Direct3D 12 is the "
                         "default; Vulkan can perform better on some drivers (and is what Linux "
                         "uses). Falls back to the default if the chosen API isn't available.",
+#ifdef _WIN32
                         {{"d3d12", "Direct3D 12"}, {"vulkan", "Vulkan"}}),
+#else
+                        {{"vulkan", "Vulkan"}}),
+#endif
                 Choices("render_target_path_vulkan", "Vulkan render path",
                         "How Vulkan emulates the console's on-chip framebuffer. Render targets "
                         "(Automatic) is much faster. Shader interlock is more exact for blending "
@@ -283,7 +298,16 @@ const std::vector<Tab>& Tabs() {
                        "Draws each frame with the port's own Vulkan renderer instead of the "
                        "Xbox 360 GPU emulation (on by default). Once its image is up, the "
                        "emulation stops drawing. Turn it off if anything looks wrong; problems "
-                       "are written to the log."),
+                       "are written to the log. While it's on, the emulation starts without "
+                       "its shader cache and resolution scaling (see Lean emulation below), so "
+                       "switching it off fully applies after a restart."),
+                Toggle("emulated_gpu_lean", "Lean emulation",
+                       "With the native renderer on at launch, the Xbox 360 GPU emulation only "
+                       "follows the game's commands, so it starts without loading its shader "
+                       "cache and without resolution scaling: faster start-up and less memory "
+                       "(most on handhelds, where graphics memory is system memory). Turn off "
+                       "if you switch between the renderers often.",
+                       /*restart=*/true),
                 Toggle("revamped_graphics", "Revamped Graphics",
                        "All the visual enhancements below at once (motion blur, speed blur, "
                        "distance fog, god rays, branch fade and the trail map clouds), each "
@@ -390,6 +414,11 @@ const std::vector<Tab>& Tabs() {
            {"Output",
             {
                 Toggle("audio_mute", "Mute", "Silences all game audio."),
+                Toggle("audio_force_stereo", "Stereo mix",
+                       "Mixes the game's 5.1 sound down to left and right even when the output "
+                       "says it has more speakers. Turn on if cutscene dialogue is missing: "
+                       "some handheld and laptop speakers report 5.1 but only play the front "
+                       "pair, which drops the center channel the dialogue is on."),
                 SliderI("audio_maxqframes", "Audio buffer",
                         "Lower means less delay; raise it if you hear crackling.", 4, 64,
                         "%d frames"),
@@ -403,7 +432,11 @@ const std::vector<Tab>& Tabs() {
                         "SDL supports Xbox, PlayStation, Switch Pro and most other controllers, "
                         "with hot-plugging and the right button layout. XInput supports Xbox "
                         "controllers only.",
+#ifdef _WIN32
                         {{"sdl", "SDL (all controllers)"}, {"xinput", "XInput (Xbox only)"}},
+#else
+                        {{"sdl", "SDL (all controllers)"}},
+#endif
                         /*restart=*/true),
                 Toggle("guide_button", "Send Guide button to game",
                        "Passes the Xbox / PS button through to the game. Usually left off so it "
@@ -550,6 +583,8 @@ bool NeedsRestart(const Option& o, const rex::cvar::FlagEntry& info) {
 
 // Names changed this session that need a relaunch but that the SDK treats as
 // live (and so does not report through GetPendingRestartFlags).
+bool g_emulated_gpu_lean = false;
+
 std::set<std::string>& ForcedRestarts() {
   static std::set<std::string> names;
   return names;
@@ -897,6 +932,9 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
   ImGui::EndChild();
 
   std::set<std::string> restart_names(ForcedRestarts().begin(), ForcedRestarts().end());
+  // The emulation was started lean for the native renderer: it draws now, but
+  // at 1x and compiling shaders as it goes until the next launch.
+  if (EmulatedGpuLean() && !NativeRendererOn()) restart_names.insert("native_renderer");
   for (const auto& name : rex::cvar::GetPendingRestartFlags()) {
     if (!LiveWithNativeRenderer(name)) restart_names.insert(name);
   }
@@ -944,4 +982,9 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
   }
 }
 
+}  // namespace amped3
+
+namespace amped3 {
+void SetEmulatedGpuLean(bool lean) { g_emulated_gpu_lean = lean; }
+bool EmulatedGpuLean() { return g_emulated_gpu_lean; }
 }  // namespace amped3

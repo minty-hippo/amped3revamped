@@ -1,0 +1,8 @@
+# Linux scripts must keep LF line endings even when checked out on Windows
+# (bash and the container build fail on CRLF).
+*.sh text eol=lf
+*.py text eol=lf
+linux/Containerfile text eol=lf
+# Windows scripts stay CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf

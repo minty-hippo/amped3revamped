@@ -358,16 +358,156 @@ void SetGuestMemory(const uint8_t* virtual_base, const uint8_t* physical_base) {
   g_pbase = physical_base;
 }
 
+void InstallFaultHandler() {}  // Windows: the unhandled-exception filter is last already
+
 }  // namespace amped3::crash
 
 #else  // !_WIN32
 
+// Linux (and other POSIX): a report with the signal, the faulting address
+// (also as a guest address) and the native stack, written straight to
+// logs/amped3_crash_<time>.txt from the signal handler (no allocation).
+//
+// Faults (SIGSEGV / SIGILL) go through the SDK's exception chain, whose MMIO
+// handler must see them first; a fault nobody handles would otherwise
+// re-execute forever (a silent hang), so the last handler in the chain reports
+// it and lets the default action end the process. Other fatal signals and
+// std::terminate are reported directly.
+
+#include <execinfo.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <exception>
+
+#include <rex/exception_handler.h>
+
 namespace amped3::crash {
-void Install(const std::filesystem::path&) {}
-void SetGuestMemory(const uint8_t*, const uint8_t*) {}
-void MarkCleanShutdown() {}
+namespace {
+
+std::filesystem::path g_log_dir;
+char g_report_dir[1024] = {};
+const uint8_t* g_vbase = nullptr;
+const uint8_t* g_pbase = nullptr;
+std::atomic<bool> g_reporting{false};
+std::atomic<bool> g_clean{false};
+
+void Put(int fd, const char* text) {
+  if (fd >= 0) (void)!write(fd, text, std::strlen(text));
+}
+void PutHex(int fd, uint64_t v) {
+  char buf[19] = "0x";
+  for (int i = 0; i < 16; ++i) buf[2 + i] = "0123456789ABCDEF"[(v >> (60 - 4 * i)) & 15];
+  buf[18] = 0;
+  Put(fd, buf);
+}
+
+// Opens logs/amped3_crash_<time>.txt (signal-safe enough: no allocation).
+int OpenReport() {
+  char path[1200];
+  const long t = long(std::time(nullptr));
+  std::snprintf(path, sizeof(path), "%s/amped3_crash_%ld.txt", g_report_dir, t);
+  return open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+}
+
+void WriteReport(const char* what, uint64_t fault_address, uint64_t pc) {
+  if (g_reporting.exchange(true)) return;  // one report
+  const int fds[2] = {OpenReport(), STDERR_FILENO};
+  void* frames[64];
+  const int n = backtrace(frames, 64);
+  for (int fd : fds) {
+    if (fd < 0) continue;
+    Put(fd, "Amped 3 Revamped crashed: ");
+    Put(fd, what);
+    Put(fd, "\n");
+    if (pc) {
+      Put(fd, "  at host address ");
+      PutHex(fd, pc);
+      Put(fd, "\n");
+    }
+    if (fault_address) {
+      Put(fd, "  accessing ");
+      PutHex(fd, fault_address);
+      const uint64_t a = fault_address;
+      if (g_vbase && a >= uint64_t(g_vbase) && a < uint64_t(g_vbase) + 0x100000000ull) {
+        Put(fd, " (guest virtual ");
+        PutHex(fd, a - uint64_t(g_vbase));
+        Put(fd, ")");
+      } else if (g_pbase && a >= uint64_t(g_pbase) && a < uint64_t(g_pbase) + 0x20000000ull) {
+        Put(fd, " (guest physical ");
+        PutHex(fd, a - uint64_t(g_pbase));
+        Put(fd, ")");
+      }
+      Put(fd, "\n");
+    }
+    Put(fd, "Stack (build with --config RelWithDebInfo for function names):\n");
+    backtrace_symbols_fd(frames, n, fd);
+  }
+  if (fds[0] >= 0) close(fds[0]);
+}
+
+// Last in the SDK's chain: nothing else claimed the fault.
+bool OnUnhandledFault(rex::arch::Exception* ex, void*) {
+  const bool illegal = ex->code() == rex::arch::Exception::Code::kIllegalInstruction;
+  WriteReport(illegal ? "illegal instruction (SIGILL)" : "access violation (SIGSEGV)",
+              illegal ? 0 : ex->fault_address(), ex->pc());
+  // Not handled: the instruction runs again and faults with the default
+  // action, ending the process (and leaving a core dump if enabled).
+  signal(SIGSEGV, SIG_DFL);
+  signal(SIGILL, SIG_DFL);
+  return false;
+}
+
+void OnFatalSignal(int sig, siginfo_t* info, void*) {
+  const char* what = sig == SIGABRT ? "abort (SIGABRT)"
+                     : sig == SIGFPE ? "floating-point exception (SIGFPE)"
+                     : sig == SIGBUS ? "bus error (SIGBUS)"
+                                     : "fatal signal";
+  WriteReport(what, sig == SIGBUS || sig == SIGFPE ? uint64_t(info->si_addr) : 0, 0);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void OnTerminate() {
+  WriteReport("std::terminate (uncaught C++ exception)", 0, 0);
+  signal(SIGABRT, SIG_DFL);
+  std::abort();
+}
+
+}  // namespace
+
+void Install(const std::filesystem::path& log_dir) {
+  g_log_dir = log_dir;
+  std::error_code ec;
+  std::filesystem::create_directories(g_log_dir, ec);
+  std::snprintf(g_report_dir, sizeof(g_report_dir), "%s", g_log_dir.string().c_str());
+  // backtrace() loads libgcc on first use; do that now, not in a handler.
+  void* warm[1];
+  backtrace(warm, 1);
+  struct sigaction sa{};
+  sa.sa_sigaction = OnFatalSignal;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  for (int sig : {SIGABRT, SIGFPE, SIGBUS}) sigaction(sig, &sa, nullptr);
+  std::set_terminate(OnTerminate);
+}
+
+void InstallFaultHandler() { rex::arch::ExceptionHandler::Install(OnUnhandledFault, nullptr); }
+
+void SetGuestMemory(const uint8_t* virtual_base, const uint8_t* physical_base) {
+  g_vbase = virtual_base;
+  g_pbase = physical_base;
+}
+void MarkCleanShutdown() { g_clean = true; }
+// Every thread's stack needs more than POSIX offers simply; not on Linux yet.
 void WriteHangReport() {}
 void SetHangReportExtra(std::function<std::string()>) {}
+
 }  // namespace amped3::crash
 
 #endif

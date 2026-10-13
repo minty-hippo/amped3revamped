@@ -3,7 +3,9 @@
 #include "amped3_app.h"
 #include "audio_trace.h"
 
+#include <cctype>
 #include <chrono>
+#include <fstream>
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -33,8 +35,14 @@
 #include "thread_qos.h"
 
 
-REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "GPU",
-                      "Graphics API for the GPU plugin: d3d12 or vulkan")
+// Direct3D 12 on Windows; Vulkan everywhere else (Linux: SteamOS, ARM handhelds).
+#ifdef _WIN32
+#define AMPED3_DEFAULT_GPU_BACKEND "d3d12"
+#else
+#define AMPED3_DEFAULT_GPU_BACKEND "vulkan"
+#endif
+REXCVAR_DEFINE_STRING(gpu_backend, AMPED3_DEFAULT_GPU_BACKEND, "GPU",
+                      "Graphics API for the GPU plugin: d3d12 (Windows) or vulkan")
     .allowed({"d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -43,6 +51,14 @@ REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "GPU",
 // nothing: keep it off unless asked for, which leaves MAILBOX/FIFO.
 REXCVAR_DEFINE_BOOL(allow_screen_tearing, false, "GPU",
                     "Vulkan: present immediately without waiting for vertical blank (tears)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(emulated_gpu_lean, true, "GPU",
+                    "When the native renderer is on at launch, start the Xbox 360 GPU "
+                    "emulation lean: no shader cache preload and no resolution scaling (it "
+                    "only follows the game's commands then). Switching to the emulation later "
+                    "still works, but compiles shaders as it goes and draws at 1x until a "
+                    "restart.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
@@ -115,14 +131,65 @@ void Amped3App::OnPreSetup(rex::RuntimeConfig& config) {
   }
 }
 
+namespace {
+
+// default.xex in `dir`, in any letter case (Linux file names are
+// case-sensitive; the game's own file lookups already aren't).
+bool HasDefaultXex(const std::filesystem::path& dir) {
+  std::error_code ec;
+  if (!std::filesystem::is_directory(dir, ec)) return false;
+  if (std::filesystem::is_regular_file(dir / "default.xex", ec)) return true;
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+    std::string name = entry.path().filename().string();
+    for (auto& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (name == "default.xex" && entry.is_regular_file(ec)) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+// Where the game files are, first match wins:
+//   game/ next to the exe (the installed layout), or default.xex beside the exe
+//   game/ in the current folder (launchers that cd first)
+//   the folder named in game.path next to the exe (setup.sh writes it into
+//     the build folder so the build can be run in place)
+//   any single folder under game/ holding default.xex (an extra level from
+//     unpacking an archive)
+// Every place looked at is kept for the log.
+std::filesystem::path Amped3App::FindGameDir(const std::filesystem::path& exe_dir,
+                                             std::vector<std::string>* searched) {
+  std::vector<std::filesystem::path> candidates = {exe_dir / "game", exe_dir};
+  std::error_code ec;
+  const auto cwd = std::filesystem::current_path(ec);
+  if (!ec && cwd != exe_dir) candidates.push_back(cwd / "game");
+  if (std::ifstream file(exe_dir / "game.path"); file) {
+    std::string line;
+    std::getline(file, line);
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (!line.empty()) candidates.push_back(std::filesystem::path(
+        std::u8string(reinterpret_cast<const char8_t*>(line.data()), line.size())));
+  }
+  for (const auto& dir : candidates) {
+    searched->push_back(dir.string());
+    if (HasDefaultXex(dir)) return dir;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(exe_dir / "game", ec)) {
+    if (!entry.is_directory(ec)) continue;
+    searched->push_back(entry.path().string());
+    if (HasDefaultXex(entry.path())) return entry.path();
+  }
+  return {};
+}
+
 void Amped3App::OnConfigurePaths(rex::PathConfig& paths) {
   // Everything lives next to the exe, so the install folder is portable:
   //   game\    the game files (unless --game_data_root says otherwise)
   //   save\    saves and profile (unless --user_data_root)
   //   cache\   the emulated GPU's shader storage (unless --cache_root)
   const auto exe_dir = rex::filesystem::GetExecutableFolder();
-  if (paths.game_data_root.empty() && std::filesystem::exists(exe_dir / "game" / "default.xex")) {
-    paths.game_data_root = exe_dir / "game";
+  if (paths.game_data_root.empty()) {
+    paths.game_data_root = FindGameDir(exe_dir, &game_search_);
   }
   if (REXCVAR_GET(user_data_root).empty()) {
     const auto old_dir = paths.user_data_root;  // the SDK's default: Documents\amped3
@@ -168,12 +235,29 @@ void Amped3App::OnPostInitLogging() {
   if (game_dir_.empty()) {
     REXLOG_ERROR(
         "Amped 3 game files not found. Put the extracted game in a 'game' folder next to "
-        "amped3.exe, or run with --game_data_root=<folder containing default.xex>.");
+        "{}, or run with --game_data_root=<folder containing default.xex>.",
+        rex::filesystem::GetExecutablePath().filename().string());
+    REXLOG_ERROR("  Executable: {}", rex::filesystem::GetExecutablePath().string());
+    for (const auto& dir : game_search_) REXLOG_ERROR("  Looked in: {}", dir);
   } else {
     REXLOG_INFO("Amped 3 game files: {}", game_dir_.string());
   }
   if (!saves_note_.empty()) REXLOG_INFO("{}", saves_note_);
+
+  // The config is loaded and the GPU isn't set up yet: with the native
+  // renderer drawing, the emulated GPU only processes the game's commands,
+  // so skip what only its drawing uses (SDK patch 0017).
+  lean_gpu_ = REXCVAR_GET(emulated_gpu_lean) &&
+              rex::cvar::GetFlagByName("native_renderer") == "true";
+  amped3::SetEmulatedGpuLean(lean_gpu_);
+  if (lean_gpu_) {
+    rex::system::SetDrawResolutionScaleCap(1);
+    REXLOG_INFO(
+        "Emulated GPU: lean (native renderer on): no shader cache preload, 1x resolution");
+  }
 }
+
+bool Amped3App::OnWantShaderStorage() { return !lean_gpu_; }
 
 void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // F3: the performance overlay, in place of the SDK's debug overlay.
@@ -206,6 +290,9 @@ void Amped3App::OnPostSetup() {
   if (auto* memory = runtime()->memory()) {
     amped3::crash::SetGuestMemory(memory->virtual_membase(), memory->physical_membase());
   }
+  // After the SDK's own fault handlers (MMIO), so only faults they don't
+  // claim are reported (Linux; nothing to do on Windows).
+  amped3::crash::InstallFaultHandler();
   amped3::crash::SetHangReportExtra(
       [this] { return amped3::diag::DescribeGuestWaits(runtime()->kernel_state()); });
 
@@ -251,7 +338,7 @@ void Amped3App::OnPostSetup() {
       REXCVAR_GET(gpu_backend),
       [this](amped3::live::GammaRamp* ramp) {
         auto* graphics =
-            dynamic_cast<rex::graphics::GraphicsSystem*>(runtime() ? runtime()->graphics_system()
+            static_cast<rex::graphics::GraphicsSystem*>(runtime() ? runtime()->graphics_system()
                                                                    : nullptr);
         auto* cp = graphics ? graphics->command_processor() : nullptr;
         if (!cp) return false;
@@ -269,7 +356,7 @@ void Amped3App::OnPostSetup() {
       },
       [this](bool on) {
         auto* graphics =
-            dynamic_cast<rex::graphics::GraphicsSystem*>(runtime() ? runtime()->graphics_system()
+            static_cast<rex::graphics::GraphicsSystem*>(runtime() ? runtime()->graphics_system()
                                                                    : nullptr);
         auto* cp = graphics ? graphics->command_processor() : nullptr;
         return cp && SetHostDrawingEnabled(cp, on);

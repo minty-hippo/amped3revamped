@@ -1,0 +1,28 @@
+# Game files: bring your own copy, never commit. If you keep the extracted
+# game inside the project under another name, add that folder here too.
+*.xex
+/game/
+/Amped 3 (USA)/
+
+# Tools setup.ps1 or you drop in the project folder (built, not sources)
+/*.exe
+/*.dll
+
+# Written by setup.ps1 / rexglue init
+/CMakeLists.txt
+/CMakePresets.json
+/amped3_manifest.toml
+/amped3_functions_auto.toml
+/generated/*
+!/generated/rexglue.cmake
+
+/out/
+/logs/
+
+# Not redistributable with these sources: Intel's XeSS headers (setup.ps1
+# fetches them), and your own assets such as the game's logo.
+/third_party/xess/
+# /assets/local/ holds your own assets (the logo); this repository publishes them.
+
+# Python caches (tools)
+__pycache__/

@@ -1,0 +1,15 @@
+diff --git a/src/graphics/display_vblank_win.cpp b/src/graphics/display_vblank_win.cpp
+--- a/src/graphics/display_vblank_win.cpp
++++ b/src/graphics/display_vblank_win.cpp
+@@ -164,7 +164,10 @@
+ bool DisplayVblank::Init() { return false; }
+ bool DisplayVblank::Wait() { return false; }
+ bool DisplayVblank::MonitorChanged() const { return false; }
+-bool DisplayVblank::window_found() const { return false; }
++// There is no monitor timing to find here, so report the window as found: the
++// vblank thread then settles on the timer once instead of retrying every half
++// second, which restarted the timer each time and made frames uneven.
++bool DisplayVblank::window_found() const { return true; }
+ }  // namespace rex::graphics
+ 
+ #endif
