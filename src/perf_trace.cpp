@@ -119,6 +119,7 @@ std::vector<int64_t> g_present_ns;
 int64_t g_start_ns = 0;
 uint64_t g_swap_tid = 0, g_worker_tid = 0;
 std::atomic<uint64_t> g_draw_tid{0};
+std::atomic<uint64_t> g_record_allocs{0};
 
 // Worker / GPU reports since the last swap.
 std::atomic<int64_t> g_worker_sum_us{0}, g_gpu_sum_us{0};
@@ -371,6 +372,8 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
     for (const Row& r : rows) allocs_total += double(r.allocs);
     s += fmt::format("Swapping thread CPU: avg {:.2f} ms/frame, p95 {:.2f}; {:.0f} heap allocations/frame\n",
                      cpu_total / n, Percentile(cpu, 0.95), allocs_total / n);
+    s += fmt::format("Recording draws: {:.0f} heap allocations/frame\n",
+                     double(g_record_allocs.load()) / n);
     s += "Zones (avg ms per frame, share of frame time):\n";
     for (int z = 0; z < kZones; ++z) {
       s += fmt::format("  {:<12} {:7.3f} ms  {:5.1f}%\n", ZoneName(Zone(z)), zone_sum[z] / n,
@@ -489,6 +492,7 @@ void Start() {
   g_gpu_count = 0;
   g_present_count = 0;
   g_draw_tid = 0;
+  g_record_allocs = 0;
   REXLOG_INFO("Performance trace: recording {} s", REXCVAR_GET(perf_trace_seconds));
   g_active.store(true, std::memory_order_release);
   std::thread(RunTrace).detach();
@@ -541,6 +545,10 @@ void OnGpuFrame(double gpu_ms) {
   if (!Active() || gpu_ms < 0) return;
   g_gpu_sum_us.fetch_add(int64_t(gpu_ms * 1000.0), std::memory_order_relaxed);
   g_gpu_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddRecordAllocations(uint64_t n) {
+  if (Active()) g_record_allocs.fetch_add(n, std::memory_order_relaxed);
 }
 
 void NoteDrawThread() {

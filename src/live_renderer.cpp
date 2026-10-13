@@ -257,6 +257,25 @@ struct RecordedFrame {
 std::mutex g_ucode_mutex;
 std::unordered_map<std::string, std::vector<uint8_t>> g_ucode;
 
+// Short names for microcode in recorded draws: the stems (ucode_vs_<16 hex>)
+// are longer than a string's inline buffer, so every draw's copy of them
+// allocated. The recorder stores V<11> / P<11> instead (a hash of the stem;
+// fits inline) and the resources look the stem up again when the renderer
+// first reads a shader. Frame dumps (F10) keep the aliases; their microcode
+// is saved under the same names.
+std::mutex g_alias_mutex;
+std::unordered_map<std::string, std::string> g_alias_to_stem;
+
+bool IsMicrocodeAlias(const std::string& name) {
+  return name.size() == 12 && (name[0] == 'V' || name[0] == 'P');
+}
+
+std::string StemOfAlias(const std::string& alias) {
+  std::lock_guard lock(g_alias_mutex);
+  auto it = g_alias_to_stem.find(alias);
+  return it != g_alias_to_stem.end() ? it->second : std::string();
+}
+
 std::vector<uint8_t> FindMicrocode(const std::string& stem) {
   std::lock_guard lock(g_ucode_mutex);
   auto it = g_ucode.find(stem);
@@ -808,6 +827,7 @@ class LiveResources : public native::FrameResources {
     auto it = f_.blobs.find(name);
     if (it != f_.blobs.end()) return it->second ? *it->second : std::vector<uint8_t>{};
     if (name.rfind("ucode_", 0) == 0) return FindMicrocode(name);
+    if (IsMicrocodeAlias(name)) return FindMicrocode(StemOfAlias(name));
     if (native::IsTextureResource(name)) {
       const size_t dot = name.rfind('.');
       if (dot == std::string::npos) return {};
@@ -1619,12 +1639,34 @@ bool RawTextureFetch(const std::array<uint32_t, 6>& words) {
   return (words[0] & 3) == 2 && (words[1] >> 12) != 0;
 }
 
+// The alias of a microcode stem (empty stays empty); the last one per stage is
+// remembered, as consecutive draws mostly share their shaders.
+const std::string& MicrocodeAlias(const std::string& stem, char tag) {
+  struct Last {
+    std::string stem, alias;
+  };
+  static Last last[2];
+  static const std::string kEmpty;
+  if (stem.empty()) return kEmpty;
+  Last& l = last[tag == 'V' ? 0 : 1];
+  if (!l.alias.empty() && l.stem == stem) return l.alias;
+  l.stem = stem;
+  l.alias = native::ShortName(tag, Fnv1a(stem.data(), stem.size()), 11);
+  std::lock_guard lock(g_alias_mutex);
+  g_alias_to_stem.emplace(l.alias, stem);
+  return l.alias;
+}
+
 std::array<SlotName, kTextureSlots> g_slot_names;
 std::array<VertexFetchName, 96> g_vf_names;
 
 void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string& vs_ucode,
             const std::string& ps_ucode) {
   if (!Recording()) return;
+  struct AllocCount {  // F11 trace: heap allocations while recording a draw
+    uint64_t start = trace::ThreadAllocations();
+    ~AllocCount() { trace::AddRecordAllocations(trace::ThreadAllocations() - start); }
+  } alloc_count;
   RecordTimer timer;
   std::lock_guard lock(g_mutex);
   if (!g_frame || !Room()) return;
@@ -1645,8 +1687,8 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   d.start = call.start;
   d.count = call.count;
   d.base_vertex = call.base_vertex;
-  d.vs = vs_ucode;
-  d.ps = ps_ucode;
+  d.vs = MicrocodeAlias(vs_ucode, 'V');
+  d.ps = MicrocodeAlias(ps_ucode, 'P');
   const uint32_t number = AddEvent(native::EventType::kDraw, uint32_t(g_frame->frame.draws.size()));
   auto* memory = GuestMemory();
 

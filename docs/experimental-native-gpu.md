@@ -149,3 +149,29 @@ order, and clears the masks; the register and constant commands are never
 written, so neither Direct3D nor the command processor spends time on them.
 When the emulation draws again, all five masks are set once and the original
 flush writes the whole state.
+
+### Step 1 results (PC, Vulkan)
+
+| | Before | After |
+|---|---|---|
+| `flush_state` | 0.60-0.74 ms | 0.36 ms |
+| `d3d` | 0.91-1.14 ms | 0.66-0.68 ms |
+| GPU Commands thread | 13-16% of a core | 5.6-6.2% |
+
+No visible problems in a test ride. The traces also show the draws come from
+the game's busiest thread (XThread F800009C, 41-43% of a core), not the
+thread that calls `D3DDevice_Swap`: the recording (2.7 ms) sits on it.
+
+## Recording without allocations
+
+The swapping thread made ~18 allocations a frame, but the draws are recorded
+on another thread. Per draw the recorder still allocated: the draw's texture
+list (a vector), its vertex stream map (a node per stream), and the two
+microcode names (`ucode_vs_<16 hex>`, longer than a string's inline buffer).
+Now `Draw::textures` and `Draw::vmem` keep up to 6 / 4 entries inline
+(`SmallVector`, `SmallMap` in `frame.h`), and the recorder names microcode by
+12-character aliases (`V<11>` / `P<11>`) that the live resources map back to
+the stems. The renderer's one check of shader identity by name (event icons)
+now compares microcode hashes. The trace counts the recorder's allocations.
+Frame dumps (F10) from the live renderer keep the aliases, so the replay
+tool's debug filters by shader hash don't match them.

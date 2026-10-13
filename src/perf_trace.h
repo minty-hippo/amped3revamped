@@ -81,4 +81,7 @@ int64_t ThreadCpuNs();
 // Heap allocations (operator new) made by this thread so far.
 uint64_t ThreadAllocations();
 
+// Heap allocations made while recording draws (any thread), for the summary.
+void AddRecordAllocations(uint64_t n);
+
 }  // namespace amped3::trace

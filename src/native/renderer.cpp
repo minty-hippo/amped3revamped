@@ -5633,11 +5633,10 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // (shader pair below: meshes drawn after the characters) and their
   // labels (quads from user data written into the scene with depth, as the
   // game draws in-world text; its soft particles don't write depth).
-  auto ends_with = [](const std::string& a, const char* b) {
-    const size_t n = std::strlen(b);
-    return a.size() >= n && a.compare(a.size() - n, n, b) == 0;
-  };
-  const bool icon_mesh = ends_with(d.vs, "6DA245E02A477C07") && ends_with(d.ps, "2C0355A9D2589300");
+  // By microcode hash (the stems' hex part), as the live recorder names
+  // microcode by short aliases.
+  const bool icon_mesh = vs->info.ucode_hash == 0x6DA245E02A477C07ull &&
+                         ps->info.ucode_hash == 0x2C0355A9D2589300ull;
   const bool label = !d.up_vertices.empty() && d.prim == 13 && (depth_ctl & 6) == 6;
   if (light_seen_ && tiling_.width && ps->info.ucode_hash != kLightingPixelShader) {
     ++post_light_draws_;
