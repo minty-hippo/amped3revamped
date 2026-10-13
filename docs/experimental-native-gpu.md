@@ -181,3 +181,31 @@ per-frame name maps: a node per texture, buffer and version), and the larger
 `Draw` cost 0.85 ms a frame to move into the frame (`store`), eating the gain.
 Draws are now built in place (`emplace_back`), with 4 textures and 2 streams
 inline.
+
+## Naming off the drawing thread
+
+Most of what remains on the drawing thread (F800009C) is naming: hashing
+the textures a draw uses, looking up the vertex cache and copying index data
+into the frame. With `native_deferred_naming` (on; needs a restart) the
+drawing thread only copies each draw's fetch constants and index buffer
+address and queues them; a new recorder thread (`amped3 recorder`) names
+them, and at the end of the frame puts the names into the draws and hands
+the frame to the prep thread. The trace shows its time as `rec_naming`.
+
+The recorder reads guest memory after the draw, so the game must not have
+rewritten that memory yet. The game already waits for a GPU fence before it
+rewrites memory a draw used (as on the console, where the GPU reads it
+later). Direct3D inserts a fence (`sub_825A3330`, value: the device's CPU
+fence at +10396, +2 each time) as an `EVENT_WRITE_SHD` packet that makes the
+GPU store it to the fence word (+10384 points to it); in some phases
+(device+20416 = 0 and flag 0x04 at +10433) it also stores it from the CPU at
+once. Each queued draw carries the CPU fence current when it was drawn, and a
+fence is let through only once every draw at or before it is named:
+
+- the command processor calls back before an `EVENT_WRITE_SHD` stores to the
+  fence word (SDK patch 0019) and waits there;
+- the hook on `sub_825A3330` waits before Direct3D's own CPU store.
+
+A wait gives up after 2 s with a warning in the log, so a mistake shows up as
+a hitch rather than a hang. With the setting off, naming runs on the drawing
+thread as before (for comparing traces).

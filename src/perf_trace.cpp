@@ -441,6 +441,7 @@ const char* ZoneName(Zone zone) {
     case Zone::kRecVertices: return "rec_vertices";
     case Zone::kRecIndices: return "rec_indices";
     case Zone::kRecState: return "rec_state";
+    case Zone::kRecNaming: return "rec_naming";
     case Zone::kFenceWait: return "fence_wait";
     case Zone::kMakeSpace: return "make_space";
     case Zone::kSwap: return "swap";

@@ -30,6 +30,7 @@ enum class Zone : int {
   kRecVertices, // part of kRecord, draws: vertex memory
   kRecIndices,  // part of kRecord, draws: indices and user-pointer data
   kRecState,    // part of kRecord, draws: state changes since the last draw
+  kRecNaming,   // the recorder thread naming draws' resources (deferred naming)
   kFenceWait,   // D3D_BlockOnFence / BlockUntilIdle / BlockUntilNotBusy: waiting on the GPU
   kMakeSpace,   // D3D_MakeSpace: command buffer full, kicking and waiting
   kSwap,        // inside the game's D3DDevice_Swap (VdSwap)

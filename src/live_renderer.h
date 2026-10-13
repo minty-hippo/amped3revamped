@@ -81,6 +81,16 @@ bool Recording();
 // setting native_skip_state_writes is on. Game thread, every draw.
 bool SkipEmulatedStateWrites();
 
+// Direct3D's ring buffer was set up (D3D_InitializeRingBuffer returned): with
+// native_deferred_naming, starts the recorder thread and has the command
+// processor hold each fence until the recorder has named the draws before it
+// (see "Deferred naming" in live_renderer.cpp). Game thread, once.
+void OnRingBufferInitialized(uint8_t* base, uint32_t dev);
+
+// sub_825A3330, Direct3D inserting a fence: before it may store the fence
+// value itself (deferred naming waits for the recorder first). Game thread.
+void BeforeCpuFenceStore(uint8_t* base, uint32_t dev);
+
 // Direct3D hooks, called after the call (state flushed), on the game's
 // rendering thread.
 void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string& vs_ucode,

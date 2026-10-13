@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,9 +29,11 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/thread.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/presenter.h>
@@ -64,6 +67,12 @@ REXCVAR_DEFINE_BOOL(native_skip_state_writes, true, "GPU",
                     "constants as GPU commands (only the vertex fetch and shader setup the "
                     "recording reads still run). Everything is written again when the "
                     "emulation draws.");
+REXCVAR_DEFINE_BOOL(native_deferred_naming, true, "GPU",
+                    "Native renderer: name each draw's textures, vertex and index data on a "
+                    "recorder thread instead of the game's drawing thread. The game sees a "
+                    "GPU fence pass only once the recorder has read everything drawn before "
+                    "it, as a real GPU would. Needs a restart.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(native_vertex_cache, true, "GPU",
                     "Native renderer: reuse vertex buffers the game hasn't written to since the "
                     "last frame (write-watched pages) instead of copying them every frame");
@@ -164,6 +173,8 @@ constexpr uint32_t kBoolLoopOffset = 768 + 8192;
 constexpr uint32_t kRegShadow = 11456;      // register shadow blocks 0x2000..0x23FF
 constexpr uint32_t kRegShadowEnd = 12000;
 constexpr uint32_t kIndexBuffer = 12532;
+constexpr uint32_t kGpuFencePointer = 10384;  // pointer to the fence value the GPU writes
+constexpr uint32_t kCpuFence = 10396;         // the next fence Direct3D inserts
 constexpr uint32_t kTextures = 12704;       // 26 slots
 constexpr uint32_t kTextureSlots = 26;
 struct ShadowBlock {
@@ -235,8 +246,64 @@ uint64_t NewVersion() { return g_blob_version.fetch_add(1, std::memory_order_rel
 
 // --- Recorded frame ---------------------------------------------------------------
 
+// What a draw's resources are named from: copied from the device on the game
+// thread at the draw, named on the recorder thread (see "Deferred naming"),
+// or right away when that is off. The results go into the draw at the end of
+// the frame.
+struct DrawInputs {
+  uint32_t draw = 0;  // index in the frame's draws
+  struct Texture {
+    uint32_t slot;
+    std::array<uint32_t, 6> words;
+  };
+  struct VertexFetch {
+    uint32_t vf, w0, w1;
+  };
+  native::SmallVector<Texture, 4> textures;
+  native::SmallVector<VertexFetch, 2> vertex_fetches;
+  uint32_t ib_address = 0, ib_size = 0;  // indexed draws through an index buffer
+  // Results.
+  native::SmallVector<native::FrameTexture, 4> named_textures;
+  native::SmallMap<uint32_t, std::string, 2> vmem;
+  std::string index_data;
+};
+
+// DrawInputs in chunks: adding one never moves the others, so the recorder
+// thread can work on one while the game thread adds more.
+class DrawInputList {
+ public:
+  DrawInputs& Add() {
+    std::lock_guard lock(mutex_);
+    if (count_ % kChunk == 0) chunks_.push_back(std::make_unique<std::array<DrawInputs, kChunk>>());
+    DrawInputs& d = (*chunks_.back())[count_ % kChunk];
+    ++count_;
+    return d;
+  }
+  DrawInputs& At(size_t i) {
+    std::lock_guard lock(mutex_);
+    return (*chunks_[i / kChunk])[i % kChunk];
+  }
+  size_t size() {
+    std::lock_guard lock(mutex_);
+    return count_;
+  }
+
+ private:
+  static constexpr size_t kChunk = 256;
+  std::mutex mutex_;
+  std::vector<std::unique_ptr<std::array<DrawInputs, kChunk>>> chunks_;
+  size_t count_ = 0;
+};
+
 struct RecordedFrame {
   Frame frame;
+  // blobs / versions / textures: written by the game thread (user-pointer
+  // data) and by the recorder thread (named resources) while recording.
+  std::mutex maps_mutex;
+  DrawInputList inputs;
+  // Front buffer fetch words to name at the end of the frame.
+  std::array<uint32_t, 6> swap_fetch_words{};
+  bool name_swap = false;
   // Vertex / index data. Shared: unchanged vertex buffers are the same
   // cached copy from frame to frame (see the vertex cache).
   std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> blobs;
@@ -423,7 +490,9 @@ void FlushPending() {
   auto* memory = GuestMemory();
   if (!memory || !p.size || p.size > (16u << 20)) return;
   const uint8_t* src = memory->TranslateVirtual<const uint8_t*>(p.address);
-  g_frame->blobs[p.name] = std::make_shared<std::vector<uint8_t>>(src, src + p.size);
+  auto blob = std::make_shared<std::vector<uint8_t>>(src, src + p.size);
+  std::lock_guard lock(g_frame->maps_mutex);
+  g_frame->blobs[p.name] = std::move(blob);
   g_frame->versions[p.name] = NewVersion();
 }
 
@@ -476,12 +545,17 @@ std::shared_ptr<std::vector<uint8_t>> NewBlob(const std::string& name, const uin
   return blob;
 }
 
-void CopyGuest(const std::string& name, const uint8_t* src, uint32_t size) {
-  auto& blob = g_frame->blobs[name];
+void CopyGuestInto(RecordedFrame& f, const std::string& name, const uint8_t* src, uint32_t size) {
+  std::lock_guard lock(f.maps_mutex);
+  auto& blob = f.blobs[name];
   if (!blob) {
     blob = NewBlob(name, src, size);
-    g_frame->versions[name] = NewVersion();
+    f.versions[name] = NewVersion();
   }
+}
+
+void CopyGuest(const std::string& name, const uint8_t* src, uint32_t size) {
+  CopyGuestInto(*g_frame, name, src, size);
 }
 
 // --- Vertex cache ---------------------------------------------------------------------
@@ -697,7 +771,7 @@ void TrimTextureHashes() {
   }
 }
 
-const std::string& TextureName(const std::array<uint32_t, 6>& words) {
+const std::string& TextureName(RecordedFrame& f, const std::array<uint32_t, 6>& words) {
   const uint64_t key = Fnv1a(words.data(), sizeof(words));
   auto it = g_tex_names.find(key);
   if (it != g_tex_names.end()) return it->second;
@@ -714,13 +788,18 @@ const std::string& TextureName(const std::array<uint32_t, 6>& words) {
   }
   std::string name =
       native::ShortName('T', key, 6) + "_" + native::ShortName('T', h, 7).substr(1);
-  g_frame->textures[name] = words;
+  {
+    std::lock_guard lock(f.maps_mutex);
+    f.textures[name] = words;
+  }
   const std::string& stored = g_tex_names.emplace(key, name).first->second;
   // Snapshot what changed (within a budget; the rest is read by the worker).
   auto snapshot = [&](const char* suffix, uint32_t address, uint32_t size) {
     if (!size || g_texture_snapshot_bytes + size > kTextureSnapshotBudget) return;
     const uint8_t* p = memory->TranslatePhysical<const uint8_t*>(address);
-    g_frame->blobs[name + suffix] = std::make_shared<std::vector<uint8_t>>(p, p + size);
+    auto blob = std::make_shared<std::vector<uint8_t>>(p, p + size);
+    std::lock_guard lock(f.maps_mutex);
+    f.blobs[name + suffix] = std::move(blob);
     g_texture_snapshot_bytes += size;
   };
   if (base_changed) snapshot(".base", ranges.base_address, ranges.base_size);
@@ -777,11 +856,23 @@ void RecordStateDelta(uint8_t* base, uint32_t dev, const ShaderUse& vs, const Sh
   g_frame->draw_delta_end.push_back(uint32_t(deltas.size()));
 }
 
-void StartFrame() {
+// The recorder side's per-frame reset: the names are per frame (a texture's
+// name carries its contents' hash). On the recorder thread with deferred
+// naming, else on the game thread at the frame's start.
+void BeginNaming() {
   ++g_record_frame;
   TrimVertexCache();
   TrimTextureHashes();
   g_texture_snapshot_bytes = 0;
+  g_tex_names.clear();
+  g_blob_names.clear();
+}
+
+bool DeferredNaming();
+void StopRecorder();
+
+void StartFrame() {
+  if (!DeferredNaming()) BeginNaming();
   g_frame = std::make_unique<RecordedFrame>();
   g_frame->frame.draws.reserve(g_last_draws + g_last_draws / 4 + 64);
   g_frame->frame.events.reserve(g_last_events + g_last_events / 4 + 64);
@@ -800,8 +891,6 @@ void StartFrame() {
     g_frame->dump_name = std::string("frame_") + buf + "_native";
   }
   g_prev_raw.fill(0);
-  g_tex_names.clear();
-  g_blob_names.clear();
   g_events = 0;
   g_pending = {};
   g_frame_overflow = false;
@@ -1606,6 +1695,7 @@ void Shutdown() {
   g_work_cv.notify_all();
   if (g_prep_thread.joinable()) g_prep_thread.join();
   if (g_worker.joinable()) g_worker.join();
+  StopRecorder();
   SetHostDrawing(true);
   if (rex::ui::Presenter* presenter = g_presenter ? g_presenter() : nullptr) {
     SetGuestOutputExternal(presenter, false);
@@ -1660,6 +1750,271 @@ const std::string& MicrocodeAlias(const std::string& stem, char tag) {
 std::array<SlotName, kTextureSlots> g_slot_names;
 std::array<VertexFetchName, 96> g_vf_names;
 
+namespace {
+
+// Names a draw's textures, vertex memory and index buffer from its inputs
+// (recorder side: the name caches, the vertex cache and the texture hashes
+// are only used here).
+void NameDraw(RecordedFrame& f, DrawInputs& in) {
+  auto* memory = GuestMemory();
+  for (const auto& t : in.textures) {
+    native::FrameTexture ft;
+    ft.slot = t.slot;
+    std::copy(t.words.begin(), t.words.end(), ft.raw.begin());
+    SlotName& last = g_slot_names[t.slot];
+    if (last.frame != g_record_frame || last.words != t.words) {
+      last.words = t.words;
+      last.name = TextureName(f, t.words);
+      last.frame = g_record_frame;
+    }
+    ft.data = last.name;
+    in.named_textures.push_back(std::move(ft));
+  }
+  if (!memory) return;
+  for (const auto& v : in.vertex_fetches) {
+    VertexFetchName& last = g_vf_names[v.vf % 96];
+    if (last.frame == g_record_frame && last.w0 == v.w0 && last.w1 == v.w1) {
+      in.vmem[v.vf] = last.name;
+      continue;
+    }
+    const uint32_t address = (v.w0 & ~3u) & 0x1FFFFFFF;
+    const uint32_t size = ((v.w1 >> 2) & 0xFFFFFF) * 4;
+    if (!address || !size || size > (64u << 20)) continue;
+    const uint64_t key = (uint64_t(address) << 32) | size;
+    auto it = g_blob_names.find(key);
+    if (it == g_blob_names.end()) {
+      std::string name = native::ShortName('M', (uint64_t(size) << 29) | address, 10);
+      bool have;
+      {
+        std::lock_guard lock(f.maps_mutex);
+        have = f.blobs[name] != nullptr;
+      }
+      if (!have) {
+        uint64_t version = 0;
+        auto blob = CachedVertexData(memory, name, address, size, &version);
+        std::lock_guard lock(f.maps_mutex);
+        f.blobs[name] = std::move(blob);
+        f.versions[name] = version;
+      }
+      it = g_blob_names.emplace(key, std::move(name)).first;
+    }
+    in.vmem[v.vf] = it->second;
+    last.w0 = v.w0;
+    last.w1 = v.w1;
+    last.name = it->second;
+    last.frame = g_record_frame;
+  }
+  const uint32_t address = in.ib_address, size = in.ib_size;
+  if (address && size && size <= (64u << 20)) {
+    const uint64_t key = (uint64_t(address) << 32) | size | (1ull << 31);  // not physical
+    auto it = g_blob_names.find(key);
+    if (it == g_blob_names.end()) {
+      std::string name = native::ShortName('I', (uint64_t(size) << 32) | address, 10);
+      // Index buffers are mostly static too: through the vertex cache when
+      // they are in physical memory (as Direct3D allocates them).
+      const uint32_t physical = memory->GetPhysicalAddress(address);
+      if (physical != UINT32_MAX &&
+          memory->GetPhysicalAddress(address + size - 1) == physical + size - 1) {
+        bool have;
+        {
+          std::lock_guard lock(f.maps_mutex);
+          have = f.blobs[name] != nullptr;
+        }
+        if (!have) {
+          uint64_t version = 0;
+          auto blob = CachedVertexData(memory, name, physical, size, &version);
+          std::lock_guard lock(f.maps_mutex);
+          f.blobs[name] = std::move(blob);
+          f.versions[name] = version;
+        }
+      } else {
+        CopyGuestInto(f, name, memory->TranslateVirtual<const uint8_t*>(address), size);
+      }
+      it = g_blob_names.emplace(key, std::move(name)).first;
+    }
+    in.index_data = it->second;
+  }
+}
+
+void ApplyNames(Draw& d, DrawInputs& in) {
+  for (auto& t : in.named_textures) d.textures.push_back(std::move(t));
+  for (const auto& [vf, name] : in.vmem) d.vmem[vf] = name;
+  if (!in.index_data.empty()) d.index_data = std::move(in.index_data);
+}
+
+// --- Deferred naming --------------------------------------------------------------
+//
+// With native_deferred_naming, the game's drawing thread only copies each
+// draw's fetch constants and index buffer address (DrawInputs) and queues
+// them; the recorder thread names them (texture hashes, the vertex cache,
+// index copies) and, at the end of each frame, puts the names into the draws
+// and hands the frame on.
+//
+// The recorder reads guest memory after the draw, so the game must not have
+// rewritten it by then. On the console the GPU reads it later too, and the game
+// waits for a GPU fence before rewriting memory a draw used. Direct3D inserts
+// a fence (value: the device's CPU fence, +2 each time) with an EVENT_WRITE_SHD
+// packet that makes the GPU store it to the fence word (device+10384 points to
+// it), and in some phases also stores it from the CPU right away. So a fence
+// is let through only once the recorder has named every draw made before it:
+// the command processor waits for that before storing a fence (SDK patch
+// 0019), and so does the game thread before Direct3D's own CPU store
+// (sub_825A3330). Each draw is queued with the CPU fence current when it was
+// drawn (the fence that covers it).
+
+struct QueuedJob {
+  RecordedFrame* frame = nullptr;  // the draw's frame (or the frame ending)
+  size_t input = 0;                // index in frame->inputs
+  uint32_t stamp = 0;              // CPU fence when it was drawn (covered by that fence)
+  std::unique_ptr<RecordedFrame> end;  // set: end of this frame
+  bool hand_over = false;
+};
+
+std::mutex g_queue_mutex;
+std::condition_variable g_queue_cv;
+std::condition_variable g_drained_cv;  // a draw was named
+std::deque<QueuedJob> g_queue;
+bool g_queue_has_stamp = false;  // g_queue holds a draw (its oldest stamp below)
+uint32_t g_queue_oldest_stamp = 0;
+bool g_naming_busy = false;      // the recorder holds a draw it took off the queue
+uint32_t g_naming_stamp = 0;     // its stamp
+std::thread g_recorder;
+std::atomic<bool> g_recorder_stop{false};
+bool g_deferred = false;  // decided when the device starts (restart to change)
+std::atomic<uint32_t> g_fence_physical{0};  // the fence word, physical address
+std::atomic<uint32_t> g_fence_physical_alt{0};
+
+bool DeferredNaming() { return g_deferred; }
+
+// Fence a is at or after b (32-bit wrap-around, as Direct3D compares them).
+bool FenceAtOrAfter(uint32_t a, uint32_t b) { return int32_t(a - b) >= 0; }
+
+// Waits until every draw covered by `fence` (stamp at or before it) is named.
+void WaitNamedThrough(uint32_t fence) {
+  std::unique_lock lock(g_queue_mutex);
+  const auto pending = [fence] {
+    if (g_naming_busy && FenceAtOrAfter(fence, g_naming_stamp)) return true;
+    return g_queue_has_stamp && FenceAtOrAfter(fence, g_queue_oldest_stamp);
+  };
+  if (!pending()) return;
+  // A safety net: never hold the GPU or the game for long if something is off.
+  if (!g_drained_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+        return !pending() || g_recorder_stop.load();
+      })) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXLOG_WARN("Native renderer: fence {:08X} waited 2 s for the recorder; going on", fence);
+    }
+  }
+}
+
+void OnGpuEventWrite(uint32_t physical_address, uint32_t value) {
+  if (physical_address == g_fence_physical.load(std::memory_order_relaxed) ||
+      physical_address == g_fence_physical_alt.load(std::memory_order_relaxed)) {
+    WaitNamedThrough(value);
+  }
+}
+
+// The oldest stamp still queued (under g_queue_mutex).
+void UpdateOldestStamp() {
+  g_queue_has_stamp = false;
+  for (const auto& j : g_queue) {
+    if (!j.end) {
+      g_queue_has_stamp = true;
+      g_queue_oldest_stamp = j.stamp;
+      return;
+    }
+  }
+}
+
+void EnqueueDraw(RecordedFrame* frame, size_t input, uint32_t stamp) {
+  {
+    std::lock_guard lock(g_queue_mutex);
+    if (!g_queue_has_stamp) {
+      g_queue_has_stamp = true;
+      g_queue_oldest_stamp = stamp;
+    }
+    QueuedJob j;
+    j.frame = frame;
+    j.input = input;
+    j.stamp = stamp;
+    g_queue.push_back(std::move(j));
+  }
+  g_queue_cv.notify_one();
+}
+
+void EnqueueEndOfFrame(std::unique_ptr<RecordedFrame> frame, bool hand_over) {
+  {
+    std::lock_guard lock(g_queue_mutex);
+    QueuedJob j;
+    j.frame = frame.get();
+    j.end = std::move(frame);
+    j.hand_over = hand_over;
+    g_queue.push_back(std::move(j));
+  }
+  g_queue_cv.notify_one();
+}
+
+void RecorderMain() {
+  qos::PreferPerformanceThread(L"amped3 native recorder", true);
+  rex::thread::set_current_thread_name("amped3 recorder");
+  RecordedFrame* naming = nullptr;  // the frame BeginNaming was last called for
+  while (!g_recorder_stop.load()) {
+    QueuedJob job;
+    {
+      std::unique_lock lock(g_queue_mutex);
+      g_queue_cv.wait(lock, [] { return g_recorder_stop.load() || !g_queue.empty(); });
+      if (g_queue.empty()) continue;
+      job = std::move(g_queue.front());
+      g_queue.pop_front();
+      if (!job.end) {
+        g_naming_busy = true;
+        g_naming_stamp = job.stamp;
+      }
+      UpdateOldestStamp();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (job.frame != naming) {
+      naming = job.frame;
+      BeginNaming();
+    }
+    if (!job.end) {
+      NameDraw(*job.frame, job.frame->inputs.At(job.input));
+    } else {
+      RecordedFrame& f = *job.end;
+      const size_t n = f.inputs.size();
+      for (size_t i = 0; i < n; ++i) {
+        DrawInputs& in = f.inputs.At(i);
+        if (in.draw < f.frame.draws.size()) ApplyNames(f.frame.draws[in.draw], in);
+      }
+      if (f.name_swap) f.frame.swap_data = TextureName(f, f.swap_fetch_words);
+      naming = nullptr;
+      if (job.hand_over) HandOver(std::move(job.end), g_prep_mutex, g_prep_cv, g_prep);
+      job.end.reset();
+    }
+    trace::Add(trace::Zone::kRecNaming,
+               std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count());
+    {
+      std::lock_guard lock(g_queue_mutex);
+      g_naming_busy = false;
+    }
+    g_drained_cv.notify_all();
+  }
+}
+
+void StopRecorder() {
+  if (g_deferred) rex::system::SetGpuEventWriteHook(nullptr);
+  g_recorder_stop = true;
+  g_queue_cv.notify_all();
+  g_drained_cv.notify_all();
+  if (g_recorder.joinable()) g_recorder.join();
+}
+
+}  // namespace
+
 void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string& vs_ucode,
             const std::string& ps_ucode) {
   if (!Recording()) return;
@@ -1694,10 +2049,15 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   d.ps = MicrocodeAlias(ps_ucode, 'P');
   auto* memory = GuestMemory();
 
+  // What the draw's resources are named from, copied from the device now.
   // Textures: the fetch constants the shaders read (all bound ones if a
   // shader couldn't be translated).
   const ShaderUse& vs_use = UseOf(vs_ucode, native::ShaderStage::kVertex);
   const ShaderUse& ps_use = UseOf(ps_ucode, native::ShaderStage::kPixel);
+  const bool deferred = DeferredNaming();
+  DrawInputs local;
+  DrawInputs& in = deferred ? g_frame->inputs.Add() : local;
+  in.draw = uint32_t(g_frame->frame.draws.size() - 1);
   uint32_t wanted = 0;
   if (vs_use.known && ps_use.known) {
     for (uint32_t t : vs_use.textures) wanted |= 1u << (t & 31);
@@ -1713,80 +2073,28 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
     // page in story scene 2.1.1 does this): the GPU reads the fetch constant
     // either way.
     if (!U32(base, dev + kTextures + 4 * s) && !RawTextureFetch(words)) continue;
-    native::FrameTexture t;
-    t.slot = s;
-    std::copy(words.begin(), words.end(), t.raw.begin());
-    SlotName& last = g_slot_names[s];
-    if (last.frame != g_record_frame || last.words != words) {
-      last.words = words;
-      last.name = TextureName(words);
-      last.frame = g_record_frame;
-    }
-    t.data = last.name;
-    d.textures.push_back(std::move(t));
+    in.textures.push_back({s, words});
   }
 
   lap(0);  // textures (and the draw's setup)
 
   // Vertex memory the vertex shader fetches.
-  if (memory) {
-    for (uint32_t vf : VertexFetchSlots(vs_ucode)) {
-      const uint32_t w0 = U32(base, dev + kFetchConsts + vf * 8);
-      const uint32_t w1 = U32(base, dev + kFetchConsts + vf * 8 + 4);
-      if ((w0 & 3) != 3) continue;
-      VertexFetchName& last = g_vf_names[vf % 96];
-      if (last.frame == g_record_frame && last.w0 == w0 && last.w1 == w1) {
-        d.vmem[vf] = last.name;
-        continue;
-      }
-      const uint32_t address = (w0 & ~3u) & 0x1FFFFFFF;
-      const uint32_t size = ((w1 >> 2) & 0xFFFFFF) * 4;
-      if (!address || !size || size > (64u << 20)) continue;
-      const uint64_t key = (uint64_t(address) << 32) | size;
-      auto it = g_blob_names.find(key);
-      if (it == g_blob_names.end()) {
-        std::string name = native::ShortName('M', (uint64_t(size) << 29) | address, 10);
-        auto& blob = g_frame->blobs[name];
-        if (!blob) blob = CachedVertexData(memory, name, address, size, &g_frame->versions[name]);
-        it = g_blob_names.emplace(key, std::move(name)).first;
-      }
-      d.vmem[vf] = it->second;
-      last.w0 = w0;
-      last.w1 = w1;
-      last.name = it->second;
-      last.frame = g_record_frame;
-    }
+  for (uint32_t vf : VertexFetchSlots(vs_ucode)) {
+    const uint32_t w0 = U32(base, dev + kFetchConsts + vf * 8);
+    const uint32_t w1 = U32(base, dev + kFetchConsts + vf * 8 + 4);
+    if ((w0 & 3) == 3) in.vertex_fetches.push_back({vf, w0, w1});
   }
 
   lap(1);
 
-  // Indices and user-pointer data.
-  if (call.kind == DrawCall::Kind::kIndexed && memory) {
+  // Indices and user-pointer data (user-pointer data is copied now: the game
+  // reuses that memory right away).
+  if (call.kind == DrawCall::Kind::kIndexed) {
     const uint32_t ib = U32(base, dev + kIndexBuffer);
     if (ib) {
-      const uint32_t address = U32(base, ib + 12), size = U32(base, ib + 16);
+      in.ib_address = U32(base, ib + 12);
+      in.ib_size = U32(base, ib + 16);
       d.index_32bit = (U32(base, ib) & 0x80000000u) != 0;
-      if (address && size && size <= (64u << 20)) {
-        const uint64_t key = (uint64_t(address) << 32) | size | (1ull << 31);  // not physical
-        auto it = g_blob_names.find(key);
-        if (it == g_blob_names.end()) {
-          std::string name = native::ShortName('I', (uint64_t(size) << 32) | address, 10);
-          // Index buffers are mostly static too: through the vertex cache
-          // when they are in physical memory (as Direct3D allocates them).
-          const uint32_t physical = memory->GetPhysicalAddress(address);
-          if (physical != UINT32_MAX && memory->GetPhysicalAddress(address + size - 1) ==
-                                            physical + size - 1) {
-            auto& blob = g_frame->blobs[name];
-            if (!blob) {
-              blob = CachedVertexData(memory, name, physical, size, &g_frame->versions[name]);
-            }
-          } else {
-            CopyGuest(name, memory->TranslateVirtual<const uint8_t*>(address), size);
-          }
-          it = g_blob_names.emplace(key, std::move(name)).first;
-        }
-        d.index_data = it->second;
-      }
     }
   }
   if (memory && call.up_indices && call.up_indices_size) {
@@ -1803,6 +2111,12 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
       CopyGuest(d.up_vertices, memory->TranslateVirtual<const uint8_t*>(call.up_vertices),
                 call.up_vertices_size);
     }
+  }
+  if (deferred) {
+    EnqueueDraw(g_frame.get(), g_frame->inputs.size() - 1, U32(base, dev + kCpuFence));
+  } else {
+    NameDraw(*g_frame, in);
+    ApplyNames(d, in);
   }
 
   lap(2);
@@ -1900,7 +2214,13 @@ void OnSwap(uint8_t* base, uint32_t front_buffer) {
       for (uint32_t i = 0; i < 10; ++i) words[i] = U32(base, front_buffer + 4 * i);
       std::copy(words.begin() + 4, words.end(), frame.swap_fetch.begin());
       frame.has_swap_fetch = true;
-      frame.swap_data = TextureName(frame.swap_fetch);
+      if (DeferredNaming()) {
+        g_frame->name_swap = true;
+        std::copy(frame.swap_fetch.begin(), frame.swap_fetch.end(),
+                  g_frame->swap_fetch_words.begin());
+      } else {
+        frame.swap_data = TextureName(*g_frame, frame.swap_fetch);
+      }
       frame.objects[front_buffer] = std::move(words);
     }
     g_frame->swap_time = std::chrono::steady_clock::now();
@@ -1924,7 +2244,11 @@ void OnSwap(uint8_t* base, uint32_t front_buffer) {
         if (IsGuestOutputExternal(presenter)) SetGuestOutputExternal(presenter, false);
       }
     }
-    if (enabled && !g_frame_overflow) {
+    if (DeferredNaming()) {
+      // The recorder thread names what is still queued, then hands the frame
+      // on (or drops it).
+      EnqueueEndOfFrame(std::move(g_frame), enabled && !g_frame_overflow);
+    } else if (enabled && !g_frame_overflow) {
       // To the prep thread (per-draw states), then the worker.
       HandOver(std::move(g_frame), g_prep_mutex, g_prep_cv, g_prep);
     }
@@ -1955,6 +2279,30 @@ Status GetStatus() {
   s.on = REXCVAR_GET(native_renderer);
   s.emulation_drawing = g_host_drawing_on.load();
   return s;
+}
+
+void OnRingBufferInitialized(uint8_t* base, uint32_t dev) {
+  if (!REXCVAR_GET(native_deferred_naming) || g_deferred) return;
+  auto* memory = GuestMemory();
+  const uint32_t fence = U32(base, dev + kGpuFencePointer);
+  if (!memory || !fence) return;
+  // The address the GPU stores the fence to: the physical address of the
+  // fence word (Direct3D computes it from the virtual one; both forms here).
+  g_fence_physical = memory->GetPhysicalAddress(fence);
+  g_fence_physical_alt = fence & 0x1FFFFFFF;
+  rex::system::SetGpuEventWriteHook(&OnGpuEventWrite);
+  g_deferred = true;
+  g_recorder_stop = false;
+  g_recorder = std::thread(RecorderMain);
+  REXLOG_INFO("Native renderer: deferred naming on (GPU fence word {:08X})", fence);
+}
+
+void BeforeCpuFenceStore(uint8_t* base, uint32_t dev) {
+  if (!g_deferred) return;
+  // sub_825A3330 stores the fence itself when the device's 20416 word is 0
+  // and flag 0x04 at +10433 is set: only then wait here.
+  if (U32(base, dev + 20416) != 0 || !(base[dev + 10433] & 0x04)) return;
+  WaitNamedThrough(U32(base, dev + kCpuFence));
 }
 
 }  // namespace amped3::live

@@ -77,6 +77,8 @@ REX_EXTERN(__imp__D3D_BlockOnFence);
 REX_EXTERN(__imp__D3DDevice_BlockUntilIdle);
 REX_EXTERN(__imp__D3DResource_BlockUntilNotBusy);
 REX_EXTERN(__imp__D3D_MakeSpace);
+REX_EXTERN(__imp__D3D_InitializeRingBuffer);
+REX_EXTERN(__imp__sub_825A3330);
 
 namespace amped3::capture {
 namespace {
@@ -1129,6 +1131,24 @@ extern "C" REX_FUNC(D3D_FlushDirtyState) {
 extern "C" REX_FUNC(D3D_BlockOnFence) {
   amped3::trace::Scope scope(amped3::trace::Zone::kFenceWait);
   __imp__D3D_BlockOnFence(ctx, base);
+}
+
+// D3D_InitializeRingBuffer(pDevice): sets up the ring buffer and the device's
+// pointer to the GPU-written fence (device+10384); deferred naming starts
+// right after.
+extern "C" REX_FUNC(D3D_InitializeRingBuffer) {
+  const uint32_t dev = ctx.r3.u32;
+  __imp__D3D_InitializeRingBuffer(ctx, base);
+  amped3::live::OnRingBufferInitialized(base, dev);
+}
+
+// 825A3330 (pDevice, pPackets): inserts a fence, the device's CPU fence
+// (device+10396, then +2): writes the EVENT_WRITE_SHD packets that make the
+// GPU store it, and in some phases stores it from the CPU right away. With
+// deferred naming that store waits for the recorder.
+extern "C" REX_FUNC(sub_825A3330) {
+  amped3::live::BeforeCpuFenceStore(base, ctx.r3.u32);
+  __imp__sub_825A3330(ctx, base);
 }
 
 extern "C" REX_FUNC(D3DDevice_BlockUntilIdle) {
