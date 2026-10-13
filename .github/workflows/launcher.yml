@@ -50,9 +50,24 @@ jobs:
 
       - name: Configure and build (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
-          cmake -S launcher -B build -A x64
-          cmake --build build --config Release
+          cmake -S launcher -B build -A x64 2>&1 | tee configure.log
+          cmake --build build --config Release 2>&1 | tee build.log
+          test -f build/Release/amped3-launcher.exe
+
+      # Compiler errors as annotations, readable without the full log.
+      - name: Report errors
+        if: failure()
+        shell: bash
+        run: |
+          for f in configure.log build.log; do
+            [ -f "$f" ] || continue
+            grep -E "error" "$f" | head -20 | while IFS= read -r line; do
+              echo "::error::${line//%/%25}"
+            done
+          done
+          exit 0
 
       - name: Name the file
         shell: bash

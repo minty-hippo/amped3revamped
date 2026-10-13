@@ -320,6 +320,7 @@ bool RunGame(const std::filesystem::path& exe, const std::filesystem::path& cwd,
   WaitForSingleObject(pi.hProcess, INFINITE);
   CloseHandle(pi.hProcess);
   ExitProcess(0);
+  return true;
 #else
   if (chdir(cwd.c_str()) != 0) {
     if (error) *error = "couldn't enter " + cwd.string();
