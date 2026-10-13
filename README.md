@@ -104,7 +104,62 @@ them into `save\` (the old folder is left as a backup). `--user_data_root`,
 - Optional: turn on **Developer Mode** (Settings → System → For developers) so
   the SDK's symlinks check out properly. The script works around them if it's off.
 
-## Install from the ISO (easiest)
+## Install with the launcher (easiest)
+
+Download the launcher for your system from the
+[Releases](https://github.com/minty-hippo/amped3revamped/releases) page and run
+it:
+
+| System | File |
+|---|---|
+| Windows | `amped3-launcher-windows-x64.exe` |
+| Linux, SteamOS (x86_64) | `amped3-launcher-linux-x86_64` |
+| Armada and other ARM handhelds (arm64) | `amped3-launcher-linux-arm64` |
+
+The launcher contains nothing from the game. It downloads this project's
+sources from GitHub and builds the game on your computer from your own Amped 3
+(USA) disc image (`.iso`, a redump/XGD2 rip).
+
+**First run:**
+
+1. Pick the disc image. The launcher lists the `.iso` files it finds in your
+   home, Downloads, Documents and Desktop folders and on removable drives;
+   select the row to browse for another one.
+2. Pick the branch: `main`, or `experimental` for the newest work.
+3. Check the install folder (default `Games/Amped3Revamped` in your user
+   folder). You need about 40 GB free.
+4. Select **Build and install** (twice, to confirm). The build's output
+   scrolls in the launcher and is saved to a log. The first build takes about
+   an hour on a PC and several hours on a handheld.
+
+Under the hood it runs the same installers as the manual routes below:
+`Install-Amped3.ps1` on Windows (it offers to install the build tools with
+winget), and `install.sh` on Linux (in a podman container on SteamOS and
+Armada).
+
+**Afterwards** the launcher opens on:
+
+- **Play.**
+- **Update branch / Update:** gets the chosen branch and rebuilds. The status
+  says whether there's anything new.
+- **Check for updates:** lists the changes on the branch since your install.
+- **Start the game directly:** the launcher starts the game at once next
+  time. Hold LB / View on a controller, or Shift, while it starts to see the
+  launcher.
+- **Desktop shortcut** (Windows) or **Add to Steam / menu** (Linux): points
+  at the launcher's copy in the install folder.
+- The installed version (branch, commit and date) is under the title.
+
+It works with a controller (d-pad or stick, A), the keyboard (arrows, Enter)
+and the mouse, and opens full screen in Steam's Game Mode. Its settings are in
+`%APPDATA%\Amped3Revamped\launcher.ini` (Windows) or
+`~/.config/amped3-revamped/launcher.ini` (Linux), with the logs of each
+install or update beside them.
+
+To build the launcher yourself: `cmake -S launcher -B out/launcher` and
+`cmake --build out/launcher --config Release` (it fetches SDL3 and Dear ImGui).
+
+## Install from the ISO with the scripts
 
 Double-click **`Install Amped 3 Revamped.bat`** in the project folder. It will:
 
@@ -323,6 +378,7 @@ hook plus a setting that switches it on:
 | `setup.ps1` | Builds the SDK and the port, with logs |
 | `src/amped3_app.*` | App hooks: GPU plugin, game path, menu hotkeys, input gating |
 | `src/options_menu.*` | The options menu |
+| `launcher/`, `.github/workflows/launcher.yml` | The launcher (SDL3 + Dear ImGui), and the build that publishes it |
 | `src/pad_bridge.*` | Controller reads for the menu, and keeping the game's input idle while it's open |
 | `overlay/CMakeLists.txt` | Build file, copied in after `rexglue init` |
 | `amped3_functions.toml` | Your recompiler hints (loaded last, so they win) |

@@ -7,6 +7,7 @@
 #   ./install.sh [--iso <image.iso>] [--game-dir <extracted game>]
 #                [--install-dir <folder>] [--config Release|RelWithDebInfo]
 #                [--container | --native] [--upscale-textures yes|no] [--yes]
+#                [--update]
 #
 #  1. Extracts the game from the ISO into <install folder>/game and checks it.
 #  2. Builds (setup.sh): natively when Clang 20+, CMake and Ninja are there,
@@ -14,11 +15,13 @@
 #  3. Puts the game together in the install folder (portable: move it
 #     anywhere), with a launcher and a desktop entry to add to Steam.
 #  4. Optionally upscales the game's textures (x86_64).
+# --update (the launcher, and update.sh): installs or rebuilds without asking
+# anything, and leaves the menu entry and Steam to the launcher.
 # The build takes a long time the first time (hours on a handheld) and needs
 # about 40 GB free. Logs go to ./logs/.
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; YES=0
+ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; YES=0; UPDATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,6 +33,7 @@ while [ $# -gt 0 ]; do
     --native) MODE=native; shift ;;
     --upscale-textures) UPSCALE="$2"; shift 2 ;;
     --yes|-y) YES=1; shift ;;
+    --update) UPDATE=1; YES=1; shift ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
@@ -89,12 +93,16 @@ fi
 
 # ---------------------------------------------------------------------------
 step 'Building - the first build takes a long time'
+# The same test setup.sh makes (clang and clang++ of one version, 20 or
+# newer), plus CMake, Ninja and Git; anything less builds in the container.
 have_tools() {
-  local c
-  for c in clang-22 clang-21 clang-20 clang; do
-    command -v "$c" >/dev/null || continue
-    local m; m="$("$c" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)"
-    [ -n "$m" ] && [ "$m" -ge 20 ] && command -v cmake >/dev/null && command -v ninja >/dev/null && command -v git >/dev/null && return 0
+  local v c cxx m
+  command -v cmake >/dev/null && command -v ninja >/dev/null && command -v git >/dev/null || return 1
+  for v in 22 21 20 ''; do
+    c="clang${v:+-$v}"; cxx="clang++${v:+-$v}"
+    command -v "$c" >/dev/null && command -v "$cxx" >/dev/null || continue
+    m="$("$c" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)"
+    [ -n "$m" ] && [ "$m" -ge 20 ] && return 0
   done
   return 1
 }
@@ -118,12 +126,16 @@ step 'Putting the game together'
 copied=0
 for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.*; do
   [ -e "$f" ] || continue
-  cp -a "$f" "$INSTALL_DIR"/; copied=$((copied + 1))
+  # A running game (the launcher's Update) has these mapped: replace the file
+  # rather than writing into it.
+  cp -a --remove-destination "$f" "$INSTALL_DIR"/; copied=$((copied + 1))
 done
 if [ -d "$BUILD_DIR/textures" ]; then
   mkdir -p "$INSTALL_DIR/textures"; cp -a "$BUILD_DIR/textures"/. "$INSTALL_DIR/textures"/
 fi
 [ -f "$INSTALL_DIR/amped3.toml" ] || cp "$PROJECT_DIR/amped3.defaults.toml" "$INSTALL_DIR/amped3.toml"
+# Where the sources are, for the launcher's Update (update.sh).
+printf '%s\n' "$PROJECT_DIR" > "$INSTALL_DIR/source.path"
 note "$copied file(s) copied"
 
 # A launcher (what Steam runs) and a desktop entry (Steam's "Add a Non-Steam
@@ -135,9 +147,12 @@ cat > "$LAUNCHER" <<'EOF'
 cd "$(dirname "$0")" && exec ./amped3 "$@"
 EOF
 chmod +x "$LAUNCHER"
-DESKTOP="$HOME/.local/share/applications/amped3-revamped.desktop"
-mkdir -p "$(dirname "$DESKTOP")"
-cat > "$DESKTOP" <<EOF
+# The menu entry and Steam: with --update the launcher (amped3-launcher) makes
+# its own, pointing at itself.
+if [ "$UPDATE" -eq 0 ]; then
+  DESKTOP="$HOME/.local/share/applications/amped3-revamped.desktop"
+  mkdir -p "$(dirname "$DESKTOP")"
+  cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Amped 3 Revamped
@@ -147,10 +162,11 @@ Path=$INSTALL_DIR
 Terminal=false
 Categories=Game;
 EOF
-note "Launcher: $LAUNCHER"
-note "Desktop entry: $DESKTOP"
-if command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then
-  steamos-add-to-steam "$DESKTOP" || warn 'steamos-add-to-steam failed; add it from Steam (Games > Add a Non-Steam Game).'
+  note "Launcher: $LAUNCHER"
+  note "Desktop entry: $DESKTOP"
+  if command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then
+    steamos-add-to-steam "$DESKTOP" || warn 'steamos-add-to-steam failed; add it from Steam (Games > Add a Non-Steam Game).'
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -302,6 +302,8 @@ run_logged build cmake --build --preset "$PRESET"
 # Lets the build be run in place: amped3 reads the game folder from here when
 # there's no game/ folder next to it (install.sh's install folder has one).
 printf '%s\n' "$GAME_DIR" > "$BUILD_DIR/game.path"
+# Where the sources are, for the launcher's Update (update.sh).
+printf '%s\n' "$PROJECT_DIR" > "$BUILD_DIR/source.path"
 
 printf '\n\033[32mBuilt: %s\033[0m\n' "$EXE"
 note 'In game: Back+Start (or F1) opens the options menu. F3 performance overlay, F4 every setting.'

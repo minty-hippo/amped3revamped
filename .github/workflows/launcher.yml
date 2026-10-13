@@ -1,0 +1,91 @@
+# Builds the launcher (launcher/) for Windows, Linux x86_64 and Linux arm64.
+# Every run keeps the three files as artifacts; a tag named launcher-v* also
+# publishes them as a release. The launcher holds nothing from the game: it
+# downloads these sources and builds the game from the player's own disc image.
+name: Launcher
+
+on:
+  push:
+    paths: ['launcher/**', '.github/workflows/launcher.yml']
+    tags: ['launcher-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            name: amped3-launcher-windows-x64.exe
+            file: build/Release/amped3-launcher.exe
+          - os: ubuntu-22.04
+            name: amped3-launcher-linux-x86_64
+            file: build/amped3-launcher
+          - os: ubuntu-22.04-arm
+            name: amped3-launcher-linux-arm64
+            file: build/amped3-launcher
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies (SDL3's X11 / Wayland / D-Bus, loaded at run time)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libx11-dev libxext-dev libxrandr-dev \
+            libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libdecor-0-dev libdbus-1-dev libudev-dev libdrm-dev libgbm-dev
+
+      - name: Configure and build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S launcher -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          strip build/amped3-launcher
+
+      - name: Configure and build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S launcher -B build -A x64
+          cmake --build build --config Release
+
+      - name: Name the file
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.file }}" "dist/${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/launcher-v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Linux files are executable
+        run: chmod +x dist/amped3-launcher-linux-*
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          name: Launcher ${{ github.ref_name }}
+          body: |
+            The Amped 3 Revamped launcher. Download the one for your system, run it, choose your
+            Amped 3 (Xbox 360) disc image and select Build and install. It downloads this
+            project's sources and builds the game on your computer; nothing from the game is
+            included or downloaded.
+
+            - Windows: amped3-launcher-windows-x64.exe
+            - Linux / SteamOS (x86_64): amped3-launcher-linux-x86_64
+            - Linux ARM handhelds such as Armada (arm64): amped3-launcher-linux-arm64
