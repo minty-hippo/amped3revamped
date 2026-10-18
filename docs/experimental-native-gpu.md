@@ -305,3 +305,34 @@ deferred naming, three without.
   (SDK patch 0023: waits on several handles busy-looped on Linux), and the
   GPU Commands thread 14% (likely patch 0024's case: it spun 500 times at
   every idle moment). Both are changed for the next build.
+
+## Renderer: fewer render passes (GPU)
+
+On a tile-based GPU (Adreno on Armada, Mali) every render pass writes its
+attachments out to memory at the end and reads them back at the start of the
+next pass on them. The renderer broke passes more often than the game's
+drawing needs:
+
+- **Texture uploads ended the pass in progress.** A texture seen for the
+  first time (and every video frame) was copied into place in the middle of
+  the frame's commands, which can't happen inside a pass. Uploads now go to a
+  command buffer of their own that runs before the frame's.
+- **Every clear was a pass of its own** (the game clears its render targets
+  and, with EDRAM tiling, each tile after resolving it). A clear now waits
+  for the next pass on its image and becomes that pass's load op, or runs
+  inside the pass already drawing to it (`vkCmdClearAttachments`). Tile
+  clears are collected until they cover the image. Clears of render targets
+  after their last use carry over to the next frame's first pass on them.
+  Setting `native_merge_clears` (on) switches it off for comparison.
+
+Replays of five captures (`amped3-replay`, SwiftShader; also with motion,
+speed and object blur, fog, god rays and a 1.5x scale; and with the frame
+drawn three times so carried clears are used) give pixel-identical pictures.
+A ride capture's first frame went from 198 render passes to 63 (135 had been
+broken by uploads); in every capture the 11-22 clear passes per frame are
+gone: 5 clears become load ops.
+
+New in the log every 5 s: render passes and clears per frame, and the GPU
+time by part (`GPU by part`: what drew into each render target up to its
+resolve, then the output passes), measured with timestamps. That shows which
+passes cost the most on the Armada's GPU.

@@ -178,6 +178,18 @@ struct RenderStats {
   uint32_t arena_resets = 0;
   double arena_mb = 0;
   double texture_cache_mb = 0;
+  // Render passes begun, and clears: done as a pass of their own, folded
+  // into the next pass that draws to the image (its load op), or done inside
+  // the pass already drawing to it (SetMergeClears).
+  uint32_t passes = 0, clear_passes = 0, clears_merged = 0, clears_in_pass = 0;
+};
+
+// The GPU time of a frame's parts (Renderer::GpuParts), in order: what ran
+// up to each resolve (named by the render target it copies from), and the
+// output passes.
+struct GpuPart {
+  std::string name;
+  double ms = 0;
 };
 
 class Renderer {
@@ -215,6 +227,11 @@ class Renderer {
   // parts of the level), not only the characters drawn after it. Costs a
   // few ms of CPU per frame: every scene draw is matched and drawn again.
   void SetSceneryObjectBlur(bool on);
+  // Clears folded into the next render pass on the image (its load op) or
+  // done inside the pass drawing to it, instead of a pass of their own (fewer
+  // passes; tile-based GPUs such as Adreno avoid writing and reading back the
+  // whole image). Applies from the next frame.
+  void SetMergeClears(bool on);
   // Upscaler inputs for the following frames: the time since the last frame
   // (ms) and FSR's sharpening (0..1).
   void SetUpscaleParams(float frame_ms, float sharpness);
@@ -260,6 +277,8 @@ class Renderer {
   // The GPU time frame `ticket` took, start to end (ms), after WaitFrame; -1
   // when the device has no timestamps or the frame is gone.
   double GpuFrameMs(uint64_t ticket);
+  // The GPU time of the frame's parts (empty if not measured). After WaitFrame.
+  std::vector<GpuPart> GpuParts(uint64_t ticket);
   // The packed output of frame `ticket` (non-shared output request), after
   // WaitFrame. False if that frame is no longer available.
   bool ReadOutput(uint64_t ticket, std::vector<uint8_t>* packed);

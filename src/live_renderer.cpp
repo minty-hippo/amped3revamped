@@ -17,6 +17,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -61,6 +62,11 @@ REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
+REXCVAR_DEFINE_BOOL(native_merge_clears, true, "GPU",
+                    "Native renderer: a clear waits for the next pass that draws to its image "
+                    "and becomes that pass's load op (or is done inside the pass already drawing "
+                    "to it), instead of a render pass of its own. Fewer passes, and tile-based "
+                    "GPUs (Adreno, Mali) don't write the whole image out and read it back.");
 REXCVAR_DEFINE_BOOL(native_skip_draw_commands, true, "GPU",
                     "Native renderer: while the emulated GPU doesn't draw (and "
                     "native_skip_state_writes is on), DrawVertices and DrawIndexedVertices "
@@ -1144,6 +1150,11 @@ struct Timings {
   // Sampled frames: the worker's draw recording by part (RenderStats::draw_part_ms).
   double parts[9] = {};
   uint32_t part_frames = 0;
+  // Render passes and clears (RenderStats).
+  uint64_t passes = 0, clear_passes = 0, clears_merged = 0, clears_in_pass = 0;
+  // GPU time by part (Renderer::GpuParts), summed per name; frames measured.
+  std::map<std::string, double> gpu_parts;
+  uint32_t gpu_part_frames = 0;
 };
 constexpr double kSlowFrameMs = 20.0;
 std::mutex g_timing_mutex;
@@ -1205,6 +1216,27 @@ void LogTimings(bool shared) {
         "Vulkan commands {:.2f}, after {:.2f}",
         t.part_frames, t.parts[0] * k, t.parts[1] * k, t.parts[2] * k, t.parts[3] * k,
         t.parts[4] * k, t.parts[5] * k, t.parts[6] * k, t.parts[7] * k, t.parts[8] * k);
+  }
+  REXLOG_INFO(
+      "Native renderer: per frame {:.1f} render passes; clears: {:.1f} as passes of their own, "
+      "{:.1f} folded into a pass's load op, {:.1f} inside a pass",
+      double(t.passes) / n, double(t.clear_passes) / n, double(t.clears_merged) / n,
+      double(t.clears_in_pass) / n);
+  if (t.gpu_part_frames) {
+    // The biggest parts first.
+    std::vector<std::pair<double, std::string>> parts;
+    double sum = 0;
+    for (const auto& [name, ms] : t.gpu_parts) {
+      parts.push_back({ms / t.gpu_part_frames, name});
+      sum += ms / t.gpu_part_frames;
+    }
+    std::sort(parts.rbegin(), parts.rend());
+    std::string text;
+    for (size_t i = 0; i < parts.size() && i < 10; ++i) {
+      text += fmt::format("{}{} {:.2f}", i ? ", " : "", parts[i].second, parts[i].first);
+    }
+    REXLOG_INFO("Native renderer: GPU by part ({:.2f} ms per frame, {} parts): {}", sum,
+                parts.size(), text);
   }
   g_timings = {};
   g_draw_ms_total = {};
@@ -1330,6 +1362,14 @@ void WorkerMain() {
     const double gpu_ms = renderer->WaitFrame(pending.ticket);
     last_gpu_wait = gpu_ms;
     perf::ReportGpuFrame(renderer->GpuFrameMs(pending.ticket));
+    {
+      const auto parts = renderer->GpuParts(pending.ticket);
+      if (!parts.empty()) {
+        std::lock_guard lock(g_timing_mutex);
+        for (const auto& part : parts) g_timings.gpu_parts[part.name] += part.ms;
+        ++g_timings.gpu_part_frames;
+      }
+    }
     const auto t_present = Clock::now();
     rex::ui::Presenter* presenter = g_presenter ? g_presenter() : nullptr;
     if (!presenter || !REXCVAR_GET(native_renderer) || g_stop) return;
@@ -1548,6 +1588,7 @@ void WorkerMain() {
         renderer->SetFog(revamped && REXCVAR_GET(native_fog) ? float(REXCVAR_GET(native_fog_density)) : 0.0f,
                          float(REXCVAR_GET(native_fog_start)));
         renderer->SetFoliageFade(revamped && REXCVAR_GET(native_foliage_fade));
+        renderer->SetMergeClears(REXCVAR_GET(native_merge_clears));
         renderer->SetMapClouds(revamped && REXCVAR_GET(native_map_clouds));
         renderer->SetHideInterface(g_hide_interface.load());
         // The game state machine (0x828901E0) + 8: 7 = the trail map.
@@ -1606,6 +1647,10 @@ void WorkerMain() {
         g_timings.states += states_ms;
         g_timings.prepass += stats.prepass_ms;
         g_timings.draw += stats.record_ms;
+        g_timings.passes += stats.passes;
+        g_timings.clear_passes += stats.clear_passes;
+        g_timings.clears_merged += stats.clears_merged;
+        g_timings.clears_in_pass += stats.clears_in_pass;
         if (stats.draw_parts_sampled) {
           for (int k = 0; k < 9; ++k) g_timings.parts[k] += stats.draw_part_ms[k];
           ++g_timings.part_frames;

@@ -108,6 +108,8 @@ struct Image {
   // A texture replacement (texture_replace.h): bigger than the guest's, with
   // its own mip chain, sampled with every level and linear filtering.
   bool replaced = false;
+  // A render target (GetTarget): draws never sample one directly.
+  bool target = false;
   // Memory from a shared block (Gpu::SubAllocate) instead of its own
   // allocation: the block's index and the range taken (-1: its own).
   int block = -1;
@@ -784,16 +786,26 @@ class Gpu {
     return cb;
   }
 
-  // Submits without waiting; `fence` signals when done.
-  void SubmitFenced(VkCommandBuffer cb, VkFence fence) {
+  // Submits without waiting; `fence` signals when done. `first` (ended by
+  // the caller, may be null) runs before `cb`.
+  void SubmitFenced(VkCommandBuffer cb, VkFence fence, VkCommandBuffer first = VK_NULL_HANDLE) {
     vk::vkEndCommandBuffer(cb);
+    VkCommandBuffer cbs[2] = {first, cb};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
+    si.commandBufferCount = first ? 2 : 1;
+    si.pCommandBuffers = first ? cbs : &cbs[1];
     vk::Check(vk::vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
   }
 
-  void Submit(VkCommandBuffer cb) {
+  void Submit(VkCommandBuffer cb, VkCommandBuffer first = VK_NULL_HANDLE) {
+    if (first) {
+      VkSubmitInfo fi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      fi.commandBufferCount = 1;
+      fi.pCommandBuffers = &first;
+      vk::Check(vk::vkQueueSubmit(queue, 1, &fi, VK_NULL_HANDLE), "vkQueueSubmit");
+      vk::Check(vk::vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+      vk::vkFreeCommandBuffers(device, pool, 1, &first);
+    }
     vk::vkEndCommandBuffer(cb);
     // Profiling the CPU side under a tool that can't run the driver's GPU
     // work (callgrind with SwiftShader): AMPED3_PROFILE_NO_SUBMIT=1 records
@@ -1077,7 +1089,7 @@ struct Renderer::Impl {
     if (upscaler_) upscaler_status_ = upscaler_->description();
     cb_ = gpu_.BeginCommands();
     CreateOnce();
-    gpu_.Submit(cb_);
+    gpu_.Submit(cb_, TakeUploads());
     cb_ = VK_NULL_HANDLE;
   }
   ~Impl();
@@ -1095,10 +1107,36 @@ struct Renderer::Impl {
     std::vector<Image> retired;
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkCommandBuffer upload_cb = VK_NULL_HANDLE;  // ran before cb (texture uploads)
     bool pending = false;
     uint64_t ticket = 0;
     bool timed = false;  // GPU timestamps at the frame's start and end (ts_pool_)
+    // GPU time by part (part_pool_): the name of what ended at each timestamp
+    // after the first.
+    std::vector<std::string> part_names;
   };
+  // Texture uploads of the frame being recorded: their own command buffer,
+  // submitted before the frame's, so an upload never ends a render pass.
+  VkCommandBuffer upload_cb_ = VK_NULL_HANDLE;
+  VkCommandBuffer UploadCommands() {
+    if (!upload_cb_) upload_cb_ = gpu_.BeginCommands();
+    return upload_cb_;
+  }
+  // Ends the uploads (made visible to everything after); null if none.
+  VkCommandBuffer TakeUploads() {
+    VkCommandBuffer cb = upload_cb_;
+    upload_cb_ = VK_NULL_HANDLE;
+    if (cb) {
+      FullBarrier(cb);
+      vk::vkEndCommandBuffer(cb);
+    }
+    return cb;
+  }
+  VkQueryPool part_pool_ = VK_NULL_HANDLE;  // kMaxParts timestamps per slot
+  static constexpr uint32_t kMaxParts = 64;
+  FrameSlot* cur_slot_ = nullptr;           // the frame being recorded (async)
+  // Timestamp after what was recorded so far, named (outside a rendering scope).
+  void MarkPart(const std::string& name);
   FrameSlot slots_[2];
   VkQueryPool ts_pool_ = VK_NULL_HANDLE;  // two timestamps per slot
   uint32_t next_slot_ = 0;
@@ -1123,6 +1161,8 @@ struct Renderer::Impl {
     vk::vkResetFences(gpu_.device, 1, &fs.fence);
     vk::vkFreeCommandBuffers(gpu_.device, gpu_.pool, 1, &fs.cb);
     fs.cb = VK_NULL_HANDLE;
+    if (fs.upload_cb) vk::vkFreeCommandBuffers(gpu_.device, gpu_.pool, 1, &fs.upload_cb);
+    fs.upload_cb = VK_NULL_HANDLE;
     fs.pending = false;
     for (auto& b : fs.staging) gpu_.DestroyBuffer(b);
     fs.staging.clear();
@@ -1596,6 +1636,39 @@ struct Renderer::Impl {
   // z = 1 where an object's own motion is known).
   bool object_blur_ = false;
   bool scenery_blur_ = false;  // SetSceneryObjectBlur
+  // SetMergeClears: clears wait for the next pass on their image (its load
+  // op), or run inside the pass drawing to it.
+  bool merge_clears_ = true;
+  struct PendingClear {
+    bool color = false, depth = false, stencil = false;
+    float rgba[4] = {};
+    float z = 0;
+    uint32_t s = 0;
+    // Parts of the image so far (tiles resolved one after another, each
+    // cleared): a pass's load op takes it once they cover all of it.
+    std::vector<VkRect2D> rects;
+  };
+  // The barrier of a resolve reading `rect` of `src`: only clears waiting for
+  // that part of `src` are done first; the rest (other images, the other
+  // tiles of `src`) may go on waiting.
+  void ResolveBarrier(const Image* src, const VkRect2D& rect);
+  // Clears waiting for `src` (all of it, or the parts overlapping `rect`)
+  // and for `dst`; with no `src`, every one.
+  void FlushPendingClearsExcept(const Image* src, const VkRect2D* rect,
+                                const Image* dst = nullptr);
+  std::unordered_map<Image*, PendingClear> pending_clears_;
+  // A full barrier, after the clears still waiting (they come first).
+  void Barrier();
+  void FlushPendingClears();
+  // DoDraw's pass: clears waiting for other render targets may go on
+  // waiting (a draw samples textures and resolves, never a target).
+  bool keep_target_clears_ = false;
+  // Does the waiting clears except render targets other than `but` / `but2`,
+  // which may go on waiting (into the next frame: its first pass on them
+  // takes them as load ops).
+  void FlushPendingClearsKeepTargets(const Image* but, const Image* but2);
+  void ClearImageNow(Image* im, const float* color, float z, uint32_t stencil, bool c, bool zf,
+                     bool s, const VkRect2D* rect);
   struct VelDraw {
     VkPipeline pipeline;
     VkDescriptorSet tex_sets[2];
@@ -1775,10 +1848,10 @@ struct Renderer::Impl {
     if (!vel_resolved_) {
       // One sample per pixel for the blur: the samples' average.
       EndRendering();
-      FullBarrier(cb_);
+      Barrier();
       CopyPass(CopyKind::kColorMs, &vel_img_, &vel_single_, 0, false, 0, vel_img_.samples, 0, 0,
                0, 0, vel_img_.width, vel_img_.height);
-      FullBarrier(cb_);
+      Barrier();
       dyn_ = DynState{};
       vel_resolved_ = true;
     }
@@ -2025,15 +2098,17 @@ Image* Renderer::Impl::GetTargetUncached(const TargetKey& base_key, bool resolve
   im.scaled = true;
   im.scale = ts;
   ToGeneral(cb_, im);
+  im.target = true;
   Image& stored = targets_[key] = im;
+  pending_clears_.erase(&stored);
   const float zero[4] = {0, 0, 0, 0};
   ClearImage(&stored, zero, 0.0f, 0, !key.depth, key.depth, key.depth);
   log_ << "created " << name << "\n";
   return &stored;
 }
 
-void Renderer::Impl::ClearImage(Image* im, const float* color, float z, uint32_t stencil, bool c,
-                          bool zf, bool s, const VkRect2D* rect) {
+void Renderer::Impl::ClearImageNow(Image* im, const float* color, float z, uint32_t stencil,
+                                   bool c, bool zf, bool s, const VkRect2D* rect) {
   const bool was_rendering = rendering_;
   auto colors = cur_colors_;
   auto depth = cur_depth_;
@@ -2065,11 +2140,186 @@ void Renderer::Impl::ClearImage(Image* im, const float* color, float z, uint32_t
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &att;
   }
-  FullBarrier(cb_);
+  Barrier();  // clears still waiting for other images come first
   vk::vkCmdBeginRendering(cb_, &ri);
   vk::vkCmdEndRendering(cb_);
   FullBarrier(cb_);
+  ++stats_.clear_passes;
   if (was_rendering) BeginRendering(colors, depth);
+}
+
+void Renderer::Impl::ClearImage(Image* im, const float* color, float z, uint32_t stencil, bool c,
+                                bool zf, bool s, const VkRect2D* rect) {
+  if (!merge_clears_) return ClearImageNow(im, color, z, stencil, c, zf, s, rect);
+  if (im->depth ? !(zf || s) : !c) return;
+  // Inside the pass drawing to it: cleared there, the pass goes on.
+  if (rendering_) {
+    int index = -1;
+    if (im->depth) {
+      if (cur_depth_ == im) index = 0;
+    } else {
+      for (size_t i = 0; i < cur_colors_.size(); ++i) {
+        if (cur_colors_[i] == im) index = int(i);
+      }
+    }
+    if (index >= 0) {
+      VkClearAttachment ca{};
+      if (im->depth) {
+        ca.aspectMask = (zf ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) | (s ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        ca.clearValue.depthStencil = {z, stencil};
+      } else {
+        ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ca.colorAttachment = uint32_t(index);
+        for (int i = 0; i < 4; ++i) ca.clearValue.color.float32[i] = color[i];
+      }
+      uint32_t w = UINT32_MAX, h = UINT32_MAX;  // the pass's area
+      for (Image* c_im : cur_colors_) w = std::min(w, c_im->width), h = std::min(h, c_im->height);
+      if (cur_depth_) w = std::min(w, cur_depth_->width), h = std::min(h, cur_depth_->height);
+      VkClearRect cr{};
+      cr.rect = rect ? *rect : VkRect2D{{0, 0}, {w, h}};
+      cr.rect.offset.x = std::min<int32_t>(cr.rect.offset.x, int32_t(w));
+      cr.rect.offset.y = std::min<int32_t>(cr.rect.offset.y, int32_t(h));
+      cr.rect.extent.width = std::min(cr.rect.extent.width, w - uint32_t(cr.rect.offset.x));
+      cr.rect.extent.height = std::min(cr.rect.extent.height, h - uint32_t(cr.rect.offset.y));
+      cr.layerCount = 1;
+      // The pass may not cover all of the image (another attachment is
+      // smaller): then as before.
+      const bool covers = rect || (w == im->width && h == im->height);
+      if (covers && cr.rect.extent.width && cr.rect.extent.height) {
+        vk::vkCmdClearAttachments(cb_, 1, &ca, 1, &cr);
+        ++stats_.clears_in_pass;
+        return;
+      }
+      if (covers) return;  // an empty rectangle
+    }
+  }
+  // All of the image: waits for the next pass on it (its load op clears).
+  const bool whole = !rect || (rect->offset.x == 0 && rect->offset.y == 0 &&
+                               rect->extent.width >= im->width && rect->extent.height >= im->height);
+  if (!whole) {
+    // A part: collected while the same clear covers the image part by part
+    // (EDRAM tiles), else done now.
+    auto it = pending_clears_.find(im);
+    const bool same =
+        it != pending_clears_.end() && !it->second.rects.empty() &&
+        (im->depth ? (it->second.depth == zf && it->second.stencil == s &&
+                      (!zf || it->second.z == z) && (!s || it->second.s == stencil))
+                   : (it->second.color && std::equal(color, color + 4, it->second.rgba)));
+    if (it != pending_clears_.end() && !same) FlushPendingClears();  // in order
+    if (it == pending_clears_.end() || !same) {
+      PendingClear p;
+      if (im->depth) {
+        p.depth = zf, p.z = z, p.stencil = s, p.s = stencil;
+      } else {
+        p.color = true;
+        std::copy(color, color + 4, p.rgba);
+      }
+      p.rects.push_back(*rect);
+      pending_clears_[im] = std::move(p);
+      return;
+    }
+    PendingClear& p = it->second;
+    p.rects.push_back(*rect);
+    // Covered: every cell between the rectangles' edges inside one of them.
+    std::vector<int64_t> xs = {0, int64_t(im->width)}, ys = {0, int64_t(im->height)};
+    for (const VkRect2D& r : p.rects) {
+      xs.push_back(r.offset.x), xs.push_back(int64_t(r.offset.x) + r.extent.width);
+      ys.push_back(r.offset.y), ys.push_back(int64_t(r.offset.y) + r.extent.height);
+    }
+    std::sort(xs.begin(), xs.end());
+    std::sort(ys.begin(), ys.end());
+    bool covered = true;
+    for (size_t i = 0; covered && i + 1 < xs.size(); ++i) {
+      if (xs[i] == xs[i + 1] || xs[i] >= int64_t(im->width)) continue;
+      for (size_t j = 0; covered && j + 1 < ys.size(); ++j) {
+        if (ys[j] == ys[j + 1] || ys[j] >= int64_t(im->height)) continue;
+        const int64_t cx = xs[i], cy = ys[j];
+        bool in = false;
+        for (const VkRect2D& r : p.rects) {
+          if (cx >= r.offset.x && cx < int64_t(r.offset.x) + r.extent.width && cy >= r.offset.y &&
+              cy < int64_t(r.offset.y) + r.extent.height) {
+            in = true;
+            break;
+          }
+        }
+        covered = in;
+      }
+    }
+    if (covered) p.rects.clear();  // all of it now
+    return;
+  }
+  if (auto it = pending_clears_.find(im); it != pending_clears_.end() && !it->second.rects.empty()) {
+    FlushPendingClears();  // parts of an earlier clear first
+  }
+  PendingClear& p = pending_clears_[im];
+  if (im->depth) {
+    if (zf) p.depth = true, p.z = z;
+    if (s) p.stencil = true, p.s = stencil;
+  } else {
+    p.color = true;
+    for (int i = 0; i < 4; ++i) p.rgba[i] = color[i];
+  }
+}
+
+void Renderer::Impl::FlushPendingClears() { FlushPendingClearsExcept(nullptr, nullptr); }
+
+void Renderer::Impl::FlushPendingClearsExcept(const Image* src, const VkRect2D* rect,
+                                              const Image* dst) {
+  if (pending_clears_.empty()) return;
+  auto pending = std::move(pending_clears_);
+  pending_clears_.clear();
+  auto overlaps = [](const VkRect2D& a, const VkRect2D& b) {
+    return int64_t(a.offset.x) < int64_t(b.offset.x) + b.extent.width &&
+           int64_t(b.offset.x) < int64_t(a.offset.x) + a.extent.width &&
+           int64_t(a.offset.y) < int64_t(b.offset.y) + b.extent.height &&
+           int64_t(b.offset.y) < int64_t(a.offset.y) + a.extent.height;
+  };
+  for (auto& [im, p] : pending) {
+    // What isn't read or written keeps waiting: other images, and parts of
+    // the source outside the rectangle read.
+    const bool keep =
+        src && im != dst &&
+        (im != src || (rect && !p.rects.empty() &&
+                       std::none_of(p.rects.begin(), p.rects.end(),
+                                    [&](const VkRect2D& r) { return overlaps(r, *rect); })));
+    if (keep) {
+      pending_clears_[im] = std::move(p);
+      continue;
+    }
+    if (p.rects.empty()) {
+      ClearImageNow(im, p.rgba, p.z, p.s, p.color, p.depth, p.stencil, nullptr);
+    } else {
+      for (const VkRect2D& r : p.rects) {
+        ClearImageNow(im, p.rgba, p.z, p.s, p.color, p.depth, p.stencil, &r);
+      }
+    }
+  }
+}
+
+void Renderer::Impl::FlushPendingClearsKeepTargets(const Image* but, const Image* but2) {
+  if (pending_clears_.empty()) return;
+  std::unordered_map<Image*, PendingClear> keep;
+  for (auto it = pending_clears_.begin(); it != pending_clears_.end();) {
+    Image* im = it->first;
+    if (im->target && im != but && im != but2) {
+      keep.emplace(im, std::move(it->second));
+      it = pending_clears_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  FlushPendingClears();
+  pending_clears_ = std::move(keep);
+}
+
+void Renderer::Impl::ResolveBarrier(const Image* src, const VkRect2D& rect) {
+  FlushPendingClearsExcept(src, &rect);
+  FullBarrier(cb_);
+}
+
+void Renderer::Impl::Barrier() {
+  FlushPendingClears();
+  FullBarrier(cb_);
 }
 
 void Renderer::Impl::BeginRendering(const std::vector<Image*>& colors, Image* depth) {
@@ -2096,15 +2346,66 @@ void Renderer::Impl::BeginRendering(const std::vector<Image*>& colors, Image* de
     w = std::min(w, depth->width);
     h = std::min(h, depth->height);
   }
+  VkRenderingAttachmentInfo satt = datt;  // stencil: its own load op
+  // Clears waiting for these images become their load ops (when the pass
+  // covers all of the image); the rest are done first, by Barrier.
+  if (!pending_clears_.empty()) {
+    for (size_t i = 0; i < colors.size(); ++i) {
+      auto it = pending_clears_.find(colors[i]);
+      if (it == pending_clears_.end() || !it->second.rects.empty() || colors[i]->width != w ||
+          colors[i]->height != h) {
+        continue;
+      }
+      atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      for (int c = 0; c < 4; ++c) atts[i].clearValue.color.float32[c] = it->second.rgba[c];
+      pending_clears_.erase(it);
+      ++stats_.clears_merged;
+    }
+    if (depth && depth->width == w && depth->height == h) {
+      auto it = pending_clears_.find(depth);
+      if (it != pending_clears_.end() && it->second.rects.empty()) {
+        if (it->second.depth) {
+          datt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          datt.clearValue.depthStencil = {it->second.z, it->second.s};
+        }
+        if (it->second.stencil) {
+          satt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          satt.clearValue.depthStencil = {it->second.z, it->second.s};
+        }
+        pending_clears_.erase(it);
+        ++stats_.clears_merged;
+      }
+    }
+  }
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
   ri.renderArea = {{0, 0}, {w, h}};
   ri.layerCount = 1;
   ri.colorAttachmentCount = uint32_t(atts.size());
   ri.pColorAttachments = atts.data();
   ri.pDepthAttachment = depth ? &datt : nullptr;
-  ri.pStencilAttachment = depth ? &datt : nullptr;
-  FullBarrier(cb_);
+  ri.pStencilAttachment = depth ? &satt : nullptr;
+  if (keep_target_clears_ && !pending_clears_.empty()) {
+    // Done now: those for this pass's attachments (not taken as load ops) and
+    // for anything that isn't a render target. (Only color attachments are
+    // in `colors`; the depth one is checked by the helper's second image.)
+    for (Image* c : colors) {
+      if (auto it = pending_clears_.find(c); it != pending_clears_.end()) {
+        auto one = std::move(*it);
+        pending_clears_.erase(it);
+        auto rest = std::move(pending_clears_);
+        pending_clears_.clear();
+        pending_clears_.insert(std::move(one));
+        FlushPendingClears();
+        pending_clears_ = std::move(rest);
+      }
+    }
+    FlushPendingClearsKeepTargets(depth, nullptr);
+    FullBarrier(cb_);
+  } else {
+    Barrier();
+  }
   vk::vkCmdBeginRendering(cb_, &ri);
+  ++stats_.passes;
   rendering_ = true;
   cur_colors_ = colors;
   cur_depth_ = depth;
@@ -2304,15 +2605,14 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
     regions.push_back(region);
     at += levels[i].rgba.size();
   }
-  const bool was_rendering = rendering_;
-  auto colors = cur_colors_;
-  auto depth = cur_depth_;
-  if (rendering_) EndRendering();
-  ToGeneral(cb_, im);
-  vk::vkCmdCopyBufferToImage(cb_, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
-                             uint32_t(regions.size()), regions.data());
-  FullBarrier(cb_);
-  if (was_rendering) BeginRendering(colors, depth);
+  // In the uploads command buffer (runs before the frame's): the render pass
+  // in progress goes on.
+  {
+    VkCommandBuffer ucb = UploadCommands();
+    ToGeneral(ucb, im);
+    vk::vkCmdCopyBufferToImage(ucb, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
+                               uint32_t(regions.size()), regions.data());
+  }
   // A texture whose contents changed (video frames) replaces its previous
   // version right away instead of keeping one image per frame until they
   // expire: same fetch constant name ("tex_<fetch hash>"), same words.
@@ -2392,15 +2692,14 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
     regions.push_back(region);
     at += rep.levels[i].rgba.size();
   }
-  const bool was_rendering = rendering_;
-  auto colors = cur_colors_;
-  auto depth = cur_depth_;
-  if (rendering_) EndRendering();
-  ToGeneral(cb_, im);
-  vk::vkCmdCopyBufferToImage(cb_, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
-                             uint32_t(regions.size()), regions.data());
-  FullBarrier(cb_);
-  if (was_rendering) BeginRendering(colors, depth);
+  // In the uploads command buffer (runs before the frame's): the render pass
+  // in progress goes on.
+  {
+    VkCommandBuffer ucb = UploadCommands();
+    ToGeneral(ucb, im);
+    vk::vkCmdCopyBufferToImage(ucb, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
+                               uint32_t(regions.size()), regions.data());
+  }
   CachedTexture& cached = textures_[key];
   cached.image = im;
   cached.last_used = frame_number_;
@@ -4190,7 +4489,7 @@ Image* Renderer::Impl::BlurredScene(Image* scene) {
   ensure(nmax_img_, tw, th, VK_FORMAT_R16G16B16A16_SFLOAT, "motion_neighbours");
   blur_img_.scaled = scene->scaled;
   blur_img_.scale = scene->scale;  // sampled like the scene (tex_scale)
-  FullBarrier(cb_);
+  Barrier();
   Image* vel = object_blur_ || vel_mask_ ? Velocities() : nullptr;
   float pc[32] = {};
   for (int c = 0; c < 4; ++c) {
@@ -4407,7 +4706,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   ensure(fog_img_, w, h, scene->format, "fog", false);
   fog_img_.scaled = scene->scaled;
   fog_img_.scale = scene->scale;
-  FullBarrier(cb_);
+  Barrier();
   float sun_uv[2];
   float sun_visible = 0.0f;
   const bool sun_seen = SunOnScreen(sun_uv, &sun_visible) && sun_visible >= 1.0f;
@@ -4419,7 +4718,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   FullscreenPass(CopyKind::kFogColor, &fog_color_img_[cur], scene, depth, &fog_color_img_[prev],
                  false, pc0, 8);
   fog_color_cur_ = cur;
-  FullBarrier(cb_);
+  Barrier();
   Image* out = scene;
   // 2: the fog.
   if (fog_density_ > 0.0f) {
@@ -4446,7 +4745,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
     pc[29] = 1.0f / float(w);
     pc[30] = 1.0f / float(h);
     FullscreenPass(CopyKind::kFog, &fog_img_, scene, depth, &fog_color_img_[cur], true, pc, 32);
-    FullBarrier(cb_);
+    Barrier();
     out = &fog_img_;
     ++stats_.fogged;
   }
@@ -4463,19 +4762,19 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
     ensure(rays_out_img_, w, h, scene->format, "god_rays", false);
     rays_out_img_.scaled = scene->scaled;
     rays_out_img_.scale = scene->scale;
-    FullBarrier(cb_);
+    Barrier();
     float m[8] = {sun_uv[0], sun_uv[1], float(w) / float(h), 0.35f,
                   1.0f / float(hw), 1.0f / float(hh), 0, 0};
     FullscreenPass(CopyKind::kRayMask, &ray_mask_img_, scene, depth, nullptr, true, m, 8);
-    FullBarrier(cb_);
+    Barrier();
     float b[8] = {sun_uv[0], sun_uv[1], 0.9f, 0.965f, 1.0f / float(hw), 1.0f / float(hh), 0, 0};
     FullscreenPass(CopyKind::kRayBlur, &ray_img_, &ray_mask_img_, nullptr, nullptr, true, b, 8);
-    FullBarrier(cb_);
+    Barrier();
     float a[8] = {3.0f * rays_strength_ * sun_visible * fog_presence_, 1.0f / float(w),
                   1.0f / float(h), float(w) / float(h), sun_uv[0], sun_uv[1], 0, 0};
     // The rays (half size) filtered in binding 0; the scene point-sampled.
     FullscreenPass(CopyKind::kRayAdd, &rays_out_img_, &ray_img_, out, nullptr, true, a, 8);
-    FullBarrier(cb_);
+    Barrier();
     out = &rays_out_img_;
     ++stats_.god_rays;
   }
@@ -4497,7 +4796,7 @@ Image* Renderer::Impl::RadialScene(Image* scene) {
   }
   radial_img_.scaled = scene->scaled;
   radial_img_.scale = scene->scale;
-  FullBarrier(cb_);
+  Barrier();
   const float amount = std::clamp(speed_amount_, 0.0f, 1.0f) * speed_strength_;
   float pc[8] = {speed_center_[0], speed_center_[1],
                  0.08f * amount,  // up to 8% of the way to the center
@@ -4508,7 +4807,7 @@ Image* Renderer::Impl::RadialScene(Image* scene) {
                  0.55f - 0.05f * std::min(amount, 1.0f), 1.0f, 1.0f / float(w),
                  1.0f / float(h)};
   FullscreenPass(CopyKind::kRadialBlur, &radial_img_, scene, nullptr, nullptr, true, pc, 8);
-  FullBarrier(cb_);
+  Barrier();
   dyn_ = DynState{};
   ++stats_.speed_blurred;
   return &radial_img_;
@@ -4578,7 +4877,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   ensure(up_out_, ow, oh, out_format, "upscaled", true);
   up_out_.scaled = true;
   up_out_.scale = out_scale_;
-  FullBarrier(cb_);
+  Barrier();
 
   // Motion vectors (none, and a reset, without last frame's camera).
   const bool have_prev = prev_valid_;
@@ -4657,7 +4956,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   Transition(*src, ro, gen);
   Transition(*depth, ro, gen);
   Transition(mv_img_, ro, gen);
-  FullBarrier(cb_);
+  Barrier();
   dyn_ = DynState{};
   if (!ok) {
     upscaler_status_ = error;
@@ -4674,6 +4973,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
 // missing ones the dummy image; binding 0 filtered when `linear0`).
 void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image* b1, Image* b2,
                                     bool linear0, const float* pc, uint32_t floats) {
+  FlushPendingClears();  // what it reads or writes may have a clear waiting
   VkPipeline p = CopyPipeline(kind, dst->format);
   VkDescriptorSet set;
   VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -4715,12 +5015,18 @@ void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image*
   vk::vkCmdSetScissor(cb_, 0, 1, &sc);
   vk::vkCmdDraw(cb_, 3, 1, 0, 0);
   vk::vkCmdEndRendering(cb_);
-  FullBarrier(cb_);
+  Barrier();
 }
 
 void Renderer::Impl::CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode,
                               bool float_depth, uint32_t first, uint32_t count, uint32_t sx0,
                               uint32_t sy0, uint32_t dx0, uint32_t dy0, uint32_t w, uint32_t h) {
+  {
+    // What it reads or writes may have a clear waiting (not the source's
+    // other tiles).
+    const VkRect2D read{{int32_t(sx0), int32_t(sy0)}, {w, h}};
+    FlushPendingClearsExcept(src, &read, dst);
+  }
   VkPipeline p = CopyPipeline(kind, dst->format);
   VkDescriptorSet set;
   VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -4762,6 +5068,15 @@ void Renderer::Impl::CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mo
   vk::vkCmdEndRendering(cb_);
 }
 
+void Renderer::Impl::MarkPart(const std::string& name) {
+  FrameSlot* fs = cur_slot_;
+  if (!fs || !fs->timed || !part_pool_ || rendering_) return;
+  if (fs->part_names.size() + 1 >= kMaxParts) return;
+  const uint32_t q = uint32_t(fs - slots_) * kMaxParts + uint32_t(fs->part_names.size()) + 1;
+  vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, part_pool_, q);
+  fs->part_names.push_back(name);
+}
+
 void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
   // Object motion: the scene pass's draws are done once a resolve follows the
   // characters (drawn after the lighting); later resolves may clear the depth.
@@ -4775,6 +5090,7 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
   }
   EndRendering();
   const uint32_t source = r.flags & 7;
+
   const uint32_t surface = r.targets[0];
   Image* src = nullptr;
   if (source == 4) {
@@ -4783,6 +5099,7 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     const uint32_t infos[4] = {r.targets[1], r.targets[3], r.targets[4], r.targets[5]};
     src = GetTarget(ColorKey(surface, infos[source & 3]), true);
   }
+  MarkPart(src->name);  // GPU time by part: what drew into it
   amped3::native::TextureFetch dest;
   std::memcpy(dest.words, r.dest_raw.data(), sizeof(dest.words));
   const uint32_t base = dest.base_address() & 0x1FFFFFFF;
@@ -4841,7 +5158,9 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     sample_count = count * scale;
   }
   if (w && h) {
-    FullBarrier(cb_);
+    // (clears waiting for the other tiles of the source may wait on)
+    const VkRect2D read{{int32_t(sx0), int32_t(sy0)}, {w, h}};
+    ResolveBarrier(src, read);
     if (source == 4) {
       // Depth -> R32F, and the raw words -> 8_8_8_8, through a fragment shader
       // (multisampled depth: the first resolved sample, depth isn't averaged).
@@ -4861,7 +5180,7 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
       vk::vkCmdCopyImage(cb_, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image,
                          VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     }
-    FullBarrier(cb_);
+    ResolveBarrier(src, read);
   }
   // Clear after resolve, of the resolved rectangle only (with EDRAM tiling
   // this clears one tile; here all tiles share one full-size image).
@@ -5349,7 +5668,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   }
 
   mark(6);
+  keep_target_clears_ = true;
   BeginRendering(colors, depth);
+  keep_target_clears_ = false;
   // Commands only for state that differs from the previous draw in this
   // render pass (each Vulkan call costs driver time; draws mostly repeat).
   DynState& ds = dyn_;
@@ -5883,7 +6204,7 @@ void Renderer::Impl::DrawVelocities() {
   vel_draws_.clear();
   mask_draws_.clear();
   vel_depth_ = depth;
-  FullBarrier(cb_);
+  Barrier();
   dyn_ = DynState{};
   vel_ready_ = true;
   vel_resolved_ = false;
@@ -5902,7 +6223,7 @@ Image Renderer::Impl::Downsample(Image* im) {
   vk::Check(vk::vkCreateDescriptorPool(gpu_.device, &dpi, nullptr, &pool_), "readback pool");
   cb_ = gpu_.BeginCommands();
   ToGeneral(cb_, tmp);
-  FullBarrier(cb_);
+  Barrier();
   const uint32_t scale = std::max(im->sample_scale, 1u);
   if (im->depth) {
     CopyPass(CopyKind::kDepthMs, im, &tmp, 0, false, 0, 1, 0, 0, 0, 0, im->width, im->height);
@@ -5910,8 +6231,8 @@ Image Renderer::Impl::Downsample(Image* im) {
     CopyPass(CopyKind::kColorMs, im, &tmp, 0, false, 0, im->samples / scale * scale, 0, 0, 0, 0,
              im->width, im->height);
   }
-  FullBarrier(cb_);
-  gpu_.Submit(cb_);
+  Barrier();
+  gpu_.Submit(cb_, TakeUploads());
   cb_ = VK_NULL_HANDLE;
   vk::vkDestroyDescriptorPool(gpu_.device, pool_, nullptr);
   pool_ = frame_pool;
@@ -6152,7 +6473,7 @@ void Renderer::Impl::UploadCloudSprite() {
   region.imageExtent = {kCloudSpriteSize, kCloudSpriteSize, 1};
   ToGeneral(cb_, cloud_sprite_);
   vk::vkCmdCopyBufferToImage(cb_, buffer, cloud_sprite_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-  FullBarrier(cb_);
+  Barrier();
   cloud_sprite_pending_.clear();
 }
 
@@ -6313,7 +6634,7 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {256, 1, 1};
-    FullBarrier(cb_);
+    Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, lut_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     staging_.push_back(staging);
   }
@@ -6321,7 +6642,7 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
   // from the other device this way).
   ToGeneral(cb_, *dst);
   UploadCloudSprite();
-  FullBarrier(cb_);
+  Barrier();
 
   // Map clouds: their state this frame; while they close in on leaving the
   // map, its last frame is shown (already through the gamma table) instead.
@@ -6396,14 +6717,14 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
       cloud_held_ = gpu_.CreateImage(w, h, VK_FORMAT_A2B10G10R10_UNORM_PACK32, false, "map_held");
       ToGeneral(cb_, cloud_held_);
     }
-    FullBarrier(cb_);
+    Barrier();
     VkImageCopy cr{};
     cr.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     cr.dstSubresource = cr.srcSubresource;
     cr.extent = {w, h, 1};
     vk::vkCmdCopyImage(cb_, dst->image, VK_IMAGE_LAYOUT_GENERAL, cloud_held_.image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &cr);
-    FullBarrier(cb_);
+    Barrier();
     cloud_held_valid_ = true;
   }
 
@@ -6427,14 +6748,14 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
       gpu_.DestroyBuffer(*readback);
       *readback = gpu_.CreateBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, /*cached=*/true);
     }
-    FullBarrier(cb_);
+    Barrier();
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {w, h, 1};
     vk::vkCmdCopyImageToBuffer(cb_, dst->image, VK_IMAGE_LAYOUT_GENERAL, readback->buffer, 1,
                                &region);
   }
-  FullBarrier(cb_);
+  Barrier();
   if (info) {
     *info = OutputInfo{};
     info->width = w;
@@ -6456,7 +6777,7 @@ bool Renderer::Impl::DrawOutput(Image* src, const uint8_t* lut, bool share, uint
   if (!pool_) return false;
   cb_ = gpu_.BeginCommands();
   const bool ok = RecordOutput(src, lut, share, slot, info, share ? nullptr : &out_readback_);
-  gpu_.Submit(cb_);
+  gpu_.Submit(cb_, TakeUploads());
   cb_ = VK_NULL_HANDLE;
   for (auto& b : staging_) gpu_.DestroyBuffer(b);
   staging_.clear();
@@ -6639,7 +6960,26 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
       vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool_, q);
       fs->timed = true;
     }
+    // The parts: a timestamp at the start, then one after each part.
+    fs->part_names.clear();
+    if (ts_pool_ && !part_pool_) {
+      VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      qi.queryCount = 2 * kMaxParts;
+      if (vk::vkCreateQueryPool(gpu_.device, &qi, nullptr, &part_pool_) != VK_SUCCESS) {
+        part_pool_ = VK_NULL_HANDLE;
+      }
+    }
+    if (part_pool_ && fs->timed) {
+      const uint32_t q = uint32_t(fs - slots_) * kMaxParts;
+      vk::vkCmdResetQueryPool(cb_, part_pool_, q, kMaxParts);
+      vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, part_pool_, q);
+    }
   }
+  cur_slot_ = fs;
+  // Clears carried over from the last frame (render targets cleared after
+  // their last use) stay waiting for this frame's first pass on them.
+  if (!merge_clears_) FlushPendingClears();
   BeginFrame();
   const auto t1 = Clock::now();
   uint32_t draw_events = 0;
@@ -6678,25 +7018,34 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
     stats_.guest_output_height = uint32_t(std::lround(final_front_->height / fs));
   }
   EndRendering();
+  MarkPart("after the last resolve");
+  // Render targets cleared after their last use this frame keep their clear
+  // for the next frame's first pass on them; the picture shown can't wait.
+  FlushPendingClearsKeepTargets(final_front_, last_color_);
   FullBarrier(cb_);
   if (output && final_front_) {
     Buffer* readback = output->share ? nullptr : fs ? &fs->readback : &out_readback_;
     stats_.output_drawn =
         RecordOutput(final_front_, output->lut, output->share, output->slot, info, readback);
+    EndRendering();
+    MarkPart("output (post effects, upscaler, HUD)");
   }
+  FlushPendingClearsKeepTargets(final_front_, last_color_);
+  cur_slot_ = nullptr;
   const auto t2 = Clock::now();
   if (fs) {
     if (fs->timed) {
       vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_,
                               uint32_t(fs - slots_) * 2 + 1);
     }
-    gpu_.SubmitFenced(cb_, fs->fence);
+    fs->upload_cb = TakeUploads();
+    gpu_.SubmitFenced(cb_, fs->fence, fs->upload_cb);
     fs->cb = cb_;
     fs->pending = true;
     fs->ticket = ++next_ticket_;
     stats_.ticket = fs->ticket;
   } else {
-    gpu_.Submit(cb_);
+    gpu_.Submit(cb_, TakeUploads());
   }
   const auto t3 = Clock::now();
   cb_ = VK_NULL_HANDLE;
@@ -6873,6 +7222,7 @@ void Renderer::SetMotionBlur(float scale, bool camera, bool objects, bool debug)
 }
 
 void Renderer::SetSceneryObjectBlur(bool on) { impl_->scenery_blur_ = on; }
+void Renderer::SetMergeClears(bool on) { impl_->merge_clears_ = on; }
 
 RenderStats Renderer::Render(const Frame& frame, FrameResources& resources, uint32_t max_draws,
                              const OutputRequest* output, OutputInfo* info) {
@@ -6908,6 +7258,29 @@ double Renderer::GpuFrameMs(uint64_t ticket) {
     return double(ticks) * double(im.gpu_.props.limits.timestampPeriod) * 1e-6;
   }
   return -1;
+}
+
+std::vector<GpuPart> Renderer::GpuParts(uint64_t ticket) {
+  auto& im = *impl_;
+  std::vector<GpuPart> parts;
+  for (auto& fs : im.slots_) {
+    if (fs.ticket != ticket || !fs.timed || !im.part_pool_ || fs.part_names.empty()) continue;
+    const uint32_t n = uint32_t(fs.part_names.size()) + 1;
+    std::vector<uint64_t> t(n);
+    const uint32_t q = uint32_t(&fs - im.slots_) * Impl::kMaxParts;
+    if (vk::vkGetQueryPoolResults(im.gpu_.device, im.part_pool_, q, n, n * sizeof(uint64_t),
+                                  t.data(), sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+      return {};
+    }
+    const uint32_t bits = im.gpu_.timestamp_bits;
+    const uint64_t mask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+    const double period = double(im.gpu_.props.limits.timestampPeriod) * 1e-6;
+    for (uint32_t i = 1; i < n; ++i) {
+      parts.push_back({fs.part_names[i - 1], double((t[i] - t[i - 1]) & mask) * period});
+    }
+  }
+  return parts;
 }
 
 bool Renderer::ReadOutput(uint64_t ticket, std::vector<uint8_t>* packed) {

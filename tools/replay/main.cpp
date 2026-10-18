@@ -466,6 +466,7 @@ int main(int argc, char** argv) {
   float motion_yaw = 0.0f;        // --motion-yaw deg: previous frame = this one, camera turned
   bool object_blur = false;       // --object-blur: per-object motion blur too
   bool scenery_blur = false;      // --object-blur-scenery: also on the scenery
+  bool merge_clears = true;       // --no-merge-clears: every clear a pass of its own
   bool no_camera_blur = false;    // --no-camera-blur: objects only
   bool blur_debug = false;        // --blur-debug: show the motion instead
   bool motion_shuffle = false;    // --motion-shuffle: previous frame's draws in reverse order
@@ -546,6 +547,8 @@ int main(int argc, char** argv) {
       motion_shuffle = true;
     } else if (a == "--motion-perturb" && i + 1 < argc) {
       motion_perturb = argv[++i];
+    } else if (a == "--no-merge-clears") {
+      merge_clears = false;
     } else if (a == "--blur-debug") {
       blur_debug = true;
     } else if (a == "--motion-yaw" && i + 1 < argc) {
@@ -705,6 +708,7 @@ int main(int argc, char** argv) {
     std::cout << "Device: " << renderer.device_name() << "\n";
     renderer.SetMotionBlur(motion_blur, !no_camera_blur, object_blur, blur_debug);
     renderer.SetSceneryObjectBlur(scenery_blur);
+    renderer.SetMergeClears(merge_clears);
     if (motion_yaw != 0.0f) {
       // Test input: the same frame with the lighting pass's inverse
       // view-projection turned about the camera (c4) around world Y.
@@ -796,6 +800,9 @@ int main(int argc, char** argv) {
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
     }
     std::cout << "Recorded " << stats.draws_done << " of " << stats.draws << " draws\n";
+    std::cout << "Render passes " << stats.passes << "; clears: " << stats.clear_passes
+              << " passes of their own, " << stats.clears_merged << " folded into a load op, "
+              << stats.clears_in_pass << " inside a pass\n";
 
     const auto final_image = renderer.FinalImage();
     if (!final_image.name.empty()) {
