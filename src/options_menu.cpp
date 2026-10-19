@@ -188,16 +188,18 @@ const std::vector<Tab>& Tabs() {
                       "Rebuilds a full-resolution picture from the Render scale using several "
                       "frames, the game's depth and its motion: sharper than a filter at the same "
                       "cost. Intel XeSS uses the XMX cores on Intel Arc GPUs and runs on other "
-                      "GPUs through DP4a. AMD FSR 3.1 runs on any GPU (FSR 4's machine-learning "
-                      "upscaler is Direct3D 12 only). The HUD is drawn afterwards at full "
-                      "resolution. Leave the Upscaling filter on Bilinear. If the library is "
-                      "missing (setup.ps1 fetches it) or the GPU can't run it, the picture is "
-                      "simply stretched and the log says why. Native renderer only.",
+                      "GPUs through DP4a (Windows only: Intel has no Linux XeSS library). AMD "
+                      "FSR 3.1 runs on any GPU (FSR 4's machine-learning upscaler is Direct3D "
+                      "12 only); on Linux setup.sh builds it from AMD's FidelityFX SDK sources. "
+                      "The HUD is drawn afterwards at full resolution. Leave the Upscaling "
+                      "filter on Bilinear. If the library is missing or the GPU can't run it, "
+                      "the picture is simply stretched and the log says why. Native renderer "
+                      "only.",
 #ifdef _WIN32
                       {{"off", "Off"}, {"xess", "Intel XeSS"}, {"fsr", "AMD FSR 3.1"}});
 #else
-                      // Their runtimes are Windows libraries.
-                      {{"off", "Off (XeSS and FSR 3.1 are Windows only)"}});
+                      // Intel ships XeSS for Windows only.
+                      {{"off", "Off"}, {"fsr", "AMD FSR 3.1"}});
 #endif
                   o.visible = NativeRendererOn;
                   return o;
@@ -312,8 +314,8 @@ const std::vector<Tab>& Tabs() {
                        /*restart=*/true),
                 Toggle("revamped_graphics", "Revamped Graphics",
                        "All the visual enhancements below at once (motion blur, speed blur, "
-                       "distance fog, god rays, branch fade and the trail map clouds), each "
-                       "as set here. Off draws the game as the console does. Also in the "
+                       "distance fog, god rays, branch fade, the trail map clouds, sharp fonts "
+                       "and upscaled textures), each as set here. Off draws the game as the console does. Also in the "
                        "game's own menu: Pause > Options > Graphics. Native renderer "
                        "only."),
                 Toggle("native_keep_emulation", "Keep the emulation drawing",
@@ -329,7 +331,7 @@ const std::vector<Tab>& Tabs() {
                        "The game's fonts (menus, HUD, scores, button icons) are 720p bitmaps. "
                        "This rebuilds each at 4x from its own letters when first shown, with "
                        "smooth, anti-aliased edges, so text stays sharp at 1080p, 1440p and 4K. "
-                       "Native renderer only."),
+                       "Part of Revamped Graphics (off when it's off). Native renderer only."),
                 Toggle("native_texture_pack", "Texture pack",
                        "Uses the PNGs in the textures folder next to the exe in place of the "
                        "game's textures (see textures\\README.txt to add your own). Comes with "
@@ -338,7 +340,8 @@ const std::vector<Tab>& Tabs() {
                 Toggle("native_upscaled_textures", "Upscaled textures",
                        "Uses the game's textures upscaled on this PC (the installer's optional "
                        "texture upscaling step, into textures\\upscaled) wherever the texture "
-                       "pack and Sharp fonts don't replace one. Native renderer only."),
+                       "pack and Sharp fonts don't replace one. Part of Revamped Graphics (off "
+                       "when it's off). Native renderer only."),
                 Toggle("native_smooth_foliage", "Smooth foliage edges",
                        "Tree branches, fences and other cut-out textures get smooth, "
                        "anti-aliased edges and stay solid as on the console, instead of the "

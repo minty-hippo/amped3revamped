@@ -216,9 +216,17 @@ Steam Input and the Deck's controls work as an Xbox controller.
   (the recompiled game is large) and about 40 GB; jobs are limited by memory
   (about one per 2.5 GB). Builds are per architecture: build the ARM version on
   the ARM device.
-- **Not on Linux:** Intel XeSS and AMD FSR 3.1 (Windows-only runtimes; the
-  render scale still works, stretched) and the F9 hang report. Crashes are
-  written to `logs/amped3_crash_*.txt`.
+- **AMD FSR 3.1 on Linux** is built from AMD's FidelityFX SDK sources (MIT):
+  AMD ships its runtime for Windows only, so `setup.sh` takes the needed
+  folders of the SDK (v1.1.4, a 25 MB sparse clone), applies
+  `linux/fidelityfx/fidelityfx-sdk-linux.patch` (the SDK's shader compiler
+  ported to Linux, plus fixes for Clang/GCC and for GPUs whose memory is all
+  host-visible, as on ARM), compiles the FSR shaders and builds
+  `libamd_fidelityfx_vk.so` next to the game: about two minutes, once. If it
+  fails the game still works with the Upscaler off.
+- **Not on Linux:** Intel XeSS (Intel's XeSS SDK has Windows libraries only;
+  the render scale still works, stretched, or use FSR 3.1) and the F9 hang
+  report. Crashes are written to `logs/amped3_crash_*.txt`.
 - **Texture upscaling** (`linux/upscale-textures.sh`, or the installer's
   question) uses Real-ESRGAN's official Linux build, x86_64 only; on ARM pass
   `--esrgan` with a build of
@@ -262,20 +270,21 @@ for the full setup, or turn off **Lean emulation** (`emulated_gpu_lean`) if
 you switch often.
 
 **Revamped Graphics** turns all the visual enhancements on or off at once:
-motion blur, speed blur, distance fog, god rays, branch fade and the trail
-map clouds. Each keeps its own setting for when the switch is back on.
+motion blur, speed blur, distance fog, god rays, branch fade, the trail map
+clouds, sharp fonts and upscaled textures. Each keeps its own setting for when
+the switch is back on.
 
 All of it is also in the game's own menu: **Pause > Options > Graphics** (the
 row that was the unused "Cheat Codes") opens the port's Graphics panel. The
 game's HUD and menus are hidden while it's open so you can see each change.
 It has two tabs, switched with LB / RB:
 
-- **Effects:** Revamped Graphics, a switch for each enhancement and the
-  motion blur strength.
+- **Effects:** Revamped Graphics, a switch for each enhancement (Sharp Fonts
+  and Upscaled Textures included) and the motion blur strength.
 - **Display:** fullscreen, a frame rate slider (30 console pacing to 144 fps, or
   unlocked), display resolution, render resolution (with the
-  pixel size it gives), upscaler (Intel XeSS or AMD FSR 3.1) and FSR
-  sharpness.
+  pixel size it gives), upscaler (Intel XeSS or AMD FSR 3.1; FSR 3.1 only on
+  Linux) and FSR sharpness.
 
 Up / down choose, left / right / A change, B goes back (keyboard: arrows,
 Enter, Escape, Q / E for tabs).
@@ -287,7 +296,8 @@ letters the first time it's shown: each glyph's outline is traced into a
 vector shape (straight edges, sharp corners, curves where the letter curves)
 and filled anti-aliased at the new size. The result is kept in `logs\`
 (`native_font_*.bin`) so later sessions load it at once; nothing is shipped. Switch it off
-with Sharp Fonts (Graphics panel, Display tab) or `native_sharp_fonts`.
+with Sharp Fonts (Graphics panel, Effects tab) or `native_sharp_fonts`; it's
+part of Revamped Graphics, so it's also off while that is.
 
 **Texture pack.** PNGs in the `textures` folder next to the exe replace game
 textures by a hash of their contents, at any size (see
@@ -311,7 +321,8 @@ time (`-Set world` adds the characters, boards and levels, experimental;
 `-Force` redoes everything). The results go to `textures\upscaled` and are
 used only where neither the texture pack nor Sharp fonts replace a texture,
 so anything you replace by hand always wins. Switch them off with Upscaled
-Textures (Graphics panel, Display tab) or `native_upscaled_textures`.
+Textures (Graphics panel, Effects tab) or `native_upscaled_textures`; like
+Sharp fonts, they're part of Revamped Graphics.
 
 The row is added in memory as the game loads its menus; the game's files are
 never changed. Set `patch_game_menus = false` in `amped3.toml` to leave the
@@ -424,7 +435,9 @@ respective owners; this project is not affiliated with or endorsed by them.
   Khronos Group (Apache 2.0 / MIT; `third_party/vulkan/LICENSE.md`).
 - **[AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)**
   (FSR 3.1 API headers) © Advanced Micro Devices, Inc. (MIT;
-  `third_party/ffx_api/LICENSE.txt`). The runtime DLL is downloaded at build time.
+  `third_party/ffx_api/LICENSE.txt`). The runtime DLL is downloaded at build
+  time; on Linux the runtime is built from the SDK's sources, with the changes
+  in `linux/fidelityfx` (its license is installed as `FidelityFX-LICENSE.txt`).
 - **[Intel XeSS](https://github.com/intel/xess)** © Intel Corporation (Intel
   Simplified Software License). Headers and runtime are downloaded at build
   time, not included here.

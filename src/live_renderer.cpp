@@ -57,8 +57,8 @@ REXCVAR_DEFINE_BOOL(native_renderer, true, "GPU",
 REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
                     "Native renderer: Revamped Graphics, the switch in the game's own Options "
                     "menu. Off turns every visual enhancement off at once (motion blur, speed "
-                    "blur, distance fog, god rays, foliage fade, map clouds); on, each one "
-                    "follows its own setting");
+                    "blur, distance fog, god rays, foliage fade, map clouds, sharp fonts, "
+                    "upscaled textures); on, each one follows its own setting");
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
@@ -101,8 +101,9 @@ REXCVAR_DEFINE_INT32(native_render_scale, 100, "GPU",
 REXCVAR_DEFINE_STRING(native_upscaler, "off", "GPU",
                       "Native renderer: temporal upscaler from the render scale to the "
                       "picture's size on screen: off, xess (Intel XeSS: XMX on Arc, DP4a "
-                      "elsewhere) or fsr (AMD FSR 3.1). Needs libxess.dll / "
-                      "amd_fidelityfx_vk.dll next to the exe (setup.ps1 fetches them)")
+                      "elsewhere; Windows only) or fsr (AMD FSR 3.1). Needs libxess.dll / "
+                      "amd_fidelityfx_vk.dll next to the exe (setup.ps1 fetches them), on Linux "
+                      "libamd_fidelityfx_vk.so (setup.sh builds it)")
     .allowed({"off", "xess", "fsr"});
 REXCVAR_DEFINE_DOUBLE(native_upscaler_sharpness, 0.3, "GPU",
                       "Native renderer: FSR's sharpening, 0 (off) to 1")
@@ -147,7 +148,8 @@ REXCVAR_DEFINE_BOOL(native_map_clouds, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_sharp_fonts, true, "GPU",
                     "Native renderer: the game's fonts (menus, HUD, scores, button icons) "
                     "rebuilt at 4x their size from their own letters when first shown, so text "
-                    "stays sharp at high resolutions instead of being a stretched 720p bitmap");
+                    "stays sharp at high resolutions instead of being a stretched 720p bitmap. "
+                    "Part of Revamped Graphics (off with it)");
 REXCVAR_DEFINE_BOOL(native_texture_pack, true, "GPU",
                     "Native renderer: replaces game textures with the PNGs in the textures "
                     "folder next to the exe (<name>_<hash>.png; see textures\\README.txt). "
@@ -155,7 +157,8 @@ REXCVAR_DEFINE_BOOL(native_texture_pack, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_upscaled_textures, true, "GPU",
                     "Native renderer: uses the game textures upscaled on this PC at install "
                     "(textures\\upscaled, made by the installer's optional texture upscaling "
-                    "step) for every texture the texture pack and Sharp fonts don't replace");
+                    "step) for every texture the texture pack and Sharp fonts don't replace. "
+                    "Part of Revamped Graphics (off with it)");
 REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
                     "Native renderer, with smooth foliage edges: tree branches close to the "
                     "camera fade out smoothly toward the middle of the screen, keeping your "
@@ -1479,9 +1482,12 @@ void WorkerMain() {
       const bool async_pipelines =
           rex::cvar::GetFlagByName("async_shader_compilation") != "false";
       const bool smooth_foliage = REXCVAR_GET(native_smooth_foliage);
-      const bool sharp_fonts = REXCVAR_GET(native_sharp_fonts);
+      // Sharp fonts and upscaled textures are Revamped Graphics: off with it
+      // (the texture pack, with the new logo, isn't).
+      const bool revamped_on = REXCVAR_GET(revamped_graphics);
+      const bool sharp_fonts = revamped_on && REXCVAR_GET(native_sharp_fonts);
       const bool texture_pack = REXCVAR_GET(native_texture_pack);
-      const bool upscaled_textures = REXCVAR_GET(native_upscaled_textures);
+      const bool upscaled_textures = revamped_on && REXCVAR_GET(native_upscaled_textures);
       if (renderer && (msaa != renderer_msaa || scale != renderer_scale ||
                        out_scale != renderer_out_scale || upscaler != renderer_upscaler ||
                        aniso != renderer_aniso || async_pipelines != renderer_async ||

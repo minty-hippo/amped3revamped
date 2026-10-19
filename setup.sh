@@ -299,6 +299,17 @@ step "Building amped3 ($PRESET) - compiling the recompiled game takes a while"
 run_logged build-reconfigure cmake --preset "$PRESET" "${CONFIGURE_ARGS[@]}"
 run_logged build cmake --build --preset "$PRESET"
 [ -x "$EXE" ] || fail "Build finished but $EXE is missing."
+
+# AMD FSR 3.1 (Upscaler option): AMD ships its runtime for Windows only, so
+# it's built here from the FidelityFX SDK's sources (linux/fidelityfx). Only
+# the first time or when those files change; the game runs without it.
+if [ -f "$SDK_DIR/thirdparty/glslang/CMakeLists.txt" ]; then
+  step 'AMD FSR 3.1 upscaler (built from the FidelityFX SDK sources)'
+  if ! run_logged --allow-fail fsr env CC="$CC" CXX="$CXX" bash "$PROJECT_DIR/linux/fidelityfx/build.sh" \
+         --dest "$BUILD_DIR" --glslang "$SDK_DIR/thirdparty/glslang" --jobs "$JOBS"; then
+    warn "FSR 3.1 couldn't be built (see $LAST_LOG); the game works without it (Upscaler stays Off)."
+  fi
+fi
 # Lets the build be run in place: amped3 reads the game folder from here when
 # there's no game/ folder next to it (install.sh's install folder has one).
 printf '%s\n' "$GAME_DIR" > "$BUILD_DIR/game.path"

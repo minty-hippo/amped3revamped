@@ -3,9 +3,11 @@
 // compute shaders on any GPU; the newest provider the runtime offers).
 //
 // Both libraries are loaded at run time (libxess.dll, amd_fidelityfx_vk.dll
-// next to the exe; setup.ps1 fetches them): without them, or on a GPU they
-// don't support, Create returns null with the reason and the renderer draws
-// without upscaling. The headers are vendored in third_party/ (unmodified).
+// next to the exe; setup.ps1 fetches them. On Linux FSR only, as
+// libamd_fidelityfx_vk.so, which setup.sh builds from AMD's sources:
+// linux/fidelityfx): without them, or on a GPU they don't support, Create
+// returns null with the reason and the renderer draws without upscaling.
+// The headers are vendored in third_party/ (unmodified).
 
 #pragma once
 

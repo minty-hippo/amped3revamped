@@ -124,7 +124,8 @@ BUILD_DIR="$PROJECT_DIR/out/build/linux-$ARCH-$CFG"
 # ---------------------------------------------------------------------------
 step 'Putting the game together'
 copied=0
-for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.*; do
+for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.* \
+         "$BUILD_DIR"/*-LICENSE.txt; do
   [ -e "$f" ] || continue
   # A running game (the launcher's Update) has these mapped: replace the file
   # rather than writing into it.

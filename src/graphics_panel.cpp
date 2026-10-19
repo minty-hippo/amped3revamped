@@ -70,6 +70,8 @@ const std::vector<Tab>& Tabs() {
            {"native_god_rays", "God Rays"},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
+           {"native_sharp_fonts", "Sharp Fonts"},
+           {"native_upscaled_textures", "Upscaled Textures"},
        }},
       {"Display",
        {
@@ -87,13 +89,14 @@ const std::vector<Tab>& Tabs() {
            {"resolution", "Display Resolution", Kind::kChoice, 0, 0, 0,
             {{"", "Native"}, {"1080p", "1920 x 1080"}, {"1440p", "2560 x 1440"}, {"4k", "3840 x 2160"}}},
            {"native_render_scale", "Render Resolution", Kind::kSlider, 25, 100, 5, {}, true},
-#ifdef _WIN32
            {"native_upscaler", "Upscaler", Kind::kChoice, 0, 0, 0,
+#ifdef _WIN32
             {{"off", "Off"}, {"xess", "Intel XeSS"}, {"fsr", "AMD FSR 3.1"}}},
-           {"native_upscaler_sharpness", "FSR Sharpness", Kind::kSlider, 0.0, 1.0, 0.05},
+#else
+            // Intel ships XeSS for Windows only.
+            {{"off", "Off"}, {"fsr", "AMD FSR 3.1"}}},
 #endif
-           {"native_sharp_fonts", "Sharp Fonts"},
-           {"native_upscaled_textures", "Upscaled Textures"},
+           {"native_upscaler_sharpness", "FSR Sharpness", Kind::kSlider, 0.0, 1.0, 0.05},
        }},
   };
   return tabs;
@@ -352,6 +355,10 @@ std::string GraphicsPanel::Hint(const Row& r) const {
     return GetString("native_upscaler") == "fsr" ? "Sharpening applied by AMD FSR 3.1."
                                                  : "Used with AMD FSR 3.1 only.";
   }
+  if ((name == "native_upscaled_textures" || name == "native_sharp_fonts") && native &&
+      !GetBool("revamped_graphics")) {
+    return "Part of Revamped Graphics, which is off.";
+  }
   if (name == "native_upscaled_textures") {
     return native ? "Textures upscaled on this PC at install (textures\\upscaled)."
                   : "Native renderer only (Options F1 > Native renderer).";
@@ -466,7 +473,9 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     if (tab_ == 0) dim = name != "revamped_graphics" && !revamped;
     if (name == "native_render_scale" || name == "native_upscaler") dim = !native;
     if (name == "native_upscaler_sharpness") dim = !native || upscaler != "fsr";
-    if (name == "native_sharp_fonts" || name == "native_upscaled_textures") dim = !native;
+    if (name == "native_sharp_fonts" || name == "native_upscaled_textures") {
+      dim = !native || !revamped;
+    }
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);
     const float ty = y + (row_h - text_px) * 0.5f;
     const float cy = y + row_h * 0.5f;
