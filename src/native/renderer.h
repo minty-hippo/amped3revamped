@@ -232,6 +232,9 @@ class Renderer {
   // passes; tile-based GPUs such as Adreno avoid writing and reading back the
   // whole image). Applies from the next frame.
   void SetMergeClears(bool on);
+  // The frame's Vulkan commands recorded on a thread of their own while the
+  // renderer prepares the next draws (cmd_stream.h). From the next frame.
+  void SetParallelCommands(bool on);
   // Upscaler inputs for the following frames: the time since the last frame
   // (ms) and FSR's sharpening (0..1).
   void SetUpscaleParams(float frame_ms, float sharpness);

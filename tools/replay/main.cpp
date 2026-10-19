@@ -467,6 +467,7 @@ int main(int argc, char** argv) {
   bool object_blur = false;       // --object-blur: per-object motion blur too
   bool scenery_blur = false;      // --object-blur-scenery: also on the scenery
   bool merge_clears = true;       // --no-merge-clears: every clear a pass of its own
+  bool parallel_commands = true;  // --no-parallel-commands: commands recorded in place
   bool no_camera_blur = false;    // --no-camera-blur: objects only
   bool blur_debug = false;        // --blur-debug: show the motion instead
   bool motion_shuffle = false;    // --motion-shuffle: previous frame's draws in reverse order
@@ -547,6 +548,8 @@ int main(int argc, char** argv) {
       motion_shuffle = true;
     } else if (a == "--motion-perturb" && i + 1 < argc) {
       motion_perturb = argv[++i];
+    } else if (a == "--no-parallel-commands") {
+      parallel_commands = false;
     } else if (a == "--no-merge-clears") {
       merge_clears = false;
     } else if (a == "--blur-debug") {
@@ -709,6 +712,7 @@ int main(int argc, char** argv) {
     renderer.SetMotionBlur(motion_blur, !no_camera_blur, object_blur, blur_debug);
     renderer.SetSceneryObjectBlur(scenery_blur);
     renderer.SetMergeClears(merge_clears);
+    renderer.SetParallelCommands(parallel_commands);
     if (motion_yaw != 0.0f) {
       // Test input: the same frame with the lighting pass's inverse
       // view-projection turned about the camera (c4) around world Y.

@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "vk.h"
+#include "cmd_stream.h"
 #include "xenos_shader.h"
 #include "xenos_texture.h"
 #include "upscaler.h"
@@ -156,6 +157,9 @@ class Gpu {
   VkPhysicalDeviceProperties props{};
   VkPhysicalDeviceMemoryProperties mem_props{};
   VkCommandPool pool = VK_NULL_HANDLE;
+  // The frames' command buffers (recorded by the command stream's thread while
+  // the renderer allocates upload command buffers from `pool`).
+  VkCommandPool frame_pool = VK_NULL_HANDLE;
   bool anisotropy = false;
   bool bc_textures = false;  // textureCompressionBC enabled
   VkFormat d24s8 = VK_FORMAT_D24_UNORM_S8_UINT;
@@ -355,6 +359,7 @@ class Gpu {
     dci.ppEnabledExtensionNames = extensions.data();
     vk::Check(vk::vkCreateDevice(physical, &dci, nullptr, &device), "vkCreateDevice");
     vk::LoadDevice(device);
+    amped3::native::cmd::Install();  // command streams (cmd_stream.h)
     if (can_export) {
 #ifdef _WIN32
       get_memory_handle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
@@ -369,6 +374,7 @@ class Gpu {
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.queueFamilyIndex = family;
     vk::Check(vk::vkCreateCommandPool(device, &pci, nullptr, &pool), "vkCreateCommandPool");
+    vk::Check(vk::vkCreateCommandPool(device, &pci, nullptr, &frame_pool), "vkCreateCommandPool");
 
     VkFormatProperties fp;
     vk::vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
@@ -762,6 +768,7 @@ class Gpu {
     }
     blocks.clear();
     if (pool) vk::vkDestroyCommandPool(device, pool, nullptr);
+    if (frame_pool) vk::vkDestroyCommandPool(device, frame_pool, nullptr);
     vk::vkDestroyDevice(device, nullptr);
     if (instance) vk::vkDestroyInstance(instance, nullptr);
     device = VK_NULL_HANDLE;
@@ -773,9 +780,9 @@ class Gpu {
     return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
   }
 
-  VkCommandBuffer BeginCommands() {
+  VkCommandBuffer BeginCommands(VkCommandPool from = VK_NULL_HANDLE) {
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool;
+    ai.commandPool = from ? from : pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
     VkCommandBuffer cb;
@@ -797,7 +804,8 @@ class Gpu {
     vk::Check(vk::vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
   }
 
-  void Submit(VkCommandBuffer cb, VkCommandBuffer first = VK_NULL_HANDLE) {
+  void Submit(VkCommandBuffer cb, VkCommandBuffer first = VK_NULL_HANDLE,
+              VkCommandPool cb_pool = VK_NULL_HANDLE) {
     if (first) {
       VkSubmitInfo fi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
       fi.commandBufferCount = 1;
@@ -812,7 +820,7 @@ class Gpu {
     // everything and submits nothing (the pictures are garbage).
     static const bool no_submit = std::getenv("AMPED3_PROFILE_NO_SUBMIT") != nullptr;
     if (no_submit) {
-      vk::vkFreeCommandBuffers(device, pool, 1, &cb);
+      vk::vkFreeCommandBuffers(device, cb_pool ? cb_pool : pool, 1, &cb);
       return;
     }
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -820,7 +828,7 @@ class Gpu {
     si.pCommandBuffers = &cb;
     vk::Check(vk::vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
     vk::Check(vk::vkQueueWaitIdle(queue), "vkQueueWaitIdle");
-    vk::vkFreeCommandBuffers(device, pool, 1, &cb);
+    vk::vkFreeCommandBuffers(device, cb_pool ? cb_pool : pool, 1, &cb);
   }
 };
 
@@ -1108,6 +1116,7 @@ struct Renderer::Impl {
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkCommandBuffer upload_cb = VK_NULL_HANDLE;  // ran before cb (texture uploads)
+    VkCommandPool cb_pool = VK_NULL_HANDLE;      // where cb came from
     bool pending = false;
     uint64_t ticket = 0;
     bool timed = false;  // GPU timestamps at the frame's start and end (ts_pool_)
@@ -1159,7 +1168,7 @@ struct Renderer::Impl {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
     vk::vkResetFences(gpu_.device, 1, &fs.fence);
-    vk::vkFreeCommandBuffers(gpu_.device, gpu_.pool, 1, &fs.cb);
+    vk::vkFreeCommandBuffers(gpu_.device, fs.cb_pool ? fs.cb_pool : gpu_.pool, 1, &fs.cb);
     fs.cb = VK_NULL_HANDLE;
     if (fs.upload_cb) vk::vkFreeCommandBuffers(gpu_.device, gpu_.pool, 1, &fs.upload_cb);
     fs.upload_cb = VK_NULL_HANDLE;
@@ -1663,6 +1672,9 @@ struct Renderer::Impl {
   // DoDraw's pass: clears waiting for other render targets may go on
   // waiting (a draw samples textures and resolves, never a target).
   bool keep_target_clears_ = false;
+  // The frame's commands recorded on another thread (SetParallelCommands).
+  amped3::native::cmd::Stream stream_;
+  bool parallel_commands_ = true;
   // Does the waiting clears except render targets other than `but` / `but2`,
   // which may go on waiting (into the next frame: its first pass on them
   // takes them as load ops).
@@ -4952,6 +4964,9 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   Transition(*src, gen, ro);
   Transition(*depth, gen, ro);
   Transition(mv_img_, gen, ro);
+  // The upscaler records into the command buffer itself: everything before
+  // it first.
+  if (stream_.active()) stream_.Drain();
   const bool ok = upscaler_->Dispatch(cb_, in, &error);
   Transition(*src, ro, gen);
   Transition(*depth, ro, gen);
@@ -6790,6 +6805,7 @@ bool Renderer::Impl::DrawOutput(Image* src, const uint8_t* lut, bool share, uint
 }
 
 Renderer::Impl::~Impl() {
+  if (stream_.active()) stream_.End();  // a frame left unfinished (an error)
   if (!gpu_.device) return;
   StopPipelineBuilders();
   if (cache_save_.valid()) cache_save_.wait();
@@ -6941,7 +6957,13 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   CollectPipelines();
   pipeline_sync_ms_ = 0;
   Prepass();
-  cb_ = gpu_.BeginCommands();
+  // The frame's commands: recorded on the command stream's thread (from a
+  // pool of their own) while this one prepares the next draws.
+  if (stream_.active()) stream_.End();  // the last frame stopped by an error
+  const bool streamed = parallel_commands_;
+  const VkCommandPool cb_pool = streamed ? gpu_.frame_pool : gpu_.pool;
+  cb_ = gpu_.BeginCommands(cb_pool);
+  if (streamed) stream_.Begin(cb_);
   // GPU time of the frame (the F3 overlay): timestamps at its start and end.
   if (fs) {
     fs->timed = false;
@@ -7038,14 +7060,17 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
       vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_,
                               uint32_t(fs - slots_) * 2 + 1);
     }
+    if (stream_.active()) stream_.End();
     fs->upload_cb = TakeUploads();
     gpu_.SubmitFenced(cb_, fs->fence, fs->upload_cb);
     fs->cb = cb_;
+    fs->cb_pool = cb_pool;
     fs->pending = true;
     fs->ticket = ++next_ticket_;
     stats_.ticket = fs->ticket;
   } else {
-    gpu_.Submit(cb_, TakeUploads());
+    if (stream_.active()) stream_.End();
+    gpu_.Submit(cb_, TakeUploads(), cb_pool);
   }
   const auto t3 = Clock::now();
   cb_ = VK_NULL_HANDLE;
@@ -7223,6 +7248,7 @@ void Renderer::SetMotionBlur(float scale, bool camera, bool objects, bool debug)
 
 void Renderer::SetSceneryObjectBlur(bool on) { impl_->scenery_blur_ = on; }
 void Renderer::SetMergeClears(bool on) { impl_->merge_clears_ = on; }
+void Renderer::SetParallelCommands(bool on) { impl_->parallel_commands_ = on; }
 
 RenderStats Renderer::Render(const Frame& frame, FrameResources& resources, uint32_t max_draws,
                              const OutputRequest* output, OutputInfo* info) {

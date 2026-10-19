@@ -111,6 +111,7 @@ rexglue_setup_target(amped3 GPU_PLUGINS xenos)
 # uses); without it the native renderer preview is compiled out.
 set(AMPED3_NATIVE_VK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/vk.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/cmd_stream.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/renderer.cpp)
 set_source_files_properties(${AMPED3_NATIVE_VK_SOURCES} PROPERTIES
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan)
@@ -188,6 +189,7 @@ add_executable(amped3-replay
     tools/replay/main.cpp
     tools/replay/capture.cpp
     src/native/vk.cpp
+    src/native/cmd_stream.cpp
     src/native/renderer.cpp
     src/native/glsl_compiler.cpp
     src/native/frame_writer.cpp

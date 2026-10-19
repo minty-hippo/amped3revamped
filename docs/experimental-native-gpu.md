@@ -336,3 +336,24 @@ New in the log every 5 s: render passes and clears per frame, and the GPU
 time by part (`GPU by part`: what drew into each render target up to its
 resolve, then the output passes), measured with timestamps. That shows which
 passes cost the most on the Armada's GPU.
+
+### Armada results, and the renderer's commands on their own thread
+
+On the Armada (scene at 960x540 with 2x MSAA, picture at 1080p, frame limit
+120): 71-79 render passes a frame, 6-7 clears folded into load ops and 3-4
+left as passes; the GPU takes 9.3-10.8 ms a frame (the scene up to its depth
+resolve 5.2-6.6 ms, the full-resolution HUD and composite about 2.1, depth at
+1080p about 1.0, the rest under 1). Games ran at about 118 fps; the limit is
+now the CPU: the drawing thread 83-85% of a core, the renderer worker 79-90%
+(8-10 ms a frame recording draws: Vulkan commands 3.0, uniforms 1.9).
+
+Next step (stage 4): the worker's Vulkan commands are recorded on a thread of
+their own (`src/native/cmd_stream.*`, setting `native_parallel_commands`).
+The vk:: command functions become stubs that, for the frame's command
+buffer, copy the call and its arrays into a queue; a recording thread makes
+the real calls in order while the worker prepares the next draws. Nothing at
+the call sites changes; the upscaler (which records into the command buffer
+itself) waits for the queue to empty first. The frame's command buffers come
+from a pool of their own, so the worker can keep allocating upload command
+buffers meanwhile. Replays (five captures, repeated frames, effects at 1.5x,
+and the async renderer's own check) are pixel-identical.

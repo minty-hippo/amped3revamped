@@ -62,6 +62,10 @@ REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
+REXCVAR_DEFINE_BOOL(native_parallel_commands, true, "GPU",
+                    "Native renderer: the frame's Vulkan commands are recorded on a thread of "
+                    "their own while the renderer prepares the next draws (the driver's time "
+                    "for each command moves off the renderer's thread).");
 REXCVAR_DEFINE_BOOL(native_merge_clears, true, "GPU",
                     "Native renderer: a clear waits for the next pass that draws to its image "
                     "and becomes that pass's load op (or is done inside the pass already drawing "
@@ -1589,6 +1593,7 @@ void WorkerMain() {
                          float(REXCVAR_GET(native_fog_start)));
         renderer->SetFoliageFade(revamped && REXCVAR_GET(native_foliage_fade));
         renderer->SetMergeClears(REXCVAR_GET(native_merge_clears));
+        renderer->SetParallelCommands(REXCVAR_GET(native_parallel_commands));
         renderer->SetMapClouds(revamped && REXCVAR_GET(native_map_clouds));
         renderer->SetHideInterface(g_hide_interface.load());
         // The game state machine (0x828901E0) + 8: 7 = the trail map.
