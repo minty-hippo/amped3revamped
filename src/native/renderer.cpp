@@ -5196,7 +5196,9 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     const uint32_t infos[4] = {r.targets[1], r.targets[3], r.targets[4], r.targets[5]};
     src = GetTarget(ColorKey(surface, infos[source & 3]), true);
   }
-  MarkPart(src->name);  // GPU time by part: what drew into it
+  // GPU time by part: what drew into it, and which of the frame's parts this
+  // is (a surface drawn to more than once a frame shows each time apart).
+  MarkPart(src->name + " #" + std::to_string(cur_slot_ ? cur_slot_->part_names.size() + 1 : 0));
   amped3::native::TextureFetch dest;
   std::memcpy(dest.words, r.dest_raw.data(), sizeof(dest.words));
   const uint32_t base = dest.base_address() & 0x1FFFFFFF;
