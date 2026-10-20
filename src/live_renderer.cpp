@@ -2358,10 +2358,11 @@ void OnEndTiling() {
 
 // --- Stall watchdog -----------------------------------------------------------
 //
-// Diagnostics (Armada: the game thread now and then runs about 0.9 s without
-// presenting, busy, during videos): when no frame has been swapped for
-// 250 ms, logs where every game thread is (link register and r3 as of its
-// last kernel call), a few times per stall, for the first stalls.
+// Diagnostics, kept for future freezes (it found the write-watch faults that
+// froze in-game videos on Armada): when no frame has been swapped for 250 ms
+// (but under 5 s: loading), logs where every game thread is (link register
+// and r3 as of its last kernel call) once, then where the stall's CPU time
+// went, for the first 12 stalls. Quiet otherwise.
 std::atomic<int64_t> g_last_swap_ns{0};
 std::once_flag g_watchdog_once;
 
@@ -2456,10 +2457,9 @@ void WatchdogMain() {
       ++stalls;
       in_stall = true;
     }
-    if (samples++ >= 6) continue;
+    if (samples++ >= 1) continue;  // one snapshot per stall
     REXLOG_WARN("Stall watch: no frame for {:.0f} ms; {}", ms,
                 amped3::diag::GuestThreadSnapshot(rex::system::kernel_state()));
-    if (samples == 1) REXLOG_WARN("Stall watch: allocations so far: {}", trace::TopAllocationSites());
   }
 }
 

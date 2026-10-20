@@ -82,9 +82,6 @@ int64_t ThreadCpuNs();
 
 // Heap allocations (operator new) made by this thread so far.
 uint64_t ThreadAllocations();
-// Diagnostics: the most frequent sources of heap allocations on game threads
-// since the last call (sampled), as one line.
-std::string TopAllocationSites();
 
 // Heap allocations made while recording draws (any thread), for the summary.
 void AddRecordAllocations(uint64_t n);
