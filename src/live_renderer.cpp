@@ -621,6 +621,7 @@ struct CachedVertices {
   uint32_t dirty_streak = 0;  // consecutive uses that found it rewritten
   bool dynamic = false;
   uint32_t same_streak = 0;   // dynamic: consecutive copies that found it unchanged
+  uint32_t same_needed = 1;   // ... before it is watched (1: a range seen for the first time)
 };
 std::unordered_map<uint64_t, CachedVertices> g_vertex_cache;
 
@@ -630,6 +631,10 @@ std::unordered_map<uint64_t, CachedVertices> g_vertex_cache;
 // cost a page fault per page for a few frames every 20 s, and a fault costs
 // about 1 ms on an ARM handheld: ~0.9 s video freezes.)
 constexpr uint32_t kStaticAgain = 30;
+// A range seen for the first time isn't watched yet either: only when its
+// next use finds it unchanged. A video's buffers, rewritten every frame, are
+// then never protected (their first two frames used to fault on every page:
+// a ~0.9 s freeze and an audio pop as an in-game video starts).
 uint64_t g_record_frame = 0;  // frames recorded (game thread)
 struct VertexCacheStats {
   std::atomic<uint64_t> hits{0}, copies{0}, hit_bytes{0}, copy_bytes{0};
@@ -668,6 +673,11 @@ std::shared_ptr<std::vector<uint8_t>> CachedVertexData(rex::memory::Memory* memo
   const uint64_t key = (uint64_t(address) << 32) | size;
   CachedVertices& e = g_vertex_cache[key];
   e.used_frame = g_record_frame;
+  if (!e.data) {  // first use: copied, not watched yet (kStaticAgain)
+    e.dynamic = true;
+    e.same_streak = 0;
+    e.same_needed = 1;
+  }
   // Staggered safety refresh (every ~4 s at 60 fps).
   const bool refresh = g_record_frame - e.copied_frame > 240 + (key % 61);
   if (e.data && !e.dynamic && !refresh && PagesClean(address, size, e.epoch)) {
@@ -683,12 +693,13 @@ std::shared_ptr<std::vector<uint8_t>> CachedVertexData(rex::memory::Memory* memo
     if (++e.dirty_streak >= 2) {
       e.dynamic = true;
       e.same_streak = 0;
+      e.same_needed = kStaticAgain;
     }
   }
   // Dynamic and unchanged for a while: watched again.
   if (e.dynamic && e.data && e.data->size() == size &&
       std::memcmp(e.data->data(), src, size) == 0) {
-    if (++e.same_streak >= kStaticAgain) {
+    if (++e.same_streak >= e.same_needed) {
       e.dynamic = false;
       e.dirty_streak = 0;
     }
@@ -747,6 +758,7 @@ struct CachedTextureHash {
   uint32_t dirty_streak = 0;
   bool dynamic = false;
   uint32_t same_streak = 0;  // dynamic: consecutive hashes that found it unchanged
+  uint32_t same_needed = 1;  // ... before it is watched (1: a range seen for the first time)
 };
 std::unordered_map<uint64_t, CachedTextureHash> g_texture_hashes;  // (address, size)
 constexpr size_t kTextureSnapshotBudget = 16u << 20;  // bytes copied a frame at most
@@ -776,6 +788,7 @@ uint64_t TextureRangeHash(rex::memory::Memory* memory, uint32_t address, uint32_
   auto [it, inserted] = g_texture_hashes.try_emplace(key);
   CachedTextureHash& e = it->second;
   e.used_frame = g_record_frame;
+  if (inserted) e.dynamic = true;  // first use: hashed, not watched yet (kStaticAgain)
   if (!inserted && !e.dynamic && PagesClean(address, size, e.epoch)) {
     e.dirty_streak = 0;
     return e.hash;
@@ -783,6 +796,7 @@ uint64_t TextureRangeHash(rex::memory::Memory* memory, uint32_t address, uint32_
   if (!inserted && !e.dynamic && ++e.dirty_streak >= 2) {
     e.dynamic = true;  // rewritten every frame: hash it every frame, unwatched
     e.same_streak = 0;
+    e.same_needed = kStaticAgain;
   }
   // Watched (static) ranges: the watch goes on before the bytes are read, so
   // a write after the read is never missed.
@@ -791,7 +805,7 @@ uint64_t TextureRangeHash(rex::memory::Memory* memory, uint32_t address, uint32_
   uint64_t h = HashBytes(p, size, 1469598103934665603ull);
   // Dynamic and unchanged for a while: watched again (kStaticAgain).
   if (e.dynamic && !inserted && h == e.hash) {
-    if (++e.same_streak >= kStaticAgain) {
+    if (++e.same_streak >= e.same_needed) {
       e.dynamic = false;
       e.dirty_streak = 0;
       epoch = g_write_epoch.load(std::memory_order_acquire);
