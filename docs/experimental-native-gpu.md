@@ -403,3 +403,18 @@ Replayer, warm repeats (record / prepass, ms):
 | 083545 | 6.8 / 2.6 | 4.1 / 2.4 |
 
 The pictures are identical to before.
+
+## The depth pre-pass at the scene's resolution
+
+Armada, riding with FSR (trace 20261020-172312): 82 fps, GPU 13 ms a frame,
+of which about 5.5 ms went to a pass drawn before the scene: about 500 draws
+into a 1280x720 surface, resolved to a texture as packed depth, blurred, and
+sampled by the scene. It was drawn at the output's scale (1920x1080) while
+the scene, with the upscaler, is at half that each way (960x540).
+
+`TargetScale` now gives screen-sized surfaces drawn before the frame's tiled
+pass (same pitch and height as the last tiled area, no MSAA, a 3D frame) the
+scene's scale. Without an upscaler the two scales are the same and nothing
+changes (replayer: identical picture). With one (replayer, scale 0.75 output
+1.5): the pass is a quarter of the pixels; the final picture differs in 0.03%
+of its pixels.

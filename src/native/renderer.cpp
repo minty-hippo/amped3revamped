@@ -1294,7 +1294,25 @@ struct Renderer::Impl {
   // drawn in one: with an upscaler they'd otherwise stay at the 3D scale).
   // Whether a tiled pass is the scene is known once its lighting pass is
   // drawn, so it goes by the last frame.
-  float TargetScale() const { return tiling_.width ? tiled_scale_ : out_scale_; }
+  // The scale a render target is drawn at: the 3D scene's inside its tiled
+  // pass, else the output's. Screen-sized passes drawn before the scene
+  // (Amped 3's depth pre-pass, about 500 draws, blurred and sampled by the
+  // scene) are at the scene's scale too: the scene samples them at its own
+  // resolution, so drawing them at the output's (2x the scene's each way with
+  // an upscaler) only cost GPU time.
+  float TargetScale(const TargetKey& k) const {
+    if (tiling_.width) return tiled_scale_;
+    if (!scene_begun_ && last_frame_lit_ && last_tiling_.width && k.samples == 1 &&
+        k.pitch == last_tiling_.width) {
+      TargetKey hk = k;
+      hk.scale_id = 0;
+      auto h = target_heights_.find(hk);
+      if (h != target_heights_.end() && h->second == last_tiling_.height) return scale_;
+    }
+    return out_scale_;
+  }
+  bool scene_begun_ = false;  // this frame's tiled pass has begun
+  Tiling last_tiling_;        // the last tiled pass's area
   bool last_frame_lit_ = true;
   float tiled_scale_ = 1.0f;  // this tiled pass's, fixed at BeginTiling
   static uint32_t Scaled(uint32_t v, float s) { return uint32_t(std::lround(double(v) * s)); }
@@ -2053,7 +2071,7 @@ Image* Renderer::Impl::GetTarget(const TargetKey& base_key, bool resolve) {
   // Draws ask for the same few targets over and over: the last few answers
   // (images live as long as the renderer, never erased from targets_).
   if (!resolve) {
-    const uint32_t scale_id = uint32_t(std::lround(TargetScale() * 80.0f));
+    const uint32_t scale_id = uint32_t(std::lround(TargetScale(base_key) * 80.0f));
     for (auto& c : target_cache_) {
       if (c.image && c.scale_id == scale_id && c.key.depth == base_key.depth &&
           c.key.base == base_key.base && c.key.format == base_key.format &&
@@ -2077,7 +2095,7 @@ Image* Renderer::Impl::GetTarget(const TargetKey& base_key, bool resolve) {
 }
 
 Image* Renderer::Impl::GetTargetUncached(const TargetKey& base_key, bool resolve) {
-  float ts = TargetScale();
+  float ts = TargetScale(base_key);
   TargetKey key = base_key;
   key.scale_id = uint32_t(std::lround(ts * 80.0f));
   if (resolve) {
@@ -7050,6 +7068,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   final_ = nullptr;
   tiling_ = {};
   light_seen_ = false;
+  scene_begun_ = false;
   blur_done_ = false;
   composite_seen_ = false;
   max_draws_ = max_draws;
@@ -7149,6 +7168,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
       case EventType::kBeginTiling:
         tiling_ = frame.tilings[e.index];
         tiled_scale_ = last_frame_lit_ ? scale_ : out_scale_;
+        scene_begun_ = true;
+        last_tiling_ = tiling_;
         break;
       case EventType::kEndTiling:
         if (!vel_ready_ && (!vel_draws_.empty() || !mask_draws_.empty())) DrawVelocities();
