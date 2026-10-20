@@ -1940,6 +1940,18 @@ struct QueuedJob {
 // queued at once; it's woken when it sleeps and kWakeBatch draws are waiting,
 // at the end of a frame, and when a fence waits for the names.
 constexpr size_t kWakeBatch = 32;
+// And it looks for queued draws on its own this often while it sleeps, so a
+// draw is never left waiting long for its name (frames of a few draws: menus,
+// videos).
+constexpr auto kRecorderPoll = std::chrono::milliseconds(2);
+
+// Diagnostics (Armada video stalls): rare long waits for names, and long
+// naming jobs, go to the log.
+void LogSlow(const char* what, double ms, size_t queued) {
+  static std::atomic<int> logged{0};
+  if (ms < 50.0 || logged.fetch_add(1) >= 40) return;
+  REXLOG_WARN("Native renderer: {} took {:.1f} ms ({} draws queued)", what, ms, queued);
+}
 
 std::mutex g_queue_mutex;
 std::condition_variable g_queue_cv;
@@ -1971,6 +1983,7 @@ void WaitNamedThrough(uint32_t fence) {
   };
   if (!pending()) return;
   g_name_waiters.fetch_add(1);
+  const auto wait_start = std::chrono::steady_clock::now();
   if (g_recorder_sleeping) {  // draws it hasn't been woken for
     g_recorder_sleeping = false;
     g_queue_cv.notify_one();
@@ -1986,6 +1999,10 @@ void WaitNamedThrough(uint32_t fence) {
     }
   }
   g_name_waiters.fetch_sub(1);
+  LogSlow("a fence waiting for draw names",
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start)
+              .count(),
+          g_queue.size());
 }
 
 void OnGpuEventWrite(uint32_t physical_address, uint32_t value) {
@@ -2046,7 +2063,7 @@ void RecorderMain() {
       std::unique_lock lock(g_queue_mutex);
       if (g_queue.empty()) {
         g_recorder_sleeping = true;
-        g_queue_cv.wait(lock, [] {
+        g_queue_cv.wait_for(lock, kRecorderPoll, [] {
           return g_recorder_stop.load() || (!g_recorder_sleeping && !g_queue.empty());
         });
         g_recorder_sleeping = false;
@@ -2058,6 +2075,7 @@ void RecorderMain() {
     }
     for (size_t b = 0; b < batch.size(); ++b) {
       QueuedJob& job = batch[b];
+      const bool end_job = job.end != nullptr;
       const auto t0 = std::chrono::steady_clock::now();
       if (job.frame != naming) {
         naming = job.frame;
@@ -2077,10 +2095,12 @@ void RecorderMain() {
         if (job.hand_over) HandOver(std::move(job.end), g_prep_mutex, g_prep_cv, g_prep);
         job.end.reset();
       }
-      trace::Add(trace::Zone::kRecNaming,
-                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                     std::chrono::steady_clock::now() - t0)
-                     .count());
+      const int64_t job_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+      trace::Add(trace::Zone::kRecNaming, job_ns);
+      LogSlow(end_job ? "naming a frame's end" : "naming a draw", double(job_ns) * 1e-6,
+              batch.size() - b - 1);
       // A fence waiting for these names: let it see the progress now.
       if (g_name_waiters.load() > 0) {
         {
