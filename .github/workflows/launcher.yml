@@ -94,7 +94,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Version
         id: version
-        run: echo "tag=launcher-v$(tr -d '[:space:]' < launcher/VERSION)" >> "$GITHUB_OUTPUT"
+        run: |
+          v="$(tr -d '[:space:]' < launcher/VERSION)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=launcher-v$v" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -108,7 +111,7 @@ jobs:
           files: dist/*
           overwrite_files: true
           make_latest: true
-          name: Launcher ${{ steps.version.outputs.tag }}
+          name: Launcher v${{ steps.version.outputs.version }}
           body: |
             The Amped 3 Revamped launcher. Download the one for your system, run it, choose your
             Amped 3 (Xbox 360) disc image and select Build and install. It downloads this

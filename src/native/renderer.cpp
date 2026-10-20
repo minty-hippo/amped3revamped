@@ -1558,6 +1558,10 @@ struct Renderer::Impl {
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
   VkShaderModule copy_fs_[18] = {};  // by CopyKind
+  // Map clouds: one quad per puff (instanced), placed by its vertex shader,
+  // with push constants in both stages (a layout of their own).
+  VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
+  VkPipelineLayout clouds_layout_ = VK_NULL_HANDLE;
   // Output (DrawOutput): shared slots, the local image for readback, the
   // gamma table.
   struct OutputSlot {
@@ -3383,6 +3387,9 @@ void Renderer::Impl::CreateOnce() {
   pli.pushConstantRangeCount = 1;
   pli.pPushConstantRanges = &pcr;
   vk::Check(vk::vkCreatePipelineLayout(dev, &pli, nullptr, &copy_layout_), "copy pipeline layout");
+  VkPushConstantRange clouds_pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+  pli.pPushConstantRanges = &clouds_pcr;
+  vk::Check(vk::vkCreatePipelineLayout(dev, &pli, nullptr, &clouds_layout_), "clouds pipeline layout");
   copy_vs_ = CompileBuiltin("builtin_fullscreen", R"(#version 450
 void main() {
   vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
@@ -3891,14 +3898,70 @@ void main() {
   // = 1; procedural look-alikes until the game has used it) covering the
   // screen, dispersing from the middle outward as a.x goes 0 -> 1: each
   // drifts off away from the middle, growing and turning a little, and fades
-  // at the end. Units: screen heights (y down).
-  copy_fs_[17] = CompileBuiltin("builtin_clouds", R"(#version 450
+  // at the end. Units: screen heights (y down). One instanced quad per puff
+  // (b.x columns, rows by the sprite), drawn in order and blended "over",
+  // which composes them as one layer would: each pixel only pays for the
+  // puffs on it (it used to test every puff, which an ARM GPU took 50 ms
+  // a frame over).
+  const char* clouds_common = R"(
 layout(push_constant) uniform Clouds {
   vec4 a;  // progress 0..1, aspect (w / h), 1 / height, sprite (1) or not (0)
+  vec4 b;  // columns
 } pc;
-layout(binding = 2) uniform sampler2D sprite;
-layout(location = 0) out vec4 o;
 float hash(float n) { return fract(sin(n) * 43758.5453); }
+)";
+  clouds_vs_ = CompileBuiltin("builtin_clouds_vs", std::string(R"(#version 450
+)") + clouds_common + R"(
+layout(location = 0) flat out vec4 v_puff;   // position (screen heights), radius, fade
+layout(location = 1) flat out vec3 v_turn;   // angle, mirrored (1) or not, id
+void main() {
+  bool textured = pc.a.w > 0.5;
+  float aspect = pc.a.y;
+  float p = pc.a.x;
+  int cols = int(pc.b.x);
+  int r = gl_InstanceIndex / cols, c = gl_InstanceIndex - r * cols;
+  float spacing = textured ? 0.14 : 0.2, R = textured ? 0.115 : 0.165;
+  vec2 center = vec2(aspect * 0.5, 0.5);
+  float far = length(center) + 0.2;
+  float id = float(r * 64 + c) + 1.0;
+  vec2 base = vec2((float(c) - 0.5 + ((r & 1) == 1 ? 0.5 : 0.0)) * spacing,
+                   (float(r) - 0.5) * spacing * 0.9);
+  base += (vec2(hash(id), hash(id + 17.0)) - 0.5) * spacing * 0.25;
+  vec2 away = base - center;
+  float dn = clamp(length(away) / far, 0.0, 1.0);
+  // The middle parts first, the edges last; moving off at once, then
+  // speeding up.
+  float s = 0.35 * dn + 0.05 * hash(id + 5.0);
+  float q = clamp((p - s) / (1.0 - s), 0.0, 1.0);
+  float e = q * q * 0.6 + q * 0.4;
+  vec2 dir = length(away) > 1e-3 ? normalize(away) : vec2(0.0, -1.0);
+  float size = 0.92 + 0.22 * hash(id + 31.0);
+  float scale = size * (1.0 + 0.45 * e);
+  vec2 pos = base + dir * e * (textured ? 0.45 + 0.35 * aspect : 0.8 + 0.6 * aspect) +
+             vec2(0.0, -0.15) * e;
+  float fade = 1.0 - smoothstep(0.75, 1.0, q);
+  float radius = R * scale;
+  // Turned a little (more as it goes, away from the middle), and mirrored
+  // for half of them (textured).
+  float ang = (hash(id + 3.0) - 0.5) * 0.6 + e * sign(dir.x + 1e-3) * 0.5;
+  v_puff = vec4(pos, radius, fade);
+  v_turn = vec3(ang, hash(id + 11.0) > 0.5 ? 1.0 : 0.0, id);
+  // The quad around it: the shape test's reach, sqrt(2.6) radii, plus a
+  // pixel for the edge's anti-aliasing. Faded out: nothing to draw.
+  int k = gl_VertexIndex;
+  vec2 corner = vec2((k == 1 || k == 2 || k == 4) ? 1.0 : -1.0,
+                     (k == 2 || k == 4 || k == 5) ? 1.0 : -1.0);
+  vec2 at = pos + corner * (radius * 1.6125 + 2.0 * pc.a.z);
+  gl_Position = fade > 0.0 ? vec4(at.x / aspect * 2.0 - 1.0, at.y * 2.0 - 1.0, 0.0, 1.0)
+                           : vec4(2.0, 2.0, 2.0, 1.0);
+}
+)", false);
+  copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
+)") + clouds_common + R"(
+layout(binding = 2) uniform sampler2D sprite;
+layout(location = 0) flat in vec4 v_puff;
+layout(location = 1) flat in vec3 v_turn;
+layout(location = 0) out vec4 o;
 // Signed distance to a puff (shape units, about 1 across): a body and six
 // bumps around it.
 float Puff(vec2 q, float id) {
@@ -3914,68 +3977,33 @@ float Puff(vec2 q, float id) {
 void main() {
   float px = pc.a.z;
   vec2 uv = gl_FragCoord.xy * px;
-  float aspect = pc.a.y;
   bool textured = pc.a.w > 0.5;
-  vec2 center = vec2(aspect * 0.5, 0.5);
-  float p = pc.a.x;
   float line = 0.0055;   // outline width (procedural)
-  // Textured: smaller and more of them, the size the pause menu draws them.
-  float spacing = textured ? 0.14 : 0.2, R = textured ? 0.115 : 0.165;
-  int rows = textured ? 10 : 7;
-  int cols = int(ceil(aspect / spacing)) + 2;
-  vec3 col = vec3(0.0);  // premultiplied
-  float alpha = 0.0;
-  float far = length(center) + 0.2;
-  for (int r = 0; r < rows; ++r) {
-    for (int c = 0; c < cols; ++c) {
-      float id = float(r * 64 + c) + 1.0;
-      vec2 base = vec2((float(c) - 0.5 + ((r & 1) == 1 ? 0.5 : 0.0)) * spacing,
-                       (float(r) - 0.5) * spacing * 0.9);
-      base += (vec2(hash(id), hash(id + 17.0)) - 0.5) * spacing * 0.25;
-      vec2 away = base - center;
-      float dn = clamp(length(away) / far, 0.0, 1.0);
-      // The middle parts first, the edges last; moving off at once, then
-      // speeding up.
-      float s = 0.35 * dn + 0.05 * hash(id + 5.0);
-      float q = clamp((p - s) / (1.0 - s), 0.0, 1.0);
-      float e = q * q * 0.6 + q * 0.4;
-      vec2 dir = length(away) > 1e-3 ? normalize(away) : vec2(0.0, -1.0);
-      float size = 0.92 + 0.22 * hash(id + 31.0);
-      float scale = size * (1.0 + 0.45 * e);
-      vec2 pos = base + dir * e * (textured ? 0.45 + 0.35 * aspect : 0.8 + 0.6 * aspect) +
-                 vec2(0.0, -0.15) * e;
-      vec2 local = (uv - pos) / (R * scale);
-      if (dot(local, local) > 2.6) continue;
-      float fade = 1.0 - smoothstep(0.75, 1.0, q);
-      vec3 pc_col;
-      float cover;
-      if (textured) {
-        // Turned a little (more as it goes, away from the middle), and
-        // mirrored for half of them.
-        float ang = (hash(id + 3.0) - 0.5) * 0.6 + e * sign(dir.x + 1e-3) * 0.5;
-        vec2 l = mat2(cos(ang), -sin(ang), sin(ang), cos(ang)) * local;
-        if (hash(id + 11.0) > 0.5) l.x = -l.x;
-        vec2 suv = l / 2.3 + 0.5;
-        if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) continue;
-        vec4 t = textureLod(sprite, suv, 0.0);
-        cover = t.a;
-        pc_col = t.rgb;
-      } else {
-        float d = Puff(local, id) * R * scale;  // screen heights
-        cover = clamp(0.5 - d / px, 0.0, 1.0);
-        // White, a touch blue toward the bottom, with a dark outline.
-        vec3 fill = mix(vec3(1.0), vec3(0.86, 0.9, 0.98), clamp(local.y * 0.45 + 0.35, 0.0, 1.0) * 0.6);
-        float edge = clamp(0.5 + (d + line) / px, 0.0, 1.0);
-        pc_col = mix(fill, vec3(0.06, 0.06, 0.08), edge);
-      }
-      cover *= fade;
-      if (cover <= 0.0) continue;
-      col = pc_col * cover + col * (1.0 - cover);
-      alpha = cover + alpha * (1.0 - cover);
-    }
+  vec2 local = (uv - v_puff.xy) / v_puff.z;
+  if (dot(local, local) > 2.6) discard;
+  float id = v_turn.z;
+  vec3 col;
+  float cover;
+  if (textured) {
+    float ang = v_turn.x;
+    vec2 l = mat2(cos(ang), -sin(ang), sin(ang), cos(ang)) * local;
+    if (v_turn.y > 0.5) l.x = -l.x;
+    vec2 suv = l / 2.3 + 0.5;
+    if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) discard;
+    vec4 t = textureLod(sprite, suv, 0.0);
+    cover = t.a;
+    col = t.rgb;
+  } else {
+    float d = Puff(local, id) * v_puff.z;  // screen heights
+    cover = clamp(0.5 - d / px, 0.0, 1.0);
+    // White, a touch blue toward the bottom, with a dark outline.
+    vec3 fill = mix(vec3(1.0), vec3(0.86, 0.9, 0.98), clamp(local.y * 0.45 + 0.35, 0.0, 1.0) * 0.6);
+    float edge = clamp(0.5 + (d + line) / px, 0.0, 1.0);
+    col = mix(fill, vec3(0.06, 0.06, 0.08), edge);
   }
-  if (alpha <= 0.0) discard;
-  o = vec4(col / max(alpha, 1e-4), alpha);
+  cover *= v_puff.w;
+  if (cover <= 0.0) discard;
+  o = vec4(col, cover);
 }
 )", true);
   // Step 2: the largest motion in each tile (tile = the longest half blur),
@@ -4309,7 +4337,7 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = copy_vs_;
+    stages[0].module = kind == CopyKind::kClouds ? clouds_vs_ : copy_vs_;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = copy_fs_[int(kind)];
@@ -4357,7 +4385,7 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
     pci.pDepthStencilState = &ds;
     pci.pColorBlendState = &cbs;
     pci.pDynamicState = &dy;
-    pci.layout = copy_layout_;
+    pci.layout = kind == CopyKind::kClouds ? clouds_layout_ : copy_layout_;
     vk::Check(vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p),
               "copy pipeline");
   }
@@ -6718,9 +6746,19 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
   if (clouds) {
     vk::vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           CopyPipeline(CopyKind::kClouds, dst->format));
-    const float cpc[4] = {cloud_p_, float(w) / float(h), 1.0f / float(h), sprite ? 1.0f : 0.0f};
-    vk::vkCmdPushConstants(cb_, copy_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(cpc), cpc);
-    vk::vkCmdDraw(cb_, 3, 1, 0, 0);
+    vk::vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, clouds_layout_, 0, 1, &set,
+                                0, nullptr);
+    // The puffs' grid (as the shader lays it out): rows by the sprite,
+    // columns across the width.
+    const float aspect = float(w) / float(h);
+    const int rows = sprite ? 10 : 7;
+    const int cols = int(std::ceil(aspect / (sprite ? 0.14f : 0.2f))) + 2;
+    const float cpc[8] = {cloud_p_, aspect, 1.0f / float(h), sprite ? 1.0f : 0.0f,
+                          float(cols), 0.0f, 0.0f, 0.0f};
+    vk::vkCmdPushConstants(cb_, clouds_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(cpc), cpc);
+    vk::vkCmdDraw(cb_, 6, uint32_t(rows * cols), 0, 0);
   }
   vk::vkCmdEndRendering(cb_);
   dyn_ = DynState{};  // all of it: a new pass or command buffer binds nothing yet
@@ -6885,6 +6923,8 @@ Renderer::Impl::~Impl() {
   if (pool_) vk::vkDestroyDescriptorPool(dev, pool_, nullptr);
   if (layout_) vk::vkDestroyPipelineLayout(dev, layout_, nullptr);
   if (copy_layout_) vk::vkDestroyPipelineLayout(dev, copy_layout_, nullptr);
+  if (clouds_layout_) vk::vkDestroyPipelineLayout(dev, clouds_layout_, nullptr);
+  if (clouds_vs_) vk::vkDestroyShaderModule(dev, clouds_vs_, nullptr);
   for (auto& l : set_layouts_) {
     if (l) vk::vkDestroyDescriptorSetLayout(dev, l, nullptr);
   }
