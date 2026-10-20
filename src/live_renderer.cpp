@@ -1934,14 +1934,23 @@ struct QueuedJob {
   bool hand_over = false;
 };
 
+// The game thread queues draws without waking the recorder for each one (a
+// wake is a system call: about 3 us a draw on the handheld, 5 ms a frame,
+// on the thread that limits the frame rate). The recorder takes everything
+// queued at once; it's woken when it sleeps and kWakeBatch draws are waiting,
+// at the end of a frame, and when a fence waits for the names.
+constexpr size_t kWakeBatch = 32;
+
 std::mutex g_queue_mutex;
 std::condition_variable g_queue_cv;
-std::condition_variable g_drained_cv;  // a draw was named
-std::deque<QueuedJob> g_queue;
+std::condition_variable g_drained_cv;  // draws were named
+std::vector<QueuedJob> g_queue;
 bool g_queue_has_stamp = false;  // g_queue holds a draw (its oldest stamp below)
 uint32_t g_queue_oldest_stamp = 0;
-bool g_naming_busy = false;      // the recorder holds a draw it took off the queue
-uint32_t g_naming_stamp = 0;     // its stamp
+bool g_naming_busy = false;      // the recorder holds draws it took off the queue
+uint32_t g_naming_stamp = 0;     // the oldest of those not named yet
+bool g_recorder_sleeping = false;
+std::atomic<int> g_name_waiters{0};  // threads in WaitNamedThrough
 std::thread g_recorder;
 std::atomic<bool> g_recorder_stop{false};
 bool g_deferred = false;  // decided when the device starts (restart to change)
@@ -1961,6 +1970,11 @@ void WaitNamedThrough(uint32_t fence) {
     return g_queue_has_stamp && FenceAtOrAfter(fence, g_queue_oldest_stamp);
   };
   if (!pending()) return;
+  g_name_waiters.fetch_add(1);
+  if (g_recorder_sleeping) {  // draws it hasn't been woken for
+    g_recorder_sleeping = false;
+    g_queue_cv.notify_one();
+  }
   // A safety net: never hold the GPU or the game for long if something is off.
   if (!g_drained_cv.wait_for(lock, std::chrono::seconds(2), [&] {
         return !pending() || g_recorder_stop.load();
@@ -1971,6 +1985,7 @@ void WaitNamedThrough(uint32_t fence) {
       REXLOG_WARN("Native renderer: fence {:08X} waited 2 s for the recorder; going on", fence);
     }
   }
+  g_name_waiters.fetch_sub(1);
 }
 
 void OnGpuEventWrite(uint32_t physical_address, uint32_t value) {
@@ -1980,92 +1995,107 @@ void OnGpuEventWrite(uint32_t physical_address, uint32_t value) {
   }
 }
 
-// The oldest stamp still queued (under g_queue_mutex).
-void UpdateOldestStamp() {
-  g_queue_has_stamp = false;
-  for (const auto& j : g_queue) {
-    if (!j.end) {
-      g_queue_has_stamp = true;
-      g_queue_oldest_stamp = j.stamp;
-      return;
-    }
-  }
-}
-
 void EnqueueDraw(RecordedFrame* frame, size_t input, uint32_t stamp) {
+  bool wake;
   {
     std::lock_guard lock(g_queue_mutex);
     if (!g_queue_has_stamp) {
       g_queue_has_stamp = true;
       g_queue_oldest_stamp = stamp;
     }
-    QueuedJob j;
+    QueuedJob& j = g_queue.emplace_back();
     j.frame = frame;
     j.input = input;
     j.stamp = stamp;
-    g_queue.push_back(std::move(j));
+    wake = g_recorder_sleeping && g_queue.size() >= kWakeBatch;
+    if (wake) g_recorder_sleeping = false;  // one wake is enough
   }
-  g_queue_cv.notify_one();
+  if (wake) g_queue_cv.notify_one();
 }
 
 void EnqueueEndOfFrame(std::unique_ptr<RecordedFrame> frame, bool hand_over) {
   {
     std::lock_guard lock(g_queue_mutex);
-    QueuedJob j;
+    QueuedJob& j = g_queue.emplace_back();
     j.frame = frame.get();
     j.end = std::move(frame);
     j.hand_over = hand_over;
-    g_queue.push_back(std::move(j));
+    g_recorder_sleeping = false;
   }
   g_queue_cv.notify_one();
+}
+
+// The stamp of the first draw at or after `from` in `batch` (none: false).
+bool FirstStamp(const std::vector<QueuedJob>& batch, size_t from, uint32_t* stamp) {
+  for (size_t i = from; i < batch.size(); ++i) {
+    if (!batch[i].end) {
+      *stamp = batch[i].stamp;
+      return true;
+    }
+  }
+  return false;
 }
 
 void RecorderMain() {
   qos::PreferPerformanceThread(L"amped3 native recorder", true);
   rex::thread::set_current_thread_name("amped3 recorder");
   RecordedFrame* naming = nullptr;  // the frame BeginNaming was last called for
+  std::vector<QueuedJob> batch;
   while (!g_recorder_stop.load()) {
-    QueuedJob job;
     {
       std::unique_lock lock(g_queue_mutex);
-      g_queue_cv.wait(lock, [] { return g_recorder_stop.load() || !g_queue.empty(); });
+      if (g_queue.empty()) {
+        g_recorder_sleeping = true;
+        g_queue_cv.wait(lock, [] {
+          return g_recorder_stop.load() || (!g_recorder_sleeping && !g_queue.empty());
+        });
+        g_recorder_sleeping = false;
+      }
       if (g_queue.empty()) continue;
-      job = std::move(g_queue.front());
-      g_queue.pop_front();
+      batch.swap(g_queue);
+      g_queue_has_stamp = false;
+      g_naming_busy = FirstStamp(batch, 0, &g_naming_stamp);
+    }
+    for (size_t b = 0; b < batch.size(); ++b) {
+      QueuedJob& job = batch[b];
+      const auto t0 = std::chrono::steady_clock::now();
+      if (job.frame != naming) {
+        naming = job.frame;
+        BeginNaming();
+      }
       if (!job.end) {
-        g_naming_busy = true;
-        g_naming_stamp = job.stamp;
+        NameDraw(*job.frame, job.frame->inputs.At(job.input));
+      } else {
+        RecordedFrame& f = *job.end;
+        const size_t n = f.inputs.size();
+        for (size_t i = 0; i < n; ++i) {
+          DrawInputs& in = f.inputs.At(i);
+          if (in.draw < f.frame.draws.size()) ApplyNames(f.frame.draws[in.draw], in);
+        }
+        if (f.name_swap) f.frame.swap_data = TextureName(f, f.swap_fetch_words);
+        naming = nullptr;
+        if (job.hand_over) HandOver(std::move(job.end), g_prep_mutex, g_prep_cv, g_prep);
+        job.end.reset();
       }
-      UpdateOldestStamp();
-    }
-    const auto t0 = std::chrono::steady_clock::now();
-    if (job.frame != naming) {
-      naming = job.frame;
-      BeginNaming();
-    }
-    if (!job.end) {
-      NameDraw(*job.frame, job.frame->inputs.At(job.input));
-    } else {
-      RecordedFrame& f = *job.end;
-      const size_t n = f.inputs.size();
-      for (size_t i = 0; i < n; ++i) {
-        DrawInputs& in = f.inputs.At(i);
-        if (in.draw < f.frame.draws.size()) ApplyNames(f.frame.draws[in.draw], in);
+      trace::Add(trace::Zone::kRecNaming,
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count());
+      // A fence waiting for these names: let it see the progress now.
+      if (g_name_waiters.load() > 0) {
+        {
+          std::lock_guard lock(g_queue_mutex);
+          g_naming_busy = FirstStamp(batch, b + 1, &g_naming_stamp);
+        }
+        g_drained_cv.notify_all();
       }
-      if (f.name_swap) f.frame.swap_data = TextureName(f, f.swap_fetch_words);
-      naming = nullptr;
-      if (job.hand_over) HandOver(std::move(job.end), g_prep_mutex, g_prep_cv, g_prep);
-      job.end.reset();
     }
-    trace::Add(trace::Zone::kRecNaming,
-               std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now() - t0)
-                   .count());
+    batch.clear();
     {
       std::lock_guard lock(g_queue_mutex);
       g_naming_busy = false;
     }
-    g_drained_cv.notify_all();
+    if (g_name_waiters.load() > 0) g_drained_cv.notify_all();
   }
 }
 

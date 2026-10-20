@@ -357,3 +357,22 @@ itself) waits for the queue to empty first. The frame's command buffers come
 from a pool of their own, so the worker can keep allocating upload command
 buffers meanwhile. Replays (five captures, repeated frames, effects at 1.5x,
 and the async renderer's own check) are pixel-identical.
+
+## Queueing draws without a wake each
+
+The Armada traces of 2026-10-20 (FSR on, about 61 fps, GPU 12.6 ms) put the
+game's draw thread at 88% of a core, 10.6 ms a frame of it in recording; the
+biggest part, `rec_indices` (5.5 ms), was not copying indices (the recorder
+thread does that) but queueing each draw for naming: a lock, a push and a
+condition-variable wake per draw. The recorder named each draw at once and went
+back to sleep, so nearly every draw paid a futex wake (a system call, about
+3 us on the handheld, for 1,500 draws a frame).
+
+Now the recorder takes everything queued in one go and is woken only when it
+sleeps and 32 draws are waiting, at the end of a frame, or when a fence waits
+for the names (it then reports its progress draw by draw while anyone waits).
+A stress test of the queue (3,000 frames of 50 to 450 draws with fence waits
+in between) found no fence let through before its draws were named, and
+ThreadSanitizer found no races. Expected on Armada: `rec_indices` from 5.5 ms
+to well under 1 ms. The next limit is then the renderer's worker thread
+(12.9 ms a frame).
