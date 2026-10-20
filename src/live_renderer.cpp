@@ -57,8 +57,9 @@ REXCVAR_DEFINE_BOOL(native_renderer, true, "GPU",
 REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
                     "Native renderer: Revamped Graphics, the switch in the game's own Options "
                     "menu. Off turns every visual enhancement off at once (motion blur, speed "
-                    "blur, distance fog, god rays, foliage fade, map clouds, sharp fonts, "
-                    "upscaled textures); on, each one follows its own setting");
+                    "blur, distance fog, god rays, foliage fade, map clouds); on, each one "
+                    "follows its own setting. Sharp fonts and upscaled textures aren't part of "
+                    "it: they're off until turned on themselves");
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
@@ -145,20 +146,20 @@ REXCVAR_DEFINE_BOOL(native_map_clouds, true, "GPU",
                     "Native renderer: at a cut to or from the trail map, cartoon clouds close "
                     "in over the old view and part from the middle out over the new one (just "
                     "part, loading into a level on the map); the distance fog fades with them");
-REXCVAR_DEFINE_BOOL(native_sharp_fonts, true, "GPU",
+REXCVAR_DEFINE_BOOL(native_sharp_fonts, false, "GPU",
                     "Native renderer: the game's fonts (menus, HUD, scores, button icons) "
                     "rebuilt at 4x their size from their own letters when first shown, so text "
                     "stays sharp at high resolutions instead of being a stretched 720p bitmap. "
-                    "Part of Revamped Graphics (off with it)");
+                    "Off unless turned on here (Revamped Graphics doesn't turn it on)");
 REXCVAR_DEFINE_BOOL(native_texture_pack, true, "GPU",
                     "Native renderer: replaces game textures with the PNGs in the textures "
                     "folder next to the exe (<name>_<hash>.png; see textures\\README.txt). "
                     "It comes with the new Amped 3 logo for the start-up and title screens");
-REXCVAR_DEFINE_BOOL(native_upscaled_textures, true, "GPU",
+REXCVAR_DEFINE_BOOL(native_upscaled_textures, false, "GPU",
                     "Native renderer: uses the game textures upscaled on this PC at install "
                     "(textures\\upscaled, made by the installer's optional texture upscaling "
                     "step) for every texture the texture pack and Sharp fonts don't replace. "
-                    "Part of Revamped Graphics (off with it)");
+                    "Off unless turned on here (Revamped Graphics doesn't turn it on)");
 REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
                     "Native renderer, with smooth foliage edges: tree branches close to the "
                     "camera fade out smoothly toward the middle of the screen, keeping your "
@@ -1482,12 +1483,11 @@ void WorkerMain() {
       const bool async_pipelines =
           rex::cvar::GetFlagByName("async_shader_compilation") != "false";
       const bool smooth_foliage = REXCVAR_GET(native_smooth_foliage);
-      // Sharp fonts and upscaled textures are Revamped Graphics: off with it
-      // (the texture pack, with the new logo, isn't).
-      const bool revamped_on = REXCVAR_GET(revamped_graphics);
-      const bool sharp_fonts = revamped_on && REXCVAR_GET(native_sharp_fonts);
+      // Sharp fonts and upscaled textures: only when turned on themselves
+      // (off by default, not part of Revamped Graphics).
+      const bool sharp_fonts = REXCVAR_GET(native_sharp_fonts);
       const bool texture_pack = REXCVAR_GET(native_texture_pack);
-      const bool upscaled_textures = revamped_on && REXCVAR_GET(native_upscaled_textures);
+      const bool upscaled_textures = REXCVAR_GET(native_upscaled_textures);
       if (renderer && (msaa != renderer_msaa || scale != renderer_scale ||
                        out_scale != renderer_out_scale || upscaler != renderer_upscaler ||
                        aniso != renderer_aniso || async_pipelines != renderer_async ||

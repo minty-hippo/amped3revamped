@@ -147,7 +147,10 @@ Armada).
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.
 - **Desktop shortcut** (Windows) or **Add to Steam / menu** (Linux): points
-  at the launcher's copy in the install folder.
+  at the launcher's copy in the install folder. Its icon is the game's own square
+  Xbox 360 dashboard logo, taken at install from your `default.xex` by
+  `amped3-icon` (`tools/xex-icon`) into `amped3-icon.ico` / `amped3-icon.png`
+  in the install folder; nothing of the game ships with the project.
 - The installed version (branch, commit and date) is under the title.
 
 It works with a controller (d-pad or stick, A), the keyboard (arrows, Enter)
@@ -270,21 +273,23 @@ for the full setup, or turn off **Lean emulation** (`emulated_gpu_lean`) if
 you switch often.
 
 **Revamped Graphics** turns all the visual enhancements on or off at once:
-motion blur, speed blur, distance fog, god rays, branch fade, the trail map
-clouds, sharp fonts and upscaled textures. Each keeps its own setting for when
-the switch is back on.
+motion blur, speed blur, distance fog, god rays, branch fade and the trail
+map clouds. Each keeps its own setting for when the switch is back on. Sharp
+fonts and upscaled textures aren't part of it: they're off until you turn them
+on yourself.
 
 All of it is also in the game's own menu: **Pause > Options > Graphics** (the
 row that was the unused "Cheat Codes") opens the port's Graphics panel. The
 game's HUD and menus are hidden while it's open so you can see each change.
 It has two tabs, switched with LB / RB:
 
-- **Effects:** Revamped Graphics, a switch for each enhancement (Sharp Fonts
-  and Upscaled Textures included) and the motion blur strength.
+- **Effects:** Revamped Graphics, a switch for each enhancement and the
+  motion blur strength.
 - **Display:** fullscreen, a frame rate slider (30 console pacing to 144 fps, or
   unlocked), display resolution, render resolution (with the
   pixel size it gives), upscaler (Intel XeSS or AMD FSR 3.1; FSR 3.1 only on
-  Linux) and FSR sharpness.
+  Linux), FSR sharpness, and Sharp Fonts and Upscaled Textures (both off by
+  default).
 
 Up / down choose, left / right / A change, B goes back (keyboard: arrows,
 Enter, Escape, Q / E for tabs).
@@ -295,9 +300,9 @@ rebuilds each of the five fonts (button icons included) at 4x from its own
 letters the first time it's shown: each glyph's outline is traced into a
 vector shape (straight edges, sharp corners, curves where the letter curves)
 and filled anti-aliased at the new size. The result is kept in `logs\`
-(`native_font_*.bin`) so later sessions load it at once; nothing is shipped. Switch it off
-with Sharp Fonts (Graphics panel, Effects tab) or `native_sharp_fonts`; it's
-part of Revamped Graphics, so it's also off while that is.
+(`native_font_*.bin`) so later sessions load it at once; nothing is shipped. It's
+off by default: turn it on with Sharp Fonts (Graphics panel, Display tab) or
+`native_sharp_fonts = true`.
 
 **Texture pack.** PNGs in the `textures` folder next to the exe replace game
 textures by a hash of their contents, at any size (see
@@ -320,9 +325,9 @@ GPU; downloaded once, 45 MB). `Upscale Textures.bat` runs the same step any
 time (`-Set world` adds the characters, boards and levels, experimental;
 `-Force` redoes everything). The results go to `textures\upscaled` and are
 used only where neither the texture pack nor Sharp fonts replace a texture,
-so anything you replace by hand always wins. Switch them off with Upscaled
-Textures (Graphics panel, Effects tab) or `native_upscaled_textures`; like
-Sharp fonts, they're part of Revamped Graphics.
+so anything you replace by hand always wins. They're off by default, even
+after upscaling: turn them on with Upscaled Textures (Graphics panel, Display
+tab) or `native_upscaled_textures = true`.
 
 The row is added in memory as the game loads its menus; the game's files are
 never changed. Set `patch_game_menus = false` in `amped3.toml` to leave the

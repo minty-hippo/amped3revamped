@@ -524,11 +524,17 @@ void App::MakeShortcut() {
   const fs::path self = fs::exists(install_dir_ / ExePath().filename()) ? install_dir_ / ExePath().filename()
                                                                         : ExePath();
 #if defined(_WIN32)
+  // The game's dashboard icon, made from default.xex at install.
+  std::error_code icon_ec;
+  const fs::path icon = install_dir_ / "amped3-icon.ico";
+  const bool has_icon = fs::exists(icon, icon_ec);
   const std::string script =
       "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([IO.Path]::Combine("
       "[Environment]::GetFolderPath('Desktop'),'Amped 3 Revamped.lnk'));"
       "$s.TargetPath='" + PathText(self) + "';$s.WorkingDirectory='" + PathText(self.parent_path()) +
-      "';$s.Save()";
+      "';" +
+      (has_icon ? "$s.IconLocation='" + PathText(icon) + ",0';" : std::string()) +
+      "$s.Save()";
   std::string out, err;
   const int code = RunCapture({"powershell.exe", "-NoProfile", "-Command", script}, &out, &err);
   notice_ = code == 0 ? "Desktop shortcut made." : "Couldn't make the shortcut.";
@@ -542,6 +548,10 @@ void App::MakeShortcut() {
     f << "[Desktop Entry]\nType=Application\nName=Amped 3 Revamped\n"
          "Comment=Amped 3 (Xbox 360), native\nExec=\"" << PathText(self) << "\"\nPath="
       << PathText(self.parent_path()) << "\nTerminal=false\nCategories=Game;\n";
+    // The game's dashboard icon, made from default.xex at install.
+    if (fs::exists(install_dir_ / "amped3-icon.png", ec)) {
+      f << "Icon=" << PathText(install_dir_ / "amped3-icon.png") << "\n";
+    }
   }
   std::string out, err;
   if (RunCapture({"sh", "-c", "command -v steamos-add-to-steam"}, &out, &err) == 0 && !out.empty()) {

@@ -314,8 +314,8 @@ const std::vector<Tab>& Tabs() {
                        /*restart=*/true),
                 Toggle("revamped_graphics", "Revamped Graphics",
                        "All the visual enhancements below at once (motion blur, speed blur, "
-                       "distance fog, god rays, branch fade, the trail map clouds, sharp fonts "
-                       "and upscaled textures), each as set here. Off draws the game as the console does. Also in the "
+                       "distance fog, god rays, branch fade and the trail map clouds), each "
+                       "as set here. Off draws the game as the console does. Also in the "
                        "game's own menu: Pause > Options > Graphics. Native renderer "
                        "only."),
                 Toggle("native_keep_emulation", "Keep the emulation drawing",
@@ -331,7 +331,8 @@ const std::vector<Tab>& Tabs() {
                        "The game's fonts (menus, HUD, scores, button icons) are 720p bitmaps. "
                        "This rebuilds each at 4x from its own letters when first shown, with "
                        "smooth, anti-aliased edges, so text stays sharp at 1080p, 1440p and 4K. "
-                       "Part of Revamped Graphics (off when it's off). Native renderer only."),
+                       "Off by default; Revamped Graphics doesn't turn it on. Native renderer "
+                       "only."),
                 Toggle("native_texture_pack", "Texture pack",
                        "Uses the PNGs in the textures folder next to the exe in place of the "
                        "game's textures (see textures\\README.txt to add your own). Comes with "
@@ -340,8 +341,8 @@ const std::vector<Tab>& Tabs() {
                 Toggle("native_upscaled_textures", "Upscaled textures",
                        "Uses the game's textures upscaled on this PC (the installer's optional "
                        "texture upscaling step, into textures\\upscaled) wherever the texture "
-                       "pack and Sharp fonts don't replace one. Part of Revamped Graphics (off "
-                       "when it's off). Native renderer only."),
+                       "pack and Sharp fonts don't replace one. Off by default; Revamped "
+                       "Graphics doesn't turn it on. Native renderer only."),
                 Toggle("native_smooth_foliage", "Smooth foliage edges",
                        "Tree branches, fences and other cut-out textures get smooth, "
                        "anti-aliased edges and stay solid as on the console, instead of the "

@@ -139,6 +139,14 @@ fi
 printf '%s\n' "$PROJECT_DIR" > "$INSTALL_DIR/source.path"
 note "$copied file(s) copied"
 
+# The icon: the game's own Xbox 360 dashboard icon, taken from this copy's
+# default.xex (tools/xex-icon; nothing of the game ships with the project).
+ICON="$INSTALL_DIR/amped3-icon.png"
+if [ -x "$BUILD_DIR/amped3-icon" ]; then
+  "$BUILD_DIR/amped3-icon" "$GAME/default.xex" "$INSTALL_DIR" >/dev/null ||
+    warn "Couldn't make the icon from default.xex (the shortcut gets a generic one)."
+fi
+
 # A launcher (what Steam runs) and a desktop entry (Steam's "Add a Non-Steam
 # Game" lists these; on SteamOS steamos-add-to-steam adds it directly).
 LAUNCHER="$INSTALL_DIR/amped3-revamped.sh"
@@ -163,6 +171,7 @@ Path=$INSTALL_DIR
 Terminal=false
 Categories=Game;
 EOF
+  [ -f "$ICON" ] && printf 'Icon=%s\n' "$ICON" >> "$DESKTOP"
   note "Launcher: $LAUNCHER"
   note "Desktop entry: $DESKTOP"
   if command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then

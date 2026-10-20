@@ -484,6 +484,14 @@ if ((Test-Path $defaults) -and -not (Test-Path (Join-Path $InstallDir 'amped3.to
   Copy-Item $defaults (Join-Path $InstallDir 'amped3.toml') -Force
 }
 $installedExe = Join-Path $InstallDir 'amped3.exe'
+# The shortcut's icon: the game's own Xbox 360 dashboard icon, taken from this
+# copy's default.xex (tools\xex-icon; nothing of the game ships with the project).
+$iconTool = Join-Path $buildDir 'amped3-icon.exe'
+$iconFile = Join-Path $InstallDir 'amped3-icon.ico'
+if (Test-Path $iconTool) {
+  $out = & $iconTool (Join-Path $TargetGame 'default.xex') $InstallDir 2>&1
+  if ($LASTEXITCODE -ne 0) { Warn "Couldn't make the icon from default.xex: $out" }
+}
 # Where the sources are, for the launcher's Update (update.ps1).
 [IO.File]::WriteAllText((Join-Path $InstallDir 'source.path'), "$ProjectDir`n")
 
@@ -517,6 +525,7 @@ if (-not $NoShortcut -and (Ask '    Add a desktop shortcut?')) {
   $link = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Amped 3 Revamped.lnk'))
   $link.TargetPath = $installedExe
   $link.WorkingDirectory = $InstallDir
+  if (Test-Path $iconFile) { $link.IconLocation = "$iconFile,0" }
   $link.Save()
   Note 'Desktop shortcut created.'
 }

@@ -183,6 +183,26 @@ if(UNIX AND NOT APPLE)
     target_link_options(amped3-texture-upscale PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
+# Shortcut icon (installers): the game's Xbox 360 dashboard icon from the
+# user's default.xex (tools/xex-icon). Decrypts and decompresses the XEX with
+# the SDK checkout's tiny-AES-c and libmspack LZX decoder.
+set(_amped3_mspack "${AMPED3_SDK_SOURCE_DIR}/thirdparty/libmspack/cabextract/mspack")
+set(_amped3_aes "${AMPED3_SDK_SOURCE_DIR}/thirdparty/tiny-aes-c")
+if(AMPED3_SDK_SOURCE_DIR AND EXISTS "${_amped3_mspack}/lzxd.c" AND EXISTS "${_amped3_aes}/aes.c")
+    add_executable(amped3-icon
+        tools/xex-icon/main.cpp
+        ${_amped3_mspack}/lzxd.c
+        ${_amped3_aes}/aes.c)
+    target_include_directories(amped3-icon PRIVATE
+        ${_amped3_mspack} ${_amped3_aes} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_compile_definitions(amped3-icon PRIVATE AES128=1 CBC=1 ECB=1)
+    set_source_files_properties(${_amped3_mspack}/lzxd.c ${_amped3_aes}/aes.c PROPERTIES
+        COMPILE_OPTIONS "-w")
+    if(UNIX AND NOT APPLE)
+        target_link_options(amped3-icon PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
+endif()
+
 # Frame capture replayer (docs/native-replay.md): draws an F10 capture with
 # the native renderer's code paths through Vulkan and writes a PNG.
 add_executable(amped3-replay
