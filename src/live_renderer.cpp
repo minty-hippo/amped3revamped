@@ -620,9 +620,16 @@ struct CachedVertices {
   uint64_t used_frame = 0;
   uint32_t dirty_streak = 0;  // consecutive uses that found it rewritten
   bool dynamic = false;
-  uint64_t dynamic_since = 0;
+  uint32_t same_streak = 0;   // dynamic: consecutive copies that found it unchanged
 };
 std::unordered_map<uint64_t, CachedVertices> g_vertex_cache;
+
+// A range treated as dynamic (rewritten every frame) is watched again only
+// once it stopped changing for this many uses in a row. (It used to be
+// watched again after 600 frames whatever it did: a video's buffers then
+// cost a page fault per page for a few frames every 20 s, and a fault costs
+// about 1 ms on an ARM handheld: ~0.9 s video freezes.)
+constexpr uint32_t kStaticAgain = 30;
 uint64_t g_record_frame = 0;  // frames recorded (game thread)
 struct VertexCacheStats {
   std::atomic<uint64_t> hits{0}, copies{0}, hit_bytes{0}, copy_bytes{0};
@@ -671,16 +678,22 @@ std::shared_ptr<std::vector<uint8_t>> CachedVertexData(rex::memory::Memory* memo
     return e.data;
   }
   if (e.data && !refresh && !e.dynamic) {
-    // Rewritten since the last copy: after a few uses in a row it is treated
-    // as dynamic (and gets another chance after 600 frames).
-    if (++e.dirty_streak >= 3) {
+    // Rewritten since the last copy: after two uses in a row it is treated
+    // as dynamic (copied every use, unwatched).
+    if (++e.dirty_streak >= 2) {
       e.dynamic = true;
-      e.dynamic_since = g_record_frame;
+      e.same_streak = 0;
     }
   }
-  if (e.dynamic && g_record_frame - e.dynamic_since > 600) {
-    e.dynamic = false;
-    e.dirty_streak = 0;
+  // Dynamic and unchanged for a while: watched again.
+  if (e.dynamic && e.data && e.data->size() == size &&
+      std::memcmp(e.data->data(), src, size) == 0) {
+    if (++e.same_streak >= kStaticAgain) {
+      e.dynamic = false;
+      e.dirty_streak = 0;
+    }
+  } else {
+    e.same_streak = 0;
   }
   const uint32_t epoch = g_write_epoch.load(std::memory_order_acquire);
   if (!e.dynamic) memory->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
@@ -733,7 +746,7 @@ struct CachedTextureHash {
   uint64_t used_frame = 0;
   uint32_t dirty_streak = 0;
   bool dynamic = false;
-  uint64_t dynamic_since = 0;
+  uint32_t same_streak = 0;  // dynamic: consecutive hashes that found it unchanged
 };
 std::unordered_map<uint64_t, CachedTextureHash> g_texture_hashes;  // (address, size)
 constexpr size_t kTextureSnapshotBudget = 16u << 20;  // bytes copied a frame at most
@@ -767,17 +780,27 @@ uint64_t TextureRangeHash(rex::memory::Memory* memory, uint32_t address, uint32_
     e.dirty_streak = 0;
     return e.hash;
   }
-  if (!inserted && !e.dynamic && ++e.dirty_streak >= 3) {
+  if (!inserted && !e.dynamic && ++e.dirty_streak >= 2) {
     e.dynamic = true;  // rewritten every frame: hash it every frame, unwatched
-    e.dynamic_since = g_record_frame;
+    e.same_streak = 0;
   }
-  if (e.dynamic && g_record_frame - e.dynamic_since > 600) {
-    e.dynamic = false;
-    e.dirty_streak = 0;
-  }
-  const uint32_t epoch = g_write_epoch.load(std::memory_order_acquire);
+  // Watched (static) ranges: the watch goes on before the bytes are read, so
+  // a write after the read is never missed.
+  uint32_t epoch = g_write_epoch.load(std::memory_order_acquire);
   if (!e.dynamic) memory->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
-  const uint64_t h = HashBytes(p, size, 1469598103934665603ull);
+  uint64_t h = HashBytes(p, size, 1469598103934665603ull);
+  // Dynamic and unchanged for a while: watched again (kStaticAgain).
+  if (e.dynamic && !inserted && h == e.hash) {
+    if (++e.same_streak >= kStaticAgain) {
+      e.dynamic = false;
+      e.dirty_streak = 0;
+      epoch = g_write_epoch.load(std::memory_order_acquire);
+      memory->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
+      h = HashBytes(p, size, 1469598103934665603ull);
+    }
+  } else {
+    e.same_streak = 0;
+  }
   *changed = inserted || h != e.hash;
   e.hash = h;
   e.epoch = epoch;
