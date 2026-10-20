@@ -47,6 +47,7 @@
 #include "native/frame.h"
 #include "native/frame_writer.h"
 #include "native/glsl_compiler.h"
+#include "guest_waits.h"
 #include "native/renderer.h"
 #include "native/xenos_shader.h"
 #include "texture_ranges.h"
@@ -2312,7 +2313,45 @@ void OnEndTiling() {
   AddEvent(native::EventType::kEndTiling, 0);
 }
 
+// --- Stall watchdog -----------------------------------------------------------
+//
+// Diagnostics (Armada: the game thread now and then runs about 0.9 s without
+// presenting, busy, during videos): when no frame has been swapped for
+// 250 ms, logs where every game thread is (link register and r3 as of its
+// last kernel call), a few times per stall, for the first stalls.
+std::atomic<int64_t> g_last_swap_ns{0};
+std::once_flag g_watchdog_once;
+
+int64_t SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void WatchdogMain() {
+  rex::thread::set_current_thread_name("amped3 stall watch");
+  int stalls = 0, samples = 0;
+  int64_t stall_swap = -1;
+  while (stalls < 12) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    const int64_t last = g_last_swap_ns.load();
+    if (!last) continue;
+    const double ms = double(SteadyNs() - last) * 1e-6;
+    if (ms < 250.0 || ms > 5000.0) continue;  // (longer: loading, a menu; not this)
+    if (last != stall_swap) {
+      stall_swap = last;
+      samples = 0;
+      ++stalls;
+    }
+    if (samples++ >= 6) continue;
+    REXLOG_WARN("Stall watch: no frame for {:.0f} ms; {}", ms,
+                amped3::diag::GuestThreadSnapshot(rex::system::kernel_state()));
+  }
+}
+
 void OnSwap(uint8_t* base, uint32_t front_buffer) {
+  g_last_swap_ns.store(SteadyNs());
+  std::call_once(g_watchdog_once, [] { std::thread(WatchdogMain).detach(); });
   // Switching the setting off and on again retries after a failure.
   if (!REXCVAR_GET(native_renderer)) g_failed = false;
   const bool enabled = Enabled();

@@ -159,4 +159,20 @@ std::string DescribeGuestWaits(rex::system::KernelState* kernel_state) {
   return out.empty() ? "  (no guest threads)\n" : out;
 }
 
+std::string GuestThreadSnapshot(rex::system::KernelState* kernel_state) {
+  if (!kernel_state) return {};
+  std::string out;
+  for (auto& obj : kernel_state->object_table()->GetAllObjects()) {
+    if (obj->type() != XObject::Type::Thread) continue;
+    auto* thread = static_cast<rex::system::XThread*>(obj.get());
+    if (!thread->is_guest_thread() || !thread->thread_state()) continue;
+    const PPCContext* ctx = thread->thread_state()->context();
+    if (!ctx) continue;
+    out += fmt::format("{}{}: lr {:08X} r3 {:08X}", out.empty() ? "" : "; ",
+                       obj->name().empty() ? fmt::format("{:08X}", thread->handle()) : obj->name(),
+                       static_cast<uint32_t>(ctx->lr), ctx->r3.u32);
+  }
+  return out;
+}
+
 }  // namespace amped3::diag

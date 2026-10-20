@@ -18,4 +18,8 @@ namespace amped3::diag {
 
 std::string DescribeGuestWaits(rex::system::KernelState* kernel_state);
 
+// One line per game thread: name, link register and r3 as of its last kernel
+// call (stall watchdog: where a thread that stopped presenting is).
+std::string GuestThreadSnapshot(rex::system::KernelState* kernel_state);
+
 }  // namespace amped3::diag
