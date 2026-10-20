@@ -3,6 +3,13 @@
 #include "perf_trace.h"
 
 #include <algorithm>
+#include <atomic>
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
+#include <rex/system/thread_state.h>
+
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -49,8 +56,47 @@ REXCVAR_DEFINE_INT32(perf_trace_seconds, 20, "Amped 3/Diagnostics",
 // operator new; plain malloc/free underneath, as the default ones).
 namespace {
 thread_local uint64_t t_allocations = 0;
+
+// Where allocations come from (diagnostics): every 1024th allocation on a
+// game thread is counted against the guest call site (the link register,
+// set at each guest call and kernel call) and the host caller of operator
+// new. Fixed tables, no allocation here.
+struct AllocSite {
+  std::atomic<uint64_t> key{0};
+  std::atomic<uint32_t> count{0};
+};
+constexpr uint32_t kAllocSites = 512;
+AllocSite g_guest_sites[kAllocSites];
+AllocSite g_host_sites[kAllocSites];
+
+void CountSite(AllocSite* table, uint64_t key) {
+  if (!key) return;
+  uint32_t h = uint32_t((key >> 2) * 0x9E3779B97F4A7C15ull >> 55);
+  for (uint32_t i = 0; i < 16; ++i) {
+    AllocSite& s = table[(h + i) & (kAllocSites - 1)];
+    uint64_t k = s.key.load(std::memory_order_relaxed);
+    if (k == 0) {
+      if (s.key.compare_exchange_strong(k, key) || k == key) {
+        s.count.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    if (k == key) {
+      s.count.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+__attribute__((noinline)) void SampleAllocation(void* host_caller) {
+  rex::runtime::ThreadState* ts = rex::runtime::ThreadState::Get();
+  if (!ts || !ts->context()) return;
+  CountSite(g_guest_sites, uint32_t(ts->context()->lr));
+  CountSite(g_host_sites, reinterpret_cast<uintptr_t>(host_caller));
+}
+
 void* CountedNew(std::size_t size) {
-  ++t_allocations;
+  if ((++t_allocations & 1023) == 0) SampleAllocation(__builtin_return_address(0));
   if (size == 0) size = 1;
   void* p = std::malloc(size);
   if (!p) throw std::bad_alloc();
@@ -78,6 +124,41 @@ void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); 
 namespace amped3::trace {
 
 uint64_t ThreadAllocations() { return t_allocations; }
+
+std::string TopAllocationSites() {
+  auto top = [](AllocSite* table, bool host) {
+    std::vector<std::pair<uint32_t, uint64_t>> v;
+    for (uint32_t i = 0; i < kAllocSites; ++i) {
+      const uint32_t c = table[i].count.exchange(0);
+      if (c) v.push_back({c, table[i].key.load()});
+    }
+    std::sort(v.rbegin(), v.rend());
+    std::string out;
+    for (size_t i = 0; i < v.size() && i < 6; ++i) {
+      if (!out.empty()) out += ", ";
+      if (host) {
+#if !defined(_WIN32)
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(v[i].second), &info) && info.dli_fbase) {
+          out += fmt::format("{}x {}+{:X}", v[i].first * 1024,
+                             info.dli_sname ? info.dli_sname : "exe",
+                             v[i].second - reinterpret_cast<uintptr_t>(
+                                               info.dli_sname ? info.dli_saddr : info.dli_fbase));
+          continue;
+        }
+#endif
+        out += fmt::format("{}x {:X}", v[i].first * 1024, v[i].second);
+      } else {
+        out += fmt::format("{}x lr {:08X}", v[i].first * 1024, v[i].second);
+      }
+    }
+    return out;
+  };
+  const std::string guest = top(g_guest_sites, false);
+  const std::string host = top(g_host_sites, true);
+  return "guest call sites: " + (guest.empty() ? "-" : guest) +
+         "; host callers: " + (host.empty() ? "-" : host);
+}
 
 namespace {
 

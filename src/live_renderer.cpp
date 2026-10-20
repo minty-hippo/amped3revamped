@@ -2346,6 +2346,7 @@ void WatchdogMain() {
     if (samples++ >= 6) continue;
     REXLOG_WARN("Stall watch: no frame for {:.0f} ms; {}", ms,
                 amped3::diag::GuestThreadSnapshot(rex::system::kernel_state()));
+    if (samples == 1) REXLOG_WARN("Stall watch: allocations so far: {}", trace::TopAllocationSites());
   }
 }
 
