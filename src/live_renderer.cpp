@@ -16,7 +16,9 @@
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -595,8 +597,12 @@ std::atomic<uint32_t> g_write_epoch{1};
 void* g_watch_handle = nullptr;
 rex::memory::Memory* g_watch_memory = nullptr;
 
+std::atomic<uint64_t> g_watch_calls{0}, g_watch_pages{0};  // diagnostics (stall watch)
+
 // Called with the memory system's lock held, on the writing thread: no locks.
 std::pair<uint32_t, uint32_t> OnPhysicalWrite(void*, uint32_t start, uint32_t length, bool) {
+  g_watch_calls.fetch_add(1, std::memory_order_relaxed);
+  g_watch_pages.fetch_add((length + 4095) >> 12, std::memory_order_relaxed);
   if (!length) return {start, length};
   const uint32_t epoch = g_write_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
   const uint32_t first = start >> kPageShift;
@@ -2328,20 +2334,90 @@ int64_t SteadyNs() {
       .count();
 }
 
+// Per thread CPU time (Linux: /proc/self/task/*/stat), user and system
+// separately, in clock ticks: what a stall's time went to.
+struct ThreadTimes {
+  std::string name;
+  uint64_t user = 0, system = 0;
+};
+std::map<int, ThreadTimes> ReadThreadTimes() {
+  std::map<int, ThreadTimes> out;
+#if defined(__linux__)
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+    std::ifstream f(entry.path() / "stat");
+    std::string line;
+    if (!std::getline(f, line)) continue;
+    const size_t open = line.find('('), close = line.rfind(')');
+    if (open == std::string::npos || close == std::string::npos) continue;
+    ThreadTimes t;
+    t.name = line.substr(open + 1, close - open - 1);
+    std::istringstream rest(line.substr(close + 2));
+    std::string field;
+    // Fields after the name: state(3) ... utime(14) stime(15).
+    for (int i = 3; i <= 15 && rest >> field; ++i) {
+      if (i == 14) t.user = std::strtoull(field.c_str(), nullptr, 10);
+      if (i == 15) t.system = std::strtoull(field.c_str(), nullptr, 10);
+    }
+    out[std::atoi(entry.path().filename().c_str())] = t;
+  }
+#endif
+  return out;
+}
+
+std::string ThreadTimeDeltas(const std::map<int, ThreadTimes>& before,
+                             const std::map<int, ThreadTimes>& after) {
+  std::vector<std::pair<uint64_t, std::string>> rows;
+  for (const auto& [tid, a] : after) {
+    auto b = before.find(tid);
+    const uint64_t u = a.user - (b != before.end() ? b->second.user : 0);
+    const uint64_t k = a.system - (b != before.end() ? b->second.system : 0);
+    if (u + k == 0) continue;
+    rows.push_back({u + k, fmt::format("{} {} user {} ms / system {} ms", a.name, tid, u * 10, k * 10)});
+  }
+  std::sort(rows.rbegin(), rows.rend());
+  std::string out;
+  for (size_t i = 0; i < rows.size() && i < 6; ++i) out += (i ? "; " : "") + rows[i].second;
+  return out;
+}
+
 void WatchdogMain() {
   rex::thread::set_current_thread_name("amped3 stall watch");
   int stalls = 0, samples = 0;
   int64_t stall_swap = -1;
+  std::map<int, ThreadTimes> baseline;
+  uint64_t base_calls = 0, base_pages = 0;
+  int tick = 0;
+  bool in_stall = false;
+  auto report = [&](const char* when) {
+    REXLOG_WARN("Stall watch: {}: CPU {}; write-watch faults {} ({} pages)", when,
+                ThreadTimeDeltas(baseline, ReadThreadTimes()), g_watch_calls.load() - base_calls,
+                g_watch_pages.load() - base_pages);
+  };
   while (stalls < 12) {
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     const int64_t last = g_last_swap_ns.load();
     if (!last) continue;
     const double ms = double(SteadyNs() - last) * 1e-6;
-    if (ms < 250.0 || ms > 5000.0) continue;  // (longer: loading, a menu; not this)
+    if (ms < 250.0 || ms > 5000.0) {  // (longer: loading, a menu; not this)
+      if (in_stall) {
+        in_stall = false;
+        report("the stall's whole time");
+      }
+      // A fresh baseline about every 0.25 s, for the next stall.
+      if (++tick % 4 == 0) {
+        baseline = ReadThreadTimes();
+        base_calls = g_watch_calls.load();
+        base_pages = g_watch_pages.load();
+      }
+      continue;
+    }
     if (last != stall_swap) {
+      if (in_stall) report("the stall's whole time");
       stall_swap = last;
       samples = 0;
       ++stalls;
+      in_stall = true;
     }
     if (samples++ >= 6) continue;
     REXLOG_WARN("Stall watch: no frame for {:.0f} ms; {}", ms,
