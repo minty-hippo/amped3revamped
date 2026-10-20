@@ -770,10 +770,11 @@ int main(int argc, char** argv) {
     auto first_use = [](const char* what, const amped3::native::RenderStats& st) {
       std::printf("%s: prepass %.2f ms, record %.2f ms; first use: %u textures (%.1f MB, %.1f ms), "
                   "%u pipelines (%.1f ms, %u to the background, %u draws waiting), %u shaders (%.1f ms); "
-                  "texture cache %u (%.0f MB)\n",
+                  "texture cache %u (%.0f MB); texture sets written %u, reset %u\n",
                   what, st.prepass_ms, st.record_ms, st.new_textures, st.texture_mb, st.texture_ms,
                   st.new_pipelines, st.pipeline_ms, st.deferred_pipelines, st.draws_waiting,
-                  st.new_shaders, st.shader_ms, st.textures_cached, st.texture_cache_mb);
+                  st.new_shaders, st.shader_ms, st.textures_cached, st.texture_cache_mb,
+                  st.texture_sets_written, st.texture_set_resets);
       if (st.draw_parts_sampled) {
         const auto& p = st.draw_part_ms;
         std::printf("  draws by part (ms): setup %.2f, targets %.2f, textures %.2f, pipeline %.2f, "

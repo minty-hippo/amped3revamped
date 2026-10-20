@@ -686,7 +686,12 @@ class Gpu {
     b = Buffer{};
   }
 
+  // Views destroyed since the renderer last looked (its cached texture
+  // descriptor sets must not use them again).
+  std::vector<VkImageView> destroyed_views;
+
   void DestroyImage(Image& im) {
+    if (im.sample_view) destroyed_views.push_back(im.sample_view);
     if (im.stencil_view) vk::vkDestroyImageView(device, im.stencil_view, nullptr);
     if (im.sample_view && im.sample_view != im.view) vk::vkDestroyImageView(device, im.sample_view, nullptr);
     if (im.view) vk::vkDestroyImageView(device, im.view, nullptr);
@@ -1316,18 +1321,39 @@ struct Renderer::Impl {
     std::string note;
   };
   std::unordered_map<uint64_t, TexLookup> frame_tex_lookup_;
-  // Texture descriptor sets this frame, by their contents.
+  // Texture descriptor sets by their contents (set, bindings, samplers,
+  // views), kept from frame to frame: most draws bind the same textures every
+  // frame, and writing a set costs far more than finding it. They live in a
+  // pool of their own. When a view one of them uses is destroyed, or the pool
+  // is full, all of them are dropped at once: the pool is retired (destroyed
+  // three frames later, when no frame in flight binds its sets any more) and
+  // a new one started.
   struct StringHash {
     using is_transparent = void;
     size_t operator()(std::string_view v) const { return std::hash<std::string_view>{}(v); }
   };
-  std::unordered_map<std::string, VkDescriptorSet, StringHash, std::equal_to<>> frame_tex_sets_;
+  std::unordered_map<std::string, VkDescriptorSet, StringHash, std::equal_to<>> tex_sets_;
+  std::unordered_set<VkImageView> tex_set_views_;  // views the cached sets use
+  VkDescriptorPool tex_set_pool_ = VK_NULL_HANDLE;
+  uint32_t tex_set_pool_left_ = 0;
+  struct RetiredPool {
+    uint64_t frame;
+    VkDescriptorPool pool;
+  };
+  std::vector<RetiredPool> retired_tex_set_pools_;
+  static constexpr uint32_t kTexSetPoolSets = 4096;
+  // The last set found for each of the two (draws in a row mostly bind the
+  // same textures: a compare instead of a hash lookup).
+  std::string last_tex_key_[2];
+  VkDescriptorSet last_tex_set_[2] = {};
+  void DropTextureSets();
   // Per-draw scratch (kept to avoid an allocation per draw).
   struct TexDesc {
     uint32_t set, binding;
     VkDescriptorImageInfo info;
   };
   std::vector<TexDesc> descs_scratch_;
+  VkDescriptorSet TextureSet(uint32_t set, const std::vector<TexDesc>& descs);
   std::vector<Image*> colors_scratch_;
   // Last shader looked up per stage (draws mostly repeat the previous one).
   std::string last_shader_stem_[2];
@@ -4159,8 +4185,18 @@ void Renderer::Impl::BeginFrame() {
   } else {
     vk::vkResetDescriptorPool(dev, pool_, 0);
   }
-  frame_tex_sets_.clear();
   frame_tex_lookup_.clear();
+  // Texture set pools retired 3+ frames ago: no frame in flight binds their
+  // sets now.
+  for (size_t i = 0; i < retired_tex_set_pools_.size();) {
+    if (frame_number_ >= retired_tex_set_pools_[i].frame + 3) {
+      vk::vkDestroyDescriptorPool(dev, retired_tex_set_pools_[i].pool, nullptr);
+      retired_tex_set_pools_[i] = retired_tex_set_pools_.back();
+      retired_tex_set_pools_.pop_back();
+    } else {
+      ++i;
+    }
+  }
   // Object motion (blur, upscaler) adds up to a system block and a constant
   // block a draw.
   const VkDeviceSize uniform_bytes =
@@ -5158,7 +5194,14 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
   } else {
     auto pit = resolved_packed_.find(base);  // overwritten by color
     if (pit != resolved_packed_.end()) {
-      Retire(pit->second);
+      // Kept aside, not destroyed: games resolve depth and then color to the
+      // same address every frame (a new image each frame also dropped the
+      // cached texture descriptor sets: TextureSet).
+      const Image old = pit->second;
+      SpareResolve& spare =
+          spare_resolves_[{&resolved_packed_, base, old.width, old.height, old.format}];
+      if (spare.image.image) Retire(spare.image);
+      spare = {old, frame_number_};
       resolved_packed_.erase(pit);
     }
   }
@@ -5237,6 +5280,85 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     Image* d = GetTarget(DepthKey(surface, r.targets[2]), true);
     ClearImage(d, r.clear_rgba, r.clear_z, 0, false, true, true, &clear_rect);
   }
+}
+
+void Renderer::Impl::DropTextureSets() {
+  if (tex_set_pool_) retired_tex_set_pools_.push_back({frame_number_, tex_set_pool_});
+  tex_set_pool_ = VK_NULL_HANDLE;
+  tex_set_pool_left_ = 0;
+  tex_sets_.clear();
+  tex_set_views_.clear();
+  for (int i = 0; i < 2; ++i) {
+    last_tex_key_[i].clear();
+    last_tex_set_[i] = VK_NULL_HANDLE;
+  }
+}
+
+VkDescriptorSet Renderer::Impl::TextureSet(uint32_t set, const std::vector<TexDesc>& descs) {
+  // A view a cached set uses was destroyed: none of them can be trusted.
+  if (!gpu_.destroyed_views.empty()) {
+    for (VkImageView v : gpu_.destroyed_views) {
+      if (tex_set_views_.count(v)) {
+        DropTextureSets();
+        ++stats_.texture_set_resets;
+        break;
+      }
+    }
+    gpu_.destroyed_views.clear();
+  }
+  char key_buf[1 + 16 * (4 + 2 * sizeof(void*))];
+  size_t key_len = 0;
+  key_buf[key_len++] = char(set);
+  for (const auto& td : descs) {
+    if (td.set != set || key_len + 4 + 2 * sizeof(void*) > sizeof(key_buf)) continue;
+    std::memcpy(key_buf + key_len, &td.binding, 4);
+    std::memcpy(key_buf + key_len + 4, &td.info.sampler, sizeof(void*));
+    std::memcpy(key_buf + key_len + 4 + sizeof(void*), &td.info.imageView, sizeof(void*));
+    key_len += 4 + 2 * sizeof(void*);
+  }
+  const std::string_view key(key_buf, key_len);
+  if (last_tex_set_[set - 2] && key == last_tex_key_[set - 2]) return last_tex_set_[set - 2];
+  auto it = tex_sets_.find(key);
+  if (it != tex_sets_.end()) {
+    last_tex_key_[set - 2].assign(key);
+    return last_tex_set_[set - 2] = it->second;
+  }
+  if (!tex_set_pool_left_) {
+    DropTextureSets();
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTexSetPoolSets * 16};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = kTexSetPoolSets;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &size;
+    vk::Check(vk::vkCreateDescriptorPool(gpu_.device, &dpi, nullptr, &tex_set_pool_),
+              "texture set pool");
+    tex_set_pool_left_ = kTexSetPoolSets;
+  }
+  VkDescriptorSet ds;
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = tex_set_pool_;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &set_layouts_[set];
+  vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &ds), "texture set");
+  --tex_set_pool_left_;
+  VkWriteDescriptorSet writes[16];
+  uint32_t n = 0;
+  for (const auto& td : descs) {
+    if (td.set != set || n >= 16) continue;
+    VkWriteDescriptorSet& w = writes[n++];
+    w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = ds;
+    w.dstBinding = td.binding;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &td.info;
+    tex_set_views_.insert(td.info.imageView);
+  }
+  if (n) vk::vkUpdateDescriptorSets(gpu_.device, n, writes, 0, nullptr);
+  ++stats_.texture_sets_written;
+  tex_sets_.emplace(std::string(key), ds);
+  last_tex_key_[set - 2].assign(key);
+  return last_tex_set_[set - 2] = ds;
 }
 
 void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
@@ -5547,45 +5669,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
 
   mark(4);
   // Texture sets, shared by draws binding the same textures and samplers
-  // (allocated per frame from the pool, reset in BeginFrame).
-  VkDescriptorSet tex_sets[2] = {};
-  for (uint32_t set = 2; set < 4; ++set) {
-    char key_buf[1 + 16 * (4 + 2 * sizeof(void*))];
-    size_t key_len = 0;
-    key_buf[key_len++] = char(set);
-    for (const auto& td : descs) {
-      if (td.set != set || key_len + 4 + 2 * sizeof(void*) > sizeof(key_buf)) continue;
-      std::memcpy(key_buf + key_len, &td.binding, 4);
-      std::memcpy(key_buf + key_len + 4, &td.info.sampler, sizeof(void*));
-      std::memcpy(key_buf + key_len + 4 + sizeof(void*), &td.info.imageView, sizeof(void*));
-      key_len += 4 + 2 * sizeof(void*);
-    }
-    const std::string_view key(key_buf, key_len);
-    auto set_it = frame_tex_sets_.find(key);
-    if (set_it == frame_tex_sets_.end()) set_it = frame_tex_sets_.emplace(std::string(key), VK_NULL_HANDLE).first;
-    VkDescriptorSet& cached = set_it->second;
-    if (!cached) {
-      VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-      ai.descriptorPool = pool_;
-      ai.descriptorSetCount = 1;
-      ai.pSetLayouts = &set_layouts_[set];
-      vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &cached), "texture set");
-      VkWriteDescriptorSet writes[16];
-      uint32_t n = 0;
-      for (const auto& td : descs) {
-        if (td.set != set || n >= 16) continue;
-        VkWriteDescriptorSet& w = writes[n++];
-        w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet = cached;
-        w.dstBinding = td.binding;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo = &td.info;
-      }
-      if (n) vk::vkUpdateDescriptorSets(gpu_.device, n, writes, 0, nullptr);
-    }
-    tex_sets[set - 2] = cached;
-  }
+  // (cached from frame to frame: TextureSet).
+  VkDescriptorSet tex_sets[2] = {TextureSet(2, descs), TextureSet(3, descs)};
 
   mark(5);
   // Indices (host-converted to 32-bit). Quad lists become triangle lists.
@@ -6921,6 +7006,8 @@ Renderer::Impl::~Impl() {
     if (m) vk::vkDestroyShaderModule(dev, m, nullptr);
   }
   if (pool_) vk::vkDestroyDescriptorPool(dev, pool_, nullptr);
+  if (tex_set_pool_) vk::vkDestroyDescriptorPool(dev, tex_set_pool_, nullptr);
+  for (auto& r : retired_tex_set_pools_) vk::vkDestroyDescriptorPool(dev, r.pool, nullptr);
   if (layout_) vk::vkDestroyPipelineLayout(dev, layout_, nullptr);
   if (copy_layout_) vk::vkDestroyPipelineLayout(dev, copy_layout_, nullptr);
   if (clouds_layout_) vk::vkDestroyPipelineLayout(dev, clouds_layout_, nullptr);

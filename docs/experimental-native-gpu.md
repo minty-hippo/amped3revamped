@@ -376,3 +376,30 @@ in between) found no fence let through before its draws were named, and
 ThreadSanitizer found no races. Expected on Armada: `rec_indices` from 5.5 ms
 to well under 1 ms. The next limit is then the renderer's worker thread
 (12.9 ms a frame).
+
+## Renderer worker: texture descriptor sets kept between frames
+
+The worker wrote every texture descriptor set again each frame: the sets
+came from the per-frame pool, reset in `BeginFrame`. On a riding frame that is
+about 224 distinct sets (4,300 draws share them), and writing them was the
+biggest single part of the draw loop: about 3 ms of the replayer's 10.9 ms
+on this machine's CPU (SwiftShader).
+
+Now `TextureSet` keeps them, by content (set, bindings, samplers, views), in a
+pool of their own. All of them are dropped at once when a view one of them
+uses is destroyed (`Gpu::DestroyImage` lists destroyed views) or the pool
+fills up; the old pool is destroyed three frames later. A depth resolve
+packed to an address the game then resolves color to (every frame) made a
+new image each frame, which would have dropped the sets every frame: that
+image is now kept aside with the other spare resolves.
+
+Replayer, warm repeats (record / prepass, ms):
+
+| capture | before | after |
+|---|---|---|
+| riding 112830 | 10.9 / 3.6 | 7.6 / 3.3 |
+| 150214 | 9.0 / 3.9 | 6.0 / 4.1 |
+| 142416 | 13.7 / 6.2 | 6.5 / 4.1 |
+| 083545 | 6.8 / 2.6 | 4.1 / 2.4 |
+
+The pictures are identical to before.

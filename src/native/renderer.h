@@ -176,6 +176,8 @@ struct RenderStats {
   // The vertex data arena started over this frame (it was full: waits for
   // the GPU), and its size.
   uint32_t arena_resets = 0;
+  uint32_t texture_sets_written = 0;  // texture descriptor sets written this frame
+  uint32_t texture_set_resets = 0;    // cached texture sets dropped (a view they use destroyed)
   double arena_mb = 0;
   double texture_cache_mb = 0;
   // Render passes begun, and clears: done as a pass of their own, folded
