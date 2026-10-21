@@ -396,6 +396,9 @@ class Fsr final : public Upscaler {
     if (in.reactive.image) {
       d.reactive = resource(in.reactive, FFX_API_RESOURCE_USAGE_READ_ONLY,
                             FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+      // Also as the transparency & composition mask: it stops FSR "locking"
+      // thin bright detail there (a flake's lock kept it in the history).
+      d.transparencyAndComposition = d.reactive;
     }
     d.jitterOffset = {in.jitter_x, in.jitter_y};
     d.motionVectorScale = {1.0f, 1.0f};

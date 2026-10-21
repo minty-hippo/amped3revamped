@@ -4057,7 +4057,8 @@ void main() {
 )", false);
   // FSR's reactive mask: this frame's (binding 0) and last frame's (1) at
   // where this pixel was (motion vectors, 2: render pixels, this -> last),
-  // the largest of a 3x3 there (flakes move a little of their own), fading.
+  // the largest of a 3x3 there (flakes move a little of their own), fading
+// 15% a frame; this frame's counts half again (faint flakes).
   copy_fs_[18] = CompileBuiltin("builtin_reactive_merge", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D cur;
 layout(set = 0, binding = 1) uniform sampler2D last;
@@ -4066,7 +4067,8 @@ layout(location = 0) out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   ivec2 lim = textureSize(cur, 0) - 1;
-  float r = texelFetch(cur, p, 0).r;
+  // A faint flake counts more (FSR keeps history in proportion).
+  float r = min(texelFetch(cur, p, 0).r * 1.5, 1.0);
   vec2 mv = texelFetch(motion, p, 0).xy;
   ivec2 q = ivec2(floor(vec2(p) + 0.5 + mv));
   float h = 0.0;
@@ -4075,7 +4077,7 @@ void main() {
       h = max(h, texelFetch(last, clamp(q + ivec2(x, y), ivec2(0), lim), 0).r);
     }
   }
-  o = vec4(max(r, h * 0.75), 0.0, 0.0, 1.0);
+  o = vec4(max(r, h * 0.85), 0.0, 0.0, 1.0);
 }
 )", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450

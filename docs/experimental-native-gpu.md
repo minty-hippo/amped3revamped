@@ -469,3 +469,8 @@ MSAA with an upscaler is its own setting, `native_upscaler_msaa` (off by
 default; Image quality, under the upscaler): with FSR or XeSS on the game
 draws one sample per pixel and the upscaler smooths the edges. Without an
 upscaler `native_msaa` decides, as before.
+
+Faint trails were left: this frame's mask now counts 1.5x (faint flakes),
+last frame's fades 15% a frame (was 25%), and the mask is also FSR's
+transparency & composition mask, which keeps FSR from locking a flake's
+bright pixels into its history.
