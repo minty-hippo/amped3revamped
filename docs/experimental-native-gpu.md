@@ -418,3 +418,28 @@ scene's scale. Without an upscaler the two scales are the same and nothing
 changes (replayer: identical picture). With one (replayer, scale 0.75 output
 1.5): the pass is a quarter of the pixels; the final picture differs in 0.03%
 of its pixels.
+
+## MSAA off with the same lighting
+
+Amped 3 uses its two MSAA samples as two layers for the scene's lighting:
+it resolves sample 0, lights sample 0 alone (PA_SC_AA_MASK 0x1111),
+resolves sample 1, lights sample 1 alone (0x2222), and the final resolve
+averages the two. With one sample per pixel both lighting passes landed on
+the same pixel: the snow lit twice, much darker (replayer: mean 105 -> 73).
+
+On a single-sample target standing for the guest's two, the one sample is
+guest sample 0: draws that write only other samples are skipped, and a
+resolve of another sample is skipped when its destination already holds
+sample 0 of the same source and rectangle with no draw to every sample
+since (before the lighting the samples are equal). Both layers would be the
+same, so their average is the sample-0 layer: the image matches.
+
+Foliage drawn with alpha to coverage (and the camera fade) used the smooth
+coverage path only when multisampled; it now also runs with one sample,
+dithered over pixels, the dither stepping each frame so the upscaler's
+accumulation sees the real coverage.
+
+Replayer (riding capture, MSAA on vs off): mean brightness 104.8 vs 104.0
+(was 72.9); pixels off by more than 32: 1.6% averaged over four frames
+(foliage dither). Two other captures without an upscaler: 0.7% and 0.8%.
+Armada: MSAA off saved about 0.8 ms of GPU time per frame.

@@ -324,9 +324,10 @@ const std::vector<Tab>& Tabs() {
                        "two."),
                 Toggle("native_msaa", "Multisampling (MSAA)",
                        "Draws with the game's own multisample anti-aliasing, as the Xbox 360 "
-                       "does: smoother edges, and the snow lit once per sample. Off draws one "
-                       "sample per pixel, which matches the emulated image (it lights the snow "
-                       "twice, giving it a darker, more orange look)."),
+                       "does: smoother edges. Off draws one sample per pixel with the same "
+                       "lighting and colors (the game's per-sample lighting and see-through "
+                       "foliage are reproduced), a little faster; with FSR or XeSS on, the "
+                       "upscaler smooths the edges instead."),
                 Toggle("native_sharp_fonts", "Sharp fonts",
                        "The game's fonts (menus, HUD, scores, button icons) are 720p bitmaps. "
                        "This rebuilds each at 4x from its own letters when first shown, with "

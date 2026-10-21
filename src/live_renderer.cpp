@@ -96,7 +96,8 @@ REXCVAR_DEFINE_BOOL(native_vertex_cache, true, "GPU",
                     "last frame (write-watched pages) instead of copying them every frame");
 REXCVAR_DEFINE_BOOL(native_msaa, true, "GPU",
                     "Native renderer: use the game's multisampling (MSAA) as the Xbox 360 does "
-                    "(off: one sample per pixel, like the emulated image)");
+                    "(off: one sample per pixel, same lighting and colors, rougher edges "
+                    "unless an upscaler smooths them)");
 REXCVAR_DEFINE_INT32(native_render_scale, 100, "GPU",
                      "Native renderer: the 3D scene's resolution, in percent of the picture's "
                      "size on screen (the window, or its 16:9 part when letterboxed); the HUD, "

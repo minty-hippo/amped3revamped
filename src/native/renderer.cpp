@@ -111,6 +111,12 @@ struct Image {
   bool replaced = false;
   // A render target (GetTarget): draws never sample one directly.
   bool target = false;
+  // The guest's sample count for a render target (1 sample here when MSAA is
+  // off: see "One sample for the guest's two" in DoDraw / DoResolve).
+  uint32_t guest_samples = 1;
+  // Draws into it that wrote every guest sample (DoResolve: a resolve of
+  // another sample is the same as one of sample 0 made since).
+  uint64_t full_draws = 0;
   // Memory from a shared block (Gpu::SubAllocate) instead of its own
   // allocation: the block's index and the range taken (-1: its own).
   int block = -1;
@@ -1490,6 +1496,18 @@ struct Renderer::Impl {
     *mapped = static_cast<uint8_t*>(own.mapped);
   }
   std::vector<Image> retired_images_;      // replaced during this frame
+  // DoResolve, one sample for the guest's two: the last resolve of sample 0
+  // into each destination (cleared each frame).
+  struct ResolveRecord {
+    const Image* src = nullptr;
+    uint64_t full_draws = 0;
+    uint32_t x = 0, y = 0, w = 0, h = 0;
+    bool operator==(const ResolveRecord& o) const {
+      return src == o.src && full_draws == o.full_draws && x == o.x && y == o.y && w == o.w &&
+             h == o.h;
+    }
+  };
+  std::unordered_map<const Image*, ResolveRecord> last_resolve_;
   std::map<uint32_t, Image> resolved_;          // masked base address -> image
   struct SpareKey {
     const void* set;
@@ -2159,6 +2177,7 @@ Image* Renderer::Impl::GetTargetUncached(const TargetKey& base_key, bool resolve
   im.scale = ts;
   ToGeneral(cb_, im);
   im.target = true;
+  im.guest_samples = key.samples;
   Image& stored = targets_[key] = im;
   pending_clears_.erase(&stored);
   const float zero[4] = {0, 0, 0, 0};
@@ -5271,7 +5290,22 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     first_sample = first * scale;
     sample_count = count * scale;
   }
-  if (w && h) {
+  // One sample for the guest's two (see DoDraw): a resolve of guest samples
+  // other than 0 copies what sample 0 held before the draws that wrote it
+  // alone. When this destination already got sample 0 of the same source
+  // and rectangle, with no draw to every sample since, it holds exactly that:
+  // the copy is skipped (copying now would bring the sample-0 lighting into
+  // the sample-1 layer).
+  bool skip_copy = false;
+  if (src->samples == 1 && src->guest_samples > 1) {
+    const uint32_t sel = (r.flags >> 4) & 7;
+    const bool sample0 = sel == 0 || sel == 1 || sel == 5 || sel == 7;
+    const ResolveRecord rec{src, src->full_draws, sx0, sy0, w, h};
+    auto& last = last_resolve_[dst];
+    if (!sample0 && last == rec) skip_copy = true;
+    if (sample0) last = rec;
+  }
+  if (w && h && !skip_copy) {
     // (clears waiting for the other tiles of the source may wait on)
     const VkRect2D read{{int32_t(sx0), int32_t(sy0)}, {w, h}};
     ResolveBarrier(src, read);
@@ -5451,6 +5485,27 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     Skip(number, "no render target");
     return;
   }
+  // One sample for the guest's two (MSAA off): the one sample stands for
+  // guest sample 0. Amped 3 uses its two samples as two layers for the
+  // scene's lighting: it resolves sample 0, lights sample 0 alone
+  // (PA_SC_AA_MASK 0x1111), resolves sample 1, lights sample 1 alone
+  // (0x2222), and the final resolve averages the two. Without MSAA both
+  // samples hold the same scene, so both lit layers are the same: drawing
+  // only the sample-0 pass (and skipping the resolve of sample 1, see
+  // DoResolve) gives the average exactly. Drawing both lit the scene twice
+  // (much darker).
+  {
+    Image* att = colors.empty() ? depth : colors[0];
+    if (att->samples == 1 && att->guest_samples > 1) {
+      const uint32_t all = (1u << std::min(att->guest_samples, 4u)) - 1;
+      const uint32_t aa_mask = st.reg(0x2312) & all;
+      if (!(aa_mask & 1u)) return;  // other samples only
+      if (aa_mask == all) {
+        for (Image* c : colors) ++c->full_draws;
+        if (depth) ++depth->full_draws;
+      }
+    }
+  }
 
   mark(1);
   // Texture descriptors (prepared before rendering starts: uploads end it).
@@ -5593,7 +5648,10 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // Multisampled: alpha to coverage, and alpha tests that cut (greater /
   // greater-equal), as a sample mask from the shader (smooth, anti-aliased
   // foliage edges instead of the hardware's few coverage steps).
-  if (att0->samples > 1 && smooth_alpha_ &&
+  // One sample for the guest's two: the same, dithered over neighbouring
+  // pixels instead of samples (the upscaler's accumulation smooths it), so
+  // foliage edges and the camera fade match the multisampled look.
+  if ((att0->samples > 1 || att0->guest_samples > 1) && smooth_alpha_ &&
       ((colorctl & 0x10) || ((colorctl & 8) && ((colorctl & 7) == 4 || (colorctl & 7) == 6)))) {
     sys.flags |= 8192u | (std::min(att0->samples, 31u) << 16) | (((colorctl >> 24) & 0xFF) << 21);
     if (colorctl & 0x10) sys.flags |= 256u;  // alpha to mask
@@ -5602,6 +5660,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // in view. Only alpha-to-coverage surfaces: the terrain and riders use a
     // plain alpha test.
     if (foliage_fade_ && tiling_.width && (colorctl & 0x10)) sys.flags |= 1u << 29;
+    // One sample per pixel: the dither's per-frame phase (the shader).
+    if (att0->samples == 1) sys.flags |= uint32_t(frame_number_ & 3) << 30;
   }
   sys.rt_inv_size[0] = 1.0f / float(rt_w);
   sys.rt_inv_size[1] = 1.0f / float(rt_h);
@@ -7079,6 +7139,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   tiling_ = {};
   light_seen_ = false;
   scene_begun_ = false;
+  last_resolve_.clear();
   blur_done_ = false;
   composite_seen_ = false;
   max_draws_ = max_draws;
