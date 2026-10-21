@@ -592,6 +592,7 @@ const char* ZoneName(Zone zone) {
     case Zone::kFlushState: return "flush_state";
     case Zone::kRecord: return "record";
     case Zone::kRecTextures: return "rec_textures";
+    case Zone::kRecSetup: return "rec_setup";
     case Zone::kRecVertices: return "rec_vertices";
     case Zone::kRecIndices: return "rec_indices";
     case Zone::kRecState: return "rec_state";

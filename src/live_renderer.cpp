@@ -290,56 +290,51 @@ struct DrawInputs {
 };
 
 // DrawInputs in chunks: adding one never moves the others, so the recorder
-// thread can work on one while the game thread adds more.
+// thread can work on one while the game thread adds more. No lock: only the
+// game thread adds, and the recorder reads an entry only after the queue
+// (g_queue_mutex) handed it over; the chunk table is fixed, never moved.
 class DrawInputList {
  public:
-  using Chunk = std::array<DrawInputs, 256>;
-  DrawInputs& Add() {
-    std::lock_guard lock(mutex_);
-    if (count_ / kChunk >= chunks_.size()) {
-      if (!spare_.empty()) {
-        chunks_.push_back(std::move(spare_.back()));
-        spare_.pop_back();
-      } else {
-        chunks_.push_back(std::make_unique<Chunk>());
-      }
-    }
-    DrawInputs& d = (*chunks_[count_ / kChunk])[count_ % kChunk];
-    if (reused_ > count_) d = DrawInputs{};  // from an earlier frame
-    ++count_;
+  static constexpr size_t kChunk = 256;
+  using Chunk = std::array<DrawInputs, kChunk>;
+  // Game thread. Returns the entry and its index.
+  DrawInputs& Add(size_t* index) {
+    const size_t i = count_.load(std::memory_order_relaxed);
+    auto& chunk = chunks_[std::min(i / kChunk, kMaxChunks - 1)];
+    if (!chunk) chunk = std::make_unique<Chunk>();
+    DrawInputs& d = (*chunk)[i % kChunk];
+    if (i < reused_) d = DrawInputs{};  // from an earlier frame
+    count_.store(i + 1, std::memory_order_release);
+    *index = i;
     return d;
   }
+  DrawInputs& At(size_t i) { return (*chunks_[i / kChunk])[i % kChunk]; }
+  size_t size() const { return count_.load(std::memory_order_acquire); }
   // Chunks of an earlier frame to fill again (frame recycling: their memory
-  // is already the process's, no page faults on first use).
+  // is already the process's). Before the frame is used.
   void Adopt(std::vector<std::unique_ptr<Chunk>> chunks) {
-    std::lock_guard lock(mutex_);
-    reused_ = chunks.size() * kChunk;
-    spare_ = std::move(chunks);
-    std::reverse(spare_.begin(), spare_.end());
+    size_t n = 0;
+    for (auto& c : chunks) {
+      if (n < kMaxChunks) chunks_[n++] = std::move(c);
+    }
+    reused_ = n * kChunk;
   }
+  // When the frame is done with.
   std::vector<std::unique_ptr<Chunk>> Release() {
-    std::lock_guard lock(mutex_);
-    for (auto& c : spare_) chunks_.push_back(std::move(c));
-    spare_.clear();
+    std::vector<std::unique_ptr<Chunk>> out;
+    for (auto& c : chunks_) {
+      if (c) out.push_back(std::move(c));
+    }
     count_ = 0;
     reused_ = 0;
-    return std::exchange(chunks_, {});
-  }
-  DrawInputs& At(size_t i) {
-    std::lock_guard lock(mutex_);
-    return (*chunks_[i / kChunk])[i % kChunk];
-  }
-  size_t size() {
-    std::lock_guard lock(mutex_);
-    return count_;
+    return out;
   }
 
  private:
-  static constexpr size_t kChunk = 256;
-  std::mutex mutex_;
-  std::vector<std::unique_ptr<Chunk>> chunks_;
-  std::vector<std::unique_ptr<Chunk>> spare_;  // adopted, not used yet (last first)
-  size_t count_ = 0;
+  // Enough for kMaxEvents draws (Room() stops recording before more).
+  static constexpr size_t kMaxChunks = kMaxEvents / kChunk + 2;
+  std::array<std::unique_ptr<Chunk>, kMaxChunks> chunks_;
+  std::atomic<size_t> count_{0};
   size_t reused_ = 0;  // the first reused_ entries come from an earlier frame
 };
 
@@ -2270,7 +2265,8 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   RecordTimer timer;
   std::lock_guard lock(g_mutex);
   if (!g_frame || !Room()) return;
-  auto lap = [t = std::chrono::steady_clock::now()](int part) mutable {
+  const auto setup_t0 = std::chrono::steady_clock::now();
+  auto lap = [t = setup_t0](int part) mutable {
     const auto now = std::chrono::steady_clock::now();
     const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
     g_draw_ns[part] += uint64_t(ns);
@@ -2301,7 +2297,8 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   const ShaderUse& ps_use = UseOf(ps_ucode, native::ShaderStage::kPixel);
   const bool deferred = DeferredNaming();
   DrawInputs local;
-  DrawInputs& in = deferred ? g_frame->inputs.Add() : local;
+  size_t input_index = 0;
+  DrawInputs& in = deferred ? g_frame->inputs.Add(&input_index) : local;
   in.draw = uint32_t(g_frame->frame.draws.size() - 1);
   uint32_t wanted = 0;
   if (vs_use.known && ps_use.known) {
@@ -2310,6 +2307,10 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   } else {
     wanted = ~0u;
   }
+  // F11 trace: the setup above (part of rec_textures).
+  trace::Add(trace::Zone::kRecSetup, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - setup_t0)
+                                         .count());
   for (uint32_t s = 0; s < kTextureSlots; ++s) {
     if (!(wanted & (1u << s))) continue;
     const auto words = FetchWords(base, dev + kFetchConsts + 24 * s);
@@ -2358,7 +2359,7 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
     }
   }
   if (deferred) {
-    EnqueueDraw(g_frame.get(), g_frame->inputs.size() - 1, U32(base, dev + kCpuFence));
+    EnqueueDraw(g_frame.get(), input_index, U32(base, dev + kCpuFence));
   } else {
     NameDraw(*g_frame, in);
     ApplyNames(d, in);

@@ -28,6 +28,7 @@ enum class Zone : int {
   kFlushState,  // D3D_FlushDirtyState (part of kD3D): writing changed state as GPU commands
   kRecord,      // the native renderer recording the frame in our hooks
   kRecTextures, // part of kRecord, draws: naming the bound textures
+  kRecSetup,    // part of kRecTextures: the draw's setup before its textures
   kRecVertices, // part of kRecord, draws: vertex memory
   kRecIndices,  // part of kRecord, draws: indices and user-pointer data
   kRecState,    // part of kRecord, draws: state changes since the last draw
