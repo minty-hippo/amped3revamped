@@ -293,12 +293,37 @@ struct DrawInputs {
 // thread can work on one while the game thread adds more.
 class DrawInputList {
  public:
+  using Chunk = std::array<DrawInputs, 256>;
   DrawInputs& Add() {
     std::lock_guard lock(mutex_);
-    if (count_ % kChunk == 0) chunks_.push_back(std::make_unique<std::array<DrawInputs, kChunk>>());
-    DrawInputs& d = (*chunks_.back())[count_ % kChunk];
+    if (count_ / kChunk >= chunks_.size()) {
+      if (!spare_.empty()) {
+        chunks_.push_back(std::move(spare_.back()));
+        spare_.pop_back();
+      } else {
+        chunks_.push_back(std::make_unique<Chunk>());
+      }
+    }
+    DrawInputs& d = (*chunks_[count_ / kChunk])[count_ % kChunk];
+    if (reused_ > count_) d = DrawInputs{};  // from an earlier frame
     ++count_;
     return d;
+  }
+  // Chunks of an earlier frame to fill again (frame recycling: their memory
+  // is already the process's, no page faults on first use).
+  void Adopt(std::vector<std::unique_ptr<Chunk>> chunks) {
+    std::lock_guard lock(mutex_);
+    reused_ = chunks.size() * kChunk;
+    spare_ = std::move(chunks);
+    std::reverse(spare_.begin(), spare_.end());
+  }
+  std::vector<std::unique_ptr<Chunk>> Release() {
+    std::lock_guard lock(mutex_);
+    for (auto& c : spare_) chunks_.push_back(std::move(c));
+    spare_.clear();
+    count_ = 0;
+    reused_ = 0;
+    return std::exchange(chunks_, {});
   }
   DrawInputs& At(size_t i) {
     std::lock_guard lock(mutex_);
@@ -312,8 +337,10 @@ class DrawInputList {
  private:
   static constexpr size_t kChunk = 256;
   std::mutex mutex_;
-  std::vector<std::unique_ptr<std::array<DrawInputs, kChunk>>> chunks_;
+  std::vector<std::unique_ptr<Chunk>> chunks_;
+  std::vector<std::unique_ptr<Chunk>> spare_;  // adopted, not used yet (last first)
   size_t count_ = 0;
+  size_t reused_ = 0;  // the first reused_ entries come from an earlier frame
 };
 
 struct RecordedFrame {
@@ -339,7 +366,56 @@ struct RecordedFrame {
   bool states_built = false;                // BuildStates done (by the prep thread)
   double states_ms = 0;                     // its time
   std::chrono::steady_clock::time_point swap_time;  // when the game swapped it
+  ~RecordedFrame();
 };
+
+// Recycled frame memory: a recorded frame's big buffers (draws, events, state
+// deltas, draw inputs: a few MB) go back to a pool when it is destroyed, and
+// the next frame takes them. Fresh allocations of that size come straight
+// from the kernel each frame, and the game thread then page-faulted on every
+// page it wrote (thousands of faults a frame).
+struct FrameBuffers {
+  std::vector<native::Event> events;
+  std::vector<native::Draw> draws;
+  std::vector<uint8_t> deltas;
+  std::vector<uint32_t> draw_delta_end;
+  std::vector<std::unique_ptr<DrawInputList::Chunk>> chunks;
+};
+std::mutex g_frame_pool_mutex;
+std::vector<FrameBuffers> g_frame_pool;  // at most kFramePool
+constexpr size_t kFramePool = 3;
+
+RecordedFrame::~RecordedFrame() {
+  FrameBuffers b;
+  b.events = std::move(frame.events);
+  b.draws = std::move(frame.draws);
+  b.deltas = std::move(deltas);
+  b.draw_delta_end = std::move(draw_delta_end);
+  b.chunks = inputs.Release();
+  // Emptied here, outside the lock (the draws hold strings and state).
+  b.events.clear();
+  b.draws.clear();
+  b.deltas.clear();
+  b.draw_delta_end.clear();
+  std::lock_guard lock(g_frame_pool_mutex);
+  if (g_frame_pool.size() < kFramePool) g_frame_pool.push_back(std::move(b));
+}
+
+// A frame's buffers: recycled ones when there are any.
+void TakeFrameBuffers(RecordedFrame& f) {
+  FrameBuffers b;
+  {
+    std::lock_guard lock(g_frame_pool_mutex);
+    if (g_frame_pool.empty()) return;
+    b = std::move(g_frame_pool.back());
+    g_frame_pool.pop_back();
+  }
+  f.frame.events = std::move(b.events);
+  f.frame.draws = std::move(b.draws);
+  f.deltas = std::move(b.deltas);
+  f.draw_delta_end = std::move(b.draw_delta_end);
+  f.inputs.Adopt(std::move(b.chunks));
+}
 
 // Microcode by stem (all the game has run so far).
 std::mutex g_ucode_mutex;
@@ -936,6 +1012,7 @@ void StopRecorder();
 void StartFrame() {
   if (!DeferredNaming()) BeginNaming();
   g_frame = std::make_unique<RecordedFrame>();
+  TakeFrameBuffers(*g_frame);
   g_frame->frame.draws.reserve(g_last_draws + g_last_draws / 4 + 64);
   g_frame->frame.events.reserve(g_last_events + g_last_events / 4 + 64);
   g_frame->deltas.reserve(g_last_deltas + g_last_deltas / 4 + 4096);

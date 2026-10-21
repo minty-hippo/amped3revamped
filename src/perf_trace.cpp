@@ -142,6 +142,10 @@ std::atomic<bool> g_running{false};
 struct ThreadSample {
   std::string name;
   int64_t cpu_ns = 0;
+  // Linux: of that, time in the kernel, and page faults (minor: memory
+  // touched for the first time, or freed and taken again).
+  int64_t sys_ns = 0;
+  int64_t faults = 0;
 };
 using ThreadMap = std::map<uint64_t, ThreadSample>;
 
@@ -209,26 +213,26 @@ ThreadMap SampleThreads() {
     s.name = ReadFirstLine(base + "/comm");
     // schedstat: nanoseconds on a CPU (precise); stat: utime + stime in ticks.
     const std::string sched = ReadFirstLine(base + "/schedstat");
-    if (!sched.empty()) {
-      s.cpu_ns = std::strtoll(sched.c_str(), nullptr, 10);
-    } else {
-      const std::string stat = ReadFirstLine(base + "/stat");
-      const size_t close = stat.rfind(')');
-      if (close != std::string::npos && ticks > 0) {
-        // Fields after the name: state is field 3; utime 14, stime 15.
-        const char* p = stat.c_str() + close + 2;
-        long long utime = 0, stime = 0;
-        int field = 3;
-        while (*p && field < 16) {
-          if (field == 14) utime = std::strtoll(p, nullptr, 10);
-          if (field == 15) stime = std::strtoll(p, nullptr, 10);
-          while (*p && *p != ' ') ++p;
-          while (*p == ' ') ++p;
-          ++field;
-        }
-        s.cpu_ns = (utime + stime) * (1'000'000'000LL / ticks);
+    const std::string stat = ReadFirstLine(base + "/stat");
+    const size_t close = stat.rfind(')');
+    long long utime = 0, stime = 0, minflt = 0;
+    if (close != std::string::npos) {
+      // Fields after the name: state is field 3; minflt 10, utime 14, stime 15.
+      const char* p = stat.c_str() + close + 2;
+      int field = 3;
+      while (*p && field < 16) {
+        if (field == 10) minflt = std::strtoll(p, nullptr, 10);
+        if (field == 14) utime = std::strtoll(p, nullptr, 10);
+        if (field == 15) stime = std::strtoll(p, nullptr, 10);
+        while (*p && *p != ' ') ++p;
+        while (*p == ' ') ++p;
+        ++field;
       }
     }
+    const int64_t tick_ns = ticks > 0 ? 1'000'000'000LL / ticks : 0;
+    s.cpu_ns = !sched.empty() ? std::strtoll(sched.c_str(), nullptr, 10) : (utime + stime) * tick_ns;
+    s.sys_ns = stime * tick_ns;
+    s.faults = minflt;
     out[std::strtoull(e->d_name, nullptr, 10)] = std::move(s);
   }
   closedir(dir);
@@ -263,6 +267,7 @@ struct ThreadStat {
   uint64_t tid;
   std::string name, role;
   double cpu_ms = 0, avg_core_pct = 0, max_core_pct = 0;
+  double sys_ms = 0, faults = 0;  // kernel time and page faults over the trace (Linux)
 };
 
 // Command stream statistics (SDK patch 0020): the command processor reports
@@ -447,6 +452,10 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
       const auto it = first.find(tid);
       const int64_t start = it != first.end() ? it->second.cpu_ns : 0;
       t.cpu_ms = double(s.cpu_ns - start) * 1e-6;
+      if (it != first.end()) {
+        t.sys_ms = double(s.sys_ns - it->second.sys_ns) * 1e-6;
+        t.faults = double(s.faults - it->second.faults);
+      }
       t.avg_core_pct = span_ms > 0 ? 100.0 * t.cpu_ms / span_ms : 0;
       for (size_t i = 1; i < samples.size(); ++i) {
         const auto a = samples[i - 1].find(tid), b = samples[i].find(tid);
@@ -462,10 +471,10 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
     std::sort(threads.begin(), threads.end(),
               [](const ThreadStat& a, const ThreadStat& b) { return a.cpu_ms > b.cpu_ms; });
     std::ofstream f(base.string() + "_threads.csv");
-    f << "tid,name,role,cpu_ms,avg_core_pct,max_core_pct_1s\n";
+    f << "tid,name,role,cpu_ms,avg_core_pct,max_core_pct_1s,system_ms,page_faults\n";
     for (const auto& t : threads) {
-      f << fmt::format("{},\"{}\",\"{}\",{:.1f},{:.1f},{:.1f}\n", t.tid, t.name, t.role, t.cpu_ms,
-                       t.avg_core_pct, t.max_core_pct);
+      f << fmt::format("{},\"{}\",\"{}\",{:.1f},{:.1f},{:.1f},{:.0f},{:.0f}\n", t.tid, t.name, t.role,
+                       t.cpu_ms, t.avg_core_pct, t.max_core_pct, t.sys_ms, t.faults);
     }
   }
 
@@ -535,11 +544,18 @@ void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
         Percentile(gaps, 1.0), uneven);
   }
   if (!threads.empty()) {
-    s += "Busiest threads (share of one core: average, busiest second):\n";
+    s += "Busiest threads (share of one core: average, busiest second; Linux: of the CPU time, "
+         "the kernel's share, and page faults per frame):\n";
+    const double nframes = std::max<double>(double(rows.size()), 1.0);
     for (size_t i = 0; i < threads.size() && i < 12; ++i) {
       const auto& t = threads[i];
-      s += fmt::format("  {:>7} {:<16} {:5.1f}% {:5.1f}%  {}\n", t.tid, t.name, t.avg_core_pct,
-                       t.max_core_pct, t.role);
+      std::string sys;
+      if (t.sys_ms > 0 || t.faults > 0) {
+        sys = fmt::format("  kernel {:4.1f}%, {:5.0f} faults/frame", t.cpu_ms > 0 ? 100.0 * t.sys_ms / t.cpu_ms : 0.0,
+                          t.faults / nframes);
+      }
+      s += fmt::format("  {:>7} {:<16} {:5.1f}% {:5.1f}%{}  {}\n", t.tid, t.name, t.avg_core_pct,
+                       t.max_core_pct, sys, t.role);
     }
   }
   {
