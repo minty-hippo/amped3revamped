@@ -38,6 +38,7 @@ struct UpscaleInputs {
   UpscaleImage depth;   // render resolution, R32F (inverted: 1 near, 0 far)
   UpscaleImage motion;  // render resolution, RG16F: pixels, current -> previous, no jitter
   UpscaleImage output;  // output resolution, storage
+  UpscaleImage reactive;  // render resolution, R8 (optional): 1 = trust this frame (FSR)
   uint32_t render_width = 0, render_height = 0;
   float jitter_x = 0, jitter_y = 0;  // pixels, as added to the projection (+x right, +y down)
   bool reset = false;

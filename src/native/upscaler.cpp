@@ -393,6 +393,10 @@ class Fsr final : public Upscaler {
     d.motionVectors = resource(in.motion, FFX_API_RESOURCE_USAGE_READ_ONLY,
                                FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     d.output = resource(in.output, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (in.reactive.image) {
+      d.reactive = resource(in.reactive, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                            FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    }
     d.jitterOffset = {in.jitter_x, in.jitter_y};
     d.motionVectorScale = {1.0f, 1.0f};
     d.renderSize = {in.render_width, in.render_height};

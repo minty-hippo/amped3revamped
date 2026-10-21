@@ -443,3 +443,16 @@ Replayer (riding capture, MSAA on vs off): mean brightness 104.8 vs 104.0
 (was 72.9); pixels off by more than 32: 1.6% averaged over four frames
 (foliage dither). Two other captures without an upscaler: 0.7% and 0.8%.
 Armada: MSAA off saved about 0.8 ms of GPU time per frame.
+
+## FSR reactive mask (snow without trails)
+
+Falling snow and other particles are blended and don't write depth, so the
+motion vectors FSR gets at their pixels are the ground's behind them: FSR
+reprojected history along the wrong motion and the flakes left trails. FSR
+takes a reactive mask for this (1: trust this frame, not history).
+
+Scene draws after the lighting that blend and don't write depth are queued
+(`QueueReactive`) and drawn again at the upscale (`DrawReactive`) into an R8
+image with their own shaders, no depth test, summing the red output scaled by
+the game's own source factor (alpha for alpha blending, one for additive).
+Opaque scenery and alpha-tested foliage that writes depth stay out of it.

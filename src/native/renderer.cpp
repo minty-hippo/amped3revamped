@@ -1221,7 +1221,7 @@ struct Renderer::Impl {
                        float lod_bias = 0.0f);
   VkPipeline PipelineFor(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
                          const std::vector<Image*>& colors, Image* depth, uint32_t color_mask_bits,
-                         bool velocity = false, bool mask = false);
+                         bool velocity = false, bool mask = false, bool reactive = false);
   void Prepass();
   void CreateOnce();
   void BeginFrame();
@@ -1911,6 +1911,17 @@ struct Renderer::Impl {
     uint32_t rt_w, rt_h;
   };
   std::vector<MaskDraw> mask_draws_;
+  // FSR's reactive mask: the scene's blended draws that don't write depth
+  // (snow, particles, glows) drawn again into reactive_img_ at the upscale,
+  // so FSR leans on the current frame there instead of history (without it
+  // a falling flake left a trail: its pixels had no motion of their own).
+  std::vector<MaskDraw> reactive_draws_;
+  Image reactive_img_;
+  void QueueReactive(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
+                     const VkDescriptorSet* tex_sets, const uint32_t* offsets, bool indexed,
+                     VkIndexType index_type, uint32_t first, uint32_t count, const VkRect2D& sc,
+                     const float* bias, uint32_t rt_w, uint32_t rt_h);
+  Image* DrawReactive(uint32_t w, uint32_t h);
   Image* mask_depth_ = nullptr;
   uint32_t post_light_draws_ = 0;  // scene draws after the lighting pass
   void DrawMasks(const MaskDraw* m, size_t n);
@@ -2803,7 +2814,8 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
 
 VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const Shader& vs,
                                  const Shader& ps, const std::vector<Image*>& colors, Image* depth,
-                                 uint32_t color_mask_bits, bool velocity, bool mask) {
+                                 uint32_t color_mask_bits, bool velocity, bool mask,
+                                 bool reactive) {
   const uint32_t mode = st.reg(0x2205);        // PA_SU_SC_MODE_CNTL
   const uint32_t depth_ctl = st.reg(0x2200);   // RB_DEPTHCONTROL
   uint32_t blend[4] = {st.reg(0x2201), st.reg(0x2209), st.reg(0x220A), st.reg(0x220B)};
@@ -2866,6 +2878,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   if (diag_range) put(0x44494147u);
   if (velocity) put(0x56454Cu);
   if (mask) put(0x4D41534Bu);
+  if (reactive) put(0x52454143u);
   const std::string_view key(key_buf, std::min(key_len, sizeof(key_buf)));
   last_pipeline_pending_ = false;
   auto it = pipelines_.find(key);
@@ -2972,6 +2985,19 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       // The velocity image's w = 1 (builtin_exempt).
       a.blendEnable = VK_FALSE;
       a.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
+    }
+    if (reactive) {
+      // The upscaler's reactive mask (R8): how much the draw adds to the
+      // pixel, roughly: its red output scaled as the game scales its color
+      // (alpha for alpha blending, one for additive), summed (saturating).
+      a.blendEnable = VK_TRUE;
+      a.srcColorBlendFactor = BlendFactor(b & 31);
+      a.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+      a.colorBlendOp = VK_BLEND_OP_ADD;
+      a.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      a.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      a.alphaBlendOp = VK_BLEND_OP_ADD;
+      a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     }
   }
   auto& cbs = build->cbs;
@@ -5057,6 +5083,8 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   in.color = image(*src);
   in.depth = image(*depth);
   in.motion = image(mv_img_);
+  Image* reactive = DrawReactive(rw, rh);
+  if (reactive) in.reactive = image(*reactive);
   in.output = image(up_out_);
   in.render_width = rw;
   in.render_height = rh;
@@ -5073,6 +5101,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   Transition(*src, gen, ro);
   Transition(*depth, gen, ro);
   Transition(mv_img_, gen, ro);
+  if (reactive) Transition(*reactive, gen, ro);
   // The upscaler records into the command buffer itself: everything before
   // it first.
   if (stream_.active()) stream_.Drain();
@@ -5080,6 +5109,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   Transition(*src, ro, gen);
   Transition(*depth, ro, gen);
   Transition(mv_img_, ro, gen);
+  if (reactive) Transition(*reactive, ro, gen);
   Barrier();
   dyn_ = DynState{};
   if (!ok) {
@@ -6177,12 +6207,72 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   const bool label = !d.up_vertices.empty() && d.prim == 13 && (depth_ctl & 6) == 6;
   if (light_seen_ && tiling_.width && ps->info.ucode_hash != kLightingPixelShader) {
     ++post_light_draws_;
+    const uint32_t blend0 = st.reg(0x2201);
+    const bool blended = (blend0 & 0x1FFF1FFF) != 0x00010001;
+    const bool writes_depth = depth && (depth_ctl & 6) == 6;
+    if (upscaler_ && blended && !writes_depth && (mask_bits & 7) && max_draws_ == UINT32_MAX) {
+      QueueReactive(d, st, *vs, *ps, tex_sets, offsets, indexed, index_type, first_index,
+                    index_count, sc, bias, rt_w, rt_h);
+    }
   }
   if (blur_scale_ > 0.0f && depth && tiling_.width && max_draws_ == UINT32_MAX &&
       (icon_mesh || label) && (depth_ctl & 6) == 6 && !ps->info.writes_depth) {
     MaskExempt(d, st, *vs, *ps, depth, tex_sets, offsets, indexed, index_type, first_index,
                index_count, sc, bias, rt_w, rt_h);
   }
+}
+
+void Renderer::Impl::QueueReactive(const Draw& d, const GpuState& st, const Shader& vs,
+                                   const Shader& ps, const VkDescriptorSet* tex_sets,
+                                   const uint32_t* offsets, bool indexed, VkIndexType index_type,
+                                   uint32_t first, uint32_t count, const VkRect2D& sc,
+                                   const float* bias, uint32_t rt_w, uint32_t rt_h) {
+  // The pipeline's format and sample count only (the image comes later).
+  static Image proto = [] {
+    Image im;
+    im.format = VK_FORMAT_R8_UNORM;
+    return im;
+  }();
+  std::vector<Image*> colors{&proto};
+  VkPipeline p = PipelineFor(d, st, vs, ps, colors, nullptr, 0x1, false, false, true);
+  if (!p) return;
+  MaskDraw m{};
+  m.pipeline = p;
+  m.tex_sets[0] = tex_sets[0];
+  m.tex_sets[1] = tex_sets[1];
+  std::memcpy(m.offsets, offsets, sizeof(m.offsets));
+  m.indexed = indexed;
+  m.index_type = index_type;
+  m.index_buffer = cur_index_buffer_;
+  m.first = first;
+  m.count = indexed ? count : d.count;
+  m.scissor = sc;
+  m.bias[0] = bias[0];
+  m.bias[1] = bias[1];
+  m.rt_w = rt_w;
+  m.rt_h = rt_h;
+  reactive_draws_.push_back(m);
+}
+
+// The reactive mask for the upscale (null: no blended draws this frame).
+Image* Renderer::Impl::DrawReactive(uint32_t w, uint32_t h) {
+  if (reactive_draws_.empty()) return nullptr;
+  EndRendering();
+  if (!reactive_img_.image || reactive_img_.width != w || reactive_img_.height != h) {
+    if (reactive_img_.image) Retire(reactive_img_);
+    reactive_img_ = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, "reactive");
+    ToGeneral(cb_, reactive_img_);
+  }
+  const float zero[4] = {0, 0, 0, 0};
+  ClearImage(&reactive_img_, zero, 0.0f, 0, true, false, false);
+  std::vector<Image*> colors{&reactive_img_};
+  BeginRendering(colors, nullptr);
+  DrawMasks(reactive_draws_.data(), reactive_draws_.size());
+  EndRendering();
+  reactive_draws_.clear();
+  Barrier();
+  dyn_ = DynState{};
+  return &reactive_img_;
 }
 
 // The velocity image, sized and sampled like the scene's depth.
@@ -7067,6 +7157,7 @@ Renderer::Impl::~Impl() {
   }
   if (vel_ps_.module) vk::vkDestroyShaderModule(dev, vel_ps_.module, nullptr);
   if (exempt_ps_.module) vk::vkDestroyShaderModule(dev, exempt_ps_.module, nullptr);
+  gpu_.DestroyImage(reactive_img_);
   gpu_.DestroyBuffer(out_readback_);
   gpu_.DestroyImage(dummy_);
   gpu_.DestroyImage(cloud_sprite_);
@@ -7164,6 +7255,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   mask_draws_.clear();
   mask_depth_ = nullptr;
   post_light_draws_ = 0;
+  reactive_draws_.clear();
   using Clock = std::chrono::steady_clock;
   auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -7561,6 +7653,7 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   for (auto& [k, im] : impl_->targets_) out.push_back(Describe(&im));
   for (auto& [k, im] : impl_->resolved_) out.push_back(Describe(&im));
   for (auto& [k, im] : impl_->resolved_packed_) out.push_back(Describe(&im));
+  if (impl_->reactive_img_.image) out.push_back(Describe(&impl_->reactive_img_));
   return out;
 }
 
