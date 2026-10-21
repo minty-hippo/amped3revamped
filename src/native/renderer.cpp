@@ -2560,17 +2560,25 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
     auto sit = resolved_.find(tex_base);
     if (sit != resolved_.end()) {
       Image* scene = &sit->second;
+      // GPU time by part: each effect on its own (they run once a frame, at
+      // the composite's first draw).
+      EndRendering();
+      MarkPart("scene done (resolves)");
       if (fog) {
         if (Image* fogged = FoggedScene(scene)) scene = fogged;
+        MarkPart("effect: fog / god rays");
       }
       if (blur) {
         if (Image* blurred = BlurredScene(scene)) scene = blurred;
+        MarkPart("effect: motion blur");
       }
       if (radial) {
         if (Image* streaked = RadialScene(scene)) scene = streaked;
+        MarkPart("effect: speed blur");
       }
       if (upscaler_) {
         if (Image* up = UpscaledScene(scene)) scene = up;
+        MarkPart("effect: upscaler");
       }
       if (scene != &sit->second) return scene;
     }
