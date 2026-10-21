@@ -1314,6 +1314,16 @@ void LogTimings(bool shared) {
   if (secs < 5.0 || !g_timings.frames) return;
   const Timings& t = g_timings;
   const double n = t.frames;
+  {
+    // Write-watch faults (a game thread writing a page the renderer watches:
+    // a signal and a protection change, far dearer than the write).
+    static uint64_t last_calls = 0, last_pages = 0;
+    const uint64_t calls = g_watch_calls.load(), pages = g_watch_pages.load();
+    REXLOG_INFO("Native renderer: write-watch faults {:.1f} per frame ({:.1f} pages)",
+                double(calls - last_calls) / n, double(pages - last_pages) / n);
+    last_calls = calls;
+    last_pages = pages;
+  }
   REXLOG_INFO(
       "Native renderer: {:.1f} frames/s shown ({} recorded); per frame: game-thread recording "
       "{:.2f} ms (draws: textures {:.2f}, vertex data {:.2f}, indices {:.2f}, state {:.2f}, store {:.2f}); worker {:.2f} ms = states {:.2f} + vertex data {:.2f} + draws {:.2f}, then "
