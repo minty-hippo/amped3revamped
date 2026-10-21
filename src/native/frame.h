@@ -166,6 +166,7 @@ class SmallMap {
   const value_type* end() const { return items_.end(); }
   size_t size() const { return items_.size(); }
   bool empty() const { return items_.empty(); }
+  void clear() { items_.clear(); }
 
  private:
   SmallVector<value_type, N> items_;

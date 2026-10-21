@@ -287,6 +287,17 @@ struct DrawInputs {
   native::SmallVector<native::FrameTexture, 4> named_textures;
   native::SmallMap<uint32_t, std::string, 2> vmem;
   std::string index_data;
+  // Emptied for reuse in place (assigning a fresh one moved ~500 bytes of
+  // inline storage element by element).
+  void Reset() {
+    draw = 0;
+    textures.clear();
+    vertex_fetches.clear();
+    ib_address = ib_size = 0;
+    named_textures.clear();
+    vmem.clear();
+    index_data.clear();
+  }
 };
 
 // DrawInputs in chunks: adding one never moves the others, so the recorder
@@ -303,7 +314,7 @@ class DrawInputList {
     auto& chunk = chunks_[std::min(i / kChunk, kMaxChunks - 1)];
     if (!chunk) chunk = std::make_unique<Chunk>();
     DrawInputs& d = (*chunk)[i % kChunk];
-    if (i < reused_) d = DrawInputs{};  // from an earlier frame
+    if (i < reused_) d.Reset();  // from an earlier frame
     count_.store(i + 1, std::memory_order_release);
     *index = i;
     return d;
@@ -2265,10 +2276,15 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
   RecordTimer timer;
   std::lock_guard lock(g_mutex);
   if (!g_frame || !Room()) return;
-  const auto setup_t0 = std::chrono::steady_clock::now();
-  auto lap = [t = setup_t0](int part) mutable {
+  // Where a draw's recording time goes, timed on one draw in 8 (and counted
+  // 8 times): a clock read costs about as much as some of the parts, and
+  // timing every draw cost the game thread several of them per draw.
+  const bool timed = (g_events & 7) == 0;
+  const auto setup_t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  auto lap = [timed, t = setup_t0](int part) mutable {
+    if (!timed) return;
     const auto now = std::chrono::steady_clock::now();
-    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+    const int64_t ns = 8 * std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
     g_draw_ns[part] += uint64_t(ns);
     // F11 trace: textures, vertex memory, indices, state (part 4, storing, is small).
     static constexpr trace::Zone kZones[] = {trace::Zone::kRecTextures,
@@ -2308,9 +2324,11 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
     wanted = ~0u;
   }
   // F11 trace: the setup above (part of rec_textures).
-  trace::Add(trace::Zone::kRecSetup, std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         std::chrono::steady_clock::now() - setup_t0)
-                                         .count());
+  if (timed) {
+    trace::Add(trace::Zone::kRecSetup, 8 * std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - setup_t0)
+                                               .count());
+  }
   for (uint32_t s = 0; s < kTextureSlots; ++s) {
     if (!(wanted & (1u << s))) continue;
     const auto words = FetchWords(base, dev + kFetchConsts + 24 * s);
