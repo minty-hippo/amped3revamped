@@ -4,6 +4,21 @@
 #include "audio_trace.h"
 
 #include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <chrono>
 #include <fstream>
 
@@ -236,6 +251,27 @@ void Amped3App::MoveOldSaves(const std::filesystem::path& from, const std::files
   }
   saves_note_ = "Copied saves from " + from.string() + " to " + to.string() +
                 " (the old folder is left as a backup)";
+}
+
+bool amped3::AcquireSingleInstance() {
+#if defined(_WIN32)
+  // Held by the process (closed by the system when it exits).
+  HANDLE m = CreateMutexW(nullptr, TRUE, L"Local\\Amped3RevampedRunning");
+  return m && GetLastError() != ERROR_ALREADY_EXISTS;
+#else
+  // An advisory lock on a file in the user's runtime folder: released by the
+  // kernel when the process ends, however it ends.
+  const char* dir = std::getenv("XDG_RUNTIME_DIR");
+  const std::string path = (dir && *dir ? std::string(dir) : std::string("/tmp")) +
+                           "/amped3-revamped-" + std::to_string(getuid()) + ".lock";
+  const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) return true;  // can't tell: run
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    close(fd);
+    return errno != EWOULDBLOCK;
+  }
+  return true;  // fd stays open (and locked) for the process's life
+#endif
 }
 
 void Amped3App::OnPostInitLogging() {
