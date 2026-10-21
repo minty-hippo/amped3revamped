@@ -98,6 +98,10 @@ REXCVAR_DEFINE_BOOL(native_msaa, true, "GPU",
                     "Native renderer: use the game's multisampling (MSAA) as the Xbox 360 does "
                     "(off: one sample per pixel, same lighting and colors, rougher edges "
                     "unless an upscaler smooths them)");
+REXCVAR_DEFINE_BOOL(native_upscaler_msaa, false, "GPU",
+                    "Native renderer: the game's multisampling (MSAA) while FSR or XeSS is on "
+                    "(off: the upscaler smooths the edges; same lighting and colors, faster). "
+                    "Without an upscaler native_msaa decides");
 REXCVAR_DEFINE_INT32(native_render_scale, 100, "GPU",
                      "Native renderer: the 3D scene's resolution, in percent of the picture's "
                      "size on screen (the window, or its 16:9 part when letterboxed); the HUD, "
@@ -1592,8 +1596,6 @@ void WorkerMain() {
     const auto t0 = Clock::now();
     last_gpu_wait = 0;
     try {
-      // The MSAA setting decides how render targets are made: start over.
-      const bool msaa = REXCVAR_GET(native_msaa);
       // The SDK's settings (Display > Image quality), read by name: they live
       // in the GPU plugin.
       float scale = RenderScaleFor(REXCVAR_GET(native_render_scale));
@@ -1603,6 +1605,10 @@ void WorkerMain() {
       const std::string upscaler_name = REXCVAR_GET(native_upscaler);
       // native::UpscalerKind: 1 = XeSS, 2 = FSR.
       const int upscaler = upscaler_name == "xess" ? 1 : upscaler_name == "fsr" ? 2 : 0;
+      // The MSAA setting decides how render targets are made: start over.
+      // With an upscaler its own setting (off by default: the upscaler
+      // smooths the edges).
+      const bool msaa = upscaler ? REXCVAR_GET(native_upscaler_msaa) : REXCVAR_GET(native_msaa);
       float out_scale = RenderScaleFor(100);
       if (renderer && (scale != renderer_scale || out_scale != renderer_out_scale)) {
         if (scale != scale_candidate || out_scale != out_scale_candidate) {

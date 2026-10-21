@@ -456,3 +456,16 @@ Scene draws after the lighting that blend and don't write depth are queued
 image with their own shaders, no depth test, summing the red output scaled by
 the game's own source factor (alpha for alpha blending, one for additive).
 Opaque scenery and alpha-tested foliage that writes depth stay out of it.
+
+The trails stayed over textured scenery: they are where a flake was, not
+where it is. FSR's history there still holds the flake (reprojected with
+the scenery's motion), this frame shows scenery (reactive 0), and over a
+textured surface FSR's history clamp lets it through (over the plain sky
+it didn't). The mask FSR gets is now this frame's blended draws merged with
+last frame's mask carried along the motion vectors (3x3 maximum, fading by a
+quarter a frame): the flake's old pixels are reactive too.
+
+MSAA with an upscaler is its own setting, `native_upscaler_msaa` (off by
+default; Image quality, under the upscaler): with FSR or XeSS on the game
+draws one sample per pixel and the upscaler smooths the edges. Without an
+upscaler `native_msaa` decides, as before.

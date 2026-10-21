@@ -102,6 +102,9 @@ Option SliderF(const char* cvar, const char* label, const char* help, const char
 
 bool NativeRendererOn() { return rex::cvar::GetFlagByName("native_renderer") == "true"; }
 bool NativeRendererOff() { return !NativeRendererOn(); }
+bool NativeUpscalerOn() {
+  return NativeRendererOn() && rex::cvar::GetFlagByName("native_upscaler") != "off";
+}
 bool NativeFsrOn() {
   return NativeRendererOn() && rex::cvar::GetFlagByName("native_upscaler") == "fsr";
 }
@@ -209,6 +212,17 @@ const std::vector<Tab>& Tabs() {
                                      "Sharpening applied by AMD FSR 3.1 (0 = none).", "%.2f",
                                      0.0, 1.0);
                   o.visible = NativeFsrOn;
+                  return o;
+                }(),
+                [] {
+                  Option o = Toggle(
+                      "native_upscaler_msaa", "MSAA with the upscaler",
+                      "The game's multisample anti-aliasing while FSR or XeSS is on. Off by "
+                      "default: the upscaler smooths the edges itself, and one sample per "
+                      "pixel keeps the same lighting and colors while saving GPU time. "
+                      "(Without an upscaler, Multisampling (MSAA) under Native renderer "
+                      "decides.)");
+                  o.visible = NativeUpscalerOn;
                   return o;
                 }(),
                 [] {
@@ -326,8 +340,9 @@ const std::vector<Tab>& Tabs() {
                        "Draws with the game's own multisample anti-aliasing, as the Xbox 360 "
                        "does: smoother edges. Off draws one sample per pixel with the same "
                        "lighting and colors (the game's per-sample lighting and see-through "
-                       "foliage are reproduced), a little faster; with FSR or XeSS on, the "
-                       "upscaler smooths the edges instead."),
+                       "foliage are reproduced), a little faster. Applies without an "
+                       "upscaler; with FSR or XeSS on, MSAA with the upscaler (Image "
+                       "quality) decides."),
                 Toggle("native_sharp_fonts", "Sharp fonts",
                        "The game's fonts (menus, HUD, scores, button icons) are 720p bitmaps. "
                        "This rebuilds each at 4x from its own letters when first shown, with "

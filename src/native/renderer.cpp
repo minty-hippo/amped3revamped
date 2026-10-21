@@ -1578,7 +1578,7 @@ struct Renderer::Impl {
     kDepth = 0, kDepthMs = 1, kColorMs = 2, kOutput = 3, kOutputMs = 4, kMotionBlur = 5,
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
-    kClouds = 17
+    kClouds = 17, kReactiveMerge = 18
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1619,7 +1619,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[18] = {};  // by CopyKind
+  VkShaderModule copy_fs_[19] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -1916,12 +1916,14 @@ struct Renderer::Impl {
   // so FSR leans on the current frame there instead of history (without it
   // a falling flake left a trail: its pixels had no motion of their own).
   std::vector<MaskDraw> reactive_draws_;
-  Image reactive_img_;
+  Image reactive_img_;      // this frame's blended draws
+  Image reactive_hist_[2];  // what FSR gets: with last frame's, carried along the motion
+  uint32_t reactive_flip_ = 0;
   void QueueReactive(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
                      const VkDescriptorSet* tex_sets, const uint32_t* offsets, bool indexed,
                      VkIndexType index_type, uint32_t first, uint32_t count, const VkRect2D& sc,
                      const float* bias, uint32_t rt_w, uint32_t rt_h);
-  Image* DrawReactive(uint32_t w, uint32_t h);
+  Image* DrawReactive(uint32_t w, uint32_t h, Image* motion);
   Image* mask_depth_ = nullptr;
   uint32_t post_light_draws_ = 0;  // scene draws after the lighting pass
   void DrawMasks(const MaskDraw* m, size_t n);
@@ -4053,6 +4055,29 @@ void main() {
                            : vec4(2.0, 2.0, 2.0, 1.0);
 }
 )", false);
+  // FSR's reactive mask: this frame's (binding 0) and last frame's (1) at
+  // where this pixel was (motion vectors, 2: render pixels, this -> last),
+  // the largest of a 3x3 there (flakes move a little of their own), fading.
+  copy_fs_[18] = CompileBuiltin("builtin_reactive_merge", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D cur;
+layout(set = 0, binding = 1) uniform sampler2D last;
+layout(set = 0, binding = 2) uniform sampler2D motion;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  ivec2 lim = textureSize(cur, 0) - 1;
+  float r = texelFetch(cur, p, 0).r;
+  vec2 mv = texelFetch(motion, p, 0).xy;
+  ivec2 q = ivec2(floor(vec2(p) + 0.5 + mv));
+  float h = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      h = max(h, texelFetch(last, clamp(q + ivec2(x, y), ivec2(0), lim), 0).r);
+    }
+  }
+  o = vec4(max(r, h * 0.75), 0.0, 0.0, 1.0);
+}
+)", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
 )") + clouds_common + R"(
 layout(binding = 2) uniform sampler2D sprite;
@@ -5083,7 +5108,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   in.color = image(*src);
   in.depth = image(*depth);
   in.motion = image(mv_img_);
-  Image* reactive = DrawReactive(rw, rh);
+  Image* reactive = DrawReactive(rw, rh, &mv_img_);
   if (reactive) in.reactive = image(*reactive);
   in.output = image(up_out_);
   in.render_width = rw;
@@ -6254,25 +6279,42 @@ void Renderer::Impl::QueueReactive(const Draw& d, const GpuState& st, const Shad
   reactive_draws_.push_back(m);
 }
 
-// The reactive mask for the upscale (null: no blended draws this frame).
-Image* Renderer::Impl::DrawReactive(uint32_t w, uint32_t h) {
-  if (reactive_draws_.empty()) return nullptr;
+// The reactive mask for the upscale (null: no blended draws this frame or
+// last). A flake's trail is where it was: FSR's history there still holds
+// the flake, reprojected with the scenery's motion, while this frame shows
+// scenery (reactive 0), and over textured scenery its history clamp doesn't
+// catch it (over the plain sky it did). So the mask is this frame's draws
+// and last frame's mask carried along the motion vectors (fading).
+Image* Renderer::Impl::DrawReactive(uint32_t w, uint32_t h, Image* motion) {
+  const bool had_last = reactive_hist_[0].image != nullptr;
+  if (reactive_draws_.empty() && !had_last) return nullptr;
   EndRendering();
-  if (!reactive_img_.image || reactive_img_.width != w || reactive_img_.height != h) {
-    if (reactive_img_.image) Retire(reactive_img_);
-    reactive_img_ = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, "reactive");
-    ToGeneral(cb_, reactive_img_);
-  }
   const float zero[4] = {0, 0, 0, 0};
+  auto ensure = [&](Image& im, const char* name) {
+    if (im.image && im.width == w && im.height == h) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, name);
+    ToGeneral(cb_, im);
+    ClearImage(&im, zero, 0.0f, 0, true, false, false);
+  };
+  ensure(reactive_img_, "reactive");
+  ensure(reactive_hist_[0], "reactive_a");
+  ensure(reactive_hist_[1], "reactive_b");
   ClearImage(&reactive_img_, zero, 0.0f, 0, true, false, false);
-  std::vector<Image*> colors{&reactive_img_};
-  BeginRendering(colors, nullptr);
-  DrawMasks(reactive_draws_.data(), reactive_draws_.size());
-  EndRendering();
-  reactive_draws_.clear();
+  if (!reactive_draws_.empty()) {
+    std::vector<Image*> colors{&reactive_img_};
+    BeginRendering(colors, nullptr);
+    DrawMasks(reactive_draws_.data(), reactive_draws_.size());
+    EndRendering();
+    reactive_draws_.clear();
+  }
   Barrier();
+  Image* out = &reactive_hist_[reactive_flip_ & 1];
+  Image* last = &reactive_hist_[(reactive_flip_ + 1) & 1];
+  ++reactive_flip_;
+  FullscreenPass(CopyKind::kReactiveMerge, out, &reactive_img_, last, motion, false, nullptr, 0);
   dyn_ = DynState{};
-  return &reactive_img_;
+  return out;
 }
 
 // The velocity image, sized and sampled like the scene's depth.
@@ -7158,6 +7200,8 @@ Renderer::Impl::~Impl() {
   if (vel_ps_.module) vk::vkDestroyShaderModule(dev, vel_ps_.module, nullptr);
   if (exempt_ps_.module) vk::vkDestroyShaderModule(dev, exempt_ps_.module, nullptr);
   gpu_.DestroyImage(reactive_img_);
+  gpu_.DestroyImage(reactive_hist_[0]);
+  gpu_.DestroyImage(reactive_hist_[1]);
   gpu_.DestroyBuffer(out_readback_);
   gpu_.DestroyImage(dummy_);
   gpu_.DestroyImage(cloud_sprite_);
