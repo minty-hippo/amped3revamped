@@ -21,6 +21,14 @@ namespace launcher {
 namespace {
 
 const ImU32 kGold = IM_COL32(255, 204, 0, 255);
+
+// Real-ESRGAN's ready-made builds: Windows and Linux x86_64 (not ARM).
+#if defined(__aarch64__) && !defined(_WIN32)
+constexpr bool kCanUpscale = false;
+#else
+constexpr bool kCanUpscale = true;
+#endif
+
 const ImU32 kWhite = IM_COL32(255, 255, 255, 255);
 const ImU32 kDim = IM_COL32(255, 255, 255, 130);
 const ImU32 kFaint = IM_COL32(255, 255, 255, 60);
@@ -167,6 +175,7 @@ struct App::Shared {
 
   enum class Job { kIdle, kRunning, kDone, kFailed, kCancelled } job = Job::kIdle;
   bool job_install = false;
+  bool job_upscale = false;  // the texture upscaler on its own
   std::string step, job_error;
   std::deque<std::string> log;
   fs::path log_path;
@@ -235,6 +244,8 @@ void App::LoadSettings() {
   if (source_dir_.empty()) source_dir_ = install_dir_ / "build" / "amped3revamped";
   if (!get("repo").empty()) repo_ = get("repo");
   direct_start_ = get("direct_start") == "1";
+  original_look_ = get("look") == "original";
+  upscale_on_install_ = get("upscale_on_install") == "1";
   std::string branch = get("branch");
   if (branch.empty()) {
     const Version v = ReadVersion(install_dir_ / "amped3-version.txt");
@@ -254,6 +265,8 @@ void App::SaveSettings() {
   kv["source_dir"] = PathText(source_dir_);
   kv["repo"] = repo_;
   kv["direct_start"] = direct_start_ ? "1" : "0";
+  kv["look"] = original_look_ ? "original" : "revamped";
+  kv["upscale_on_install"] = upscale_on_install_ ? "1" : "0";
   {
     std::lock_guard lock(s_->m);
     kv["branch"] = s_->branches[size_t(s_->branch)];
@@ -375,7 +388,7 @@ void App::StartCheck() {
 // Downloads the branch into the sources folder (or updates a git checkout),
 // then runs the installer: an install from the disc image, or a rebuild of
 // the existing install.
-void App::StartJob(bool install) {
+void App::StartJob(bool install, bool upscale) {
   std::string branch;
   {
     std::lock_guard lock(s_->m);
@@ -383,6 +396,7 @@ void App::StartJob(bool install) {
     branch = s_->branches[size_t(s_->branch)];
     s_->job = Shared::Job::kRunning;
     s_->job_install = install;
+    s_->job_upscale = upscale;
     s_->step = "Starting";
     s_->job_error.clear();
     s_->log.clear();
@@ -401,12 +415,17 @@ void App::StartJob(bool install) {
 #endif
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
-    s_->log_path = logs / (std::string(install ? "install_" : "update_") + stamp + ".log");
+    s_->log_path =
+        logs / (std::string(upscale ? "upscale_" : install ? "install_" : "update_") + stamp + ".log");
     s_->log_file.close();
     s_->log_file.open(s_->log_path);
   }
   SaveSettings();
   const fs::path iso = install && !discs_.empty() ? discs_[size_t(disc_)] : fs::path();
+  if (upscale) {
+    std::thread([this] { UpscaleMain(); }).detach();
+    return;
+  }
   std::thread([this, install, branch, iso] { JobMain(install, branch, iso); }).detach();
 }
 
@@ -497,14 +516,22 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
           PathText(build_src / "installer" / "Install-Amped3.ps1")};
   if (install) argv.insert(argv.end(), {"-Iso", PathText(iso)});
   else argv.insert(argv.end(), {"-GameDir", PathText(install_dir / "game")});
-  argv.insert(argv.end(), {"-InstallDir", PathText(install_dir), "-Yes", "-UpscaleTextures", "no"});
+  argv.insert(argv.end(), {"-InstallDir", PathText(install_dir), "-Yes", "-UpscaleTextures",
+                           install && upscale_on_install_ && kCanUpscale ? "yes" : "no"});
+  if (install && FileContains(build_src / "installer" / "Install-Amped3.ps1", "$Graphics")) {
+    argv.insert(argv.end(), {"-Graphics", original_look_ ? "original" : "revamped"});
+  }
   // (an installer from before the launcher doesn't know it)
   if (FileContains(source / "installer" / "Install-Amped3.ps1", "NoShortcut")) argv.push_back("-NoShortcut");
 #else
   argv = {"bash", PathText(build_src / "install.sh")};
   if (install) argv.insert(argv.end(), {"--iso", PathText(iso)});
   else argv.insert(argv.end(), {"--game-dir", PathText(install_dir / "game")});
-  argv.insert(argv.end(), {"--install-dir", PathText(install_dir), "--yes", "--upscale-textures", "no"});
+  argv.insert(argv.end(), {"--install-dir", PathText(install_dir), "--yes", "--upscale-textures",
+                           install && upscale_on_install_ && kCanUpscale ? "yes" : "no"});
+  if (install && FileContains(build_src / "install.sh", "--graphics)")) {
+    argv.insert(argv.end(), {"--graphics", original_look_ ? "original" : "revamped"});
+  }
   // No questions, no Steam entry of its own (the launcher makes one); an
   // install.sh from before the launcher doesn't know it.
   if (FileContains(source / "install.sh", "--update)")) argv.push_back("--update");
@@ -524,6 +551,64 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   // The launcher moves into the install folder (the shortcuts point there),
   // leaving nothing in Downloads.
   RelocateLauncher(install_dir);
+  finish(Shared::Job::kDone, "");
+}
+
+// Upscale textures: the install's texture upscaler (installer/Upscale-Textures.ps1,
+// linux/upscale-textures.sh from its sources), then the game uses them.
+void App::UpscaleMain() {
+  auto s = s_;
+  const fs::path install_dir = install_dir_;
+  const fs::path source = source_dir_;
+  auto finish = [&](Shared::Job result, const std::string& error) {
+    std::lock_guard lock(s->m);
+    s->job = s->cancel ? Shared::Job::kCancelled : result;
+    s->job_error = s->cancel ? std::string("Stopped.") : error;
+    s->job_end = std::chrono::steady_clock::now();
+    if (s->log_file) {
+      s->log_file << (result == Shared::Job::kDone ? "Finished.\n" : "Failed: " + error + "\n");
+      s->log_file.close();
+    }
+  };
+  std::error_code ec;
+  s->Step("Upscaling textures (Real-ESRGAN): downloads 45 MB once, then a few minutes on the GPU");
+  const fs::path src = NoSpacePath(source);
+  std::vector<std::string> argv;
+#if defined(_WIN32)
+  const fs::path script = src / "installer" / "Upscale-Textures.ps1";
+  argv = {"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PathText(script),
+          "-InstallDir", PathText(install_dir)};
+  for (const auto& entry : fs::directory_iterator(src / "out" / "build", ec)) {
+    const fs::path tool = entry.path() / "amped3-texture-upscale.exe";
+    if (fs::exists(tool, ec)) {
+      argv.insert(argv.end(), {"-Tool", PathText(tool)});
+      break;
+    }
+  }
+#else
+  const fs::path script = src / "linux" / "upscale-textures.sh";
+  argv = {"bash", PathText(script), "--install-dir", PathText(install_dir)};
+#endif
+  if (!fs::exists(script, ec)) {
+    return finish(Shared::Job::kFailed,
+                  "The texture upscaler isn't in this install's sources (" + PathText(source) +
+                      "): Update first.");
+  }
+  std::string error;
+  const int code = RunProcess(argv, src, [&](const std::string& line) {
+    if (line.rfind("==> ", 0) == 0) s->Step(line.substr(4));
+    else s->Log(line);
+  }, &error);
+  if (code < 0) s->Log(error);
+  if (code != 0) {
+    return finish(Shared::Job::kFailed, "The texture upscaler failed (exit " + std::to_string(code) + ").");
+  }
+  // Used from now on (Graphics settings: Upscaled textures).
+  GameConfig config;
+  config.Load(install_dir / "amped3.toml");
+  for (const auto& gs : DisplaySettings()) {
+    if (std::string(gs.key) == "native_upscaled_textures") config.Set(gs, "true");
+  }
   finish(Shared::Job::kDone, "");
 }
 
@@ -637,7 +722,8 @@ std::vector<App::Row> App::Rows() const {
   std::lock_guard lock(s_->m);
   if (s_->job == Shared::Job::kRunning) return {kRowCancel};
   if (!IsInstalled(install_dir_)) {
-    return {kRowDisc, kRowBranch, kRowFolder, kRowInstall, kRowQuit};
+    if (!kCanUpscale) return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowInstall, kRowQuit};
+    return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowUpscaleOnInstall, kRowInstall, kRowQuit};
   }
   if (page_ != Page::kHome) {
     std::vector<Row> rows;
@@ -646,8 +732,10 @@ std::vector<App::Row> App::Rows() const {
     rows.push_back(kRowBack);
     return rows;
   }
-  return {kRowPlay, kRowGraphics, kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut,
-          kRowQuit};
+  std::vector<Row> rows = {kRowPlay, kRowGraphics};
+  if (kCanUpscale) rows.push_back(kRowUpscale);
+  for (Row r : {kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut, kRowQuit}) rows.push_back(r);
+  return rows;
 }
 
 const std::vector<GameSetting>& App::PageSettings() const {
@@ -677,7 +765,7 @@ void App::Change(Row row, int step) {
     if (IsInstalled(install_dir_)) check_at_ = ImGui::GetTime() + 0.6;
   } else if (row == kRowDisc && !discs_.empty()) {
     disc_ = (disc_ + step + int(discs_.size())) % int(discs_.size());
-  } else if (row == kRowDirect) {
+  } else if (row == kRowDirect || row == kRowLook || row == kRowUpscaleOnInstall) {
     Activate(row);
   } else if (row >= kRowSetting && size_t(row - kRowSetting) < PageSettings().size()) {
     if (!config_.Step(PageSettings()[size_t(row - kRowSetting)], step)) {
@@ -738,6 +826,22 @@ void App::Activate(Row row) {
       break;
     case kRowGraphics:
       OpenPage(Page::kDisplay);
+      break;
+    case kRowLook:
+      original_look_ = !original_look_;
+      SaveSettings();
+      break;
+    case kRowUpscaleOnInstall:
+      upscale_on_install_ = !upscale_on_install_;
+      SaveSettings();
+      break;
+    case kRowUpscale:
+      if (now < confirm_until_) {
+        confirm_until_ = 0;
+        StartJob(false, true);
+      } else {
+        confirm_until_ = now + 6.0;
+      }
       break;
     case kRowEffects:
       OpenPage(Page::kEffects);
@@ -820,7 +924,7 @@ void App::Draw(ImFont* font) {
   Shared::Check check;
   CommitInfo remote;
   int behind, ahead;
-  bool job_install;
+  bool job_install, job_upscale;
   std::chrono::steady_clock::duration elapsed{};
   {
     std::lock_guard lock(s_->m);
@@ -828,6 +932,7 @@ void App::Draw(ImFont* font) {
     step = s_->step;
     job = s_->job;
     job_install = s_->job_install;
+    job_upscale = s_->job_upscale;
     job_error = s_->job_error;
     check = s_->check;
     check_error = s_->check_error;
@@ -926,7 +1031,8 @@ void App::Draw(ImFont* font) {
         t.label = "Build and install";
         const uint64_t free = FreeSpace(install_dir_);
         if (now < confirm_until_) {
-          t.value = "select again to start";
+          t.value = std::string("select again: ") + (original_look_ ? "Original" : "Revamped") +
+                    (upscale_on_install_ && kCanUpscale ? ", upscaled textures" : "");
           t.color = kGold;
         } else {
           t.value = "needs about 40 GB (" + GiB(free) + " free)";
@@ -980,7 +1086,8 @@ void App::Draw(ImFont* font) {
         break;
       case kRowCancel:
         t.label = "Stop";
-        t.value = (job_install ? "installing " : "updating ") + Elapsed(elapsed);
+        t.value = (job_upscale ? "upscaling " : job_install ? "installing " : "updating ") +
+                  Elapsed(elapsed);
         t.color = kGold;
         break;
       case kRowQuit:
@@ -988,6 +1095,25 @@ void App::Draw(ImFont* font) {
         break;
       case kRowGraphics:
         t.label = "Graphics settings";
+        break;
+      case kRowLook:
+        t.label = "Graphics";
+        t.value = original_look_ ? "<  Original (as on the Xbox 360)  >"
+                                 : "<  Revamped (new effects, 60 fps)  >";
+        break;
+      case kRowUpscaleOnInstall:
+        t.label = "Upscale textures";
+        t.value = upscale_on_install_ ? "<  Yes, after the build  >" : "<  No  >";
+        break;
+      case kRowUpscale:
+        t.label = "Upscale textures";
+        if (now < confirm_until_) {
+          t.value = "select again to start";
+          t.color = kGold;
+        } else {
+          t.value = "menus, HUD, loading screens (Real-ESRGAN, 4x)";
+          t.color = kDim;
+        }
         break;
       case kRowEffects:
         t.label = "Effects";
@@ -1077,7 +1203,11 @@ void App::Draw(ImFont* font) {
     if (job == Shared::Job::kRunning) {
       para(step, kGold);
     } else if (job == Shared::Job::kDone) {
-      para(job_install ? "Installed. Select Play." : "Updated. Select Play.", kGreen);
+      para(job_upscale    ? "Textures upscaled and switched on (Graphics settings: Upscaled "
+                            "textures). Select Play."
+           : job_install ? "Installed. Select Play."
+                         : "Updated. Select Play.",
+           kGreen);
     } else {
       para(job_error.empty() ? std::string("Failed.") : job_error, kRed);
       para("Full output: " + log_path, kDim);

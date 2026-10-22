@@ -50,7 +50,11 @@ param(
   [ValidateSet('ask', 'yes', 'no')]
   [string]$UpscaleTextures = 'ask',
   [ValidateSet('ui', 'world', 'all')]
-  [string]$UpscaleSet = 'ui'
+  [string]$UpscaleSet = 'ui',
+  # Revamped Graphics (the native renderer's effects and 60 fps; default) or
+  # the original look. Asked unless given (-Yes: revamped).
+  [ValidateSet('ask', 'revamped', 'original')]
+  [string]$Graphics = 'ask'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,6 +83,17 @@ function Fail($text) {
   if (-not $Yes) { Read-Host 'Press Enter to close' | Out-Null }
   exit 1
 }
+# Sets one "name = value" line in amped3.toml (added when missing).
+function Set-GameSetting([string]$file, [string]$name, [string]$value) {
+  $lines = if (Test-Path $file) { @(Get-Content $file) } else { @() }
+  $found = $false
+  $lines = @($lines | ForEach-Object {
+    if ($_ -match "^\s*$([regex]::Escape($name))\s*=") { $found = $true; "$name = $value" } else { $_ }
+  })
+  if (-not $found) { $lines += "$name = $value" }
+  [IO.File]::WriteAllLines($file, [string[]]$lines)
+}
+
 function Ask([string]$question) {
   if ($Yes) { return $true }
   $answer = Read-Host "$question [Y/n]"
@@ -480,8 +495,28 @@ Note "$copied file(s) copied next to $TargetGame"
 # Starting settings, only on a first install: amped3.toml holds the options
 # menu's choices, which a reinstall keeps.
 $defaults = Join-Path $ProjectDir 'amped3.defaults.toml'
+$firstInstall = -not (Test-Path (Join-Path $InstallDir 'amped3.toml'))
 if ((Test-Path $defaults) -and -not (Test-Path (Join-Path $InstallDir 'amped3.toml'))) {
   Copy-Item $defaults (Join-Path $InstallDir 'amped3.toml') -Force
+}
+$gameSettings = Join-Path $InstallDir 'amped3.toml'
+# Revamped Graphics or the original look: asked on a first install (a
+# reinstall or update keeps what the game's settings say), or as given.
+if ($Graphics -ne 'ask' -or $firstInstall) {
+$revamped = switch ($Graphics) {
+  'revamped' { $true }
+  'original' { $false }
+  default {
+    if ($Yes) { $true } else {
+      $answer = Read-Host ("    Graphics: Revamped (new effects, motion blur, fog, god rays; 60 fps) or " +
+                           "Original (as on the Xbox 360, 30 fps)? Both can be changed later in the " +
+                           "game's Graphics panel. [R/o]")
+      -not ($answer -match '^[Oo]')
+    }
+  }
+}
+Set-GameSetting $gameSettings 'revamped_graphics' $(if ($revamped) { 'true' } else { 'false' })
+Note ("Graphics: " + $(if ($revamped) { 'Revamped' } else { 'Original' }))
 }
 $installedExe = Join-Path $InstallDir 'amped3.exe'
 # The shortcut's icon: the game's own Xbox 360 dashboard icon, taken from this
@@ -515,6 +550,8 @@ if ($upscale) {
   try {
     & (Join-Path $InstallerDir 'Upscale-Textures.ps1') -InstallDir $InstallDir -Set $UpscaleSet `
       -Tool (Join-Path $buildDir 'amped3-texture-upscale.exe')
+    # Used from now on (Graphics panel: Upscaled Textures).
+    Set-GameSetting $gameSettings 'native_upscaled_textures' 'true'
   } catch {
     Warn "Texture upscaling didn't finish: $_ (the game runs without it; run 'Upscale Textures.bat' to retry)"
   }

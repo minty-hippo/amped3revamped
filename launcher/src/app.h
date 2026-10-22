@@ -64,6 +64,7 @@ class App {
     kRowPlay, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut,           // home
     kRowCancel, kRowQuit,
     kRowGraphics, kRowEffects, kRowBack,                                 // settings pages
+    kRowLook, kRowUpscaleOnInstall, kRowUpscale,                         // install choices
     kRowSetting = 100  // + the setting's index on the page
   };
   enum class Page { kHome, kDisplay, kEffects };
@@ -79,8 +80,9 @@ class App {
   void SaveSettings();
   void StartBranchList();
   void StartCheck();
-  void StartJob(bool install);
+  void StartJob(bool install, bool upscale = false);
   void JobMain(bool install, std::string branch, fs::path iso);
+  void UpscaleMain();  // the texture upscaler on its own (Upscale textures)
   void BrowseDisc();
   void BrowseFolder();
   void MakeShortcut();
@@ -101,6 +103,10 @@ class App {
   fs::path source_dir_;
   std::string repo_ = "minty-hippo/amped3revamped";
   bool direct_start_ = false;
+  // Asked before Build and install: Revamped Graphics or the original look,
+  // and whether to upscale the textures after the build.
+  bool original_look_ = false;
+  bool upscale_on_install_ = false;
   std::vector<fs::path> discs_;
   int disc_ = 0;
 };

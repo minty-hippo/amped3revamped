@@ -6,7 +6,8 @@
 #
 #   ./install.sh [--iso <image.iso>] [--game-dir <extracted game>]
 #                [--install-dir <folder>] [--config Release|RelWithDebInfo]
-#                [--container | --native] [--upscale-textures yes|no] [--yes]
+#                [--container | --native] [--upscale-textures yes|no]
+#                [--graphics revamped|original] [--yes]
 #                [--update]
 #
 #  1. Extracts the game from the ISO into <install folder>/game and checks it.
@@ -22,6 +23,7 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; YES=0; UPDATE=0
+GRAPHICS=ask
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +34,7 @@ while [ $# -gt 0 ]; do
     --container) MODE=container; shift ;;
     --native) MODE=native; shift ;;
     --upscale-textures) UPSCALE="$2"; shift 2 ;;
+    --graphics) GRAPHICS="$2"; shift 2 ;;
     --yes|-y) YES=1; shift ;;
     --update) UPDATE=1; YES=1; shift ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -134,7 +137,42 @@ done
 if [ -d "$BUILD_DIR/textures" ]; then
   mkdir -p "$INSTALL_DIR/textures"; cp -a "$BUILD_DIR/textures"/. "$INSTALL_DIR/textures"/
 fi
-[ -f "$INSTALL_DIR/amped3.toml" ] || cp "$PROJECT_DIR/amped3.defaults.toml" "$INSTALL_DIR/amped3.toml"
+FIRST_INSTALL=0
+if [ ! -f "$INSTALL_DIR/amped3.toml" ]; then
+  cp "$PROJECT_DIR/amped3.defaults.toml" "$INSTALL_DIR/amped3.toml"; FIRST_INSTALL=1
+fi
+# Sets one "name = value" line in amped3.toml (added when missing).
+set_game_setting() {
+  python3 - "$INSTALL_DIR/amped3.toml" "$1" "$2" <<'PY'
+import re, sys
+path, name, value = sys.argv[1:4]
+try:
+    lines = open(path).read().splitlines()
+except FileNotFoundError:
+    lines = []
+pat = re.compile(r'^\s*' + re.escape(name) + r'\s*=')
+found = False
+for i, line in enumerate(lines):
+    if pat.match(line):
+        lines[i] = f'{name} = {value}'; found = True
+if not found:
+    lines.append(f'{name} = {value}')
+open(path, 'w').write('\n'.join(lines) + '\n')
+PY
+}
+# Revamped Graphics or the original look: asked on a first install (a
+# reinstall or update keeps what the game's settings say), or as given.
+if [ "$GRAPHICS" != ask ] || [ "$FIRST_INSTALL" -eq 1 ]; then
+  if [ "$GRAPHICS" = ask ]; then
+    if [ "$YES" -eq 1 ]; then GRAPHICS=revamped
+    else
+      read -r -p "    Graphics: Revamped (new effects, motion blur, fog, god rays; 60 fps) or Original (as on the Xbox 360, 30 fps)? Both can be changed later in the game's Graphics panel. [R/o] " answer || true
+      [[ "${answer:-r}" =~ ^[Oo] ]] && GRAPHICS=original || GRAPHICS=revamped
+    fi
+  fi
+  set_game_setting revamped_graphics "$([ "$GRAPHICS" = original ] && echo false || echo true)"
+  note "Graphics: $GRAPHICS"
+fi
 # Where the sources are, for the launcher's Update (update.sh).
 printf '%s\n' "$PROJECT_DIR" > "$INSTALL_DIR/source.path"
 note "$copied file(s) copied"
@@ -190,8 +228,11 @@ if [ "$UPSCALE" = ask ]; then
 fi
 if [ "$UPSCALE" = yes ]; then
   step 'Upscaling textures (Real-ESRGAN)'
-  bash "$PROJECT_DIR/linux/upscale-textures.sh" --install-dir "$INSTALL_DIR" ||
+  if bash "$PROJECT_DIR/linux/upscale-textures.sh" --install-dir "$INSTALL_DIR"; then
+    set_game_setting native_upscaled_textures true  # used from now on
+  else
     warn "Texture upscaling didn't finish (the game runs without it; run linux/upscale-textures.sh to retry)"
+  fi
 fi
 
 printf '\n\033[32mDone. Amped 3 Revamped is in %s\033[0m\n' "$INSTALL_DIR"

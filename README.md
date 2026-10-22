@@ -171,10 +171,15 @@ sources from GitHub and builds the game on your computer from your own Amped 3
 3. Check the install folder (default `Games/Amped3Revamped` in your user
    folder). You need about 40 GB free. Everything goes there: the game, its
    build (`build/amped3revamped`) and the launcher itself.
-4. Select **Build and install** (twice, to confirm). The build's output
+4. Choose the **Graphics**: Revamped (the new effects and 60 fps; the
+   default) or Original (as on the Xbox 360), and whether to **Upscale
+   textures** (menus, HUD and loading screens 4x with Real-ESRGAN after the
+   build; Windows and Linux x86_64). Both can be changed later: Graphics
+   settings, and Upscale textures on the launcher's home page.
+5. Select **Build and install** (twice, to confirm). The build's output
    scrolls in the launcher and is saved to a log. The first build takes about
    an hour on a PC and several hours on a handheld.
-5. Once installed, the launcher moves itself into the install folder as
+6. Once installed, the launcher moves itself into the install folder as
    `amped3-launcher(.exe)`, so nothing is left in Downloads; a newer launcher
    you download later takes its place the first time you run it.
 
@@ -194,6 +199,9 @@ Armada).
   sharp fonts, upscaled textures; effects: Revamped Graphics and its parts),
   saved to the install's `amped3.toml` for the next start. New installs start
   fullscreen.
+- **Upscale textures:** runs the texture upscaler (Real-ESRGAN, 4x: menus,
+  HUD and loading screens) and switches Upscaled textures on. Windows and
+  Linux x86_64.
 - **Start the game directly:** the launcher starts the game at once next
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.
