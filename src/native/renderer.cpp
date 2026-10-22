@@ -2776,6 +2776,10 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
   Image im = gpu_.CreateTexture(base.width, base.height, format, uint32_t(rep.levels.size()),
                                 data + ".replaced", components);
   im.replaced = true;
+  // Larger than the game's texture (an upscaled one is 4x): fetches in guest
+  // texels (unnormalized coordinates, texel offsets, filter weights) divide
+  // by the guest size, as for a render target drawn at a higher resolution.
+  im.scale = tf.width() ? float(base.width) / float(tf.width()) : 1.0f;
   size_t total = 0;
   for (const auto& l : rep.levels) total += l.rgba.size();
   VkBuffer upload_buffer;
@@ -5680,7 +5684,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       VkDescriptorImageInfo ii{sampler, im->sample_view, VK_IMAGE_LAYOUT_GENERAL};
       descs.push_back({uint32_t(2 + stage), b.binding, ii});
       if (im->scaled) scaled_textures |= 1u << ((b.binding & 15) + (stage ? 16 : 0));
-      tex_scales[(b.binding & 15) + (stage ? 16 : 0)] = im->scaled ? im->scale : 1.0f;
+      tex_scales[(b.binding & 15) + (stage ? 16 : 0)] =
+          im->scaled || im->replaced ? im->scale : 1.0f;
     }
   }
 
