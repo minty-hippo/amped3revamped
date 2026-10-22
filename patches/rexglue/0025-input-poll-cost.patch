@@ -1,0 +1,87 @@
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>
+ #include <memory>
+ #include <mutex>
+ #include <vector>
+@@ -69,6 +70,12 @@
+ 
+   // Guest threads poll input concurrently; RefreshDevices() rebuilds devices_.
+   std::recursive_mutex mutex_;
++
++  // amped3 patch 0025: games may poll input thousands of times a frame (Amped
++  // 3's video player does while it waits for the next video frame); devices
++  // are enumerated again at most this often, not on every poll.
++  std::chrono::steady_clock::time_point last_refresh_{};
++  bool refreshed_once_ = false;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -80,6 +80,15 @@
+ }
+ 
+ void InputSystem::RefreshDevices() {
++  // amped3 patch 0025: enumerating every driver's devices builds strings and
++  // vectors per device; a few times a second is enough to notice a pad being
++  // plugged in or out.
++  const auto now = std::chrono::steady_clock::now();
++  if (refreshed_once_ && now - last_refresh_ < std::chrono::milliseconds(250)) {
++    return;
++  }
++  refreshed_once_ = true;
++  last_refresh_ = now;
+   std::vector<DeviceInfo> seen;
+   std::vector<InputDriver*> owners;
+   std::vector<DeviceInfo> enumerated;
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -67,6 +67,11 @@
+     DeviceId id;
+     // Per pad rather than per guest user, so it survives reassignment.
+     KeystrokeState keystroke;
++    // amped3 patch 0025: the rumble last sent to the pad, so the same values
++    // set again (every poll, by some games) don't reach the device each time.
++    bool rumble_known;
++    uint16_t rumble_left, rumble_right;
++    uint64_t rumble_ticks;  // SDL_GetTicks() when it was sent
+   };
+ 
+   // WindowListener
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -239,10 +239,25 @@
+   // XInput vibration holds until the guest changes it, but SDL rumble expires,
+   // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
+   // SDL's maximum instead; each call cancels the previous effect anyway.
+-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
+-                           vibration->right_motor_speed, kRumbleDurationMs)
+-             ? X_ERROR_SUCCESS
+-             : X_ERROR_FUNCTION_FAILED;
++  // amped3 patch 0025: unchanged values are sent again only before the armed
++  // rumble would run out (a call can mean a write to the device: on handhelds
++  // through hidapi, which made Amped 3's video playback stutter).
++  const uint16_t left = vibration->left_motor_speed;
++  const uint16_t right = vibration->right_motor_speed;
++  const uint64_t ticks = SDL_GetTicks();
++  if (controller->rumble_known && controller->rumble_left == left &&
++      controller->rumble_right == right && ticks - controller->rumble_ticks < kRumbleDurationMs / 2) {
++    return X_ERROR_SUCCESS;
++  }
++  if (!SDL_RumbleGamepad(controller->sdl, left, right, kRumbleDurationMs)) {
++    controller->rumble_known = false;
++    return X_ERROR_FUNCTION_FAILED;
++  }
++  controller->rumble_known = true;
++  controller->rumble_left = left;
++  controller->rumble_right = right;
++  controller->rumble_ticks = ticks;
++  return X_ERROR_SUCCESS;
+ }
+ 
+ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,

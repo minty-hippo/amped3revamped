@@ -4,7 +4,11 @@
 
 #include "amped3_app.h"
 
+#include <cstdlib>
+
 std::unique_ptr<rex::ui::WindowedApp> Amped3App::Create(rex::ui::WindowedAppContext& ctx) {
+  // Already running (a second launch): leave the first one alone.
+  if (!amped3::AcquireSingleInstance()) std::exit(0);
   return std::unique_ptr<Amped3App>(new Amped3App(ctx, "amped3", PPCImageConfig));
 }
 

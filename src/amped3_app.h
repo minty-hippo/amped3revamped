@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 #include <memory>
@@ -17,6 +18,13 @@ namespace amped3 {
 class OptionsMenu;
 class GraphicsPanel;
 }
+
+namespace amped3 {
+// One game at a time: false when another Amped 3 Revamped is already running
+// (a second launch from the launcher or a shortcut played its menu music over
+// the first one's game). The lock is held until the process exits.
+bool AcquireSingleInstance();
+}  // namespace amped3
 
 class Amped3App : public rex::ReXApp {
  public:

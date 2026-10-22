@@ -102,6 +102,9 @@ Option SliderF(const char* cvar, const char* label, const char* help, const char
 
 bool NativeRendererOn() { return rex::cvar::GetFlagByName("native_renderer") == "true"; }
 bool NativeRendererOff() { return !NativeRendererOn(); }
+bool NativeUpscalerOn() {
+  return NativeRendererOn() && rex::cvar::GetFlagByName("native_upscaler") != "off";
+}
 bool NativeFsrOn() {
   return NativeRendererOn() && rex::cvar::GetFlagByName("native_upscaler") == "fsr";
 }
@@ -188,16 +191,18 @@ const std::vector<Tab>& Tabs() {
                       "Rebuilds a full-resolution picture from the Render scale using several "
                       "frames, the game's depth and its motion: sharper than a filter at the same "
                       "cost. Intel XeSS uses the XMX cores on Intel Arc GPUs and runs on other "
-                      "GPUs through DP4a. AMD FSR 3.1 runs on any GPU (FSR 4's machine-learning "
-                      "upscaler is Direct3D 12 only). The HUD is drawn afterwards at full "
-                      "resolution. Leave the Upscaling filter on Bilinear. If the library is "
-                      "missing (setup.ps1 fetches it) or the GPU can't run it, the picture is "
-                      "simply stretched and the log says why. Native renderer only.",
+                      "GPUs through DP4a (Windows only: Intel has no Linux XeSS library). AMD "
+                      "FSR 3.1 runs on any GPU (FSR 4's machine-learning upscaler is Direct3D "
+                      "12 only); on Linux setup.sh builds it from AMD's FidelityFX SDK sources. "
+                      "The HUD is drawn afterwards at full resolution. Leave the Upscaling "
+                      "filter on Bilinear. If the library is missing or the GPU can't run it, "
+                      "the picture is simply stretched and the log says why. Native renderer "
+                      "only.",
 #ifdef _WIN32
                       {{"off", "Off"}, {"xess", "Intel XeSS"}, {"fsr", "AMD FSR 3.1"}});
 #else
-                      // Their runtimes are Windows libraries.
-                      {{"off", "Off (XeSS and FSR 3.1 are Windows only)"}});
+                      // Intel ships XeSS for Windows only.
+                      {{"off", "Off"}, {"fsr", "AMD FSR 3.1"}});
 #endif
                   o.visible = NativeRendererOn;
                   return o;
@@ -207,6 +212,17 @@ const std::vector<Tab>& Tabs() {
                                      "Sharpening applied by AMD FSR 3.1 (0 = none).", "%.2f",
                                      0.0, 1.0);
                   o.visible = NativeFsrOn;
+                  return o;
+                }(),
+                [] {
+                  Option o = Toggle(
+                      "native_upscaler_msaa", "MSAA with the upscaler",
+                      "The game's multisample anti-aliasing while FSR or XeSS is on. Off by "
+                      "default: the upscaler smooths the edges itself, and one sample per "
+                      "pixel keeps the same lighting and colors while saving GPU time. "
+                      "(Without an upscaler, Multisampling (MSAA) under Native renderer "
+                      "decides.)");
+                  o.visible = NativeUpscalerOn;
                   return o;
                 }(),
                 [] {
@@ -239,13 +255,15 @@ const std::vector<Tab>& Tabs() {
            {"Renderer",
             {
                 Choices("gpu_backend", "Graphics API",
-                        "Which API the Xbox 360 GPU emulation draws with. Direct3D 12 is the "
-                        "default; Vulkan can perform better on some drivers (and is what Linux "
-                        "uses). Falls back to the default if the chosen API isn't available.",
+                        "Which API the Xbox 360 GPU emulation and the window use. Automatic "
+                        "picks Vulkan while the native renderer draws (its picture then reaches "
+                        "the window without a trip through the CPU) and, on Windows, "
+                        "Direct3D 12 when the emulation draws. Falls back to the default if the "
+                        "chosen API isn't available.",
 #ifdef _WIN32
-                        {{"d3d12", "Direct3D 12"}, {"vulkan", "Vulkan"}}),
+                        {{"auto", "Automatic"}, {"d3d12", "Direct3D 12"}, {"vulkan", "Vulkan"}}),
 #else
-                        {{"vulkan", "Vulkan"}}),
+                        {{"auto", "Automatic"}, {"vulkan", "Vulkan"}}),
 #endif
                 Choices("render_target_path_vulkan", "Vulkan render path",
                         "How Vulkan emulates the console's on-chip framebuffer. Render targets "
@@ -320,14 +338,17 @@ const std::vector<Tab>& Tabs() {
                        "two."),
                 Toggle("native_msaa", "Multisampling (MSAA)",
                        "Draws with the game's own multisample anti-aliasing, as the Xbox 360 "
-                       "does: smoother edges, and the snow lit once per sample. Off draws one "
-                       "sample per pixel, which matches the emulated image (it lights the snow "
-                       "twice, giving it a darker, more orange look)."),
+                       "does: smoother edges. Off draws one sample per pixel with the same "
+                       "lighting and colors (the game's per-sample lighting and see-through "
+                       "foliage are reproduced), a little faster. Applies without an "
+                       "upscaler; with FSR or XeSS on, MSAA with the upscaler (Image "
+                       "quality) decides."),
                 Toggle("native_sharp_fonts", "Sharp fonts",
                        "The game's fonts (menus, HUD, scores, button icons) are 720p bitmaps. "
                        "This rebuilds each at 4x from its own letters when first shown, with "
                        "smooth, anti-aliased edges, so text stays sharp at 1080p, 1440p and 4K. "
-                       "Native renderer only."),
+                       "Off by default; Revamped Graphics doesn't turn it on. Native renderer "
+                       "only."),
                 Toggle("native_texture_pack", "Texture pack",
                        "Uses the PNGs in the textures folder next to the exe in place of the "
                        "game's textures (see textures\\README.txt to add your own). Comes with "
@@ -336,7 +357,8 @@ const std::vector<Tab>& Tabs() {
                 Toggle("native_upscaled_textures", "Upscaled textures",
                        "Uses the game's textures upscaled on this PC (the installer's optional "
                        "texture upscaling step, into textures\\upscaled) wherever the texture "
-                       "pack and Sharp fonts don't replace one. Native renderer only."),
+                       "pack and Sharp fonts don't replace one. Off by default; Revamped "
+                       "Graphics doesn't turn it on. Native renderer only."),
                 Toggle("native_smooth_foliage", "Smooth foliage edges",
                        "Tree branches, fences and other cut-out textures get smooth, "
                        "anti-aliased edges and stay solid as on the console, instead of the "
@@ -476,6 +498,16 @@ const std::vector<Tab>& Tabs() {
                         "itself by elapsed time can then render more frames; a game that counts "
                         "frames will play too fast. Go back to 60 Hz if gameplay speeds up.",
                         {{"60", "60 Hz (original)"}, {"120", "120 Hz"}, {"144", "144 Hz"}}),
+            }},
+           {"Performance",
+            {
+                Toggle("perf_trace", "Record performance trace",
+                       "Records where each frame's time goes for a while (perf_trace_seconds, "
+                       "20 s by default), then switches itself off and writes "
+                       "logs/perf_<time>.csv, _threads.csv and _summary.txt. Close this menu and "
+                       "play normally while it records. Also F11."),
+                SliderI("perf_trace_seconds", "Trace length",
+                        "How many seconds a performance trace records.", 5, 120, "%d s"),
             }},
        }},
       {"Cutscenes", {},

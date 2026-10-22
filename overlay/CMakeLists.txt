@@ -29,6 +29,48 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniz/miniz.
     COMPILE_DEFINITIONS "MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES")
 
 
+# The version the launcher shows (src/version.cpp): the git checkout's branch
+# and commit, or .amped3-source (written by update.ps1 / update.sh when they
+# fetch a branch's zip). Read at configure time, which every setup run does.
+set(AMPED3_VERSION_BRANCH "unknown")
+set(AMPED3_VERSION_COMMIT "unknown")
+set(AMPED3_VERSION_DATE "")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    foreach(_q "BRANCH;rev-parse;--abbrev-ref;HEAD" "COMMIT;rev-parse;HEAD" "DATE;log;-1;--format=%cs")
+        list(POP_FRONT _q _var)
+        execute_process(COMMAND ${GIT_EXECUTABLE} -c safe.directory=* ${_q}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE _out OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _rc ERROR_QUIET)
+        if(_rc EQUAL 0 AND _out)
+            set(AMPED3_VERSION_${_var} "${_out}")
+        endif()
+    endforeach()
+    # A new commit or checkout reconfigures.
+    foreach(_f HEAD packed-refs "refs/heads/${AMPED3_VERSION_BRANCH}")
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git/${_f}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/.git/${_f}")
+        endif()
+    endforeach()
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.amped3-source")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/.amped3-source" _lines)
+    foreach(_line IN LISTS _lines)
+        if(_line MATCHES "^(branch|commit|date)=(.*)$")
+            string(TOUPPER "${CMAKE_MATCH_1}" _key)
+            set(AMPED3_VERSION_${_key} "${CMAKE_MATCH_2}")
+        endif()
+    endforeach()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/.amped3-source")
+endif()
+message(STATUS "amped3: version ${AMPED3_VERSION_BRANCH} ${AMPED3_VERSION_COMMIT} ${AMPED3_VERSION_DATE}")
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/amped3_version.h.in
+    ${CMAKE_BINARY_DIR}/amped3_version/amped3_version.h @ONLY)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/version.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/amped3_version)
+
 if(WIN32)
     target_link_libraries(amped3 PRIVATE dbghelp pdh)  # crash reports; performance counters (F3)
 endif()
@@ -69,6 +111,7 @@ rexglue_setup_target(amped3 GPU_PLUGINS xenos)
 # uses); without it the native renderer preview is compiled out.
 set(AMPED3_NATIVE_VK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/vk.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/cmd_stream.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/renderer.cpp)
 set_source_files_properties(${AMPED3_NATIVE_VK_SOURCES} PROPERTIES
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan)
@@ -140,12 +183,33 @@ if(UNIX AND NOT APPLE)
     target_link_options(amped3-texture-upscale PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
+# Shortcut icon (installers): the game's Xbox 360 dashboard icon from the
+# user's default.xex (tools/xex-icon). Decrypts and decompresses the XEX with
+# the SDK checkout's tiny-AES-c and libmspack LZX decoder.
+set(_amped3_mspack "${AMPED3_SDK_SOURCE_DIR}/thirdparty/libmspack/cabextract/mspack")
+set(_amped3_aes "${AMPED3_SDK_SOURCE_DIR}/thirdparty/tiny-aes-c")
+if(AMPED3_SDK_SOURCE_DIR AND EXISTS "${_amped3_mspack}/lzxd.c" AND EXISTS "${_amped3_aes}/aes.c")
+    add_executable(amped3-icon
+        tools/xex-icon/main.cpp
+        ${_amped3_mspack}/lzxd.c
+        ${_amped3_aes}/aes.c)
+    target_include_directories(amped3-icon PRIVATE
+        ${_amped3_mspack} ${_amped3_aes} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_compile_definitions(amped3-icon PRIVATE AES128=1 CBC=1 ECB=1)
+    set_source_files_properties(${_amped3_mspack}/lzxd.c ${_amped3_aes}/aes.c PROPERTIES
+        COMPILE_OPTIONS "-w")
+    if(UNIX AND NOT APPLE)
+        target_link_options(amped3-icon PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
+endif()
+
 # Frame capture replayer (docs/native-replay.md): draws an F10 capture with
 # the native renderer's code paths through Vulkan and writes a PNG.
 add_executable(amped3-replay
     tools/replay/main.cpp
     tools/replay/capture.cpp
     src/native/vk.cpp
+    src/native/cmd_stream.cpp
     src/native/renderer.cpp
     src/native/glsl_compiler.cpp
     src/native/frame_writer.cpp

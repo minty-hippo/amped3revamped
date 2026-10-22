@@ -16,10 +16,14 @@
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,20 +32,24 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/thread.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/presenter.h>
 
 #include "live_present.h"
 #include "perf_overlay.h"
+#include "perf_trace.h"
 #include "thread_qos.h"
 #include "presenter_external.h"
 #include "native/frame.h"
 #include "native/frame_writer.h"
 #include "native/glsl_compiler.h"
+#include "guest_waits.h"
 #include "native/renderer.h"
 #include "native/xenos_shader.h"
 #include "texture_ranges.h"
@@ -53,16 +61,47 @@ REXCVAR_DEFINE_BOOL(revamped_graphics, true, "GPU",
                     "Native renderer: Revamped Graphics, the switch in the game's own Options "
                     "menu. Off turns every visual enhancement off at once (motion blur, speed "
                     "blur, distance fog, god rays, foliage fade, map clouds); on, each one "
-                    "follows its own setting");
+                    "follows its own setting. Sharp fonts and upscaled textures aren't part of "
+                    "it: they're off until turned on themselves");
 REXCVAR_DEFINE_BOOL(native_keep_emulation, false, "GPU",
                     "Native renderer: keep the emulated GPU drawing every frame underneath "
                     "(slower; for comparing the two)");
+REXCVAR_DEFINE_BOOL(native_parallel_commands, true, "GPU",
+                    "Native renderer: the frame's Vulkan commands are recorded on a thread of "
+                    "their own while the renderer prepares the next draws (the driver's time "
+                    "for each command moves off the renderer's thread).");
+REXCVAR_DEFINE_BOOL(native_merge_clears, true, "GPU",
+                    "Native renderer: a clear waits for the next pass that draws to its image "
+                    "and becomes that pass's load op (or is done inside the pass already drawing "
+                    "to it), instead of a render pass of its own. Fewer passes, and tile-based "
+                    "GPUs (Adreno, Mali) don't write the whole image out and read it back.");
+REXCVAR_DEFINE_BOOL(native_skip_draw_commands, true, "GPU",
+                    "Native renderer: while the emulated GPU doesn't draw (and "
+                    "native_skip_state_writes is on), DrawVertices and DrawIndexedVertices "
+                    "only update Direct3D's state and don't write their draw packets.");
+REXCVAR_DEFINE_BOOL(native_skip_state_writes, true, "GPU",
+                    "Native renderer: while the emulated GPU doesn't draw, Direct3D's state "
+                    "flush before each draw skips writing the changed registers and shader "
+                    "constants as GPU commands (only the vertex fetch and shader setup the "
+                    "recording reads still run). Everything is written again when the "
+                    "emulation draws.");
+REXCVAR_DEFINE_BOOL(native_deferred_naming, true, "GPU",
+                    "Native renderer: name each draw's textures, vertex and index data on a "
+                    "recorder thread instead of the game's drawing thread. The game sees a "
+                    "GPU fence pass only once the recorder has read everything drawn before "
+                    "it, as a real GPU would. Needs a restart.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(native_vertex_cache, true, "GPU",
                     "Native renderer: reuse vertex buffers the game hasn't written to since the "
                     "last frame (write-watched pages) instead of copying them every frame");
 REXCVAR_DEFINE_BOOL(native_msaa, true, "GPU",
                     "Native renderer: use the game's multisampling (MSAA) as the Xbox 360 does "
-                    "(off: one sample per pixel, like the emulated image)");
+                    "(off: one sample per pixel, same lighting and colors, rougher edges "
+                    "unless an upscaler smooths them)");
+REXCVAR_DEFINE_BOOL(native_upscaler_msaa, false, "GPU",
+                    "Native renderer: the game's multisampling (MSAA) while FSR or XeSS is on "
+                    "(off: the upscaler smooths the edges; same lighting and colors, faster). "
+                    "Without an upscaler native_msaa decides");
 REXCVAR_DEFINE_INT32(native_render_scale, 100, "GPU",
                      "Native renderer: the 3D scene's resolution, in percent of the picture's "
                      "size on screen (the window, or its 16:9 part when letterboxed); the HUD, "
@@ -71,8 +110,9 @@ REXCVAR_DEFINE_INT32(native_render_scale, 100, "GPU",
 REXCVAR_DEFINE_STRING(native_upscaler, "off", "GPU",
                       "Native renderer: temporal upscaler from the render scale to the "
                       "picture's size on screen: off, xess (Intel XeSS: XMX on Arc, DP4a "
-                      "elsewhere) or fsr (AMD FSR 3.1). Needs libxess.dll / "
-                      "amd_fidelityfx_vk.dll next to the exe (setup.ps1 fetches them)")
+                      "elsewhere; Windows only) or fsr (AMD FSR 3.1). Needs libxess.dll / "
+                      "amd_fidelityfx_vk.dll next to the exe (setup.ps1 fetches them), on Linux "
+                      "libamd_fidelityfx_vk.so (setup.sh builds it)")
     .allowed({"off", "xess", "fsr"});
 REXCVAR_DEFINE_DOUBLE(native_upscaler_sharpness, 0.3, "GPU",
                       "Native renderer: FSR's sharpening, 0 (off) to 1")
@@ -114,18 +154,20 @@ REXCVAR_DEFINE_BOOL(native_map_clouds, true, "GPU",
                     "Native renderer: at a cut to or from the trail map, cartoon clouds close "
                     "in over the old view and part from the middle out over the new one (just "
                     "part, loading into a level on the map); the distance fog fades with them");
-REXCVAR_DEFINE_BOOL(native_sharp_fonts, true, "GPU",
+REXCVAR_DEFINE_BOOL(native_sharp_fonts, false, "GPU",
                     "Native renderer: the game's fonts (menus, HUD, scores, button icons) "
                     "rebuilt at 4x their size from their own letters when first shown, so text "
-                    "stays sharp at high resolutions instead of being a stretched 720p bitmap");
+                    "stays sharp at high resolutions instead of being a stretched 720p bitmap. "
+                    "Off unless turned on here (Revamped Graphics doesn't turn it on)");
 REXCVAR_DEFINE_BOOL(native_texture_pack, true, "GPU",
                     "Native renderer: replaces game textures with the PNGs in the textures "
                     "folder next to the exe (<name>_<hash>.png; see textures\\README.txt). "
                     "It comes with the new Amped 3 logo for the start-up and title screens");
-REXCVAR_DEFINE_BOOL(native_upscaled_textures, true, "GPU",
+REXCVAR_DEFINE_BOOL(native_upscaled_textures, false, "GPU",
                     "Native renderer: uses the game textures upscaled on this PC at install "
                     "(textures\\upscaled, made by the installer's optional texture upscaling "
-                    "step) for every texture the texture pack and Sharp fonts don't replace");
+                    "step) for every texture the texture pack and Sharp fonts don't replace. "
+                    "Off unless turned on here (Revamped Graphics doesn't turn it on)");
 REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
                     "Native renderer, with smooth foliage edges: tree branches close to the "
                     "camera fade out smoothly toward the middle of the screen, keeping your "
@@ -137,6 +179,10 @@ REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_god_rays_strength, 1.0, "GPU",
                       "Native renderer: god ray strength (0..2)")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_BOOL(native_reactive_debug, false, "GPU",
+                    "Native renderer, diagnostics: with FSR, show the scene (stretched, not "
+                    "upscaled, darkened) with FSR's reactive mask in red: where snow and "
+                    "other particles tell FSR to trust the current frame");
 REXCVAR_DEFINE_BOOL(native_motion_blur_debug, false, "GPU",
                     "Native renderer, diagnostics: show the motion blur's motion instead of the "
                     "picture (red = sideways, green = up/down, blue = object pixels, grey = "
@@ -157,6 +203,8 @@ constexpr uint32_t kBoolLoopOffset = 768 + 8192;
 constexpr uint32_t kRegShadow = 11456;      // register shadow blocks 0x2000..0x23FF
 constexpr uint32_t kRegShadowEnd = 12000;
 constexpr uint32_t kIndexBuffer = 12532;
+constexpr uint32_t kGpuFencePointer = 10384;  // pointer to the fence value the GPU writes
+constexpr uint32_t kCpuFence = 10396;         // the next fence Direct3D inserts
 constexpr uint32_t kTextures = 12704;       // 26 slots
 constexpr uint32_t kTextureSlots = 26;
 struct ShadowBlock {
@@ -228,8 +276,97 @@ uint64_t NewVersion() { return g_blob_version.fetch_add(1, std::memory_order_rel
 
 // --- Recorded frame ---------------------------------------------------------------
 
+// What a draw's resources are named from: copied from the device on the game
+// thread at the draw, named on the recorder thread (see "Deferred naming"),
+// or right away when that is off. The results go into the draw at the end of
+// the frame.
+struct DrawInputs {
+  uint32_t draw = 0;  // index in the frame's draws
+  struct Texture {
+    uint32_t slot;
+    std::array<uint32_t, 6> words;
+  };
+  struct VertexFetch {
+    uint32_t vf, w0, w1;
+  };
+  native::SmallVector<Texture, 4> textures;
+  native::SmallVector<VertexFetch, 2> vertex_fetches;
+  uint32_t ib_address = 0, ib_size = 0;  // indexed draws through an index buffer
+  // Results.
+  native::SmallVector<native::FrameTexture, 4> named_textures;
+  native::SmallMap<uint32_t, std::string, 2> vmem;
+  std::string index_data;
+  // Emptied for reuse in place (assigning a fresh one moved ~500 bytes of
+  // inline storage element by element).
+  void Reset() {
+    draw = 0;
+    textures.clear();
+    vertex_fetches.clear();
+    ib_address = ib_size = 0;
+    named_textures.clear();
+    vmem.clear();
+    index_data.clear();
+  }
+};
+
+// DrawInputs in chunks: adding one never moves the others, so the recorder
+// thread can work on one while the game thread adds more. No lock: only the
+// game thread adds, and the recorder reads an entry only after the queue
+// (g_queue_mutex) handed it over; the chunk table is fixed, never moved.
+class DrawInputList {
+ public:
+  static constexpr size_t kChunk = 256;
+  using Chunk = std::array<DrawInputs, kChunk>;
+  // Game thread. Returns the entry and its index.
+  DrawInputs& Add(size_t* index) {
+    const size_t i = count_.load(std::memory_order_relaxed);
+    auto& chunk = chunks_[std::min(i / kChunk, kMaxChunks - 1)];
+    if (!chunk) chunk = std::make_unique<Chunk>();
+    DrawInputs& d = (*chunk)[i % kChunk];
+    if (i < reused_) d.Reset();  // from an earlier frame
+    count_.store(i + 1, std::memory_order_release);
+    *index = i;
+    return d;
+  }
+  DrawInputs& At(size_t i) { return (*chunks_[i / kChunk])[i % kChunk]; }
+  size_t size() const { return count_.load(std::memory_order_acquire); }
+  // Chunks of an earlier frame to fill again (frame recycling: their memory
+  // is already the process's). Before the frame is used.
+  void Adopt(std::vector<std::unique_ptr<Chunk>> chunks) {
+    size_t n = 0;
+    for (auto& c : chunks) {
+      if (n < kMaxChunks) chunks_[n++] = std::move(c);
+    }
+    reused_ = n * kChunk;
+  }
+  // When the frame is done with.
+  std::vector<std::unique_ptr<Chunk>> Release() {
+    std::vector<std::unique_ptr<Chunk>> out;
+    for (auto& c : chunks_) {
+      if (c) out.push_back(std::move(c));
+    }
+    count_ = 0;
+    reused_ = 0;
+    return out;
+  }
+
+ private:
+  // Enough for kMaxEvents draws (Room() stops recording before more).
+  static constexpr size_t kMaxChunks = kMaxEvents / kChunk + 2;
+  std::array<std::unique_ptr<Chunk>, kMaxChunks> chunks_;
+  std::atomic<size_t> count_{0};
+  size_t reused_ = 0;  // the first reused_ entries come from an earlier frame
+};
+
 struct RecordedFrame {
   Frame frame;
+  // blobs / versions / textures: written by the game thread (user-pointer
+  // data) and by the recorder thread (named resources) while recording.
+  std::mutex maps_mutex;
+  DrawInputList inputs;
+  // Front buffer fetch words to name at the end of the frame.
+  std::array<uint32_t, 6> swap_fetch_words{};
+  bool name_swap = false;
   // Vertex / index data. Shared: unchanged vertex buffers are the same
   // cached copy from frame to frame (see the vertex cache).
   std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> blobs;
@@ -244,11 +381,79 @@ struct RecordedFrame {
   bool states_built = false;                // BuildStates done (by the prep thread)
   double states_ms = 0;                     // its time
   std::chrono::steady_clock::time_point swap_time;  // when the game swapped it
+  ~RecordedFrame();
 };
+
+// Recycled frame memory: a recorded frame's big buffers (draws, events, state
+// deltas, draw inputs: a few MB) go back to a pool when it is destroyed, and
+// the next frame takes them. Fresh allocations of that size come straight
+// from the kernel each frame, and the game thread then page-faulted on every
+// page it wrote (thousands of faults a frame).
+struct FrameBuffers {
+  std::vector<native::Event> events;
+  std::vector<native::Draw> draws;
+  std::vector<uint8_t> deltas;
+  std::vector<uint32_t> draw_delta_end;
+  std::vector<std::unique_ptr<DrawInputList::Chunk>> chunks;
+};
+std::mutex g_frame_pool_mutex;
+std::vector<FrameBuffers> g_frame_pool;  // at most kFramePool
+constexpr size_t kFramePool = 3;
+
+RecordedFrame::~RecordedFrame() {
+  FrameBuffers b;
+  b.events = std::move(frame.events);
+  b.draws = std::move(frame.draws);
+  b.deltas = std::move(deltas);
+  b.draw_delta_end = std::move(draw_delta_end);
+  b.chunks = inputs.Release();
+  // Emptied here, outside the lock (the draws hold strings and state).
+  b.events.clear();
+  b.draws.clear();
+  b.deltas.clear();
+  b.draw_delta_end.clear();
+  std::lock_guard lock(g_frame_pool_mutex);
+  if (g_frame_pool.size() < kFramePool) g_frame_pool.push_back(std::move(b));
+}
+
+// A frame's buffers: recycled ones when there are any.
+void TakeFrameBuffers(RecordedFrame& f) {
+  FrameBuffers b;
+  {
+    std::lock_guard lock(g_frame_pool_mutex);
+    if (g_frame_pool.empty()) return;
+    b = std::move(g_frame_pool.back());
+    g_frame_pool.pop_back();
+  }
+  f.frame.events = std::move(b.events);
+  f.frame.draws = std::move(b.draws);
+  f.deltas = std::move(b.deltas);
+  f.draw_delta_end = std::move(b.draw_delta_end);
+  f.inputs.Adopt(std::move(b.chunks));
+}
 
 // Microcode by stem (all the game has run so far).
 std::mutex g_ucode_mutex;
 std::unordered_map<std::string, std::vector<uint8_t>> g_ucode;
+
+// Short names for microcode in recorded draws: the stems (ucode_vs_<16 hex>)
+// are longer than a string's inline buffer, so every draw's copy of them
+// allocated. The recorder stores V<11> / P<11> instead (a hash of the stem;
+// fits inline) and the resources look the stem up again when the renderer
+// first reads a shader. Frame dumps (F10) keep the aliases; their microcode
+// is saved under the same names.
+std::mutex g_alias_mutex;
+std::unordered_map<std::string, std::string> g_alias_to_stem;
+
+bool IsMicrocodeAlias(const std::string& name) {
+  return name.size() == 12 && (name[0] == 'V' || name[0] == 'P');
+}
+
+std::string StemOfAlias(const std::string& alias) {
+  std::lock_guard lock(g_alias_mutex);
+  auto it = g_alias_to_stem.find(alias);
+  return it != g_alias_to_stem.end() ? it->second : std::string();
+}
 
 std::vector<uint8_t> FindMicrocode(const std::string& stem) {
   std::lock_guard lock(g_ucode_mutex);
@@ -268,11 +473,25 @@ struct ShaderUse {
 };
 std::unordered_map<std::string, ShaderUse> g_shader_use;
 
+// The last shader looked up per stage: consecutive draws mostly share their
+// shaders, so a string compare usually replaces the map lookup.
+struct ShaderUseCache {
+  std::string stem;
+  const ShaderUse* use = nullptr;
+};
+ShaderUseCache g_use_cache[2];
+
 const ShaderUse& UseOf(const std::string& stem, native::ShaderStage stage) {
   static const ShaderUse kUnknown;
   if (stem.empty()) return kUnknown;
+  ShaderUseCache& cache = g_use_cache[stage == native::ShaderStage::kVertex ? 0 : 1];
+  if (cache.use && cache.stem == stem) return *cache.use;
   auto it = g_shader_use.find(stem);
-  if (it != g_shader_use.end()) return it->second;
+  if (it != g_shader_use.end()) {
+    cache.stem = stem;
+    cache.use = &it->second;
+    return it->second;
+  }
   const auto bytes = FindMicrocode(stem);
   if (bytes.size() < 12) return kUnknown;  // not seen yet; try again next time
   ShaderUse use;
@@ -297,7 +516,10 @@ const ShaderUse& UseOf(const std::string& stem, native::ShaderStage stage) {
       }
     }
   }
-  return g_shader_use.emplace(stem, std::move(use)).first->second;
+  const ShaderUse& stored = g_shader_use.emplace(stem, std::move(use)).first->second;
+  cache.stem = stem;
+  cache.use = &stored;
+  return stored;
 }
 
 const std::vector<uint32_t>& VertexFetchSlots(const std::string& stem) {
@@ -323,6 +545,19 @@ std::array<uint8_t, kRawBytes> g_prev_raw{};
 std::unordered_map<uint64_t, std::string> g_tex_names;  // fetch words hash -> name (per frame)
 // Vertex / index ranges already copied this frame: (kind, address, size) -> name.
 std::unordered_map<uint64_t, std::string> g_blob_names;
+// What each texture slot and vertex fetch constant was named at the previous
+// draw this frame: draws in a row mostly keep their bindings, so comparing the
+// raw fetch words usually replaces hashing and the map lookups.
+struct SlotName {
+  std::array<uint32_t, 6> words{};
+  std::string name;
+  uint64_t frame = 0;  // g_record_frame it was set in (names are per frame)
+};
+struct VertexFetchName {
+  uint32_t w0 = 0, w1 = 0;
+  std::string name;
+  uint64_t frame = 0;
+};
 uint32_t g_events = 0;
 struct PendingVertices {
   uint32_t address = 0, size = 0;
@@ -367,7 +602,9 @@ void FlushPending() {
   auto* memory = GuestMemory();
   if (!memory || !p.size || p.size > (16u << 20)) return;
   const uint8_t* src = memory->TranslateVirtual<const uint8_t*>(p.address);
-  g_frame->blobs[p.name] = std::make_shared<std::vector<uint8_t>>(src, src + p.size);
+  auto blob = std::make_shared<std::vector<uint8_t>>(src, src + p.size);
+  std::lock_guard lock(g_frame->maps_mutex);
+  g_frame->blobs[p.name] = std::move(blob);
   g_frame->versions[p.name] = NewVersion();
 }
 
@@ -420,12 +657,17 @@ std::shared_ptr<std::vector<uint8_t>> NewBlob(const std::string& name, const uin
   return blob;
 }
 
-void CopyGuest(const std::string& name, const uint8_t* src, uint32_t size) {
-  auto& blob = g_frame->blobs[name];
+void CopyGuestInto(RecordedFrame& f, const std::string& name, const uint8_t* src, uint32_t size) {
+  std::lock_guard lock(f.maps_mutex);
+  auto& blob = f.blobs[name];
   if (!blob) {
     blob = NewBlob(name, src, size);
-    g_frame->versions[name] = NewVersion();
+    f.versions[name] = NewVersion();
   }
+}
+
+void CopyGuest(const std::string& name, const uint8_t* src, uint32_t size) {
+  CopyGuestInto(*g_frame, name, src, size);
 }
 
 // --- Vertex cache ---------------------------------------------------------------------
@@ -446,8 +688,12 @@ std::atomic<uint32_t> g_write_epoch{1};
 void* g_watch_handle = nullptr;
 rex::memory::Memory* g_watch_memory = nullptr;
 
+std::atomic<uint64_t> g_watch_calls{0}, g_watch_pages{0};  // diagnostics (stall watch)
+
 // Called with the memory system's lock held, on the writing thread: no locks.
 std::pair<uint32_t, uint32_t> OnPhysicalWrite(void*, uint32_t start, uint32_t length, bool) {
+  g_watch_calls.fetch_add(1, std::memory_order_relaxed);
+  g_watch_pages.fetch_add((length + 4095) >> 12, std::memory_order_relaxed);
   if (!length) return {start, length};
   const uint32_t epoch = g_write_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
   const uint32_t first = start >> kPageShift;
@@ -465,9 +711,21 @@ struct CachedVertices {
   uint64_t used_frame = 0;
   uint32_t dirty_streak = 0;  // consecutive uses that found it rewritten
   bool dynamic = false;
-  uint64_t dynamic_since = 0;
+  uint32_t same_streak = 0;   // dynamic: consecutive copies that found it unchanged
+  uint32_t same_needed = 1;   // ... before it is watched (1: a range seen for the first time)
 };
 std::unordered_map<uint64_t, CachedVertices> g_vertex_cache;
+
+// A range treated as dynamic (rewritten every frame) is watched again only
+// once it stopped changing for this many uses in a row. (It used to be
+// watched again after 600 frames whatever it did: a video's buffers then
+// cost a page fault per page for a few frames every 20 s, and a fault costs
+// about 1 ms on an ARM handheld: ~0.9 s video freezes.)
+constexpr uint32_t kStaticAgain = 30;
+// A range seen for the first time isn't watched yet either: only when its
+// next use finds it unchanged. A video's buffers, rewritten every frame, are
+// then never protected (their first two frames used to fault on every page:
+// a ~0.9 s freeze and an audio pop as an in-game video starts).
 uint64_t g_record_frame = 0;  // frames recorded (game thread)
 struct VertexCacheStats {
   std::atomic<uint64_t> hits{0}, copies{0}, hit_bytes{0}, copy_bytes{0};
@@ -506,6 +764,11 @@ std::shared_ptr<std::vector<uint8_t>> CachedVertexData(rex::memory::Memory* memo
   const uint64_t key = (uint64_t(address) << 32) | size;
   CachedVertices& e = g_vertex_cache[key];
   e.used_frame = g_record_frame;
+  if (!e.data) {  // first use: copied, not watched yet (kStaticAgain)
+    e.dynamic = true;
+    e.same_streak = 0;
+    e.same_needed = 1;
+  }
   // Staggered safety refresh (every ~4 s at 60 fps).
   const bool refresh = g_record_frame - e.copied_frame > 240 + (key % 61);
   if (e.data && !e.dynamic && !refresh && PagesClean(address, size, e.epoch)) {
@@ -516,16 +779,23 @@ std::shared_ptr<std::vector<uint8_t>> CachedVertexData(rex::memory::Memory* memo
     return e.data;
   }
   if (e.data && !refresh && !e.dynamic) {
-    // Rewritten since the last copy: after a few uses in a row it is treated
-    // as dynamic (and gets another chance after 600 frames).
-    if (++e.dirty_streak >= 3) {
+    // Rewritten since the last copy: after two uses in a row it is treated
+    // as dynamic (copied every use, unwatched).
+    if (++e.dirty_streak >= 2) {
       e.dynamic = true;
-      e.dynamic_since = g_record_frame;
+      e.same_streak = 0;
+      e.same_needed = kStaticAgain;
     }
   }
-  if (e.dynamic && g_record_frame - e.dynamic_since > 600) {
-    e.dynamic = false;
-    e.dirty_streak = 0;
+  // Dynamic and unchanged for a while: watched again.
+  if (e.dynamic && e.data && e.data->size() == size &&
+      std::memcmp(e.data->data(), src, size) == 0) {
+    if (++e.same_streak >= e.same_needed) {
+      e.dynamic = false;
+      e.dirty_streak = 0;
+    }
+  } else {
+    e.same_streak = 0;
   }
   const uint32_t epoch = g_write_epoch.load(std::memory_order_acquire);
   if (!e.dynamic) memory->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
@@ -578,7 +848,8 @@ struct CachedTextureHash {
   uint64_t used_frame = 0;
   uint32_t dirty_streak = 0;
   bool dynamic = false;
-  uint64_t dynamic_since = 0;
+  uint32_t same_streak = 0;  // dynamic: consecutive hashes that found it unchanged
+  uint32_t same_needed = 1;  // ... before it is watched (1: a range seen for the first time)
 };
 std::unordered_map<uint64_t, CachedTextureHash> g_texture_hashes;  // (address, size)
 constexpr size_t kTextureSnapshotBudget = 16u << 20;  // bytes copied a frame at most
@@ -608,21 +879,33 @@ uint64_t TextureRangeHash(rex::memory::Memory* memory, uint32_t address, uint32_
   auto [it, inserted] = g_texture_hashes.try_emplace(key);
   CachedTextureHash& e = it->second;
   e.used_frame = g_record_frame;
+  if (inserted) e.dynamic = true;  // first use: hashed, not watched yet (kStaticAgain)
   if (!inserted && !e.dynamic && PagesClean(address, size, e.epoch)) {
     e.dirty_streak = 0;
     return e.hash;
   }
-  if (!inserted && !e.dynamic && ++e.dirty_streak >= 3) {
+  if (!inserted && !e.dynamic && ++e.dirty_streak >= 2) {
     e.dynamic = true;  // rewritten every frame: hash it every frame, unwatched
-    e.dynamic_since = g_record_frame;
+    e.same_streak = 0;
+    e.same_needed = kStaticAgain;
   }
-  if (e.dynamic && g_record_frame - e.dynamic_since > 600) {
-    e.dynamic = false;
-    e.dirty_streak = 0;
-  }
-  const uint32_t epoch = g_write_epoch.load(std::memory_order_acquire);
+  // Watched (static) ranges: the watch goes on before the bytes are read, so
+  // a write after the read is never missed.
+  uint32_t epoch = g_write_epoch.load(std::memory_order_acquire);
   if (!e.dynamic) memory->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
-  const uint64_t h = HashBytes(p, size, 1469598103934665603ull);
+  uint64_t h = HashBytes(p, size, 1469598103934665603ull);
+  // Dynamic and unchanged for a while: watched again (kStaticAgain).
+  if (e.dynamic && !inserted && h == e.hash) {
+    if (++e.same_streak >= e.same_needed) {
+      e.dynamic = false;
+      e.dirty_streak = 0;
+      epoch = g_write_epoch.load(std::memory_order_acquire);
+      memory->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
+      h = HashBytes(p, size, 1469598103934665603ull);
+    }
+  } else {
+    e.same_streak = 0;
+  }
   *changed = inserted || h != e.hash;
   e.hash = h;
   e.epoch = epoch;
@@ -641,7 +924,7 @@ void TrimTextureHashes() {
   }
 }
 
-std::string TextureName(const std::array<uint32_t, 6>& words) {
+const std::string& TextureName(RecordedFrame& f, const std::array<uint32_t, 6>& words) {
   const uint64_t key = Fnv1a(words.data(), sizeof(words));
   auto it = g_tex_names.find(key);
   if (it != g_tex_names.end()) return it->second;
@@ -656,19 +939,25 @@ std::string TextureName(const std::array<uint32_t, 6>& words) {
           TextureRangeHash(memory, ranges.mip_address, ranges.mip_size, &mips_changed);
     }
   }
-  std::string name = fmt::format("tex_{:016X}_{:016X}", key, h);
-  g_frame->textures[name] = words;
-  g_tex_names[key] = name;
+  std::string name =
+      native::ShortName('T', key, 6) + "_" + native::ShortName('T', h, 7).substr(1);
+  {
+    std::lock_guard lock(f.maps_mutex);
+    f.textures[name] = words;
+  }
+  const std::string& stored = g_tex_names.emplace(key, name).first->second;
   // Snapshot what changed (within a budget; the rest is read by the worker).
   auto snapshot = [&](const char* suffix, uint32_t address, uint32_t size) {
     if (!size || g_texture_snapshot_bytes + size > kTextureSnapshotBudget) return;
     const uint8_t* p = memory->TranslatePhysical<const uint8_t*>(address);
-    g_frame->blobs[name + suffix] = std::make_shared<std::vector<uint8_t>>(p, p + size);
+    auto blob = std::make_shared<std::vector<uint8_t>>(p, p + size);
+    std::lock_guard lock(f.maps_mutex);
+    f.blobs[name + suffix] = std::move(blob);
     g_texture_snapshot_bytes += size;
   };
   if (base_changed) snapshot(".base", ranges.base_address, ranges.base_size);
   if (mips_changed) snapshot(".mips", ranges.mip_address, ranges.mip_size);
-  return name;
+  return stored;
 }
 
 // Changed state chunks since the previous draw, straight from guest memory.
@@ -720,12 +1009,25 @@ void RecordStateDelta(uint8_t* base, uint32_t dev, const ShaderUse& vs, const Sh
   g_frame->draw_delta_end.push_back(uint32_t(deltas.size()));
 }
 
-void StartFrame() {
+// The recorder side's per-frame reset: the names are per frame (a texture's
+// name carries its contents' hash). On the recorder thread with deferred
+// naming, else on the game thread at the frame's start.
+void BeginNaming() {
   ++g_record_frame;
   TrimVertexCache();
   TrimTextureHashes();
   g_texture_snapshot_bytes = 0;
+  g_tex_names.clear();
+  g_blob_names.clear();
+}
+
+bool DeferredNaming();
+void StopRecorder();
+
+void StartFrame() {
+  if (!DeferredNaming()) BeginNaming();
   g_frame = std::make_unique<RecordedFrame>();
+  TakeFrameBuffers(*g_frame);
   g_frame->frame.draws.reserve(g_last_draws + g_last_draws / 4 + 64);
   g_frame->frame.events.reserve(g_last_events + g_last_events / 4 + 64);
   g_frame->deltas.reserve(g_last_deltas + g_last_deltas / 4 + 4096);
@@ -743,8 +1045,6 @@ void StartFrame() {
     g_frame->dump_name = std::string("frame_") + buf + "_native";
   }
   g_prev_raw.fill(0);
-  g_tex_names.clear();
-  g_blob_names.clear();
   g_events = 0;
   g_pending = {};
   g_frame_overflow = false;
@@ -770,7 +1070,8 @@ class LiveResources : public native::FrameResources {
     auto it = f_.blobs.find(name);
     if (it != f_.blobs.end()) return it->second ? *it->second : std::vector<uint8_t>{};
     if (name.rfind("ucode_", 0) == 0) return FindMicrocode(name);
-    if (name.rfind("tex_", 0) == 0) {
+    if (IsMicrocodeAlias(name)) return FindMicrocode(StemOfAlias(name));
+    if (native::IsTextureResource(name)) {
       const size_t dot = name.rfind('.');
       if (dot == std::string::npos) return {};
       auto t = f_.textures.find(name.substr(0, dot));
@@ -993,6 +1294,11 @@ struct Timings {
   // Sampled frames: the worker's draw recording by part (RenderStats::draw_part_ms).
   double parts[9] = {};
   uint32_t part_frames = 0;
+  // Render passes and clears (RenderStats).
+  uint64_t passes = 0, clear_passes = 0, clears_merged = 0, clears_in_pass = 0;
+  // GPU time by part (Renderer::GpuParts), summed per name; frames measured.
+  std::map<std::string, double> gpu_parts;
+  uint32_t gpu_part_frames = 0;
 };
 constexpr double kSlowFrameMs = 20.0;
 std::mutex g_timing_mutex;
@@ -1023,6 +1329,16 @@ void LogTimings(bool shared) {
   if (secs < 5.0 || !g_timings.frames) return;
   const Timings& t = g_timings;
   const double n = t.frames;
+  {
+    // Write-watch faults (a game thread writing a page the renderer watches:
+    // a signal and a protection change, far dearer than the write).
+    static uint64_t last_calls = 0, last_pages = 0;
+    const uint64_t calls = g_watch_calls.load(), pages = g_watch_pages.load();
+    REXLOG_INFO("Native renderer: write-watch faults {:.1f} per frame ({:.1f} pages)",
+                double(calls - last_calls) / n, double(pages - last_pages) / n);
+    last_calls = calls;
+    last_pages = pages;
+  }
   REXLOG_INFO(
       "Native renderer: {:.1f} frames/s shown ({} recorded); per frame: game-thread recording "
       "{:.2f} ms (draws: textures {:.2f}, vertex data {:.2f}, indices {:.2f}, state {:.2f}, store {:.2f}); worker {:.2f} ms = states {:.2f} + vertex data {:.2f} + draws {:.2f}, then "
@@ -1054,6 +1370,27 @@ void LogTimings(bool shared) {
         "Vulkan commands {:.2f}, after {:.2f}",
         t.part_frames, t.parts[0] * k, t.parts[1] * k, t.parts[2] * k, t.parts[3] * k,
         t.parts[4] * k, t.parts[5] * k, t.parts[6] * k, t.parts[7] * k, t.parts[8] * k);
+  }
+  REXLOG_INFO(
+      "Native renderer: per frame {:.1f} render passes; clears: {:.1f} as passes of their own, "
+      "{:.1f} folded into a pass's load op, {:.1f} inside a pass",
+      double(t.passes) / n, double(t.clear_passes) / n, double(t.clears_merged) / n,
+      double(t.clears_in_pass) / n);
+  if (t.gpu_part_frames) {
+    // The biggest parts first.
+    std::vector<std::pair<double, std::string>> parts;
+    double sum = 0;
+    for (const auto& [name, ms] : t.gpu_parts) {
+      parts.push_back({ms / t.gpu_part_frames, name});
+      sum += ms / t.gpu_part_frames;
+    }
+    std::sort(parts.rbegin(), parts.rend());
+    std::string text;
+    for (size_t i = 0; i < parts.size() && i < 10; ++i) {
+      text += fmt::format("{}{} {:.2f}", i ? ", " : "", parts[i].second, parts[i].first);
+    }
+    REXLOG_INFO("Native renderer: GPU by part ({:.2f} ms per frame, {} parts): {}", sum,
+                parts.size(), text);
   }
   g_timings = {};
   g_draw_ms_total = {};
@@ -1179,6 +1516,14 @@ void WorkerMain() {
     const double gpu_ms = renderer->WaitFrame(pending.ticket);
     last_gpu_wait = gpu_ms;
     perf::ReportGpuFrame(renderer->GpuFrameMs(pending.ticket));
+    {
+      const auto parts = renderer->GpuParts(pending.ticket);
+      if (!parts.empty()) {
+        std::lock_guard lock(g_timing_mutex);
+        for (const auto& part : parts) g_timings.gpu_parts[part.name] += part.ms;
+        ++g_timings.gpu_part_frames;
+      }
+    }
     const auto t_present = Clock::now();
     rex::ui::Presenter* presenter = g_presenter ? g_presenter() : nullptr;
     if (!presenter || !REXCVAR_GET(native_renderer) || g_stop) return;
@@ -1255,8 +1600,6 @@ void WorkerMain() {
     const auto t0 = Clock::now();
     last_gpu_wait = 0;
     try {
-      // The MSAA setting decides how render targets are made: start over.
-      const bool msaa = REXCVAR_GET(native_msaa);
       // The SDK's settings (Display > Image quality), read by name: they live
       // in the GPU plugin.
       float scale = RenderScaleFor(REXCVAR_GET(native_render_scale));
@@ -1266,6 +1609,10 @@ void WorkerMain() {
       const std::string upscaler_name = REXCVAR_GET(native_upscaler);
       // native::UpscalerKind: 1 = XeSS, 2 = FSR.
       const int upscaler = upscaler_name == "xess" ? 1 : upscaler_name == "fsr" ? 2 : 0;
+      // The MSAA setting decides how render targets are made: start over.
+      // With an upscaler its own setting (off by default: the upscaler
+      // smooths the edges).
+      const bool msaa = upscaler ? REXCVAR_GET(native_upscaler_msaa) : REXCVAR_GET(native_msaa);
       float out_scale = RenderScaleFor(100);
       if (renderer && (scale != renderer_scale || out_scale != renderer_out_scale)) {
         if (scale != scale_candidate || out_scale != out_scale_candidate) {
@@ -1284,6 +1631,8 @@ void WorkerMain() {
       const bool async_pipelines =
           rex::cvar::GetFlagByName("async_shader_compilation") != "false";
       const bool smooth_foliage = REXCVAR_GET(native_smooth_foliage);
+      // Sharp fonts and upscaled textures: only when turned on themselves
+      // (off by default, not part of Revamped Graphics).
       const bool sharp_fonts = REXCVAR_GET(native_sharp_fonts);
       const bool texture_pack = REXCVAR_GET(native_texture_pack);
       const bool upscaled_textures = REXCVAR_GET(native_upscaled_textures);
@@ -1393,10 +1742,13 @@ void WorkerMain() {
         }
         renderer->SetMotionBlur(blur, camera, objects, REXCVAR_GET(native_motion_blur_debug));
         renderer->SetUpscaleParams(dt > 0.0 && dt < 0.25 ? float(dt * 1000.0) : 16.7f,
-                                   float(REXCVAR_GET(native_upscaler_sharpness)));
+                                   float(REXCVAR_GET(native_upscaler_sharpness)),
+                                   REXCVAR_GET(native_reactive_debug));
         renderer->SetFog(revamped && REXCVAR_GET(native_fog) ? float(REXCVAR_GET(native_fog_density)) : 0.0f,
                          float(REXCVAR_GET(native_fog_start)));
         renderer->SetFoliageFade(revamped && REXCVAR_GET(native_foliage_fade));
+        renderer->SetMergeClears(REXCVAR_GET(native_merge_clears));
+        renderer->SetParallelCommands(REXCVAR_GET(native_parallel_commands));
         renderer->SetMapClouds(revamped && REXCVAR_GET(native_map_clouds));
         renderer->SetHideInterface(g_hide_interface.load());
         // The game state machine (0x828901E0) + 8: 7 = the trail map.
@@ -1455,6 +1807,10 @@ void WorkerMain() {
         g_timings.states += states_ms;
         g_timings.prepass += stats.prepass_ms;
         g_timings.draw += stats.record_ms;
+        g_timings.passes += stats.passes;
+        g_timings.clear_passes += stats.clear_passes;
+        g_timings.clears_merged += stats.clears_merged;
+        g_timings.clears_in_pass += stats.clears_in_pass;
         if (stats.draw_parts_sampled) {
           for (int k = 0; k < 9; ++k) g_timings.parts[k] += stats.draw_part_ms[k];
           ++g_timings.part_frames;
@@ -1548,6 +1904,7 @@ void Shutdown() {
   g_work_cv.notify_all();
   if (g_prep_thread.joinable()) g_prep_thread.join();
   if (g_worker.joinable()) g_worker.join();
+  StopRecorder();
   SetHostDrawing(true);
   if (rex::ui::Presenter* presenter = g_presenter ? g_presenter() : nullptr) {
     SetGuestOutputExternal(presenter, false);
@@ -1560,6 +1917,14 @@ bool Enabled() { return REXCVAR_GET(native_renderer) && !g_failed.load(); }
 void SetHideInterface(bool hide) { g_hide_interface = hide; }
 
 bool Recording() { return g_recording.load(std::memory_order_relaxed); }
+
+bool SkipEmulatedStateWrites() {
+  return REXCVAR_GET(native_skip_state_writes) && !g_host_drawing_on.load(std::memory_order_relaxed);
+}
+
+bool SkipEmulatedDrawCommands() {
+  return REXCVAR_GET(native_skip_draw_commands) && SkipEmulatedStateWrites();
+}
 
 void RequestDump() {
   if (REXCVAR_GET(native_renderer)) g_dump_requested = true;
@@ -1577,38 +1942,404 @@ bool RawTextureFetch(const std::array<uint32_t, 6>& words) {
   return (words[0] & 3) == 2 && (words[1] >> 12) != 0;
 }
 
+// The alias of a microcode stem (empty stays empty); the last one per stage is
+// remembered, as consecutive draws mostly share their shaders.
+const std::string& MicrocodeAlias(const std::string& stem, char tag) {
+  struct Last {
+    std::string stem, alias;
+  };
+  static Last last[2];
+  static const std::string kEmpty;
+  if (stem.empty()) return kEmpty;
+  Last& l = last[tag == 'V' ? 0 : 1];
+  if (!l.alias.empty() && l.stem == stem) return l.alias;
+  l.stem = stem;
+  l.alias = native::ShortName(tag, Fnv1a(stem.data(), stem.size()), 11);
+  std::lock_guard lock(g_alias_mutex);
+  g_alias_to_stem.emplace(l.alias, stem);
+  return l.alias;
+}
+
+std::array<SlotName, kTextureSlots> g_slot_names;
+std::array<VertexFetchName, 96> g_vf_names;
+
+namespace {
+
+// Names a draw's textures, vertex memory and index buffer from its inputs
+// (recorder side: the name caches, the vertex cache and the texture hashes
+// are only used here).
+void NameDraw(RecordedFrame& f, DrawInputs& in) {
+  auto* memory = GuestMemory();
+  for (const auto& t : in.textures) {
+    native::FrameTexture ft;
+    ft.slot = t.slot;
+    std::copy(t.words.begin(), t.words.end(), ft.raw.begin());
+    SlotName& last = g_slot_names[t.slot];
+    if (last.frame != g_record_frame || last.words != t.words) {
+      last.words = t.words;
+      last.name = TextureName(f, t.words);
+      last.frame = g_record_frame;
+    }
+    ft.data = last.name;
+    in.named_textures.push_back(std::move(ft));
+  }
+  if (!memory) return;
+  for (const auto& v : in.vertex_fetches) {
+    VertexFetchName& last = g_vf_names[v.vf % 96];
+    if (last.frame == g_record_frame && last.w0 == v.w0 && last.w1 == v.w1) {
+      in.vmem[v.vf] = last.name;
+      continue;
+    }
+    const uint32_t address = (v.w0 & ~3u) & 0x1FFFFFFF;
+    const uint32_t size = ((v.w1 >> 2) & 0xFFFFFF) * 4;
+    if (!address || !size || size > (64u << 20)) continue;
+    const uint64_t key = (uint64_t(address) << 32) | size;
+    auto it = g_blob_names.find(key);
+    if (it == g_blob_names.end()) {
+      std::string name = native::ShortName('M', (uint64_t(size) << 29) | address, 10);
+      bool have;
+      {
+        std::lock_guard lock(f.maps_mutex);
+        have = f.blobs[name] != nullptr;
+      }
+      if (!have) {
+        uint64_t version = 0;
+        auto blob = CachedVertexData(memory, name, address, size, &version);
+        std::lock_guard lock(f.maps_mutex);
+        f.blobs[name] = std::move(blob);
+        f.versions[name] = version;
+      }
+      it = g_blob_names.emplace(key, std::move(name)).first;
+    }
+    in.vmem[v.vf] = it->second;
+    last.w0 = v.w0;
+    last.w1 = v.w1;
+    last.name = it->second;
+    last.frame = g_record_frame;
+  }
+  const uint32_t address = in.ib_address, size = in.ib_size;
+  if (address && size && size <= (64u << 20)) {
+    const uint64_t key = (uint64_t(address) << 32) | size | (1ull << 31);  // not physical
+    auto it = g_blob_names.find(key);
+    if (it == g_blob_names.end()) {
+      std::string name = native::ShortName('I', (uint64_t(size) << 32) | address, 10);
+      // Index buffers are mostly static too: through the vertex cache when
+      // they are in physical memory (as Direct3D allocates them).
+      const uint32_t physical = memory->GetPhysicalAddress(address);
+      if (physical != UINT32_MAX &&
+          memory->GetPhysicalAddress(address + size - 1) == physical + size - 1) {
+        bool have;
+        {
+          std::lock_guard lock(f.maps_mutex);
+          have = f.blobs[name] != nullptr;
+        }
+        if (!have) {
+          uint64_t version = 0;
+          auto blob = CachedVertexData(memory, name, physical, size, &version);
+          std::lock_guard lock(f.maps_mutex);
+          f.blobs[name] = std::move(blob);
+          f.versions[name] = version;
+        }
+      } else {
+        CopyGuestInto(f, name, memory->TranslateVirtual<const uint8_t*>(address), size);
+      }
+      it = g_blob_names.emplace(key, std::move(name)).first;
+    }
+    in.index_data = it->second;
+  }
+}
+
+void ApplyNames(Draw& d, DrawInputs& in) {
+  for (auto& t : in.named_textures) d.textures.push_back(std::move(t));
+  for (const auto& [vf, name] : in.vmem) d.vmem[vf] = name;
+  if (!in.index_data.empty()) d.index_data = std::move(in.index_data);
+}
+
+// --- Deferred naming --------------------------------------------------------------
+//
+// With native_deferred_naming, the game's drawing thread only copies each
+// draw's fetch constants and index buffer address (DrawInputs) and queues
+// them; the recorder thread names them (texture hashes, the vertex cache,
+// index copies) and, at the end of each frame, puts the names into the draws
+// and hands the frame on.
+//
+// The recorder reads guest memory after the draw, so the game must not have
+// rewritten it by then. On the console the GPU reads it later too, and the game
+// waits for a GPU fence before rewriting memory a draw used. Direct3D inserts
+// a fence (value: the device's CPU fence, +2 each time) with an EVENT_WRITE_SHD
+// packet that makes the GPU store it to the fence word (device+10384 points to
+// it), and in some phases also stores it from the CPU right away. So a fence
+// is let through only once the recorder has named every draw made before it:
+// the command processor waits for that before storing a fence (SDK patch
+// 0019), and so does the game thread before Direct3D's own CPU store
+// (sub_825A3330). Each draw is queued with the CPU fence current when it was
+// drawn (the fence that covers it).
+
+struct QueuedJob {
+  RecordedFrame* frame = nullptr;  // the draw's frame (or the frame ending)
+  size_t input = 0;                // index in frame->inputs
+  uint32_t stamp = 0;              // CPU fence when it was drawn (covered by that fence)
+  std::unique_ptr<RecordedFrame> end;  // set: end of this frame
+  bool hand_over = false;
+};
+
+// The game thread queues draws without waking the recorder for each one (a
+// wake is a system call: about 3 us a draw on the handheld, 5 ms a frame,
+// on the thread that limits the frame rate). The recorder takes everything
+// queued at once; it's woken when it sleeps and kWakeBatch draws are waiting,
+// at the end of a frame, and when a fence waits for the names.
+constexpr size_t kWakeBatch = 32;
+// And it looks for queued draws on its own this often while it sleeps, so a
+// draw is never left waiting long for its name (frames of a few draws: menus,
+// videos).
+constexpr auto kRecorderPoll = std::chrono::milliseconds(2);
+
+// Diagnostics (Armada video stalls): rare long waits for names, and long
+// naming jobs, go to the log.
+void LogSlow(const char* what, double ms, size_t queued) {
+  static std::atomic<int> logged{0};
+  if (ms < 50.0 || logged.fetch_add(1) >= 40) return;
+  REXLOG_WARN("Native renderer: {} took {:.1f} ms ({} draws queued)", what, ms, queued);
+}
+
+std::mutex g_queue_mutex;
+std::condition_variable g_queue_cv;
+std::condition_variable g_drained_cv;  // draws were named
+std::vector<QueuedJob> g_queue;
+bool g_queue_has_stamp = false;  // g_queue holds a draw (its oldest stamp below)
+uint32_t g_queue_oldest_stamp = 0;
+bool g_naming_busy = false;      // the recorder holds draws it took off the queue
+uint32_t g_naming_stamp = 0;     // the oldest of those not named yet
+bool g_recorder_sleeping = false;
+std::atomic<int> g_name_waiters{0};  // threads in WaitNamedThrough
+std::thread g_recorder;
+std::atomic<bool> g_recorder_stop{false};
+bool g_deferred = false;  // decided when the device starts (restart to change)
+std::atomic<uint32_t> g_fence_physical{0};  // the fence word, physical address
+std::atomic<uint32_t> g_fence_physical_alt{0};
+
+bool DeferredNaming() { return g_deferred; }
+
+// Fence a is at or after b (32-bit wrap-around, as Direct3D compares them).
+bool FenceAtOrAfter(uint32_t a, uint32_t b) { return int32_t(a - b) >= 0; }
+
+// Waits until every draw covered by `fence` (stamp at or before it) is named.
+void WaitNamedThrough(uint32_t fence) {
+  std::unique_lock lock(g_queue_mutex);
+  const auto pending = [fence] {
+    if (g_naming_busy && FenceAtOrAfter(fence, g_naming_stamp)) return true;
+    return g_queue_has_stamp && FenceAtOrAfter(fence, g_queue_oldest_stamp);
+  };
+  if (!pending()) return;
+  g_name_waiters.fetch_add(1);
+  const auto wait_start = std::chrono::steady_clock::now();
+  if (g_recorder_sleeping) {  // draws it hasn't been woken for
+    g_recorder_sleeping = false;
+    g_queue_cv.notify_one();
+  }
+  // A safety net: never hold the GPU or the game for long if something is off.
+  if (!g_drained_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+        return !pending() || g_recorder_stop.load();
+      })) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXLOG_WARN("Native renderer: fence {:08X} waited 2 s for the recorder; going on", fence);
+    }
+  }
+  g_name_waiters.fetch_sub(1);
+  LogSlow("a fence waiting for draw names",
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start)
+              .count(),
+          g_queue.size());
+}
+
+void OnGpuEventWrite(uint32_t physical_address, uint32_t value) {
+  if (physical_address == g_fence_physical.load(std::memory_order_relaxed) ||
+      physical_address == g_fence_physical_alt.load(std::memory_order_relaxed)) {
+    WaitNamedThrough(value);
+  }
+}
+
+void EnqueueDraw(RecordedFrame* frame, size_t input, uint32_t stamp) {
+  bool wake;
+  {
+    std::lock_guard lock(g_queue_mutex);
+    if (!g_queue_has_stamp) {
+      g_queue_has_stamp = true;
+      g_queue_oldest_stamp = stamp;
+    }
+    QueuedJob& j = g_queue.emplace_back();
+    j.frame = frame;
+    j.input = input;
+    j.stamp = stamp;
+    wake = g_recorder_sleeping && g_queue.size() >= kWakeBatch;
+    if (wake) g_recorder_sleeping = false;  // one wake is enough
+  }
+  if (wake) g_queue_cv.notify_one();
+}
+
+void EnqueueEndOfFrame(std::unique_ptr<RecordedFrame> frame, bool hand_over) {
+  {
+    std::lock_guard lock(g_queue_mutex);
+    QueuedJob& j = g_queue.emplace_back();
+    j.frame = frame.get();
+    j.end = std::move(frame);
+    j.hand_over = hand_over;
+    g_recorder_sleeping = false;
+  }
+  g_queue_cv.notify_one();
+}
+
+// The stamp of the first draw at or after `from` in `batch` (none: false).
+bool FirstStamp(const std::vector<QueuedJob>& batch, size_t from, uint32_t* stamp) {
+  for (size_t i = from; i < batch.size(); ++i) {
+    if (!batch[i].end) {
+      *stamp = batch[i].stamp;
+      return true;
+    }
+  }
+  return false;
+}
+
+void RecorderMain() {
+  qos::PreferPerformanceThread(L"amped3 native recorder", true);
+  rex::thread::set_current_thread_name("amped3 recorder");
+  RecordedFrame* naming = nullptr;  // the frame BeginNaming was last called for
+  std::vector<QueuedJob> batch;
+  while (!g_recorder_stop.load()) {
+    {
+      std::unique_lock lock(g_queue_mutex);
+      if (g_queue.empty()) {
+        g_recorder_sleeping = true;
+        g_queue_cv.wait_for(lock, kRecorderPoll, [] {
+          return g_recorder_stop.load() || (!g_recorder_sleeping && !g_queue.empty());
+        });
+        g_recorder_sleeping = false;
+      }
+      if (g_queue.empty()) continue;
+      batch.swap(g_queue);
+      g_queue_has_stamp = false;
+      g_naming_busy = FirstStamp(batch, 0, &g_naming_stamp);
+    }
+    for (size_t b = 0; b < batch.size(); ++b) {
+      QueuedJob& job = batch[b];
+      const bool end_job = job.end != nullptr;
+      const auto t0 = std::chrono::steady_clock::now();
+      if (job.frame != naming) {
+        naming = job.frame;
+        BeginNaming();
+      }
+      if (!job.end) {
+        NameDraw(*job.frame, job.frame->inputs.At(job.input));
+      } else {
+        RecordedFrame& f = *job.end;
+        const size_t n = f.inputs.size();
+        for (size_t i = 0; i < n; ++i) {
+          DrawInputs& in = f.inputs.At(i);
+          if (in.draw < f.frame.draws.size()) ApplyNames(f.frame.draws[in.draw], in);
+        }
+        if (f.name_swap) f.frame.swap_data = TextureName(f, f.swap_fetch_words);
+        naming = nullptr;
+        if (job.hand_over) HandOver(std::move(job.end), g_prep_mutex, g_prep_cv, g_prep);
+        job.end.reset();
+      }
+      const int64_t job_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+      trace::Add(trace::Zone::kRecNaming, job_ns);
+      LogSlow(end_job ? "naming a frame's end" : "naming a draw", double(job_ns) * 1e-6,
+              batch.size() - b - 1);
+      // A fence waiting for these names: let it see the progress now.
+      if (g_name_waiters.load() > 0) {
+        {
+          std::lock_guard lock(g_queue_mutex);
+          g_naming_busy = FirstStamp(batch, b + 1, &g_naming_stamp);
+        }
+        g_drained_cv.notify_all();
+      }
+    }
+    batch.clear();
+    {
+      std::lock_guard lock(g_queue_mutex);
+      g_naming_busy = false;
+    }
+    if (g_name_waiters.load() > 0) g_drained_cv.notify_all();
+  }
+}
+
+void StopRecorder() {
+  if (g_deferred) rex::system::SetGpuEventWriteHook(nullptr);
+  g_recorder_stop = true;
+  g_queue_cv.notify_all();
+  g_drained_cv.notify_all();
+  if (g_recorder.joinable()) g_recorder.join();
+}
+
+}  // namespace
+
 void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string& vs_ucode,
             const std::string& ps_ucode) {
   if (!Recording()) return;
+  struct AllocCount {  // F11 trace: heap allocations while recording a draw
+    uint64_t start = trace::ThreadAllocations();
+    ~AllocCount() { trace::AddRecordAllocations(trace::ThreadAllocations() - start); }
+  } alloc_count;
   RecordTimer timer;
   std::lock_guard lock(g_mutex);
   if (!g_frame || !Room()) return;
-  auto lap = [t = std::chrono::steady_clock::now()](int part) mutable {
+  // Where a draw's recording time goes, timed on one draw in 8 (and counted
+  // 8 times): a clock read costs about as much as some of the parts, and
+  // timing every draw cost the game thread several of them per draw.
+  const bool timed = (g_events & 7) == 0;
+  const auto setup_t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  auto lap = [timed, t = setup_t0](int part) mutable {
+    if (!timed) return;
     const auto now = std::chrono::steady_clock::now();
-    g_draw_ns[part] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count());
+    const int64_t ns = 8 * std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+    g_draw_ns[part] += uint64_t(ns);
+    // F11 trace: textures, vertex memory, indices, state (part 4, storing, is small).
+    static constexpr trace::Zone kZones[] = {trace::Zone::kRecTextures,
+                                             trace::Zone::kRecVertices,
+                                             trace::Zone::kRecIndices, trace::Zone::kRecState};
+    if (part < 4) trace::Add(kZones[part], ns);
     t = now;
   };
-  Draw d;
+  const uint32_t number = AddEvent(native::EventType::kDraw, uint32_t(g_frame->frame.draws.size()));
+  // Built in place: a Draw keeps its first textures and streams inline, so
+  // moving one in afterwards copied a few hundred bytes per draw.
+  Draw& d = g_frame->frame.draws.emplace_back();
   d.kind = Draw::Kind(int(call.kind));
   d.prim = call.prim;
   d.start = call.start;
   d.count = call.count;
   d.base_vertex = call.base_vertex;
-  d.vs = vs_ucode;
-  d.ps = ps_ucode;
-  const uint32_t number = AddEvent(native::EventType::kDraw, uint32_t(g_frame->frame.draws.size()));
+  d.vs = MicrocodeAlias(vs_ucode, 'V');
+  d.ps = MicrocodeAlias(ps_ucode, 'P');
   auto* memory = GuestMemory();
 
+  // What the draw's resources are named from, copied from the device now.
   // Textures: the fetch constants the shaders read (all bound ones if a
   // shader couldn't be translated).
   const ShaderUse& vs_use = UseOf(vs_ucode, native::ShaderStage::kVertex);
   const ShaderUse& ps_use = UseOf(ps_ucode, native::ShaderStage::kPixel);
+  const bool deferred = DeferredNaming();
+  DrawInputs local;
+  size_t input_index = 0;
+  DrawInputs& in = deferred ? g_frame->inputs.Add(&input_index) : local;
+  in.draw = uint32_t(g_frame->frame.draws.size() - 1);
   uint32_t wanted = 0;
   if (vs_use.known && ps_use.known) {
     for (uint32_t t : vs_use.textures) wanted |= 1u << (t & 31);
     for (uint32_t t : ps_use.textures) wanted |= 1u << (t & 31);
   } else {
     wanted = ~0u;
+  }
+  // F11 trace: the setup above (part of rec_textures).
+  if (timed) {
+    trace::Add(trace::Zone::kRecSetup, 8 * std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - setup_t0)
+                                               .count());
   }
   for (uint32_t s = 0; s < kTextureSlots; ++s) {
     if (!(wanted & (1u << s))) continue;
@@ -1618,65 +2349,28 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
     // page in story scene 2.1.1 does this): the GPU reads the fetch constant
     // either way.
     if (!U32(base, dev + kTextures + 4 * s) && !RawTextureFetch(words)) continue;
-    native::FrameTexture t;
-    t.slot = s;
-    std::copy(words.begin(), words.end(), t.raw.begin());
-    t.data = TextureName(words);
-    d.textures.push_back(std::move(t));
+    in.textures.push_back({s, words});
   }
 
   lap(0);  // textures (and the draw's setup)
 
   // Vertex memory the vertex shader fetches.
-  if (memory) {
-    for (uint32_t vf : VertexFetchSlots(vs_ucode)) {
-      const uint32_t w0 = U32(base, dev + kFetchConsts + vf * 8);
-      const uint32_t w1 = U32(base, dev + kFetchConsts + vf * 8 + 4);
-      if ((w0 & 3) != 3) continue;
-      const uint32_t address = (w0 & ~3u) & 0x1FFFFFFF;
-      const uint32_t size = ((w1 >> 2) & 0xFFFFFF) * 4;
-      if (!address || !size || size > (64u << 20)) continue;
-      const uint64_t key = (uint64_t(address) << 32) | size;
-      auto it = g_blob_names.find(key);
-      if (it == g_blob_names.end()) {
-        std::string name = fmt::format("mem_{:08X}_{}", address, size);
-        auto& blob = g_frame->blobs[name];
-        if (!blob) blob = CachedVertexData(memory, name, address, size, &g_frame->versions[name]);
-        it = g_blob_names.emplace(key, std::move(name)).first;
-      }
-      d.vmem[vf] = it->second;
-    }
+  for (uint32_t vf : VertexFetchSlots(vs_ucode)) {
+    const uint32_t w0 = U32(base, dev + kFetchConsts + vf * 8);
+    const uint32_t w1 = U32(base, dev + kFetchConsts + vf * 8 + 4);
+    if ((w0 & 3) == 3) in.vertex_fetches.push_back({vf, w0, w1});
   }
 
   lap(1);
 
-  // Indices and user-pointer data.
-  if (call.kind == DrawCall::Kind::kIndexed && memory) {
+  // Indices and user-pointer data (user-pointer data is copied now: the game
+  // reuses that memory right away).
+  if (call.kind == DrawCall::Kind::kIndexed) {
     const uint32_t ib = U32(base, dev + kIndexBuffer);
     if (ib) {
-      const uint32_t address = U32(base, ib + 12), size = U32(base, ib + 16);
+      in.ib_address = U32(base, ib + 12);
+      in.ib_size = U32(base, ib + 16);
       d.index_32bit = (U32(base, ib) & 0x80000000u) != 0;
-      if (address && size && size <= (64u << 20)) {
-        const uint64_t key = (uint64_t(address) << 32) | size | (1ull << 31);  // not physical
-        auto it = g_blob_names.find(key);
-        if (it == g_blob_names.end()) {
-          std::string name = fmt::format("ib_{:08X}_{}", address, size);
-          // Index buffers are mostly static too: through the vertex cache
-          // when they are in physical memory (as Direct3D allocates them).
-          const uint32_t physical = memory->GetPhysicalAddress(address);
-          if (physical != UINT32_MAX && memory->GetPhysicalAddress(address + size - 1) ==
-                                            physical + size - 1) {
-            auto& blob = g_frame->blobs[name];
-            if (!blob) {
-              blob = CachedVertexData(memory, name, physical, size, &g_frame->versions[name]);
-            }
-          } else {
-            CopyGuest(name, memory->TranslateVirtual<const uint8_t*>(address), size);
-          }
-          it = g_blob_names.emplace(key, std::move(name)).first;
-        }
-        d.index_data = it->second;
-      }
     }
   }
   if (memory && call.up_indices && call.up_indices_size) {
@@ -1694,11 +2388,16 @@ void OnDraw(uint8_t* base, uint32_t dev, const DrawCall& call, const std::string
                 call.up_vertices_size);
     }
   }
+  if (deferred) {
+    EnqueueDraw(g_frame.get(), input_index, U32(base, dev + kCpuFence));
+  } else {
+    NameDraw(*g_frame, in);
+    ApplyNames(d, in);
+  }
 
   lap(2);
   RecordStateDelta(base, dev, vs_use, ps_use);
   lap(3);
-  g_frame->frame.draws.push_back(std::move(d));
   lap(4);
 }
 
@@ -1775,7 +2474,116 @@ void OnEndTiling() {
   AddEvent(native::EventType::kEndTiling, 0);
 }
 
+// --- Stall watchdog -----------------------------------------------------------
+//
+// Diagnostics, kept for future freezes (it found the write-watch faults that
+// froze in-game videos on Armada): when no frame has been swapped for 250 ms
+// (but under 5 s: loading), logs where every game thread is (link register
+// and r3 as of its last kernel call) once, then where the stall's CPU time
+// went, for the first 12 stalls. Quiet otherwise.
+std::atomic<int64_t> g_last_swap_ns{0};
+std::once_flag g_watchdog_once;
+
+int64_t SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Per thread CPU time (Linux: /proc/self/task/*/stat), user and system
+// separately, in clock ticks: what a stall's time went to.
+struct ThreadTimes {
+  std::string name;
+  uint64_t user = 0, system = 0;
+};
+std::map<int, ThreadTimes> ReadThreadTimes() {
+  std::map<int, ThreadTimes> out;
+#if defined(__linux__)
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+    std::ifstream f(entry.path() / "stat");
+    std::string line;
+    if (!std::getline(f, line)) continue;
+    const size_t open = line.find('('), close = line.rfind(')');
+    if (open == std::string::npos || close == std::string::npos) continue;
+    ThreadTimes t;
+    t.name = line.substr(open + 1, close - open - 1);
+    std::istringstream rest(line.substr(close + 2));
+    std::string field;
+    // Fields after the name: state(3) ... utime(14) stime(15).
+    for (int i = 3; i <= 15 && rest >> field; ++i) {
+      if (i == 14) t.user = std::strtoull(field.c_str(), nullptr, 10);
+      if (i == 15) t.system = std::strtoull(field.c_str(), nullptr, 10);
+    }
+    out[std::atoi(entry.path().filename().c_str())] = t;
+  }
+#endif
+  return out;
+}
+
+std::string ThreadTimeDeltas(const std::map<int, ThreadTimes>& before,
+                             const std::map<int, ThreadTimes>& after) {
+  std::vector<std::pair<uint64_t, std::string>> rows;
+  for (const auto& [tid, a] : after) {
+    auto b = before.find(tid);
+    const uint64_t u = a.user - (b != before.end() ? b->second.user : 0);
+    const uint64_t k = a.system - (b != before.end() ? b->second.system : 0);
+    if (u + k == 0) continue;
+    rows.push_back({u + k, fmt::format("{} {} user {} ms / system {} ms", a.name, tid, u * 10, k * 10)});
+  }
+  std::sort(rows.rbegin(), rows.rend());
+  std::string out;
+  for (size_t i = 0; i < rows.size() && i < 6; ++i) out += (i ? "; " : "") + rows[i].second;
+  return out;
+}
+
+void WatchdogMain() {
+  rex::thread::set_current_thread_name("amped3 stall watch");
+  int stalls = 0, samples = 0;
+  int64_t stall_swap = -1;
+  std::map<int, ThreadTimes> baseline;
+  uint64_t base_calls = 0, base_pages = 0;
+  int tick = 0;
+  bool in_stall = false;
+  auto report = [&](const char* when) {
+    REXLOG_WARN("Stall watch: {}: CPU {}; write-watch faults {} ({} pages)", when,
+                ThreadTimeDeltas(baseline, ReadThreadTimes()), g_watch_calls.load() - base_calls,
+                g_watch_pages.load() - base_pages);
+  };
+  while (stalls < 12) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    const int64_t last = g_last_swap_ns.load();
+    if (!last) continue;
+    const double ms = double(SteadyNs() - last) * 1e-6;
+    if (ms < 250.0 || ms > 5000.0) {  // (longer: loading, a menu; not this)
+      if (in_stall) {
+        in_stall = false;
+        report("the stall's whole time");
+      }
+      // A fresh baseline about every 0.25 s, for the next stall.
+      if (++tick % 4 == 0) {
+        baseline = ReadThreadTimes();
+        base_calls = g_watch_calls.load();
+        base_pages = g_watch_pages.load();
+      }
+      continue;
+    }
+    if (last != stall_swap) {
+      if (in_stall) report("the stall's whole time");
+      stall_swap = last;
+      samples = 0;
+      ++stalls;
+      in_stall = true;
+    }
+    if (samples++ >= 1) continue;  // one snapshot per stall
+    REXLOG_WARN("Stall watch: no frame for {:.0f} ms; {}", ms,
+                amped3::diag::GuestThreadSnapshot(rex::system::kernel_state()));
+  }
+}
+
 void OnSwap(uint8_t* base, uint32_t front_buffer) {
+  g_last_swap_ns.store(SteadyNs());
+  std::call_once(g_watchdog_once, [] { std::thread(WatchdogMain).detach(); });
   // Switching the setting off and on again retries after a failure.
   if (!REXCVAR_GET(native_renderer)) g_failed = false;
   const bool enabled = Enabled();
@@ -1791,7 +2599,13 @@ void OnSwap(uint8_t* base, uint32_t front_buffer) {
       for (uint32_t i = 0; i < 10; ++i) words[i] = U32(base, front_buffer + 4 * i);
       std::copy(words.begin() + 4, words.end(), frame.swap_fetch.begin());
       frame.has_swap_fetch = true;
-      frame.swap_data = TextureName(frame.swap_fetch);
+      if (DeferredNaming()) {
+        g_frame->name_swap = true;
+        std::copy(frame.swap_fetch.begin(), frame.swap_fetch.end(),
+                  g_frame->swap_fetch_words.begin());
+      } else {
+        frame.swap_data = TextureName(*g_frame, frame.swap_fetch);
+      }
       frame.objects[front_buffer] = std::move(words);
     }
     g_frame->swap_time = std::chrono::steady_clock::now();
@@ -1815,7 +2629,11 @@ void OnSwap(uint8_t* base, uint32_t front_buffer) {
         if (IsGuestOutputExternal(presenter)) SetGuestOutputExternal(presenter, false);
       }
     }
-    if (enabled && !g_frame_overflow) {
+    if (DeferredNaming()) {
+      // The recorder thread names what is still queued, then hands the frame
+      // on (or drops it).
+      EnqueueEndOfFrame(std::move(g_frame), enabled && !g_frame_overflow);
+    } else if (enabled && !g_frame_overflow) {
       // To the prep thread (per-draw states), then the worker.
       HandOver(std::move(g_frame), g_prep_mutex, g_prep_cv, g_prep);
     }
@@ -1846,6 +2664,30 @@ Status GetStatus() {
   s.on = REXCVAR_GET(native_renderer);
   s.emulation_drawing = g_host_drawing_on.load();
   return s;
+}
+
+void OnRingBufferInitialized(uint8_t* base, uint32_t dev) {
+  if (!REXCVAR_GET(native_deferred_naming) || g_deferred) return;
+  auto* memory = GuestMemory();
+  const uint32_t fence = U32(base, dev + kGpuFencePointer);
+  if (!memory || !fence) return;
+  // The address the GPU stores the fence to: the physical address of the
+  // fence word (Direct3D computes it from the virtual one; both forms here).
+  g_fence_physical = memory->GetPhysicalAddress(fence);
+  g_fence_physical_alt = fence & 0x1FFFFFFF;
+  rex::system::SetGpuEventWriteHook(&OnGpuEventWrite);
+  g_deferred = true;
+  g_recorder_stop = false;
+  g_recorder = std::thread(RecorderMain);
+  REXLOG_INFO("Native renderer: deferred naming on (GPU fence word {:08X})", fence);
+}
+
+void BeforeCpuFenceStore(uint8_t* base, uint32_t dev) {
+  if (!g_deferred) return;
+  // sub_825A3330 stores the fence itself when the device's 20416 word is 0
+  // and flag 0x04 at +10433 is set: only then wait here.
+  if (U32(base, dev + 20416) != 0 || !(base[dev + 10433] & 0x04)) return;
+  WaitNamedThrough(U32(base, dev + kCpuFence));
 }
 
 }  // namespace amped3::live

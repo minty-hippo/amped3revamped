@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "vk.h"
+#include "cmd_stream.h"
 #include "xenos_shader.h"
 #include "xenos_texture.h"
 #include "upscaler.h"
@@ -108,6 +109,14 @@ struct Image {
   // A texture replacement (texture_replace.h): bigger than the guest's, with
   // its own mip chain, sampled with every level and linear filtering.
   bool replaced = false;
+  // A render target (GetTarget): draws never sample one directly.
+  bool target = false;
+  // The guest's sample count for a render target (1 sample here when MSAA is
+  // off: see "One sample for the guest's two" in DoDraw / DoResolve).
+  uint32_t guest_samples = 1;
+  // Draws into it that wrote every guest sample (DoResolve: a resolve of
+  // another sample is the same as one of sample 0 made since).
+  uint64_t full_draws = 0;
   // Memory from a shared block (Gpu::SubAllocate) instead of its own
   // allocation: the block's index and the range taken (-1: its own).
   int block = -1;
@@ -154,6 +163,9 @@ class Gpu {
   VkPhysicalDeviceProperties props{};
   VkPhysicalDeviceMemoryProperties mem_props{};
   VkCommandPool pool = VK_NULL_HANDLE;
+  // The frames' command buffers (recorded by the command stream's thread while
+  // the renderer allocates upload command buffers from `pool`).
+  VkCommandPool frame_pool = VK_NULL_HANDLE;
   bool anisotropy = false;
   bool bc_textures = false;  // textureCompressionBC enabled
   VkFormat d24s8 = VK_FORMAT_D24_UNORM_S8_UINT;
@@ -353,6 +365,7 @@ class Gpu {
     dci.ppEnabledExtensionNames = extensions.data();
     vk::Check(vk::vkCreateDevice(physical, &dci, nullptr, &device), "vkCreateDevice");
     vk::LoadDevice(device);
+    amped3::native::cmd::Install();  // command streams (cmd_stream.h)
     if (can_export) {
 #ifdef _WIN32
       get_memory_handle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
@@ -367,6 +380,7 @@ class Gpu {
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.queueFamilyIndex = family;
     vk::Check(vk::vkCreateCommandPool(device, &pci, nullptr, &pool), "vkCreateCommandPool");
+    vk::Check(vk::vkCreateCommandPool(device, &pci, nullptr, &frame_pool), "vkCreateCommandPool");
 
     VkFormatProperties fp;
     vk::vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
@@ -678,7 +692,12 @@ class Gpu {
     b = Buffer{};
   }
 
+  // Views destroyed since the renderer last looked (its cached texture
+  // descriptor sets must not use them again).
+  std::vector<VkImageView> destroyed_views;
+
   void DestroyImage(Image& im) {
+    if (im.sample_view) destroyed_views.push_back(im.sample_view);
     if (im.stencil_view) vk::vkDestroyImageView(device, im.stencil_view, nullptr);
     if (im.sample_view && im.sample_view != im.view) vk::vkDestroyImageView(device, im.sample_view, nullptr);
     if (im.view) vk::vkDestroyImageView(device, im.view, nullptr);
@@ -760,6 +779,7 @@ class Gpu {
     }
     blocks.clear();
     if (pool) vk::vkDestroyCommandPool(device, pool, nullptr);
+    if (frame_pool) vk::vkDestroyCommandPool(device, frame_pool, nullptr);
     vk::vkDestroyDevice(device, nullptr);
     if (instance) vk::vkDestroyInstance(instance, nullptr);
     device = VK_NULL_HANDLE;
@@ -771,9 +791,9 @@ class Gpu {
     return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
   }
 
-  VkCommandBuffer BeginCommands() {
+  VkCommandBuffer BeginCommands(VkCommandPool from = VK_NULL_HANDLE) {
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool;
+    ai.commandPool = from ? from : pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
     VkCommandBuffer cb;
@@ -784,23 +804,34 @@ class Gpu {
     return cb;
   }
 
-  // Submits without waiting; `fence` signals when done.
-  void SubmitFenced(VkCommandBuffer cb, VkFence fence) {
+  // Submits without waiting; `fence` signals when done. `first` (ended by
+  // the caller, may be null) runs before `cb`.
+  void SubmitFenced(VkCommandBuffer cb, VkFence fence, VkCommandBuffer first = VK_NULL_HANDLE) {
     vk::vkEndCommandBuffer(cb);
+    VkCommandBuffer cbs[2] = {first, cb};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
+    si.commandBufferCount = first ? 2 : 1;
+    si.pCommandBuffers = first ? cbs : &cbs[1];
     vk::Check(vk::vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
   }
 
-  void Submit(VkCommandBuffer cb) {
+  void Submit(VkCommandBuffer cb, VkCommandBuffer first = VK_NULL_HANDLE,
+              VkCommandPool cb_pool = VK_NULL_HANDLE) {
+    if (first) {
+      VkSubmitInfo fi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      fi.commandBufferCount = 1;
+      fi.pCommandBuffers = &first;
+      vk::Check(vk::vkQueueSubmit(queue, 1, &fi, VK_NULL_HANDLE), "vkQueueSubmit");
+      vk::Check(vk::vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+      vk::vkFreeCommandBuffers(device, pool, 1, &first);
+    }
     vk::vkEndCommandBuffer(cb);
     // Profiling the CPU side under a tool that can't run the driver's GPU
     // work (callgrind with SwiftShader): AMPED3_PROFILE_NO_SUBMIT=1 records
     // everything and submits nothing (the pictures are garbage).
     static const bool no_submit = std::getenv("AMPED3_PROFILE_NO_SUBMIT") != nullptr;
     if (no_submit) {
-      vk::vkFreeCommandBuffers(device, pool, 1, &cb);
+      vk::vkFreeCommandBuffers(device, cb_pool ? cb_pool : pool, 1, &cb);
       return;
     }
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -808,7 +839,7 @@ class Gpu {
     si.pCommandBuffers = &cb;
     vk::Check(vk::vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
     vk::Check(vk::vkQueueWaitIdle(queue), "vkQueueWaitIdle");
-    vk::vkFreeCommandBuffers(device, pool, 1, &cb);
+    vk::vkFreeCommandBuffers(device, cb_pool ? cb_pool : pool, 1, &cb);
   }
 };
 
@@ -1077,7 +1108,7 @@ struct Renderer::Impl {
     if (upscaler_) upscaler_status_ = upscaler_->description();
     cb_ = gpu_.BeginCommands();
     CreateOnce();
-    gpu_.Submit(cb_);
+    gpu_.Submit(cb_, TakeUploads());
     cb_ = VK_NULL_HANDLE;
   }
   ~Impl();
@@ -1095,10 +1126,37 @@ struct Renderer::Impl {
     std::vector<Image> retired;
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkCommandBuffer upload_cb = VK_NULL_HANDLE;  // ran before cb (texture uploads)
+    VkCommandPool cb_pool = VK_NULL_HANDLE;      // where cb came from
     bool pending = false;
     uint64_t ticket = 0;
     bool timed = false;  // GPU timestamps at the frame's start and end (ts_pool_)
+    // GPU time by part (part_pool_): the name of what ended at each timestamp
+    // after the first.
+    std::vector<std::string> part_names;
   };
+  // Texture uploads of the frame being recorded: their own command buffer,
+  // submitted before the frame's, so an upload never ends a render pass.
+  VkCommandBuffer upload_cb_ = VK_NULL_HANDLE;
+  VkCommandBuffer UploadCommands() {
+    if (!upload_cb_) upload_cb_ = gpu_.BeginCommands();
+    return upload_cb_;
+  }
+  // Ends the uploads (made visible to everything after); null if none.
+  VkCommandBuffer TakeUploads() {
+    VkCommandBuffer cb = upload_cb_;
+    upload_cb_ = VK_NULL_HANDLE;
+    if (cb) {
+      FullBarrier(cb);
+      vk::vkEndCommandBuffer(cb);
+    }
+    return cb;
+  }
+  VkQueryPool part_pool_ = VK_NULL_HANDLE;  // kMaxParts timestamps per slot
+  static constexpr uint32_t kMaxParts = 64;
+  FrameSlot* cur_slot_ = nullptr;           // the frame being recorded (async)
+  // Timestamp after what was recorded so far, named (outside a rendering scope).
+  void MarkPart(const std::string& name);
   FrameSlot slots_[2];
   VkQueryPool ts_pool_ = VK_NULL_HANDLE;  // two timestamps per slot
   uint32_t next_slot_ = 0;
@@ -1121,8 +1179,10 @@ struct Renderer::Impl {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
     vk::vkResetFences(gpu_.device, 1, &fs.fence);
-    vk::vkFreeCommandBuffers(gpu_.device, gpu_.pool, 1, &fs.cb);
+    vk::vkFreeCommandBuffers(gpu_.device, fs.cb_pool ? fs.cb_pool : gpu_.pool, 1, &fs.cb);
     fs.cb = VK_NULL_HANDLE;
+    if (fs.upload_cb) vk::vkFreeCommandBuffers(gpu_.device, gpu_.pool, 1, &fs.upload_cb);
+    fs.upload_cb = VK_NULL_HANDLE;
     fs.pending = false;
     for (auto& b : fs.staging) gpu_.DestroyBuffer(b);
     fs.staging.clear();
@@ -1161,7 +1221,7 @@ struct Renderer::Impl {
                        float lod_bias = 0.0f);
   VkPipeline PipelineFor(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
                          const std::vector<Image*>& colors, Image* depth, uint32_t color_mask_bits,
-                         bool velocity = false, bool mask = false);
+                         bool velocity = false, bool mask = false, bool reactive = false);
   void Prepass();
   void CreateOnce();
   void BeginFrame();
@@ -1240,7 +1300,25 @@ struct Renderer::Impl {
   // drawn in one: with an upscaler they'd otherwise stay at the 3D scale).
   // Whether a tiled pass is the scene is known once its lighting pass is
   // drawn, so it goes by the last frame.
-  float TargetScale() const { return tiling_.width ? tiled_scale_ : out_scale_; }
+  // The scale a render target is drawn at: the 3D scene's inside its tiled
+  // pass, else the output's. Screen-sized passes drawn before the scene
+  // (Amped 3's depth pre-pass, about 500 draws, blurred and sampled by the
+  // scene) are at the scene's scale too: the scene samples them at its own
+  // resolution, so drawing them at the output's (2x the scene's each way with
+  // an upscaler) only cost GPU time.
+  float TargetScale(const TargetKey& k) const {
+    if (tiling_.width) return tiled_scale_;
+    if (!scene_begun_ && last_frame_lit_ && last_tiling_.width && k.samples == 1 &&
+        k.pitch == last_tiling_.width) {
+      TargetKey hk = k;
+      hk.scale_id = 0;
+      auto h = target_heights_.find(hk);
+      if (h != target_heights_.end() && h->second == last_tiling_.height) return scale_;
+    }
+    return out_scale_;
+  }
+  bool scene_begun_ = false;  // this frame's tiled pass has begun
+  Tiling last_tiling_;        // the last tiled pass's area
   bool last_frame_lit_ = true;
   float tiled_scale_ = 1.0f;  // this tiled pass's, fixed at BeginTiling
   static uint32_t Scaled(uint32_t v, float s) { return uint32_t(std::lround(double(v) * s)); }
@@ -1267,18 +1345,39 @@ struct Renderer::Impl {
     std::string note;
   };
   std::unordered_map<uint64_t, TexLookup> frame_tex_lookup_;
-  // Texture descriptor sets this frame, by their contents.
+  // Texture descriptor sets by their contents (set, bindings, samplers,
+  // views), kept from frame to frame: most draws bind the same textures every
+  // frame, and writing a set costs far more than finding it. They live in a
+  // pool of their own. When a view one of them uses is destroyed, or the pool
+  // is full, all of them are dropped at once: the pool is retired (destroyed
+  // three frames later, when no frame in flight binds its sets any more) and
+  // a new one started.
   struct StringHash {
     using is_transparent = void;
     size_t operator()(std::string_view v) const { return std::hash<std::string_view>{}(v); }
   };
-  std::unordered_map<std::string, VkDescriptorSet, StringHash, std::equal_to<>> frame_tex_sets_;
+  std::unordered_map<std::string, VkDescriptorSet, StringHash, std::equal_to<>> tex_sets_;
+  std::unordered_set<VkImageView> tex_set_views_;  // views the cached sets use
+  VkDescriptorPool tex_set_pool_ = VK_NULL_HANDLE;
+  uint32_t tex_set_pool_left_ = 0;
+  struct RetiredPool {
+    uint64_t frame;
+    VkDescriptorPool pool;
+  };
+  std::vector<RetiredPool> retired_tex_set_pools_;
+  static constexpr uint32_t kTexSetPoolSets = 4096;
+  // The last set found for each of the two (draws in a row mostly bind the
+  // same textures: a compare instead of a hash lookup).
+  std::string last_tex_key_[2];
+  VkDescriptorSet last_tex_set_[2] = {};
+  void DropTextureSets();
   // Per-draw scratch (kept to avoid an allocation per draw).
   struct TexDesc {
     uint32_t set, binding;
     VkDescriptorImageInfo info;
   };
   std::vector<TexDesc> descs_scratch_;
+  VkDescriptorSet TextureSet(uint32_t set, const std::vector<TexDesc>& descs);
   std::vector<Image*> colors_scratch_;
   // Last shader looked up per stage (draws mostly repeat the previous one).
   std::string last_shader_stem_[2];
@@ -1397,6 +1496,18 @@ struct Renderer::Impl {
     *mapped = static_cast<uint8_t*>(own.mapped);
   }
   std::vector<Image> retired_images_;      // replaced during this frame
+  // DoResolve, one sample for the guest's two: the last resolve of sample 0
+  // into each destination (cleared each frame).
+  struct ResolveRecord {
+    const Image* src = nullptr;
+    uint64_t full_draws = 0;
+    uint32_t x = 0, y = 0, w = 0, h = 0;
+    bool operator==(const ResolveRecord& o) const {
+      return src == o.src && full_draws == o.full_draws && x == o.x && y == o.y && w == o.w &&
+             h == o.h;
+    }
+  };
+  std::unordered_map<const Image*, ResolveRecord> last_resolve_;
   std::map<uint32_t, Image> resolved_;          // masked base address -> image
   struct SpareKey {
     const void* set;
@@ -1467,7 +1578,7 @@ struct Renderer::Impl {
     kDepth = 0, kDepthMs = 1, kColorMs = 2, kOutput = 3, kOutputMs = 4, kMotionBlur = 5,
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
-    kClouds = 17
+    kClouds = 17, kReactiveMerge = 18, kReactiveView = 19
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1508,7 +1619,11 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[18] = {};  // by CopyKind
+  VkShaderModule copy_fs_[20] = {};  // by CopyKind
+  // Map clouds: one quad per puff (instanced), placed by its vertex shader,
+  // with push constants in both stages (a layout of their own).
+  VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
+  VkPipelineLayout clouds_layout_ = VK_NULL_HANDLE;
   // Output (DrawOutput): shared slots, the local image for readback, the
   // gamma table.
   struct OutputSlot {
@@ -1596,6 +1711,42 @@ struct Renderer::Impl {
   // z = 1 where an object's own motion is known).
   bool object_blur_ = false;
   bool scenery_blur_ = false;  // SetSceneryObjectBlur
+  // SetMergeClears: clears wait for the next pass on their image (its load
+  // op), or run inside the pass drawing to it.
+  bool merge_clears_ = true;
+  struct PendingClear {
+    bool color = false, depth = false, stencil = false;
+    float rgba[4] = {};
+    float z = 0;
+    uint32_t s = 0;
+    // Parts of the image so far (tiles resolved one after another, each
+    // cleared): a pass's load op takes it once they cover all of it.
+    std::vector<VkRect2D> rects;
+  };
+  // The barrier of a resolve reading `rect` of `src`: only clears waiting for
+  // that part of `src` are done first; the rest (other images, the other
+  // tiles of `src`) may go on waiting.
+  void ResolveBarrier(const Image* src, const VkRect2D& rect);
+  // Clears waiting for `src` (all of it, or the parts overlapping `rect`)
+  // and for `dst`; with no `src`, every one.
+  void FlushPendingClearsExcept(const Image* src, const VkRect2D* rect,
+                                const Image* dst = nullptr);
+  std::unordered_map<Image*, PendingClear> pending_clears_;
+  // A full barrier, after the clears still waiting (they come first).
+  void Barrier();
+  void FlushPendingClears();
+  // DoDraw's pass: clears waiting for other render targets may go on
+  // waiting (a draw samples textures and resolves, never a target).
+  bool keep_target_clears_ = false;
+  // The frame's commands recorded on another thread (SetParallelCommands).
+  amped3::native::cmd::Stream stream_;
+  bool parallel_commands_ = true;
+  // Does the waiting clears except render targets other than `but` / `but2`,
+  // which may go on waiting (into the next frame: its first pass on them
+  // takes them as load ops).
+  void FlushPendingClearsKeepTargets(const Image* but, const Image* but2);
+  void ClearImageNow(Image* im, const float* color, float z, uint32_t stencil, bool c, bool zf,
+                     bool s, const VkRect2D* rect);
   struct VelDraw {
     VkPipeline pipeline;
     VkDescriptorSet tex_sets[2];
@@ -1760,6 +1911,20 @@ struct Renderer::Impl {
     uint32_t rt_w, rt_h;
   };
   std::vector<MaskDraw> mask_draws_;
+  // FSR's reactive mask: the scene's blended draws that don't write depth
+  // (snow, particles, glows) drawn again into reactive_img_ at the upscale,
+  // so FSR leans on the current frame there instead of history (without it
+  // a falling flake left a trail: its pixels had no motion of their own).
+  std::vector<MaskDraw> reactive_draws_;
+  Image reactive_img_;      // this frame's blended draws
+  Image reactive_hist_[2];  // what FSR gets: with last frame's, carried along the motion
+  uint32_t reactive_flip_ = 0;
+  bool reactive_debug_ = false;  // show the mask over the (stretched) scene
+  void QueueReactive(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
+                     const VkDescriptorSet* tex_sets, const uint32_t* offsets, bool indexed,
+                     VkIndexType index_type, uint32_t first, uint32_t count, const VkRect2D& sc,
+                     const float* bias, uint32_t rt_w, uint32_t rt_h);
+  Image* DrawReactive(uint32_t w, uint32_t h, Image* motion);
   Image* mask_depth_ = nullptr;
   uint32_t post_light_draws_ = 0;  // scene draws after the lighting pass
   void DrawMasks(const MaskDraw* m, size_t n);
@@ -1775,10 +1940,10 @@ struct Renderer::Impl {
     if (!vel_resolved_) {
       // One sample per pixel for the blur: the samples' average.
       EndRendering();
-      FullBarrier(cb_);
+      Barrier();
       CopyPass(CopyKind::kColorMs, &vel_img_, &vel_single_, 0, false, 0, vel_img_.samples, 0, 0,
                0, 0, vel_img_.width, vel_img_.height);
-      FullBarrier(cb_);
+      Barrier();
       dyn_ = DynState{};
       vel_resolved_ = true;
     }
@@ -1938,7 +2103,7 @@ Image* Renderer::Impl::GetTarget(const TargetKey& base_key, bool resolve) {
   // Draws ask for the same few targets over and over: the last few answers
   // (images live as long as the renderer, never erased from targets_).
   if (!resolve) {
-    const uint32_t scale_id = uint32_t(std::lround(TargetScale() * 80.0f));
+    const uint32_t scale_id = uint32_t(std::lround(TargetScale(base_key) * 80.0f));
     for (auto& c : target_cache_) {
       if (c.image && c.scale_id == scale_id && c.key.depth == base_key.depth &&
           c.key.base == base_key.base && c.key.format == base_key.format &&
@@ -1962,7 +2127,7 @@ Image* Renderer::Impl::GetTarget(const TargetKey& base_key, bool resolve) {
 }
 
 Image* Renderer::Impl::GetTargetUncached(const TargetKey& base_key, bool resolve) {
-  float ts = TargetScale();
+  float ts = TargetScale(base_key);
   TargetKey key = base_key;
   key.scale_id = uint32_t(std::lround(ts * 80.0f));
   if (resolve) {
@@ -2025,15 +2190,18 @@ Image* Renderer::Impl::GetTargetUncached(const TargetKey& base_key, bool resolve
   im.scaled = true;
   im.scale = ts;
   ToGeneral(cb_, im);
+  im.target = true;
+  im.guest_samples = key.samples;
   Image& stored = targets_[key] = im;
+  pending_clears_.erase(&stored);
   const float zero[4] = {0, 0, 0, 0};
   ClearImage(&stored, zero, 0.0f, 0, !key.depth, key.depth, key.depth);
   log_ << "created " << name << "\n";
   return &stored;
 }
 
-void Renderer::Impl::ClearImage(Image* im, const float* color, float z, uint32_t stencil, bool c,
-                          bool zf, bool s, const VkRect2D* rect) {
+void Renderer::Impl::ClearImageNow(Image* im, const float* color, float z, uint32_t stencil,
+                                   bool c, bool zf, bool s, const VkRect2D* rect) {
   const bool was_rendering = rendering_;
   auto colors = cur_colors_;
   auto depth = cur_depth_;
@@ -2065,11 +2233,186 @@ void Renderer::Impl::ClearImage(Image* im, const float* color, float z, uint32_t
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &att;
   }
-  FullBarrier(cb_);
+  Barrier();  // clears still waiting for other images come first
   vk::vkCmdBeginRendering(cb_, &ri);
   vk::vkCmdEndRendering(cb_);
   FullBarrier(cb_);
+  ++stats_.clear_passes;
   if (was_rendering) BeginRendering(colors, depth);
+}
+
+void Renderer::Impl::ClearImage(Image* im, const float* color, float z, uint32_t stencil, bool c,
+                                bool zf, bool s, const VkRect2D* rect) {
+  if (!merge_clears_) return ClearImageNow(im, color, z, stencil, c, zf, s, rect);
+  if (im->depth ? !(zf || s) : !c) return;
+  // Inside the pass drawing to it: cleared there, the pass goes on.
+  if (rendering_) {
+    int index = -1;
+    if (im->depth) {
+      if (cur_depth_ == im) index = 0;
+    } else {
+      for (size_t i = 0; i < cur_colors_.size(); ++i) {
+        if (cur_colors_[i] == im) index = int(i);
+      }
+    }
+    if (index >= 0) {
+      VkClearAttachment ca{};
+      if (im->depth) {
+        ca.aspectMask = (zf ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) | (s ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        ca.clearValue.depthStencil = {z, stencil};
+      } else {
+        ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ca.colorAttachment = uint32_t(index);
+        for (int i = 0; i < 4; ++i) ca.clearValue.color.float32[i] = color[i];
+      }
+      uint32_t w = UINT32_MAX, h = UINT32_MAX;  // the pass's area
+      for (Image* c_im : cur_colors_) w = std::min(w, c_im->width), h = std::min(h, c_im->height);
+      if (cur_depth_) w = std::min(w, cur_depth_->width), h = std::min(h, cur_depth_->height);
+      VkClearRect cr{};
+      cr.rect = rect ? *rect : VkRect2D{{0, 0}, {w, h}};
+      cr.rect.offset.x = std::min<int32_t>(cr.rect.offset.x, int32_t(w));
+      cr.rect.offset.y = std::min<int32_t>(cr.rect.offset.y, int32_t(h));
+      cr.rect.extent.width = std::min(cr.rect.extent.width, w - uint32_t(cr.rect.offset.x));
+      cr.rect.extent.height = std::min(cr.rect.extent.height, h - uint32_t(cr.rect.offset.y));
+      cr.layerCount = 1;
+      // The pass may not cover all of the image (another attachment is
+      // smaller): then as before.
+      const bool covers = rect || (w == im->width && h == im->height);
+      if (covers && cr.rect.extent.width && cr.rect.extent.height) {
+        vk::vkCmdClearAttachments(cb_, 1, &ca, 1, &cr);
+        ++stats_.clears_in_pass;
+        return;
+      }
+      if (covers) return;  // an empty rectangle
+    }
+  }
+  // All of the image: waits for the next pass on it (its load op clears).
+  const bool whole = !rect || (rect->offset.x == 0 && rect->offset.y == 0 &&
+                               rect->extent.width >= im->width && rect->extent.height >= im->height);
+  if (!whole) {
+    // A part: collected while the same clear covers the image part by part
+    // (EDRAM tiles), else done now.
+    auto it = pending_clears_.find(im);
+    const bool same =
+        it != pending_clears_.end() && !it->second.rects.empty() &&
+        (im->depth ? (it->second.depth == zf && it->second.stencil == s &&
+                      (!zf || it->second.z == z) && (!s || it->second.s == stencil))
+                   : (it->second.color && std::equal(color, color + 4, it->second.rgba)));
+    if (it != pending_clears_.end() && !same) FlushPendingClears();  // in order
+    if (it == pending_clears_.end() || !same) {
+      PendingClear p;
+      if (im->depth) {
+        p.depth = zf, p.z = z, p.stencil = s, p.s = stencil;
+      } else {
+        p.color = true;
+        std::copy(color, color + 4, p.rgba);
+      }
+      p.rects.push_back(*rect);
+      pending_clears_[im] = std::move(p);
+      return;
+    }
+    PendingClear& p = it->second;
+    p.rects.push_back(*rect);
+    // Covered: every cell between the rectangles' edges inside one of them.
+    std::vector<int64_t> xs = {0, int64_t(im->width)}, ys = {0, int64_t(im->height)};
+    for (const VkRect2D& r : p.rects) {
+      xs.push_back(r.offset.x), xs.push_back(int64_t(r.offset.x) + r.extent.width);
+      ys.push_back(r.offset.y), ys.push_back(int64_t(r.offset.y) + r.extent.height);
+    }
+    std::sort(xs.begin(), xs.end());
+    std::sort(ys.begin(), ys.end());
+    bool covered = true;
+    for (size_t i = 0; covered && i + 1 < xs.size(); ++i) {
+      if (xs[i] == xs[i + 1] || xs[i] >= int64_t(im->width)) continue;
+      for (size_t j = 0; covered && j + 1 < ys.size(); ++j) {
+        if (ys[j] == ys[j + 1] || ys[j] >= int64_t(im->height)) continue;
+        const int64_t cx = xs[i], cy = ys[j];
+        bool in = false;
+        for (const VkRect2D& r : p.rects) {
+          if (cx >= r.offset.x && cx < int64_t(r.offset.x) + r.extent.width && cy >= r.offset.y &&
+              cy < int64_t(r.offset.y) + r.extent.height) {
+            in = true;
+            break;
+          }
+        }
+        covered = in;
+      }
+    }
+    if (covered) p.rects.clear();  // all of it now
+    return;
+  }
+  if (auto it = pending_clears_.find(im); it != pending_clears_.end() && !it->second.rects.empty()) {
+    FlushPendingClears();  // parts of an earlier clear first
+  }
+  PendingClear& p = pending_clears_[im];
+  if (im->depth) {
+    if (zf) p.depth = true, p.z = z;
+    if (s) p.stencil = true, p.s = stencil;
+  } else {
+    p.color = true;
+    for (int i = 0; i < 4; ++i) p.rgba[i] = color[i];
+  }
+}
+
+void Renderer::Impl::FlushPendingClears() { FlushPendingClearsExcept(nullptr, nullptr); }
+
+void Renderer::Impl::FlushPendingClearsExcept(const Image* src, const VkRect2D* rect,
+                                              const Image* dst) {
+  if (pending_clears_.empty()) return;
+  auto pending = std::move(pending_clears_);
+  pending_clears_.clear();
+  auto overlaps = [](const VkRect2D& a, const VkRect2D& b) {
+    return int64_t(a.offset.x) < int64_t(b.offset.x) + b.extent.width &&
+           int64_t(b.offset.x) < int64_t(a.offset.x) + a.extent.width &&
+           int64_t(a.offset.y) < int64_t(b.offset.y) + b.extent.height &&
+           int64_t(b.offset.y) < int64_t(a.offset.y) + a.extent.height;
+  };
+  for (auto& [im, p] : pending) {
+    // What isn't read or written keeps waiting: other images, and parts of
+    // the source outside the rectangle read.
+    const bool keep =
+        src && im != dst &&
+        (im != src || (rect && !p.rects.empty() &&
+                       std::none_of(p.rects.begin(), p.rects.end(),
+                                    [&](const VkRect2D& r) { return overlaps(r, *rect); })));
+    if (keep) {
+      pending_clears_[im] = std::move(p);
+      continue;
+    }
+    if (p.rects.empty()) {
+      ClearImageNow(im, p.rgba, p.z, p.s, p.color, p.depth, p.stencil, nullptr);
+    } else {
+      for (const VkRect2D& r : p.rects) {
+        ClearImageNow(im, p.rgba, p.z, p.s, p.color, p.depth, p.stencil, &r);
+      }
+    }
+  }
+}
+
+void Renderer::Impl::FlushPendingClearsKeepTargets(const Image* but, const Image* but2) {
+  if (pending_clears_.empty()) return;
+  std::unordered_map<Image*, PendingClear> keep;
+  for (auto it = pending_clears_.begin(); it != pending_clears_.end();) {
+    Image* im = it->first;
+    if (im->target && im != but && im != but2) {
+      keep.emplace(im, std::move(it->second));
+      it = pending_clears_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  FlushPendingClears();
+  pending_clears_ = std::move(keep);
+}
+
+void Renderer::Impl::ResolveBarrier(const Image* src, const VkRect2D& rect) {
+  FlushPendingClearsExcept(src, &rect);
+  FullBarrier(cb_);
+}
+
+void Renderer::Impl::Barrier() {
+  FlushPendingClears();
+  FullBarrier(cb_);
 }
 
 void Renderer::Impl::BeginRendering(const std::vector<Image*>& colors, Image* depth) {
@@ -2096,15 +2439,66 @@ void Renderer::Impl::BeginRendering(const std::vector<Image*>& colors, Image* de
     w = std::min(w, depth->width);
     h = std::min(h, depth->height);
   }
+  VkRenderingAttachmentInfo satt = datt;  // stencil: its own load op
+  // Clears waiting for these images become their load ops (when the pass
+  // covers all of the image); the rest are done first, by Barrier.
+  if (!pending_clears_.empty()) {
+    for (size_t i = 0; i < colors.size(); ++i) {
+      auto it = pending_clears_.find(colors[i]);
+      if (it == pending_clears_.end() || !it->second.rects.empty() || colors[i]->width != w ||
+          colors[i]->height != h) {
+        continue;
+      }
+      atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      for (int c = 0; c < 4; ++c) atts[i].clearValue.color.float32[c] = it->second.rgba[c];
+      pending_clears_.erase(it);
+      ++stats_.clears_merged;
+    }
+    if (depth && depth->width == w && depth->height == h) {
+      auto it = pending_clears_.find(depth);
+      if (it != pending_clears_.end() && it->second.rects.empty()) {
+        if (it->second.depth) {
+          datt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          datt.clearValue.depthStencil = {it->second.z, it->second.s};
+        }
+        if (it->second.stencil) {
+          satt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          satt.clearValue.depthStencil = {it->second.z, it->second.s};
+        }
+        pending_clears_.erase(it);
+        ++stats_.clears_merged;
+      }
+    }
+  }
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
   ri.renderArea = {{0, 0}, {w, h}};
   ri.layerCount = 1;
   ri.colorAttachmentCount = uint32_t(atts.size());
   ri.pColorAttachments = atts.data();
   ri.pDepthAttachment = depth ? &datt : nullptr;
-  ri.pStencilAttachment = depth ? &datt : nullptr;
-  FullBarrier(cb_);
+  ri.pStencilAttachment = depth ? &satt : nullptr;
+  if (keep_target_clears_ && !pending_clears_.empty()) {
+    // Done now: those for this pass's attachments (not taken as load ops) and
+    // for anything that isn't a render target. (Only color attachments are
+    // in `colors`; the depth one is checked by the helper's second image.)
+    for (Image* c : colors) {
+      if (auto it = pending_clears_.find(c); it != pending_clears_.end()) {
+        auto one = std::move(*it);
+        pending_clears_.erase(it);
+        auto rest = std::move(pending_clears_);
+        pending_clears_.clear();
+        pending_clears_.insert(std::move(one));
+        FlushPendingClears();
+        pending_clears_ = std::move(rest);
+      }
+    }
+    FlushPendingClearsKeepTargets(depth, nullptr);
+    FullBarrier(cb_);
+  } else {
+    Barrier();
+  }
   vk::vkCmdBeginRendering(cb_, &ri);
+  ++stats_.passes;
   rendering_ = true;
   cur_colors_ = colors;
   cur_depth_ = depth;
@@ -2199,17 +2593,25 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
     auto sit = resolved_.find(tex_base);
     if (sit != resolved_.end()) {
       Image* scene = &sit->second;
+      // GPU time by part: each effect on its own (they run once a frame, at
+      // the composite's first draw).
+      EndRendering();
+      MarkPart("scene done (resolves)");
       if (fog) {
         if (Image* fogged = FoggedScene(scene)) scene = fogged;
+        MarkPart("effect: fog / god rays");
       }
       if (blur) {
         if (Image* blurred = BlurredScene(scene)) scene = blurred;
+        MarkPart("effect: motion blur");
       }
       if (radial) {
         if (Image* streaked = RadialScene(scene)) scene = streaked;
+        MarkPart("effect: speed blur");
       }
       if (upscaler_) {
         if (Image* up = UpscaledScene(scene)) scene = up;
+        MarkPart("effect: upscaler");
       }
       if (scene != &sit->second) return scene;
     }
@@ -2304,15 +2706,14 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
     regions.push_back(region);
     at += levels[i].rgba.size();
   }
-  const bool was_rendering = rendering_;
-  auto colors = cur_colors_;
-  auto depth = cur_depth_;
-  if (rendering_) EndRendering();
-  ToGeneral(cb_, im);
-  vk::vkCmdCopyBufferToImage(cb_, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
-                             uint32_t(regions.size()), regions.data());
-  FullBarrier(cb_);
-  if (was_rendering) BeginRendering(colors, depth);
+  // In the uploads command buffer (runs before the frame's): the render pass
+  // in progress goes on.
+  {
+    VkCommandBuffer ucb = UploadCommands();
+    ToGeneral(ucb, im);
+    vk::vkCmdCopyBufferToImage(ucb, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
+                               uint32_t(regions.size()), regions.data());
+  }
   // A texture whose contents changed (video frames) replaces its previous
   // version right away instead of keeping one image per frame until they
   // expire: same fetch constant name ("tex_<fetch hash>"), same words.
@@ -2392,15 +2793,14 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
     regions.push_back(region);
     at += rep.levels[i].rgba.size();
   }
-  const bool was_rendering = rendering_;
-  auto colors = cur_colors_;
-  auto depth = cur_depth_;
-  if (rendering_) EndRendering();
-  ToGeneral(cb_, im);
-  vk::vkCmdCopyBufferToImage(cb_, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
-                             uint32_t(regions.size()), regions.data());
-  FullBarrier(cb_);
-  if (was_rendering) BeginRendering(colors, depth);
+  // In the uploads command buffer (runs before the frame's): the render pass
+  // in progress goes on.
+  {
+    VkCommandBuffer ucb = UploadCommands();
+    ToGeneral(ucb, im);
+    vk::vkCmdCopyBufferToImage(ucb, upload_buffer, im.image, VK_IMAGE_LAYOUT_GENERAL,
+                               uint32_t(regions.size()), regions.data());
+  }
   CachedTexture& cached = textures_[key];
   cached.image = im;
   cached.last_used = frame_number_;
@@ -2417,7 +2817,8 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
 
 VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const Shader& vs,
                                  const Shader& ps, const std::vector<Image*>& colors, Image* depth,
-                                 uint32_t color_mask_bits, bool velocity, bool mask) {
+                                 uint32_t color_mask_bits, bool velocity, bool mask,
+                                 bool reactive) {
   const uint32_t mode = st.reg(0x2205);        // PA_SU_SC_MODE_CNTL
   const uint32_t depth_ctl = st.reg(0x2200);   // RB_DEPTHCONTROL
   uint32_t blend[4] = {st.reg(0x2201), st.reg(0x2209), st.reg(0x220A), st.reg(0x220B)};
@@ -2480,6 +2881,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   if (diag_range) put(0x44494147u);
   if (velocity) put(0x56454Cu);
   if (mask) put(0x4D41534Bu);
+  if (reactive) put(0x52454143u);
   const std::string_view key(key_buf, std::min(key_len, sizeof(key_buf)));
   last_pipeline_pending_ = false;
   auto it = pipelines_.find(key);
@@ -2586,6 +2988,19 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       // The velocity image's w = 1 (builtin_exempt).
       a.blendEnable = VK_FALSE;
       a.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
+    }
+    if (reactive) {
+      // The upscaler's reactive mask (R8): how much the draw adds to the
+      // pixel, roughly: its red output scaled as the game scales its color
+      // (alpha for alpha blending, one for additive), summed (saturating).
+      a.blendEnable = VK_TRUE;
+      a.srcColorBlendFactor = BlendFactor(b & 31);
+      a.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+      a.colorBlendOp = VK_BLEND_OP_ADD;
+      a.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      a.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      a.alphaBlendOp = VK_BLEND_OP_ADD;
+      a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     }
   }
   auto& cbs = build->cbs;
@@ -3072,6 +3487,9 @@ void Renderer::Impl::CreateOnce() {
   pli.pushConstantRangeCount = 1;
   pli.pPushConstantRanges = &pcr;
   vk::Check(vk::vkCreatePipelineLayout(dev, &pli, nullptr, &copy_layout_), "copy pipeline layout");
+  VkPushConstantRange clouds_pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+  pli.pPushConstantRanges = &clouds_pcr;
+  vk::Check(vk::vkCreatePipelineLayout(dev, &pli, nullptr, &clouds_layout_), "clouds pipeline layout");
   copy_vs_ = CompileBuiltin("builtin_fullscreen", R"(#version 450
 void main() {
   vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
@@ -3580,14 +3998,128 @@ void main() {
   // = 1; procedural look-alikes until the game has used it) covering the
   // screen, dispersing from the middle outward as a.x goes 0 -> 1: each
   // drifts off away from the middle, growing and turning a little, and fades
-  // at the end. Units: screen heights (y down).
-  copy_fs_[17] = CompileBuiltin("builtin_clouds", R"(#version 450
+  // at the end. Units: screen heights (y down). One instanced quad per puff
+  // (b.x columns, rows by the sprite), drawn in order and blended "over",
+  // which composes them as one layer would: each pixel only pays for the
+  // puffs on it (it used to test every puff, which an ARM GPU took 50 ms
+  // a frame over).
+  const char* clouds_common = R"(
 layout(push_constant) uniform Clouds {
   vec4 a;  // progress 0..1, aspect (w / h), 1 / height, sprite (1) or not (0)
+  vec4 b;  // columns
 } pc;
-layout(binding = 2) uniform sampler2D sprite;
-layout(location = 0) out vec4 o;
 float hash(float n) { return fract(sin(n) * 43758.5453); }
+)";
+  clouds_vs_ = CompileBuiltin("builtin_clouds_vs", std::string(R"(#version 450
+)") + clouds_common + R"(
+layout(location = 0) flat out vec4 v_puff;   // position (screen heights), radius, fade
+layout(location = 1) flat out vec3 v_turn;   // angle, mirrored (1) or not, id
+void main() {
+  bool textured = pc.a.w > 0.5;
+  float aspect = pc.a.y;
+  float p = pc.a.x;
+  int cols = int(pc.b.x);
+  int r = gl_InstanceIndex / cols, c = gl_InstanceIndex - r * cols;
+  float spacing = textured ? 0.14 : 0.2, R = textured ? 0.115 : 0.165;
+  vec2 center = vec2(aspect * 0.5, 0.5);
+  float far = length(center) + 0.2;
+  float id = float(r * 64 + c) + 1.0;
+  vec2 base = vec2((float(c) - 0.5 + ((r & 1) == 1 ? 0.5 : 0.0)) * spacing,
+                   (float(r) - 0.5) * spacing * 0.9);
+  base += (vec2(hash(id), hash(id + 17.0)) - 0.5) * spacing * 0.25;
+  vec2 away = base - center;
+  float dn = clamp(length(away) / far, 0.0, 1.0);
+  // The middle parts first, the edges last; moving off at once, then
+  // speeding up.
+  float s = 0.35 * dn + 0.05 * hash(id + 5.0);
+  float q = clamp((p - s) / (1.0 - s), 0.0, 1.0);
+  float e = q * q * 0.6 + q * 0.4;
+  vec2 dir = length(away) > 1e-3 ? normalize(away) : vec2(0.0, -1.0);
+  float size = 0.92 + 0.22 * hash(id + 31.0);
+  float scale = size * (1.0 + 0.45 * e);
+  vec2 pos = base + dir * e * (textured ? 0.45 + 0.35 * aspect : 0.8 + 0.6 * aspect) +
+             vec2(0.0, -0.15) * e;
+  float fade = 1.0 - smoothstep(0.75, 1.0, q);
+  float radius = R * scale;
+  // Turned a little (more as it goes, away from the middle), and mirrored
+  // for half of them (textured).
+  float ang = (hash(id + 3.0) - 0.5) * 0.6 + e * sign(dir.x + 1e-3) * 0.5;
+  v_puff = vec4(pos, radius, fade);
+  v_turn = vec3(ang, hash(id + 11.0) > 0.5 ? 1.0 : 0.0, id);
+  // The quad around it: the shape test's reach, sqrt(2.6) radii, plus a
+  // pixel for the edge's anti-aliasing. Faded out: nothing to draw.
+  int k = gl_VertexIndex;
+  vec2 corner = vec2((k == 1 || k == 2 || k == 4) ? 1.0 : -1.0,
+                     (k == 2 || k == 4 || k == 5) ? 1.0 : -1.0);
+  vec2 at = pos + corner * (radius * 1.6125 + 2.0 * pc.a.z);
+  gl_Position = fade > 0.0 ? vec4(at.x / aspect * 2.0 - 1.0, at.y * 2.0 - 1.0, 0.0, 1.0)
+                           : vec4(2.0, 2.0, 2.0, 1.0);
+}
+)", false);
+  // FSR's reactive mask: this frame's (binding 0) and last frame's (1) at
+  // where this pixel was (motion vectors, 2: render pixels, this -> last),
+  // the largest of a 3x3 there (flakes move a little of their own), fading
+// 15% a frame; this frame's widened by a pixel, small things in it (flakes)
+// made nearly all-or-nothing.
+  copy_fs_[18] = CompileBuiltin("builtin_reactive_merge", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D cur;
+layout(set = 0, binding = 1) uniform sampler2D last;
+layout(set = 0, binding = 2) uniform sampler2D motion;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  ivec2 lim = textureSize(cur, 0) - 1;
+  // This frame's: a pixel around each flake too (its edge, half covered at
+  // the render size, and the output pixels around it), and nearly all-or-
+  // nothing: FSR keeps history in proportion to what's left, so a faint or
+  // half-covered flake pixel kept a faint trail.
+  float c = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      float v = texelFetch(cur, clamp(p + ivec2(x, y), ivec2(0), lim), 0).r;
+      c = max(c, (x == 0 && y == 0) ? v : v * 0.8);
+    }
+  }
+  // Small things (flakes: little around them three pixels out) go nearly
+  // all-or-nothing; broad soft ones (a spray cloud, a glow) keep their own
+  // strength, or FSR would drop its history over a whole area.
+  float ring = 0.0;
+  for (int i = 0; i < 8; ++i) {
+    ivec2 o8 = ivec2(i < 3 ? -3 : i < 5 ? 0 : 3, i % 3 == 0 ? -3 : i % 3 == 1 ? 0 : 3);
+    if (i == 3) o8 = ivec2(0, -3);
+    if (i == 4) o8 = ivec2(0, 3);
+    ring = max(ring, texelFetch(cur, clamp(p + o8, ivec2(0), lim), 0).r);
+  }
+  float r = max(min(c * 1.5, 1.0), smoothstep(0.01, 0.12, c - ring));
+  vec2 mv = texelFetch(motion, p, 0).xy;
+  ivec2 q = ivec2(floor(vec2(p) + 0.5 + mv));
+  float h = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      h = max(h, texelFetch(last, clamp(q + ivec2(x, y), ivec2(0), lim), 0).r);
+    }
+  }
+  o = vec4(max(r, h * 0.85), 0.0, 0.0, 1.0);
+}
+)", true);
+  copy_fs_[19] = CompileBuiltin("builtin_reactive_view", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D mask;
+layout(push_constant) uniform View { vec2 inv_size; } pc;  // 1 / output size
+layout(location = 0) out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.inv_size;
+  vec3 c = texture(scene, uv).rgb;
+  float r = texelFetch(mask, ivec2(uv * vec2(textureSize(mask, 0))), 0).r;
+  o = vec4(mix(c * 0.6, vec3(1.0, 0.0, 0.0), r), 1.0);
+}
+)", true);
+  copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
+)") + clouds_common + R"(
+layout(binding = 2) uniform sampler2D sprite;
+layout(location = 0) flat in vec4 v_puff;
+layout(location = 1) flat in vec3 v_turn;
+layout(location = 0) out vec4 o;
 // Signed distance to a puff (shape units, about 1 across): a body and six
 // bumps around it.
 float Puff(vec2 q, float id) {
@@ -3603,68 +4135,33 @@ float Puff(vec2 q, float id) {
 void main() {
   float px = pc.a.z;
   vec2 uv = gl_FragCoord.xy * px;
-  float aspect = pc.a.y;
   bool textured = pc.a.w > 0.5;
-  vec2 center = vec2(aspect * 0.5, 0.5);
-  float p = pc.a.x;
   float line = 0.0055;   // outline width (procedural)
-  // Textured: smaller and more of them, the size the pause menu draws them.
-  float spacing = textured ? 0.14 : 0.2, R = textured ? 0.115 : 0.165;
-  int rows = textured ? 10 : 7;
-  int cols = int(ceil(aspect / spacing)) + 2;
-  vec3 col = vec3(0.0);  // premultiplied
-  float alpha = 0.0;
-  float far = length(center) + 0.2;
-  for (int r = 0; r < rows; ++r) {
-    for (int c = 0; c < cols; ++c) {
-      float id = float(r * 64 + c) + 1.0;
-      vec2 base = vec2((float(c) - 0.5 + ((r & 1) == 1 ? 0.5 : 0.0)) * spacing,
-                       (float(r) - 0.5) * spacing * 0.9);
-      base += (vec2(hash(id), hash(id + 17.0)) - 0.5) * spacing * 0.25;
-      vec2 away = base - center;
-      float dn = clamp(length(away) / far, 0.0, 1.0);
-      // The middle parts first, the edges last; moving off at once, then
-      // speeding up.
-      float s = 0.35 * dn + 0.05 * hash(id + 5.0);
-      float q = clamp((p - s) / (1.0 - s), 0.0, 1.0);
-      float e = q * q * 0.6 + q * 0.4;
-      vec2 dir = length(away) > 1e-3 ? normalize(away) : vec2(0.0, -1.0);
-      float size = 0.92 + 0.22 * hash(id + 31.0);
-      float scale = size * (1.0 + 0.45 * e);
-      vec2 pos = base + dir * e * (textured ? 0.45 + 0.35 * aspect : 0.8 + 0.6 * aspect) +
-                 vec2(0.0, -0.15) * e;
-      vec2 local = (uv - pos) / (R * scale);
-      if (dot(local, local) > 2.6) continue;
-      float fade = 1.0 - smoothstep(0.75, 1.0, q);
-      vec3 pc_col;
-      float cover;
-      if (textured) {
-        // Turned a little (more as it goes, away from the middle), and
-        // mirrored for half of them.
-        float ang = (hash(id + 3.0) - 0.5) * 0.6 + e * sign(dir.x + 1e-3) * 0.5;
-        vec2 l = mat2(cos(ang), -sin(ang), sin(ang), cos(ang)) * local;
-        if (hash(id + 11.0) > 0.5) l.x = -l.x;
-        vec2 suv = l / 2.3 + 0.5;
-        if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) continue;
-        vec4 t = textureLod(sprite, suv, 0.0);
-        cover = t.a;
-        pc_col = t.rgb;
-      } else {
-        float d = Puff(local, id) * R * scale;  // screen heights
-        cover = clamp(0.5 - d / px, 0.0, 1.0);
-        // White, a touch blue toward the bottom, with a dark outline.
-        vec3 fill = mix(vec3(1.0), vec3(0.86, 0.9, 0.98), clamp(local.y * 0.45 + 0.35, 0.0, 1.0) * 0.6);
-        float edge = clamp(0.5 + (d + line) / px, 0.0, 1.0);
-        pc_col = mix(fill, vec3(0.06, 0.06, 0.08), edge);
-      }
-      cover *= fade;
-      if (cover <= 0.0) continue;
-      col = pc_col * cover + col * (1.0 - cover);
-      alpha = cover + alpha * (1.0 - cover);
-    }
+  vec2 local = (uv - v_puff.xy) / v_puff.z;
+  if (dot(local, local) > 2.6) discard;
+  float id = v_turn.z;
+  vec3 col;
+  float cover;
+  if (textured) {
+    float ang = v_turn.x;
+    vec2 l = mat2(cos(ang), -sin(ang), sin(ang), cos(ang)) * local;
+    if (v_turn.y > 0.5) l.x = -l.x;
+    vec2 suv = l / 2.3 + 0.5;
+    if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) discard;
+    vec4 t = textureLod(sprite, suv, 0.0);
+    cover = t.a;
+    col = t.rgb;
+  } else {
+    float d = Puff(local, id) * v_puff.z;  // screen heights
+    cover = clamp(0.5 - d / px, 0.0, 1.0);
+    // White, a touch blue toward the bottom, with a dark outline.
+    vec3 fill = mix(vec3(1.0), vec3(0.86, 0.9, 0.98), clamp(local.y * 0.45 + 0.35, 0.0, 1.0) * 0.6);
+    float edge = clamp(0.5 + (d + line) / px, 0.0, 1.0);
+    col = mix(fill, vec3(0.06, 0.06, 0.08), edge);
   }
-  if (alpha <= 0.0) discard;
-  o = vec4(col / max(alpha, 1e-4), alpha);
+  cover *= v_puff.w;
+  if (cover <= 0.0) discard;
+  o = vec4(col, cover);
 }
 )", true);
   // Step 2: the largest motion in each tile (tile = the longest half blur),
@@ -3820,8 +4317,18 @@ void Renderer::Impl::BeginFrame() {
   } else {
     vk::vkResetDescriptorPool(dev, pool_, 0);
   }
-  frame_tex_sets_.clear();
   frame_tex_lookup_.clear();
+  // Texture set pools retired 3+ frames ago: no frame in flight binds their
+  // sets now.
+  for (size_t i = 0; i < retired_tex_set_pools_.size();) {
+    if (frame_number_ >= retired_tex_set_pools_[i].frame + 3) {
+      vk::vkDestroyDescriptorPool(dev, retired_tex_set_pools_[i].pool, nullptr);
+      retired_tex_set_pools_[i] = retired_tex_set_pools_.back();
+      retired_tex_set_pools_.pop_back();
+    } else {
+      ++i;
+    }
+  }
   // Object motion (blur, upscaler) adds up to a system block and a constant
   // block a draw.
   const VkDeviceSize uniform_bytes =
@@ -3998,7 +4505,7 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = copy_vs_;
+    stages[0].module = kind == CopyKind::kClouds ? clouds_vs_ : copy_vs_;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = copy_fs_[int(kind)];
@@ -4046,7 +4553,7 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
     pci.pDepthStencilState = &ds;
     pci.pColorBlendState = &cbs;
     pci.pDynamicState = &dy;
-    pci.layout = copy_layout_;
+    pci.layout = kind == CopyKind::kClouds ? clouds_layout_ : copy_layout_;
     vk::Check(vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p),
               "copy pipeline");
   }
@@ -4190,7 +4697,7 @@ Image* Renderer::Impl::BlurredScene(Image* scene) {
   ensure(nmax_img_, tw, th, VK_FORMAT_R16G16B16A16_SFLOAT, "motion_neighbours");
   blur_img_.scaled = scene->scaled;
   blur_img_.scale = scene->scale;  // sampled like the scene (tex_scale)
-  FullBarrier(cb_);
+  Barrier();
   Image* vel = object_blur_ || vel_mask_ ? Velocities() : nullptr;
   float pc[32] = {};
   for (int c = 0; c < 4; ++c) {
@@ -4407,7 +4914,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   ensure(fog_img_, w, h, scene->format, "fog", false);
   fog_img_.scaled = scene->scaled;
   fog_img_.scale = scene->scale;
-  FullBarrier(cb_);
+  Barrier();
   float sun_uv[2];
   float sun_visible = 0.0f;
   const bool sun_seen = SunOnScreen(sun_uv, &sun_visible) && sun_visible >= 1.0f;
@@ -4419,7 +4926,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   FullscreenPass(CopyKind::kFogColor, &fog_color_img_[cur], scene, depth, &fog_color_img_[prev],
                  false, pc0, 8);
   fog_color_cur_ = cur;
-  FullBarrier(cb_);
+  Barrier();
   Image* out = scene;
   // 2: the fog.
   if (fog_density_ > 0.0f) {
@@ -4446,7 +4953,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
     pc[29] = 1.0f / float(w);
     pc[30] = 1.0f / float(h);
     FullscreenPass(CopyKind::kFog, &fog_img_, scene, depth, &fog_color_img_[cur], true, pc, 32);
-    FullBarrier(cb_);
+    Barrier();
     out = &fog_img_;
     ++stats_.fogged;
   }
@@ -4463,19 +4970,19 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
     ensure(rays_out_img_, w, h, scene->format, "god_rays", false);
     rays_out_img_.scaled = scene->scaled;
     rays_out_img_.scale = scene->scale;
-    FullBarrier(cb_);
+    Barrier();
     float m[8] = {sun_uv[0], sun_uv[1], float(w) / float(h), 0.35f,
                   1.0f / float(hw), 1.0f / float(hh), 0, 0};
     FullscreenPass(CopyKind::kRayMask, &ray_mask_img_, scene, depth, nullptr, true, m, 8);
-    FullBarrier(cb_);
+    Barrier();
     float b[8] = {sun_uv[0], sun_uv[1], 0.9f, 0.965f, 1.0f / float(hw), 1.0f / float(hh), 0, 0};
     FullscreenPass(CopyKind::kRayBlur, &ray_img_, &ray_mask_img_, nullptr, nullptr, true, b, 8);
-    FullBarrier(cb_);
+    Barrier();
     float a[8] = {3.0f * rays_strength_ * sun_visible * fog_presence_, 1.0f / float(w),
                   1.0f / float(h), float(w) / float(h), sun_uv[0], sun_uv[1], 0, 0};
     // The rays (half size) filtered in binding 0; the scene point-sampled.
     FullscreenPass(CopyKind::kRayAdd, &rays_out_img_, &ray_img_, out, nullptr, true, a, 8);
-    FullBarrier(cb_);
+    Barrier();
     out = &rays_out_img_;
     ++stats_.god_rays;
   }
@@ -4497,7 +5004,7 @@ Image* Renderer::Impl::RadialScene(Image* scene) {
   }
   radial_img_.scaled = scene->scaled;
   radial_img_.scale = scene->scale;
-  FullBarrier(cb_);
+  Barrier();
   const float amount = std::clamp(speed_amount_, 0.0f, 1.0f) * speed_strength_;
   float pc[8] = {speed_center_[0], speed_center_[1],
                  0.08f * amount,  // up to 8% of the way to the center
@@ -4508,7 +5015,7 @@ Image* Renderer::Impl::RadialScene(Image* scene) {
                  0.55f - 0.05f * std::min(amount, 1.0f), 1.0f, 1.0f / float(w),
                  1.0f / float(h)};
   FullscreenPass(CopyKind::kRadialBlur, &radial_img_, scene, nullptr, nullptr, true, pc, 8);
-  FullBarrier(cb_);
+  Barrier();
   dyn_ = DynState{};
   ++stats_.speed_blurred;
   return &radial_img_;
@@ -4578,7 +5085,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   ensure(up_out_, ow, oh, out_format, "upscaled", true);
   up_out_.scaled = true;
   up_out_.scale = out_scale_;
-  FullBarrier(cb_);
+  Barrier();
 
   // Motion vectors (none, and a reset, without last frame's camera).
   const bool have_prev = prev_valid_;
@@ -4637,6 +5144,8 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   in.color = image(*src);
   in.depth = image(*depth);
   in.motion = image(mv_img_);
+  Image* reactive = DrawReactive(rw, rh, &mv_img_);
+  if (reactive) in.reactive = image(*reactive);
   in.output = image(up_out_);
   in.render_width = rw;
   in.render_height = rh;
@@ -4653,11 +5162,16 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   Transition(*src, gen, ro);
   Transition(*depth, gen, ro);
   Transition(mv_img_, gen, ro);
+  if (reactive) Transition(*reactive, gen, ro);
+  // The upscaler records into the command buffer itself: everything before
+  // it first.
+  if (stream_.active()) stream_.Drain();
   const bool ok = upscaler_->Dispatch(cb_, in, &error);
   Transition(*src, ro, gen);
   Transition(*depth, ro, gen);
   Transition(mv_img_, ro, gen);
-  FullBarrier(cb_);
+  if (reactive) Transition(*reactive, ro, gen);
+  Barrier();
   dyn_ = DynState{};
   if (!ok) {
     upscaler_status_ = error;
@@ -4666,6 +5180,13 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
     return nullptr;
   }
   up_reset_ = false;
+  if (reactive_debug_ && reactive) {
+    // Diagnostics: the scene stretched (not upscaled), red where the mask
+    // tells FSR to trust this frame.
+    const float view_pc[2] = {1.0f / float(up_out_.width), 1.0f / float(up_out_.height)};
+    FullscreenPass(CopyKind::kReactiveView, &up_out_, src, reactive, nullptr, true, view_pc, 2);
+    dyn_ = DynState{};
+  }
   up_result_ = &up_out_;
   return up_result_;
 }
@@ -4674,6 +5195,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
 // missing ones the dummy image; binding 0 filtered when `linear0`).
 void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image* b1, Image* b2,
                                     bool linear0, const float* pc, uint32_t floats) {
+  FlushPendingClears();  // what it reads or writes may have a clear waiting
   VkPipeline p = CopyPipeline(kind, dst->format);
   VkDescriptorSet set;
   VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -4715,12 +5237,18 @@ void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image*
   vk::vkCmdSetScissor(cb_, 0, 1, &sc);
   vk::vkCmdDraw(cb_, 3, 1, 0, 0);
   vk::vkCmdEndRendering(cb_);
-  FullBarrier(cb_);
+  Barrier();
 }
 
 void Renderer::Impl::CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode,
                               bool float_depth, uint32_t first, uint32_t count, uint32_t sx0,
                               uint32_t sy0, uint32_t dx0, uint32_t dy0, uint32_t w, uint32_t h) {
+  {
+    // What it reads or writes may have a clear waiting (not the source's
+    // other tiles).
+    const VkRect2D read{{int32_t(sx0), int32_t(sy0)}, {w, h}};
+    FlushPendingClearsExcept(src, &read, dst);
+  }
   VkPipeline p = CopyPipeline(kind, dst->format);
   VkDescriptorSet set;
   VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -4762,6 +5290,15 @@ void Renderer::Impl::CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mo
   vk::vkCmdEndRendering(cb_);
 }
 
+void Renderer::Impl::MarkPart(const std::string& name) {
+  FrameSlot* fs = cur_slot_;
+  if (!fs || !fs->timed || !part_pool_ || rendering_) return;
+  if (fs->part_names.size() + 1 >= kMaxParts) return;
+  const uint32_t q = uint32_t(fs - slots_) * kMaxParts + uint32_t(fs->part_names.size()) + 1;
+  vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, part_pool_, q);
+  fs->part_names.push_back(name);
+}
+
 void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
   // Object motion: the scene pass's draws are done once a resolve follows the
   // characters (drawn after the lighting); later resolves may clear the depth.
@@ -4775,6 +5312,7 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
   }
   EndRendering();
   const uint32_t source = r.flags & 7;
+
   const uint32_t surface = r.targets[0];
   Image* src = nullptr;
   if (source == 4) {
@@ -4783,6 +5321,9 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     const uint32_t infos[4] = {r.targets[1], r.targets[3], r.targets[4], r.targets[5]};
     src = GetTarget(ColorKey(surface, infos[source & 3]), true);
   }
+  // GPU time by part: what drew into it, and which of the frame's parts this
+  // is (a surface drawn to more than once a frame shows each time apart).
+  MarkPart(src->name + " #" + std::to_string(cur_slot_ ? cur_slot_->part_names.size() + 1 : 0));
   amped3::native::TextureFetch dest;
   std::memcpy(dest.words, r.dest_raw.data(), sizeof(dest.words));
   const uint32_t base = dest.base_address() & 0x1FFFFFFF;
@@ -4798,7 +5339,14 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
   } else {
     auto pit = resolved_packed_.find(base);  // overwritten by color
     if (pit != resolved_packed_.end()) {
-      Retire(pit->second);
+      // Kept aside, not destroyed: games resolve depth and then color to the
+      // same address every frame (a new image each frame also dropped the
+      // cached texture descriptor sets: TextureSet).
+      const Image old = pit->second;
+      SpareResolve& spare =
+          spare_resolves_[{&resolved_packed_, base, old.width, old.height, old.format}];
+      if (spare.image.image) Retire(spare.image);
+      spare = {old, frame_number_};
       resolved_packed_.erase(pit);
     }
   }
@@ -4840,8 +5388,25 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     first_sample = first * scale;
     sample_count = count * scale;
   }
-  if (w && h) {
-    FullBarrier(cb_);
+  // One sample for the guest's two (see DoDraw): a resolve of guest samples
+  // other than 0 copies what sample 0 held before the draws that wrote it
+  // alone. When this destination already got sample 0 of the same source
+  // and rectangle, with no draw to every sample since, it holds exactly that:
+  // the copy is skipped (copying now would bring the sample-0 lighting into
+  // the sample-1 layer).
+  bool skip_copy = false;
+  if (src->samples == 1 && src->guest_samples > 1) {
+    const uint32_t sel = (r.flags >> 4) & 7;
+    const bool sample0 = sel == 0 || sel == 1 || sel == 5 || sel == 7;
+    const ResolveRecord rec{src, src->full_draws, sx0, sy0, w, h};
+    auto& last = last_resolve_[dst];
+    if (!sample0 && last == rec) skip_copy = true;
+    if (sample0) last = rec;
+  }
+  if (w && h && !skip_copy) {
+    // (clears waiting for the other tiles of the source may wait on)
+    const VkRect2D read{{int32_t(sx0), int32_t(sy0)}, {w, h}};
+    ResolveBarrier(src, read);
     if (source == 4) {
       // Depth -> R32F, and the raw words -> 8_8_8_8, through a fragment shader
       // (multisampled depth: the first resolved sample, depth isn't averaged).
@@ -4861,7 +5426,7 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
       vk::vkCmdCopyImage(cb_, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image,
                          VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     }
-    FullBarrier(cb_);
+    ResolveBarrier(src, read);
   }
   // Clear after resolve, of the resolved rectangle only (with EDRAM tiling
   // this clears one tile; here all tiles share one full-size image).
@@ -4875,6 +5440,85 @@ void Renderer::Impl::DoResolve(const Resolve& r, uint32_t number) {
     Image* d = GetTarget(DepthKey(surface, r.targets[2]), true);
     ClearImage(d, r.clear_rgba, r.clear_z, 0, false, true, true, &clear_rect);
   }
+}
+
+void Renderer::Impl::DropTextureSets() {
+  if (tex_set_pool_) retired_tex_set_pools_.push_back({frame_number_, tex_set_pool_});
+  tex_set_pool_ = VK_NULL_HANDLE;
+  tex_set_pool_left_ = 0;
+  tex_sets_.clear();
+  tex_set_views_.clear();
+  for (int i = 0; i < 2; ++i) {
+    last_tex_key_[i].clear();
+    last_tex_set_[i] = VK_NULL_HANDLE;
+  }
+}
+
+VkDescriptorSet Renderer::Impl::TextureSet(uint32_t set, const std::vector<TexDesc>& descs) {
+  // A view a cached set uses was destroyed: none of them can be trusted.
+  if (!gpu_.destroyed_views.empty()) {
+    for (VkImageView v : gpu_.destroyed_views) {
+      if (tex_set_views_.count(v)) {
+        DropTextureSets();
+        ++stats_.texture_set_resets;
+        break;
+      }
+    }
+    gpu_.destroyed_views.clear();
+  }
+  char key_buf[1 + 16 * (4 + 2 * sizeof(void*))];
+  size_t key_len = 0;
+  key_buf[key_len++] = char(set);
+  for (const auto& td : descs) {
+    if (td.set != set || key_len + 4 + 2 * sizeof(void*) > sizeof(key_buf)) continue;
+    std::memcpy(key_buf + key_len, &td.binding, 4);
+    std::memcpy(key_buf + key_len + 4, &td.info.sampler, sizeof(void*));
+    std::memcpy(key_buf + key_len + 4 + sizeof(void*), &td.info.imageView, sizeof(void*));
+    key_len += 4 + 2 * sizeof(void*);
+  }
+  const std::string_view key(key_buf, key_len);
+  if (last_tex_set_[set - 2] && key == last_tex_key_[set - 2]) return last_tex_set_[set - 2];
+  auto it = tex_sets_.find(key);
+  if (it != tex_sets_.end()) {
+    last_tex_key_[set - 2].assign(key);
+    return last_tex_set_[set - 2] = it->second;
+  }
+  if (!tex_set_pool_left_) {
+    DropTextureSets();
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTexSetPoolSets * 16};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = kTexSetPoolSets;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &size;
+    vk::Check(vk::vkCreateDescriptorPool(gpu_.device, &dpi, nullptr, &tex_set_pool_),
+              "texture set pool");
+    tex_set_pool_left_ = kTexSetPoolSets;
+  }
+  VkDescriptorSet ds;
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = tex_set_pool_;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &set_layouts_[set];
+  vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &ds), "texture set");
+  --tex_set_pool_left_;
+  VkWriteDescriptorSet writes[16];
+  uint32_t n = 0;
+  for (const auto& td : descs) {
+    if (td.set != set || n >= 16) continue;
+    VkWriteDescriptorSet& w = writes[n++];
+    w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = ds;
+    w.dstBinding = td.binding;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &td.info;
+    tex_set_views_.insert(td.info.imageView);
+  }
+  if (n) vk::vkUpdateDescriptorSets(gpu_.device, n, writes, 0, nullptr);
+  ++stats_.texture_sets_written;
+  tex_sets_.emplace(std::string(key), ds);
+  last_tex_key_[set - 2].assign(key);
+  return last_tex_set_[set - 2] = ds;
 }
 
 void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
@@ -4938,6 +5582,27 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   if (colors.empty() && !depth) {
     Skip(number, "no render target");
     return;
+  }
+  // One sample for the guest's two (MSAA off): the one sample stands for
+  // guest sample 0. Amped 3 uses its two samples as two layers for the
+  // scene's lighting: it resolves sample 0, lights sample 0 alone
+  // (PA_SC_AA_MASK 0x1111), resolves sample 1, lights sample 1 alone
+  // (0x2222), and the final resolve averages the two. Without MSAA both
+  // samples hold the same scene, so both lit layers are the same: drawing
+  // only the sample-0 pass (and skipping the resolve of sample 1, see
+  // DoResolve) gives the average exactly. Drawing both lit the scene twice
+  // (much darker).
+  {
+    Image* att = colors.empty() ? depth : colors[0];
+    if (att->samples == 1 && att->guest_samples > 1) {
+      const uint32_t all = (1u << std::min(att->guest_samples, 4u)) - 1;
+      const uint32_t aa_mask = st.reg(0x2312) & all;
+      if (!(aa_mask & 1u)) return;  // other samples only
+      if (aa_mask == all) {
+        for (Image* c : colors) ++c->full_draws;
+        if (depth) ++depth->full_draws;
+      }
+    }
   }
 
   mark(1);
@@ -5081,7 +5746,10 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // Multisampled: alpha to coverage, and alpha tests that cut (greater /
   // greater-equal), as a sample mask from the shader (smooth, anti-aliased
   // foliage edges instead of the hardware's few coverage steps).
-  if (att0->samples > 1 && smooth_alpha_ &&
+  // One sample for the guest's two: the same, dithered over neighbouring
+  // pixels instead of samples (the upscaler's accumulation smooths it), so
+  // foliage edges and the camera fade match the multisampled look.
+  if ((att0->samples > 1 || att0->guest_samples > 1) && smooth_alpha_ &&
       ((colorctl & 0x10) || ((colorctl & 8) && ((colorctl & 7) == 4 || (colorctl & 7) == 6)))) {
     sys.flags |= 8192u | (std::min(att0->samples, 31u) << 16) | (((colorctl >> 24) & 0xFF) << 21);
     if (colorctl & 0x10) sys.flags |= 256u;  // alpha to mask
@@ -5090,6 +5758,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // in view. Only alpha-to-coverage surfaces: the terrain and riders use a
     // plain alpha test.
     if (foliage_fade_ && tiling_.width && (colorctl & 0x10)) sys.flags |= 1u << 29;
+    // One sample per pixel: the dither's per-frame phase (the shader).
+    if (att0->samples == 1) sys.flags |= uint32_t(frame_number_ & 3) << 30;
   }
   sys.rt_inv_size[0] = 1.0f / float(rt_w);
   sys.rt_inv_size[1] = 1.0f / float(rt_h);
@@ -5185,45 +5855,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
 
   mark(4);
   // Texture sets, shared by draws binding the same textures and samplers
-  // (allocated per frame from the pool, reset in BeginFrame).
-  VkDescriptorSet tex_sets[2] = {};
-  for (uint32_t set = 2; set < 4; ++set) {
-    char key_buf[1 + 16 * (4 + 2 * sizeof(void*))];
-    size_t key_len = 0;
-    key_buf[key_len++] = char(set);
-    for (const auto& td : descs) {
-      if (td.set != set || key_len + 4 + 2 * sizeof(void*) > sizeof(key_buf)) continue;
-      std::memcpy(key_buf + key_len, &td.binding, 4);
-      std::memcpy(key_buf + key_len + 4, &td.info.sampler, sizeof(void*));
-      std::memcpy(key_buf + key_len + 4 + sizeof(void*), &td.info.imageView, sizeof(void*));
-      key_len += 4 + 2 * sizeof(void*);
-    }
-    const std::string_view key(key_buf, key_len);
-    auto set_it = frame_tex_sets_.find(key);
-    if (set_it == frame_tex_sets_.end()) set_it = frame_tex_sets_.emplace(std::string(key), VK_NULL_HANDLE).first;
-    VkDescriptorSet& cached = set_it->second;
-    if (!cached) {
-      VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-      ai.descriptorPool = pool_;
-      ai.descriptorSetCount = 1;
-      ai.pSetLayouts = &set_layouts_[set];
-      vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &cached), "texture set");
-      VkWriteDescriptorSet writes[16];
-      uint32_t n = 0;
-      for (const auto& td : descs) {
-        if (td.set != set || n >= 16) continue;
-        VkWriteDescriptorSet& w = writes[n++];
-        w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet = cached;
-        w.dstBinding = td.binding;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo = &td.info;
-      }
-      if (n) vk::vkUpdateDescriptorSets(gpu_.device, n, writes, 0, nullptr);
-    }
-    tex_sets[set - 2] = cached;
-  }
+  // (cached from frame to frame: TextureSet).
+  VkDescriptorSet tex_sets[2] = {TextureSet(2, descs), TextureSet(3, descs)};
 
   mark(5);
   // Indices (host-converted to 32-bit). Quad lists become triangle lists.
@@ -5349,7 +5982,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   }
 
   mark(6);
+  keep_target_clears_ = true;
   BeginRendering(colors, depth);
+  keep_target_clears_ = false;
   // Commands only for state that differs from the previous draw in this
   // render pass (each Vulkan call costs driver time; draws mostly repeat).
   DynState& ds = dyn_;
@@ -5633,20 +6268,96 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // (shader pair below: meshes drawn after the characters) and their
   // labels (quads from user data written into the scene with depth, as the
   // game draws in-world text; its soft particles don't write depth).
-  auto ends_with = [](const std::string& a, const char* b) {
-    const size_t n = std::strlen(b);
-    return a.size() >= n && a.compare(a.size() - n, n, b) == 0;
-  };
-  const bool icon_mesh = ends_with(d.vs, "6DA245E02A477C07") && ends_with(d.ps, "2C0355A9D2589300");
+  // By microcode hash (the stems' hex part), as the live recorder names
+  // microcode by short aliases.
+  const bool icon_mesh = vs->info.ucode_hash == 0x6DA245E02A477C07ull &&
+                         ps->info.ucode_hash == 0x2C0355A9D2589300ull;
   const bool label = !d.up_vertices.empty() && d.prim == 13 && (depth_ctl & 6) == 6;
   if (light_seen_ && tiling_.width && ps->info.ucode_hash != kLightingPixelShader) {
     ++post_light_draws_;
+    const uint32_t blend0 = st.reg(0x2201);
+    const bool blended = (blend0 & 0x1FFF1FFF) != 0x00010001;
+    const bool writes_depth = depth && (depth_ctl & 6) == 6;
+    if (upscaler_ && blended && !writes_depth && (mask_bits & 7) && max_draws_ == UINT32_MAX) {
+      QueueReactive(d, st, *vs, *ps, tex_sets, offsets, indexed, index_type, first_index,
+                    index_count, sc, bias, rt_w, rt_h);
+    }
   }
   if (blur_scale_ > 0.0f && depth && tiling_.width && max_draws_ == UINT32_MAX &&
       (icon_mesh || label) && (depth_ctl & 6) == 6 && !ps->info.writes_depth) {
     MaskExempt(d, st, *vs, *ps, depth, tex_sets, offsets, indexed, index_type, first_index,
                index_count, sc, bias, rt_w, rt_h);
   }
+}
+
+void Renderer::Impl::QueueReactive(const Draw& d, const GpuState& st, const Shader& vs,
+                                   const Shader& ps, const VkDescriptorSet* tex_sets,
+                                   const uint32_t* offsets, bool indexed, VkIndexType index_type,
+                                   uint32_t first, uint32_t count, const VkRect2D& sc,
+                                   const float* bias, uint32_t rt_w, uint32_t rt_h) {
+  // The pipeline's format and sample count only (the image comes later).
+  static Image proto = [] {
+    Image im;
+    im.format = VK_FORMAT_R8_UNORM;
+    return im;
+  }();
+  std::vector<Image*> colors{&proto};
+  VkPipeline p = PipelineFor(d, st, vs, ps, colors, nullptr, 0x1, false, false, true);
+  if (!p) return;
+  MaskDraw m{};
+  m.pipeline = p;
+  m.tex_sets[0] = tex_sets[0];
+  m.tex_sets[1] = tex_sets[1];
+  std::memcpy(m.offsets, offsets, sizeof(m.offsets));
+  m.indexed = indexed;
+  m.index_type = index_type;
+  m.index_buffer = cur_index_buffer_;
+  m.first = first;
+  m.count = indexed ? count : d.count;
+  m.scissor = sc;
+  m.bias[0] = bias[0];
+  m.bias[1] = bias[1];
+  m.rt_w = rt_w;
+  m.rt_h = rt_h;
+  reactive_draws_.push_back(m);
+}
+
+// The reactive mask for the upscale (null: no blended draws this frame or
+// last). A flake's trail is where it was: FSR's history there still holds
+// the flake, reprojected with the scenery's motion, while this frame shows
+// scenery (reactive 0), and over textured scenery its history clamp doesn't
+// catch it (over the plain sky it did). So the mask is this frame's draws
+// and last frame's mask carried along the motion vectors (fading).
+Image* Renderer::Impl::DrawReactive(uint32_t w, uint32_t h, Image* motion) {
+  const bool had_last = reactive_hist_[0].image != nullptr;
+  if (reactive_draws_.empty() && !had_last) return nullptr;
+  EndRendering();
+  const float zero[4] = {0, 0, 0, 0};
+  auto ensure = [&](Image& im, const char* name) {
+    if (im.image && im.width == w && im.height == h) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, name);
+    ToGeneral(cb_, im);
+    ClearImage(&im, zero, 0.0f, 0, true, false, false);
+  };
+  ensure(reactive_img_, "reactive");
+  ensure(reactive_hist_[0], "reactive_a");
+  ensure(reactive_hist_[1], "reactive_b");
+  ClearImage(&reactive_img_, zero, 0.0f, 0, true, false, false);
+  if (!reactive_draws_.empty()) {
+    std::vector<Image*> colors{&reactive_img_};
+    BeginRendering(colors, nullptr);
+    DrawMasks(reactive_draws_.data(), reactive_draws_.size());
+    EndRendering();
+    reactive_draws_.clear();
+  }
+  Barrier();
+  Image* out = &reactive_hist_[reactive_flip_ & 1];
+  Image* last = &reactive_hist_[(reactive_flip_ + 1) & 1];
+  ++reactive_flip_;
+  FullscreenPass(CopyKind::kReactiveMerge, out, &reactive_img_, last, motion, false, nullptr, 0);
+  dyn_ = DynState{};
+  return out;
 }
 
 // The velocity image, sized and sampled like the scene's depth.
@@ -5884,7 +6595,7 @@ void Renderer::Impl::DrawVelocities() {
   vel_draws_.clear();
   mask_draws_.clear();
   vel_depth_ = depth;
-  FullBarrier(cb_);
+  Barrier();
   dyn_ = DynState{};
   vel_ready_ = true;
   vel_resolved_ = false;
@@ -5903,7 +6614,7 @@ Image Renderer::Impl::Downsample(Image* im) {
   vk::Check(vk::vkCreateDescriptorPool(gpu_.device, &dpi, nullptr, &pool_), "readback pool");
   cb_ = gpu_.BeginCommands();
   ToGeneral(cb_, tmp);
-  FullBarrier(cb_);
+  Barrier();
   const uint32_t scale = std::max(im->sample_scale, 1u);
   if (im->depth) {
     CopyPass(CopyKind::kDepthMs, im, &tmp, 0, false, 0, 1, 0, 0, 0, 0, im->width, im->height);
@@ -5911,8 +6622,8 @@ Image Renderer::Impl::Downsample(Image* im) {
     CopyPass(CopyKind::kColorMs, im, &tmp, 0, false, 0, im->samples / scale * scale, 0, 0, 0, 0,
              im->width, im->height);
   }
-  FullBarrier(cb_);
-  gpu_.Submit(cb_);
+  Barrier();
+  gpu_.Submit(cb_, TakeUploads());
   cb_ = VK_NULL_HANDLE;
   vk::vkDestroyDescriptorPool(gpu_.device, pool_, nullptr);
   pool_ = frame_pool;
@@ -6153,7 +6864,7 @@ void Renderer::Impl::UploadCloudSprite() {
   region.imageExtent = {kCloudSpriteSize, kCloudSpriteSize, 1};
   ToGeneral(cb_, cloud_sprite_);
   vk::vkCmdCopyBufferToImage(cb_, buffer, cloud_sprite_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-  FullBarrier(cb_);
+  Barrier();
   cloud_sprite_pending_.clear();
 }
 
@@ -6314,7 +7025,7 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {256, 1, 1};
-    FullBarrier(cb_);
+    Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, lut_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     staging_.push_back(staging);
   }
@@ -6322,7 +7033,7 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
   // from the other device this way).
   ToGeneral(cb_, *dst);
   UploadCloudSprite();
-  FullBarrier(cb_);
+  Barrier();
 
   // Map clouds: their state this frame; while they close in on leaving the
   // map, its last frame is shown (already through the gamma table) instead.
@@ -6383,9 +7094,19 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
   if (clouds) {
     vk::vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           CopyPipeline(CopyKind::kClouds, dst->format));
-    const float cpc[4] = {cloud_p_, float(w) / float(h), 1.0f / float(h), sprite ? 1.0f : 0.0f};
-    vk::vkCmdPushConstants(cb_, copy_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(cpc), cpc);
-    vk::vkCmdDraw(cb_, 3, 1, 0, 0);
+    vk::vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, clouds_layout_, 0, 1, &set,
+                                0, nullptr);
+    // The puffs' grid (as the shader lays it out): rows by the sprite,
+    // columns across the width.
+    const float aspect = float(w) / float(h);
+    const int rows = sprite ? 10 : 7;
+    const int cols = int(std::ceil(aspect / (sprite ? 0.14f : 0.2f))) + 2;
+    const float cpc[8] = {cloud_p_, aspect, 1.0f / float(h), sprite ? 1.0f : 0.0f,
+                          float(cols), 0.0f, 0.0f, 0.0f};
+    vk::vkCmdPushConstants(cb_, clouds_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(cpc), cpc);
+    vk::vkCmdDraw(cb_, 6, uint32_t(rows * cols), 0, 0);
   }
   vk::vkCmdEndRendering(cb_);
   dyn_ = DynState{};  // all of it: a new pass or command buffer binds nothing yet
@@ -6397,14 +7118,14 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
       cloud_held_ = gpu_.CreateImage(w, h, VK_FORMAT_A2B10G10R10_UNORM_PACK32, false, "map_held");
       ToGeneral(cb_, cloud_held_);
     }
-    FullBarrier(cb_);
+    Barrier();
     VkImageCopy cr{};
     cr.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     cr.dstSubresource = cr.srcSubresource;
     cr.extent = {w, h, 1};
     vk::vkCmdCopyImage(cb_, dst->image, VK_IMAGE_LAYOUT_GENERAL, cloud_held_.image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &cr);
-    FullBarrier(cb_);
+    Barrier();
     cloud_held_valid_ = true;
   }
 
@@ -6428,14 +7149,14 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
       gpu_.DestroyBuffer(*readback);
       *readback = gpu_.CreateBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, /*cached=*/true);
     }
-    FullBarrier(cb_);
+    Barrier();
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {w, h, 1};
     vk::vkCmdCopyImageToBuffer(cb_, dst->image, VK_IMAGE_LAYOUT_GENERAL, readback->buffer, 1,
                                &region);
   }
-  FullBarrier(cb_);
+  Barrier();
   if (info) {
     *info = OutputInfo{};
     info->width = w;
@@ -6457,7 +7178,7 @@ bool Renderer::Impl::DrawOutput(Image* src, const uint8_t* lut, bool share, uint
   if (!pool_) return false;
   cb_ = gpu_.BeginCommands();
   const bool ok = RecordOutput(src, lut, share, slot, info, share ? nullptr : &out_readback_);
-  gpu_.Submit(cb_);
+  gpu_.Submit(cb_, TakeUploads());
   cb_ = VK_NULL_HANDLE;
   for (auto& b : staging_) gpu_.DestroyBuffer(b);
   staging_.clear();
@@ -6470,6 +7191,7 @@ bool Renderer::Impl::DrawOutput(Image* src, const uint8_t* lut, bool share, uint
 }
 
 Renderer::Impl::~Impl() {
+  if (stream_.active()) stream_.End();  // a frame left unfinished (an error)
   if (!gpu_.device) return;
   StopPipelineBuilders();
   if (cache_save_.valid()) cache_save_.wait();
@@ -6520,6 +7242,9 @@ Renderer::Impl::~Impl() {
   }
   if (vel_ps_.module) vk::vkDestroyShaderModule(dev, vel_ps_.module, nullptr);
   if (exempt_ps_.module) vk::vkDestroyShaderModule(dev, exempt_ps_.module, nullptr);
+  gpu_.DestroyImage(reactive_img_);
+  gpu_.DestroyImage(reactive_hist_[0]);
+  gpu_.DestroyImage(reactive_hist_[1]);
   gpu_.DestroyBuffer(out_readback_);
   gpu_.DestroyImage(dummy_);
   gpu_.DestroyImage(cloud_sprite_);
@@ -6547,8 +7272,12 @@ Renderer::Impl::~Impl() {
     if (m) vk::vkDestroyShaderModule(dev, m, nullptr);
   }
   if (pool_) vk::vkDestroyDescriptorPool(dev, pool_, nullptr);
+  if (tex_set_pool_) vk::vkDestroyDescriptorPool(dev, tex_set_pool_, nullptr);
+  for (auto& r : retired_tex_set_pools_) vk::vkDestroyDescriptorPool(dev, r.pool, nullptr);
   if (layout_) vk::vkDestroyPipelineLayout(dev, layout_, nullptr);
   if (copy_layout_) vk::vkDestroyPipelineLayout(dev, copy_layout_, nullptr);
+  if (clouds_layout_) vk::vkDestroyPipelineLayout(dev, clouds_layout_, nullptr);
+  if (clouds_vs_) vk::vkDestroyShaderModule(dev, clouds_vs_, nullptr);
   for (auto& l : set_layouts_) {
     if (l) vk::vkDestroyDescriptorSetLayout(dev, l, nullptr);
   }
@@ -6587,6 +7316,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   final_ = nullptr;
   tiling_ = {};
   light_seen_ = false;
+  scene_begun_ = false;
+  last_resolve_.clear();
   blur_done_ = false;
   composite_seen_ = false;
   max_draws_ = max_draws;
@@ -6611,6 +7342,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   mask_draws_.clear();
   mask_depth_ = nullptr;
   post_light_draws_ = 0;
+  reactive_draws_.clear();
   using Clock = std::chrono::steady_clock;
   auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -6621,7 +7353,13 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   CollectPipelines();
   pipeline_sync_ms_ = 0;
   Prepass();
-  cb_ = gpu_.BeginCommands();
+  // The frame's commands: recorded on the command stream's thread (from a
+  // pool of their own) while this one prepares the next draws.
+  if (stream_.active()) stream_.End();  // the last frame stopped by an error
+  const bool streamed = parallel_commands_;
+  const VkCommandPool cb_pool = streamed ? gpu_.frame_pool : gpu_.pool;
+  cb_ = gpu_.BeginCommands(cb_pool);
+  if (streamed) stream_.Begin(cb_);
   // GPU time of the frame (the F3 overlay): timestamps at its start and end.
   if (fs) {
     fs->timed = false;
@@ -6640,7 +7378,26 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
       vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool_, q);
       fs->timed = true;
     }
+    // The parts: a timestamp at the start, then one after each part.
+    fs->part_names.clear();
+    if (ts_pool_ && !part_pool_) {
+      VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      qi.queryCount = 2 * kMaxParts;
+      if (vk::vkCreateQueryPool(gpu_.device, &qi, nullptr, &part_pool_) != VK_SUCCESS) {
+        part_pool_ = VK_NULL_HANDLE;
+      }
+    }
+    if (part_pool_ && fs->timed) {
+      const uint32_t q = uint32_t(fs - slots_) * kMaxParts;
+      vk::vkCmdResetQueryPool(cb_, part_pool_, q, kMaxParts);
+      vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, part_pool_, q);
+    }
   }
+  cur_slot_ = fs;
+  // Clears carried over from the last frame (render targets cleared after
+  // their last use) stay waiting for this frame's first pass on them.
+  if (!merge_clears_) FlushPendingClears();
   BeginFrame();
   const auto t1 = Clock::now();
   uint32_t draw_events = 0;
@@ -6661,6 +7418,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
       case EventType::kBeginTiling:
         tiling_ = frame.tilings[e.index];
         tiled_scale_ = last_frame_lit_ ? scale_ : out_scale_;
+        scene_begun_ = true;
+        last_tiling_ = tiling_;
         break;
       case EventType::kEndTiling:
         if (!vel_ready_ && (!vel_draws_.empty() || !mask_draws_.empty())) DrawVelocities();
@@ -6679,25 +7438,37 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
     stats_.guest_output_height = uint32_t(std::lround(final_front_->height / fs));
   }
   EndRendering();
+  MarkPart("after the last resolve");
+  // Render targets cleared after their last use this frame keep their clear
+  // for the next frame's first pass on them; the picture shown can't wait.
+  FlushPendingClearsKeepTargets(final_front_, last_color_);
   FullBarrier(cb_);
   if (output && final_front_) {
     Buffer* readback = output->share ? nullptr : fs ? &fs->readback : &out_readback_;
     stats_.output_drawn =
         RecordOutput(final_front_, output->lut, output->share, output->slot, info, readback);
+    EndRendering();
+    MarkPart("output (post effects, upscaler, HUD)");
   }
+  FlushPendingClearsKeepTargets(final_front_, last_color_);
+  cur_slot_ = nullptr;
   const auto t2 = Clock::now();
   if (fs) {
     if (fs->timed) {
       vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_,
                               uint32_t(fs - slots_) * 2 + 1);
     }
-    gpu_.SubmitFenced(cb_, fs->fence);
+    if (stream_.active()) stream_.End();
+    fs->upload_cb = TakeUploads();
+    gpu_.SubmitFenced(cb_, fs->fence, fs->upload_cb);
     fs->cb = cb_;
+    fs->cb_pool = cb_pool;
     fs->pending = true;
     fs->ticket = ++next_ticket_;
     stats_.ticket = fs->ticket;
   } else {
-    gpu_.Submit(cb_);
+    if (stream_.active()) stream_.End();
+    gpu_.Submit(cb_, TakeUploads(), cb_pool);
   }
   const auto t3 = Clock::now();
   cb_ = VK_NULL_HANDLE;
@@ -6857,7 +7628,8 @@ void Renderer::SetSpeedBlur(float strength, float dt, float force_amount) {
   if (force_amount >= 0.0f) impl_->speed_amount_ = force_amount;
 }
 
-void Renderer::SetUpscaleParams(float frame_ms, float sharpness) {
+void Renderer::SetUpscaleParams(float frame_ms, float sharpness, bool reactive_debug) {
+  impl_->reactive_debug_ = reactive_debug;
   impl_->frame_ms_ = std::clamp(frame_ms, 1.0f, 250.0f);
   impl_->up_sharpness_ = std::clamp(sharpness, 0.0f, 1.0f);
 }
@@ -6874,6 +7646,8 @@ void Renderer::SetMotionBlur(float scale, bool camera, bool objects, bool debug)
 }
 
 void Renderer::SetSceneryObjectBlur(bool on) { impl_->scenery_blur_ = on; }
+void Renderer::SetMergeClears(bool on) { impl_->merge_clears_ = on; }
+void Renderer::SetParallelCommands(bool on) { impl_->parallel_commands_ = on; }
 
 RenderStats Renderer::Render(const Frame& frame, FrameResources& resources, uint32_t max_draws,
                              const OutputRequest* output, OutputInfo* info) {
@@ -6911,6 +7685,29 @@ double Renderer::GpuFrameMs(uint64_t ticket) {
   return -1;
 }
 
+std::vector<GpuPart> Renderer::GpuParts(uint64_t ticket) {
+  auto& im = *impl_;
+  std::vector<GpuPart> parts;
+  for (auto& fs : im.slots_) {
+    if (fs.ticket != ticket || !fs.timed || !im.part_pool_ || fs.part_names.empty()) continue;
+    const uint32_t n = uint32_t(fs.part_names.size()) + 1;
+    std::vector<uint64_t> t(n);
+    const uint32_t q = uint32_t(&fs - im.slots_) * Impl::kMaxParts;
+    if (vk::vkGetQueryPoolResults(im.gpu_.device, im.part_pool_, q, n, n * sizeof(uint64_t),
+                                  t.data(), sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+      return {};
+    }
+    const uint32_t bits = im.gpu_.timestamp_bits;
+    const uint64_t mask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+    const double period = double(im.gpu_.props.limits.timestampPeriod) * 1e-6;
+    for (uint32_t i = 1; i < n; ++i) {
+      parts.push_back({fs.part_names[i - 1], double((t[i] - t[i - 1]) & mask) * period});
+    }
+  }
+  return parts;
+}
+
 bool Renderer::ReadOutput(uint64_t ticket, std::vector<uint8_t>* packed) {
   if (!impl_->options_.async) return false;
   for (auto& fs : impl_->slots_) {
@@ -6944,6 +7741,7 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   for (auto& [k, im] : impl_->targets_) out.push_back(Describe(&im));
   for (auto& [k, im] : impl_->resolved_) out.push_back(Describe(&im));
   for (auto& [k, im] : impl_->resolved_packed_) out.push_back(Describe(&im));
+  if (impl_->reactive_img_.image) out.push_back(Describe(&impl_->reactive_img_));
   return out;
 }
 

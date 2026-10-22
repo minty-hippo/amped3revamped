@@ -78,7 +78,7 @@ class CaptureFiles : public amped3::native::FrameResources {
   }
   // Vertex and index data stay in memory, as the game's recorded blobs do.
   const std::vector<uint8_t>* Peek(const std::string& name) override {
-    if (name.rfind("tex_", 0) == 0 || name.rfind("ucode_", 0) == 0) return nullptr;
+    if (amped3::native::IsTextureResource(name) || name.rfind("ucode_", 0) == 0) return nullptr;
     auto it = blobs_.find(name);
     if (it == blobs_.end()) it = blobs_.emplace(name, ReadFile(resources_ / (name + ".bin"))).first;
     return &it->second;
@@ -444,7 +444,8 @@ int main(int argc, char** argv) {
   uint32_t max_draws = UINT32_MAX;
   bool dump = false;
   int device = -1;
-  int repeat = 1;  // render the frame this many times (tests the caches)
+  int repeat = 1;
+  bool reactive_debug = false;  // --reactive-debug: show FSR's reactive mask  // render the frame this many times (tests the caches)
   std::string pipeline_cache;  // --pipeline-cache file
   std::string cloud_sprite;    // --cloud-sprite file (RendererOptions::cloud_sprite_path)
   bool async_pipelines = false;
@@ -466,6 +467,8 @@ int main(int argc, char** argv) {
   float motion_yaw = 0.0f;        // --motion-yaw deg: previous frame = this one, camera turned
   bool object_blur = false;       // --object-blur: per-object motion blur too
   bool scenery_blur = false;      // --object-blur-scenery: also on the scenery
+  bool merge_clears = true;       // --no-merge-clears: every clear a pass of its own
+  bool parallel_commands = true;  // --no-parallel-commands: commands recorded in place
   bool no_camera_blur = false;    // --no-camera-blur: objects only
   bool blur_debug = false;        // --blur-debug: show the motion instead
   bool motion_shuffle = false;    // --motion-shuffle: previous frame's draws in reverse order
@@ -529,6 +532,8 @@ int main(int argc, char** argv) {
       res_scale = std::stof(argv[++i]);
     } else if (a == "--aniso" && i + 1 < argc) {
       aniso = std::stoi(argv[++i]);
+    } else if (a == "--reactive-debug") {
+      reactive_debug = true;
     } else if (a == "--no-msaa") {
       msaa = false;
     } else if (a == "--motion-blur" && i + 1 < argc) {
@@ -546,6 +551,10 @@ int main(int argc, char** argv) {
       motion_shuffle = true;
     } else if (a == "--motion-perturb" && i + 1 < argc) {
       motion_perturb = argv[++i];
+    } else if (a == "--no-parallel-commands") {
+      parallel_commands = false;
+    } else if (a == "--no-merge-clears") {
+      merge_clears = false;
     } else if (a == "--blur-debug") {
       blur_debug = true;
     } else if (a == "--motion-yaw" && i + 1 < argc) {
@@ -705,6 +714,8 @@ int main(int argc, char** argv) {
     std::cout << "Device: " << renderer.device_name() << "\n";
     renderer.SetMotionBlur(motion_blur, !no_camera_blur, object_blur, blur_debug);
     renderer.SetSceneryObjectBlur(scenery_blur);
+    renderer.SetMergeClears(merge_clears);
+    renderer.SetParallelCommands(parallel_commands);
     if (motion_yaw != 0.0f) {
       // Test input: the same frame with the lighting pass's inverse
       // view-projection turned about the camera (c4) around world Y.
@@ -762,10 +773,11 @@ int main(int argc, char** argv) {
     auto first_use = [](const char* what, const amped3::native::RenderStats& st) {
       std::printf("%s: prepass %.2f ms, record %.2f ms; first use: %u textures (%.1f MB, %.1f ms), "
                   "%u pipelines (%.1f ms, %u to the background, %u draws waiting), %u shaders (%.1f ms); "
-                  "texture cache %u (%.0f MB)\n",
+                  "texture cache %u (%.0f MB); texture sets written %u, reset %u\n",
                   what, st.prepass_ms, st.record_ms, st.new_textures, st.texture_mb, st.texture_ms,
                   st.new_pipelines, st.pipeline_ms, st.deferred_pipelines, st.draws_waiting,
-                  st.new_shaders, st.shader_ms, st.textures_cached, st.texture_cache_mb);
+                  st.new_shaders, st.shader_ms, st.textures_cached, st.texture_cache_mb,
+                  st.texture_sets_written, st.texture_set_resets);
       if (st.draw_parts_sampled) {
         const auto& p = st.draw_part_ms;
         std::printf("  draws by part (ms): setup %.2f, targets %.2f, textures %.2f, pipeline %.2f, "
@@ -773,6 +785,7 @@ int main(int argc, char** argv) {
                     p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]);
       }
     };
+    if (reactive_debug) renderer.SetUpscaleParams(16.7f, 0.0f, true);
     if (speed_blur >= 0.0f) renderer.SetSpeedBlur(1.0f, 1.0f / 60.0f, speed_blur);
     if (fog > 0.0f) renderer.SetFog(fog, fog_start);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
@@ -796,6 +809,9 @@ int main(int argc, char** argv) {
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
     }
     std::cout << "Recorded " << stats.draws_done << " of " << stats.draws << " draws\n";
+    std::cout << "Render passes " << stats.passes << "; clears: " << stats.clear_passes
+              << " passes of their own, " << stats.clears_merged << " folded into a load op, "
+              << stats.clears_in_pass << " inside a pass\n";
 
     const auto final_image = renderer.FinalImage();
     if (!final_image.name.empty()) {

@@ -57,6 +57,46 @@ executable. On top of the plain recompile it adds:
   The menu only shows settings your SDK build actually has. While it is open,
   the game sees an idle controller.
 
+## Patch notes
+
+### 2026-10-22: experimental merged into main
+
+**Launcher (v0.2.2)**
+- New program that installs, updates and starts the game from one download
+  (Windows, Linux x86_64, Linux arm64), driven by controller, keyboard or mouse.
+- Animated Amped 3 Revamped logo as the title (plays once, holds its last frame).
+- Desktop shortcut / Steam entry uses the game's own Xbox 360 dashboard icon,
+  taken from your `default.xex` at install (made on the spot for older installs).
+
+**Performance (native renderer)**
+- Draw recording moved off the game thread, with fewer locks, allocations and
+  clock reads per draw; Direct3D's draw and state packets skipped while the
+  emulation doesn't draw.
+- Renderer: Vulkan commands recorded on their own thread, fewer render passes,
+  texture descriptor sets kept between frames, depth pre-pass at the scene's
+  resolution with an upscaler.
+- Linux: the audio worker and command processor no longer spin (SDK patches
+  0023, 0024); input polling no longer re-enumerates devices (0025).
+- Armada (AYN Odin 3): riding went from about 60 to 100+ fps.
+
+**Fixes**
+- In-game challenge videos no longer freeze or pop at the start on Armada.
+- Map clouds no longer drop the frame rate to ~10 fps.
+- Only one copy of the game runs at a time (a second launch no longer plays
+  menu music over the game).
+
+**Graphics**
+- FSR 3.1 on Linux (built from AMD's FidelityFX sources by setup.sh).
+- MSAA off now keeps the multisampled look (the game's per-sample lighting and
+  see-through foliage are reproduced). With FSR or XeSS, MSAA is off by default
+  and has its own setting, MSAA with the upscaler.
+- FSR: snow and other particles no longer leave trails (reactive mask).
+- Sharp Fonts and Upscaled Textures are opt-in, separate from Revamped Graphics.
+
+**Diagnostics**
+- F11 performance trace: per-zone times, per-thread CPU, kernel share and page
+  faults, GPU time by part, and the command stream; a stall watch in the log.
+
 ## Folders
 
 Nothing needs a particular name or place. The project folder can be called
@@ -147,7 +187,10 @@ Armada).
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.
 - **Desktop shortcut** (Windows) or **Add to Steam / menu** (Linux): points
-  at the launcher's copy in the install folder.
+  at the launcher's copy in the install folder. Its icon is the game's own square
+  Xbox 360 dashboard logo, taken at install from your `default.xex` by
+  `amped3-icon` (`tools/xex-icon`) into `amped3-icon.ico` / `amped3-icon.png`
+  in the install folder; nothing of the game ships with the project.
 - The installed version (branch, commit and date) is under the title.
 
 It works with a controller (d-pad or stick, A), the keyboard (arrows, Enter)
@@ -216,9 +259,17 @@ Steam Input and the Deck's controls work as an Xbox controller.
   (the recompiled game is large) and about 40 GB; jobs are limited by memory
   (about one per 2.5 GB). Builds are per architecture: build the ARM version on
   the ARM device.
-- **Not on Linux:** Intel XeSS and AMD FSR 3.1 (Windows-only runtimes; the
-  render scale still works, stretched) and the F9 hang report. Crashes are
-  written to `logs/amped3_crash_*.txt`.
+- **AMD FSR 3.1 on Linux** is built from AMD's FidelityFX SDK sources (MIT):
+  AMD ships its runtime for Windows only, so `setup.sh` takes the needed
+  folders of the SDK (v1.1.4, a 25 MB sparse clone), applies
+  `linux/fidelityfx/fidelityfx-sdk-linux.patch` (the SDK's shader compiler
+  ported to Linux, plus fixes for Clang/GCC and for GPUs whose memory is all
+  host-visible, as on ARM), compiles the FSR shaders and builds
+  `libamd_fidelityfx_vk.so` next to the game: about two minutes, once. If it
+  fails the game still works with the Upscaler off.
+- **Not on Linux:** Intel XeSS (Intel's XeSS SDK has Windows libraries only;
+  the render scale still works, stretched, or use FSR 3.1) and the F9 hang
+  report. Crashes are written to `logs/amped3_crash_*.txt`.
 - **Texture upscaling** (`linux/upscale-textures.sh`, or the installer's
   question) uses Real-ESRGAN's official Linux build, x86_64 only; on ARM pass
   `--esrgan` with a build of
@@ -263,7 +314,9 @@ you switch often.
 
 **Revamped Graphics** turns all the visual enhancements on or off at once:
 motion blur, speed blur, distance fog, god rays, branch fade and the trail
-map clouds. Each keeps its own setting for when the switch is back on.
+map clouds. Each keeps its own setting for when the switch is back on. Sharp
+fonts and upscaled textures aren't part of it: they're off until you turn them
+on yourself.
 
 All of it is also in the game's own menu: **Pause > Options > Graphics** (the
 row that was the unused "Cheat Codes") opens the port's Graphics panel. The
@@ -274,8 +327,9 @@ It has two tabs, switched with LB / RB:
   motion blur strength.
 - **Display:** fullscreen, a frame rate slider (30 console pacing to 144 fps, or
   unlocked), display resolution, render resolution (with the
-  pixel size it gives), upscaler (Intel XeSS or AMD FSR 3.1) and FSR
-  sharpness.
+  pixel size it gives), upscaler (Intel XeSS or AMD FSR 3.1; FSR 3.1 only on
+  Linux), FSR sharpness, and Sharp Fonts and Upscaled Textures (both off by
+  default).
 
 Up / down choose, left / right / A change, B goes back (keyboard: arrows,
 Enter, Escape, Q / E for tabs).
@@ -286,8 +340,9 @@ rebuilds each of the five fonts (button icons included) at 4x from its own
 letters the first time it's shown: each glyph's outline is traced into a
 vector shape (straight edges, sharp corners, curves where the letter curves)
 and filled anti-aliased at the new size. The result is kept in `logs\`
-(`native_font_*.bin`) so later sessions load it at once; nothing is shipped. Switch it off
-with Sharp Fonts (Graphics panel, Display tab) or `native_sharp_fonts`.
+(`native_font_*.bin`) so later sessions load it at once; nothing is shipped. It's
+off by default: turn it on with Sharp Fonts (Graphics panel, Display tab) or
+`native_sharp_fonts = true`.
 
 **Texture pack.** PNGs in the `textures` folder next to the exe replace game
 textures by a hash of their contents, at any size (see
@@ -310,8 +365,9 @@ GPU; downloaded once, 45 MB). `Upscale Textures.bat` runs the same step any
 time (`-Set world` adds the characters, boards and levels, experimental;
 `-Force` redoes everything). The results go to `textures\upscaled` and are
 used only where neither the texture pack nor Sharp fonts replace a texture,
-so anything you replace by hand always wins. Switch them off with Upscaled
-Textures (Graphics panel, Display tab) or `native_upscaled_textures`.
+so anything you replace by hand always wins. They're off by default, even
+after upscaling: turn them on with Upscaled Textures (Graphics panel, Display
+tab) or `native_upscaled_textures = true`.
 
 The row is added in memory as the game loads its menus; the game's files are
 never changed. Set `patch_game_menus = false` in `amped3.toml` to leave the
@@ -424,7 +480,9 @@ respective owners; this project is not affiliated with or endorsed by them.
   Khronos Group (Apache 2.0 / MIT; `third_party/vulkan/LICENSE.md`).
 - **[AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)**
   (FSR 3.1 API headers) © Advanced Micro Devices, Inc. (MIT;
-  `third_party/ffx_api/LICENSE.txt`). The runtime DLL is downloaded at build time.
+  `third_party/ffx_api/LICENSE.txt`). The runtime DLL is downloaded at build
+  time; on Linux the runtime is built from the SDK's sources, with the changes
+  in `linux/fidelityfx` (its license is installed as `FidelityFX-LICENSE.txt`).
 - **[Intel XeSS](https://github.com/intel/xess)** © Intel Corporation (Intel
   Simplified Software License). Headers and runtime are downloaded at build
   time, not included here.

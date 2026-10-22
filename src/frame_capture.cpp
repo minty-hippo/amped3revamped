@@ -8,6 +8,7 @@
 
 #include "frame_capture.h"
 #include "frame_limit.h"
+#include "perf_trace.h"
 #include "native/xenos_shader.h"
 #include "live_renderer.h"
 #include "perf_overlay.h"
@@ -69,6 +70,16 @@ REX_EXTERN(__imp__D3DDevice_Swap);
 REX_EXTERN(__imp__D3DDevice_CreateVertexShader);
 REX_EXTERN(__imp__D3DDevice_CreatePixelShader);
 REX_EXTERN(__imp__D3DXAssembleShader);
+REX_EXTERN(__imp__D3D_FlushDirtyState);
+REX_EXTERN(D3D_FlushDirtyState);
+REX_EXTERN(D3D_CommitVertexFetch);
+REX_EXTERN(D3D_CommitShaders);
+REX_EXTERN(__imp__D3D_BlockOnFence);
+REX_EXTERN(__imp__D3DDevice_BlockUntilIdle);
+REX_EXTERN(__imp__D3DResource_BlockUntilNotBusy);
+REX_EXTERN(__imp__D3D_MakeSpace);
+REX_EXTERN(__imp__D3D_InitializeRingBuffer);
+REX_EXTERN(__imp__sub_825A3330);
 
 namespace amped3::capture {
 namespace {
@@ -582,14 +593,38 @@ std::unordered_map<uint64_t, std::string> g_bound_seen;  // object x checksum ->
 uint32_t g_last_ps = 0;
 
 // Saves the microcode (once) and returns its file stem, ucode_<kind>_<hash>.
+// A fast checksum of raw guest bytes (size a multiple of 4): four independent
+// multiply-xor lanes over 8-byte words, so it runs at memory speed. It runs on
+// the drawing thread whenever the bound shaders change.
+uint64_t QuickSum(const uint8_t* p, uint32_t n) {
+  constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
+  uint64_t a = 0x243F6A8885A308D3ull, b = 0x13198A2E03707344ull, c = 0xA4093822299F31D0ull,
+           d = 0x082EFA98EC4E6C89ull;
+  uint32_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    uint64_t w[4];
+    std::memcpy(w, p + i, 32);
+    a = (a ^ w[0]) * kMul;
+    b = (b ^ w[1]) * kMul;
+    c = (c ^ w[2]) * kMul;
+    d = (d ^ w[3]) * kMul;
+  }
+  for (; i + 4 <= n; i += 4) {
+    uint32_t w;
+    std::memcpy(&w, p + i, 4);
+    a = (a ^ w) * kMul;
+  }
+  const auto rot = [](uint64_t v, int r) { return (v << r) | (v >> (64 - r)); };
+  uint64_t h = a ^ rot(b, 17) ^ rot(c, 31) ^ rot(d, 47) ^ n;
+  h ^= h >> 29;
+  return h * kMul;
+}
+
 std::string SaveDrawnMicrocode(uint8_t* base, const char* kind, uint32_t object, uint32_t address,
                                uint32_t bytes, uint32_t decl) {
   if (!object || !address || !bytes || bytes > 0x10000 || (bytes & 3)) return {};
   // Cheap checksum first; the full hash only for new microcode.
-  uint64_t sum = 0;
-  for (uint32_t i = 0; i < bytes; i += 4) {
-    sum = sum * 31 + U32(base, address + i);
-  }
+  const uint64_t sum = QuickSum(base + address, bytes);
   const uint64_t key = sum ^ (uint64_t(object) << 32) ^ bytes ^ (kind[0] == 'v' ? 1ull << 63 : 0);
   {
     std::lock_guard lock(g_shader_mutex);
@@ -746,6 +781,7 @@ namespace cap = amped3::capture;
 // The native renderer preview records the same draw (live_renderer.cpp).
 #define LIVE_DRAW(dev, call)                                                    \
   if (amped3::live::Recording()) {                                              \
+    amped3::trace::Scope live_scope(amped3::trace::Zone::kRecord);              \
     amped3::live::OnDraw(base, dev, call, cap::g_cur_vs_ucode, cap::g_cur_ps_ucode); \
   }
 
@@ -761,6 +797,21 @@ amped3::live::DrawCall LiveCall(amped3::live::DrawCall::Kind kind, uint32_t prim
   return c;
 }
 using LiveKind = amped3::live::DrawCall::Kind;
+
+// DrawVertices / DrawIndexedVertices (825A1288 / 825A14B8) without their
+// packets: what they do besides writing DRAW_INDX is note the base vertex
+// (device+11540, marking bit 61 of the +40 mask when it changes) and flush the
+// dirty state. Their other stores are the command write pointer and, while
+// tiling, the list of draw positions to patch per tile.
+void DrawWithoutCommands(PPCContext& ctx, uint8_t* base, uint32_t dev, uint32_t base_vertex) {
+  if (cap::U32(base, dev + 11540) != base_vertex) {
+    rex::memory::store_and_swap<uint32_t>(base + dev + 11540, base_vertex);
+    rex::memory::store_and_swap<uint64_t>(base + dev + 40,
+                                          cap::U64(base, dev + 40) | (1ull << 61));
+  }
+  ctx.r3.u64 = dev;
+  D3D_FlushDirtyState(ctx, base);
+}
 }  // namespace
 
 extern "C" REX_FUNC(D3DDevice_DrawVertices) {
@@ -768,7 +819,14 @@ extern "C" REX_FUNC(D3DDevice_DrawVertices) {
                            ctx.r6.u32));
   const uint32_t dev = ctx.r3.u32;
   const auto live_call = LiveCall(LiveKind::kVertices, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
-  __imp__D3DDevice_DrawVertices(ctx, base);
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    if (amped3::live::SkipEmulatedDrawCommands() && !captured_draw) {
+      DrawWithoutCommands(ctx, base, dev, ctx.r5.u32);
+    } else {
+      __imp__D3DDevice_DrawVertices(ctx, base);
+    }
+  }
   CAPTURE_DRAW_STATE(dev);
   LIVE_DRAW(dev, live_call);
 }
@@ -779,7 +837,14 @@ extern "C" REX_FUNC(D3DDevice_DrawIndexedVertices) {
   const uint32_t dev = ctx.r3.u32;
   const auto live_call =
       LiveCall(LiveKind::kIndexed, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, ctx.r5.s32);
-  __imp__D3DDevice_DrawIndexedVertices(ctx, base);
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    if (amped3::live::SkipEmulatedDrawCommands() && !captured_draw) {
+      DrawWithoutCommands(ctx, base, dev, ctx.r5.u32);
+    } else {
+      __imp__D3DDevice_DrawIndexedVertices(ctx, base);
+    }
+  }
   CAPTURE_DRAW_STATE(dev);
   LIVE_DRAW(dev, live_call);
 }
@@ -798,7 +863,10 @@ extern "C" REX_FUNC(D3D_DrawVerticesUP_Internal) {
   }
   const uint32_t dev = ctx.r3.u32, prim = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   CAPTURE_DRAW(fmt::format("BeginVertices prim={} count={} stride={}", prim, count, stride));
-  __imp__D3D_DrawVerticesUP_Internal(ctx, base);
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    __imp__D3D_DrawVerticesUP_Internal(ctx, base);
+  }
   const uint32_t data = ctx.r3.u32;
   if (captured_draw && cap::Recording()) {
     std::lock_guard lock(cap::g_mutex);
@@ -832,6 +900,7 @@ extern "C" REX_FUNC(D3DDevice_DrawVerticesUP) {
   live_call.up_vertices_size = ctx.r5.u32 * ctx.r7.u32;
   {
     Guard guard;
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
     __imp__D3DDevice_DrawVerticesUP(ctx, base);
   }
   CAPTURE_DRAW_STATE(dev);
@@ -870,7 +939,10 @@ extern "C" REX_FUNC(D3DDevice_DrawIndexedVerticesUP) {
       live_call.up_vertices_size = (ctx.r5.u32 + ctx.r6.u32) * stride;
     }
   }
-  __imp__D3DDevice_DrawIndexedVerticesUP(ctx, base);
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    __imp__D3DDevice_DrawIndexedVerticesUP(ctx, base);
+  }
   CAPTURE_DRAW_STATE(dev);
   LIVE_DRAW(dev, live_call);
 }
@@ -891,8 +963,14 @@ extern "C" REX_FUNC(D3DDevice_ClearF) {
       cap::g_out += cap::TargetsLine(base, ctx.r3.u32);
     }
   }
-  amped3::live::OnClear(base, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, ctx.f1.f64, ctx.r8.u32);
-  __imp__D3DDevice_ClearF(ctx, base);
+  {
+    amped3::trace::Scope rec_scope(amped3::trace::Zone::kRecord);
+    amped3::live::OnClear(base, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, ctx.f1.f64, ctx.r8.u32);
+  }
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    __imp__D3DDevice_ClearF(ctx, base);
+  }
 }
 
 extern "C" REX_FUNC(D3DDevice_Resolve) {
@@ -921,9 +999,15 @@ extern "C" REX_FUNC(D3DDevice_Resolve) {
       }
     }
   }
-  amped3::live::OnResolve(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
-                          ctx.r10.u32, ctx.f1.f64);
-  __imp__D3DDevice_Resolve(ctx, base);
+  {
+    amped3::trace::Scope rec_scope(amped3::trace::Zone::kRecord);
+    amped3::live::OnResolve(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
+                            ctx.r10.u32, ctx.f1.f64);
+  }
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    __imp__D3DDevice_Resolve(ctx, base);
+  }
 }
 
 extern "C" REX_FUNC(D3DDevice_BeginTiling) {
@@ -938,8 +1022,14 @@ extern "C" REX_FUNC(D3DDevice_BeginTiling) {
                              ctx.r4.u32, ctx.r5.u32, rects, ctx.r7.u32, ctx.f1.f64));
     }
   }
-  amped3::live::OnBeginTiling(base, ctx.r5.u32, ctx.r6.u32);
-  __imp__D3DDevice_BeginTiling(ctx, base);
+  {
+    amped3::trace::Scope rec_scope(amped3::trace::Zone::kRecord);
+    amped3::live::OnBeginTiling(base, ctx.r5.u32, ctx.r6.u32);
+  }
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    __imp__D3DDevice_BeginTiling(ctx, base);
+  }
 }
 
 extern "C" REX_FUNC(D3DDevice_EndTiling) {
@@ -950,8 +1040,14 @@ extern "C" REX_FUNC(D3DDevice_EndTiling) {
                              ctx.r4.u32, ctx.r5.u32, ctx.r6.u32));
     }
   }
-  amped3::live::OnEndTiling();
-  __imp__D3DDevice_EndTiling(ctx, base);
+  {
+    amped3::trace::Scope rec_scope(amped3::trace::Zone::kRecord);
+    amped3::live::OnEndTiling();
+  }
+  {
+    amped3::trace::Scope d3d_scope(amped3::trace::Zone::kD3D);
+    __imp__D3DDevice_EndTiling(ctx, base);
+  }
 }
 
 extern "C" REX_FUNC(D3DDevice_SetRenderTarget) {
@@ -977,12 +1073,19 @@ extern "C" REX_FUNC(D3DDevice_SetDepthStencilSurface) {
 }
 
 extern "C" REX_FUNC(D3DDevice_Swap) {
+  amped3::trace::OnSwap();        // F11 performance trace: closes the frame's row
   amped3::perf::OnSwapBegin();    // F3 overlay: frame and game-thread CPU time
-  amped3::frame_limit::OnSwap();  // frame rate cap (frame_limit.cpp)
+  {
+    amped3::trace::Scope limit_scope(amped3::trace::Zone::kLimiter);
+    amped3::frame_limit::OnSwap();  // frame rate cap (frame_limit.cpp)
+  }
   amped3::perf::OnSwapEnd();
   const uint32_t frame = cap::g_frame_counter.fetch_add(1);
   cap::OnSwapTiming();
-  amped3::live::OnSwap(base, ctx.r4.u32);
+  {
+    amped3::trace::Scope rec_scope(amped3::trace::Zone::kRecord);
+    amped3::live::OnSwap(base, ctx.r4.u32);
+  }
   const int state = cap::g_state.load();
   if (state == cap::kRecording) {
     std::lock_guard lock(cap::g_mutex);
@@ -1013,7 +1116,102 @@ extern "C" REX_FUNC(D3DDevice_Swap) {
     cap::g_res_full_logged = false;
     cap::g_state = cap::kRecording;
   }
+  amped3::trace::Scope swap_scope(amped3::trace::Zone::kSwap);
   __imp__D3DDevice_Swap(ctx, base);
+}
+
+// Timing only (F11 performance trace): where the game thread waits on the GPU
+// and what the command stream costs. See docs/d3d-map.md for these functions.
+// D3D_FlushDirtyState(pDevice), at the start of every draw: walks the dirty
+// masks at device+16..+48 (64-bit, big-endian) and writes each dirty register
+// block, the shader constants and the fetch constants as GPU commands (see
+// docs/d3d-map.md and docs/experimental-native-gpu.md). While the emulated GPU
+// doesn't draw, nothing reads those commands: only the two calls that change
+// CPU-side state the recording reads are kept (the vertex fetch constants built
+// from the streams, and the shader setup that patches the vertex shader for
+// the declaration), plus one shadow store, in the original order; the masks
+// are cleared as the original does. When the emulation draws again, every mask
+// is set once so the original writes the whole state.
+namespace {
+inline void Store64(uint8_t* base, uint32_t address, uint64_t v) {
+  rex::memory::store_and_swap<uint64_t>(base + address, v);
+}
+
+void FlushDirtyStateNoCommands(PPCContext& ctx, uint8_t* base, uint32_t dev) {
+  if (cap::U64(base, dev + 48)) {
+    if (cap::U64(base, dev + 48) & 0x400) {  // streams / declaration
+      ctx.r3.u64 = dev;
+      D3D_CommitVertexFetch(ctx, base);
+    }
+    if (cap::U64(base, dev + 48) & 0x1E0) {  // shaders
+      ctx.r3.u64 = dev;
+      D3D_CommitShaders(ctx, base);
+    }
+    Store64(base, dev + 48, 0);
+  }
+  if (cap::U64(base, dev + 16)) Store64(base, dev + 16, 0);  // vertex shader constants
+  if (cap::U64(base, dev + 24)) Store64(base, dev + 24, 0);  // pixel shader constants
+  if (const uint64_t fetch = cap::U64(base, dev + 32)) {     // fetch constants, misc
+    if (fetch & 0x80000000u) Store64(base, dev + 11440, 0xFFFFFFFFFF000000ull);
+    Store64(base, dev + 32, 0);
+  }
+  if (cap::U64(base, dev + 40)) Store64(base, dev + 40, 0);
+}
+}  // namespace
+
+extern "C" REX_FUNC(D3D_FlushDirtyState) {
+  amped3::trace::Scope scope(amped3::trace::Zone::kFlushState);
+  amped3::trace::NoteDrawThread();
+  static bool skipping = false;  // game thread only
+  const uint32_t dev = ctx.r3.u32;
+  if (amped3::live::SkipEmulatedStateWrites()) {
+    skipping = true;
+    FlushDirtyStateNoCommands(ctx, base, dev);
+    return;
+  }
+  if (skipping) {
+    skipping = false;
+    for (uint32_t off = 16; off <= 48; off += 8) Store64(base, dev + off, ~0ull);
+  }
+  __imp__D3D_FlushDirtyState(ctx, base);
+}
+
+extern "C" REX_FUNC(D3D_BlockOnFence) {
+  amped3::trace::Scope scope(amped3::trace::Zone::kFenceWait);
+  __imp__D3D_BlockOnFence(ctx, base);
+}
+
+// D3D_InitializeRingBuffer(pDevice): sets up the ring buffer and the device's
+// pointer to the GPU-written fence (device+10384); deferred naming starts
+// right after.
+extern "C" REX_FUNC(D3D_InitializeRingBuffer) {
+  const uint32_t dev = ctx.r3.u32;
+  __imp__D3D_InitializeRingBuffer(ctx, base);
+  amped3::live::OnRingBufferInitialized(base, dev);
+}
+
+// 825A3330 (pDevice, pPackets): inserts a fence, the device's CPU fence
+// (device+10396, then +2): writes the EVENT_WRITE_SHD packets that make the
+// GPU store it, and in some phases stores it from the CPU right away. With
+// deferred naming that store waits for the recorder.
+extern "C" REX_FUNC(sub_825A3330) {
+  amped3::live::BeforeCpuFenceStore(base, ctx.r3.u32);
+  __imp__sub_825A3330(ctx, base);
+}
+
+extern "C" REX_FUNC(D3DDevice_BlockUntilIdle) {
+  amped3::trace::Scope scope(amped3::trace::Zone::kFenceWait);
+  __imp__D3DDevice_BlockUntilIdle(ctx, base);
+}
+
+extern "C" REX_FUNC(D3DResource_BlockUntilNotBusy) {
+  amped3::trace::Scope scope(amped3::trace::Zone::kFenceWait);
+  __imp__D3DResource_BlockUntilNotBusy(ctx, base);
+}
+
+extern "C" REX_FUNC(D3D_MakeSpace) {
+  amped3::trace::Scope scope(amped3::trace::Zone::kMakeSpace);
+  __imp__D3D_MakeSpace(ctx, base);
 }
 
 // D3D_PatchVertexShaderFetches(pDevice, pVertexShader, pMicrocode, pDecl):

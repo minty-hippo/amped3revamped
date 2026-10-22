@@ -23,6 +23,7 @@
 #include <rex/ui/imgui_dialog.h>
 
 struct ImFontAtlas;
+struct ImFont;
 namespace rex::ui {
 class Window;
 }
@@ -32,6 +33,9 @@ namespace amped3 {
 // The panel's fonts: a TrueType font baked at a few sizes, so its text is
 // drawn near 1:1 at any display resolution. From the app's OnConfigureFonts.
 void LoadPanelFonts(ImFontAtlas* atlas);
+
+// The panel's font for text `px` high (also the launcher's). ImGui thread.
+ImFont* UiFont(float px);
 
 struct GraphicsRow;  // a setting on the panel (graphics_panel.cpp)
 

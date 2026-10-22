@@ -1,0 +1,739 @@
+// amped3 - performance trace (see perf_trace.h).
+
+#include "perf_trace.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <new>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/logging.h>
+#include <rex/system/gpu_plugin.h>
+#include <rex/ui/keybinds.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <tlhelp32.h>
+#else
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+REXCVAR_DEFINE_BOOL(perf_trace, false, "Amped 3/Diagnostics",
+                    "Records a performance trace to logs (perf_<time>.csv, _threads.csv, "
+                    "_summary.txt) for perf_trace_seconds, then switches itself back off. Also F11.");
+REXCVAR_DEFINE_INT32(perf_trace_seconds, 20, "Amped 3/Diagnostics",
+                     "How long a performance trace records (seconds)")
+    .range(2, 300);
+
+// Heap allocations per thread, for the trace (one thread-local increment per
+// operator new; plain malloc/free underneath, as the default ones).
+namespace {
+thread_local uint64_t t_allocations = 0;
+
+void* CountedNew(std::size_t size) {
+  ++t_allocations;
+  if (size == 0) size = 1;
+  void* p = std::malloc(size);
+  if (!p) throw std::bad_alloc();
+  return p;
+}
+}  // namespace
+
+void* operator new(std::size_t size) { return CountedNew(size); }
+void* operator new[](std::size_t size) { return CountedNew(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+  ++t_allocations;
+  return std::malloc(size ? size : 1);
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+  ++t_allocations;
+  return std::malloc(size ? size : 1);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+
+namespace amped3::trace {
+
+uint64_t ThreadAllocations() { return t_allocations; }
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+constexpr int kZones = int(Zone::kCount);
+constexpr const char* kBind = "bind_perf_trace";
+
+int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+      .count();
+}
+
+uint64_t CurrentTid() {
+#if defined(_WIN32)
+  return GetCurrentThreadId();
+#else
+  return uint64_t(syscall(SYS_gettid));
+#endif
+}
+
+// --- Trace state -----------------------------------------------------------------
+
+std::atomic<bool> g_active{false};
+std::atomic<int64_t> g_zone_ns[kZones];
+
+struct Row {
+  double t_ms = 0;         // since the trace started
+  double frame_ms = 0;     // swap to swap
+  double swap_cpu_ms = 0;  // CPU time of the swapping thread over the frame
+  std::array<double, kZones> zone_ms{};
+  double worker_ms = -1;  // native renderer worker, average over reports in the frame
+  double gpu_ms = -1;
+  int presents = 0;
+  uint64_t allocs = 0;  // heap allocations by the swapping thread over the frame
+};
+
+std::mutex g_mutex;  // rows, presents, thread ids
+std::vector<Row> g_rows;
+std::vector<int64_t> g_present_ns;
+int64_t g_start_ns = 0;
+uint64_t g_swap_tid = 0, g_worker_tid = 0;
+std::atomic<uint64_t> g_draw_tid{0};
+std::atomic<uint64_t> g_record_allocs{0};
+
+// Worker / GPU reports since the last swap.
+std::atomic<int64_t> g_worker_sum_us{0}, g_gpu_sum_us{0};
+std::atomic<int> g_worker_count{0}, g_gpu_count{0}, g_present_count{0};
+
+// Swap thread only.
+bool t_have_prev = false;
+int64_t t_prev_ns = 0, t_prev_cpu_ns = 0;
+uint64_t t_prev_allocs = 0;
+std::array<int64_t, kZones> t_prev_zone{};
+
+// A trace's sampler thread runs detached (a process can end while one
+// records); this stays set until it has written its files.
+std::atomic<bool> g_running{false};
+
+// --- Threads ---------------------------------------------------------------------
+
+struct ThreadSample {
+  std::string name;
+  int64_t cpu_ns = 0;
+  // Linux: of that, time in the kernel, and page faults (minor: memory
+  // touched for the first time, or freed and taken again).
+  int64_t sys_ns = 0;
+  int64_t faults = 0;
+};
+using ThreadMap = std::map<uint64_t, ThreadSample>;
+
+#if defined(_WIN32)
+std::string WideToUtf8(const wchar_t* w) {
+  if (!w || !*w) return {};
+  const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+  std::string s(size_t(std::max(n - 1, 0)), '\0');
+  if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
+  return s;
+}
+
+ThreadMap SampleThreads() {
+  ThreadMap out;
+  using GetDescFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+  static const auto get_desc = reinterpret_cast<GetDescFn>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+  const DWORD pid = GetCurrentProcessId();
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snap == INVALID_HANDLE_VALUE) return out;
+  THREADENTRY32 te{};
+  te.dwSize = sizeof(te);
+  for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+    if (te.th32OwnerProcessID != pid) continue;
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+    if (!h) continue;
+    FILETIME c, e, k, u;
+    ThreadSample s;
+    if (GetThreadTimes(h, &c, &e, &k, &u)) {
+      const auto v = [](const FILETIME& f) {
+        return (int64_t(f.dwHighDateTime) << 32 | f.dwLowDateTime) * 100;
+      };
+      s.cpu_ns = v(k) + v(u);
+    }
+    if (get_desc) {
+      PWSTR desc = nullptr;
+      if (SUCCEEDED(get_desc(h, &desc)) && desc) {
+        s.name = WideToUtf8(desc);
+        LocalFree(desc);
+      }
+    }
+    CloseHandle(h);
+    out[te.th32ThreadID] = std::move(s);
+  }
+  CloseHandle(snap);
+  return out;
+}
+#else
+std::string ReadFirstLine(const std::string& path) {
+  std::ifstream f(path);
+  std::string line;
+  std::getline(f, line);
+  return line;
+}
+
+ThreadMap SampleThreads() {
+  ThreadMap out;
+  DIR* dir = opendir("/proc/self/task");
+  if (!dir) return out;
+  static const long ticks = sysconf(_SC_CLK_TCK);
+  while (dirent* e = readdir(dir)) {
+    if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+    const std::string base = std::string("/proc/self/task/") + e->d_name;
+    ThreadSample s;
+    s.name = ReadFirstLine(base + "/comm");
+    // schedstat: nanoseconds on a CPU (precise); stat: utime + stime in ticks.
+    const std::string sched = ReadFirstLine(base + "/schedstat");
+    const std::string stat = ReadFirstLine(base + "/stat");
+    const size_t close = stat.rfind(')');
+    long long utime = 0, stime = 0, minflt = 0;
+    if (close != std::string::npos) {
+      // Fields after the name: state is field 3; minflt 10, utime 14, stime 15.
+      const char* p = stat.c_str() + close + 2;
+      int field = 3;
+      while (*p && field < 16) {
+        if (field == 10) minflt = std::strtoll(p, nullptr, 10);
+        if (field == 14) utime = std::strtoll(p, nullptr, 10);
+        if (field == 15) stime = std::strtoll(p, nullptr, 10);
+        while (*p && *p != ' ') ++p;
+        while (*p == ' ') ++p;
+        ++field;
+      }
+    }
+    const int64_t tick_ns = ticks > 0 ? 1'000'000'000LL / ticks : 0;
+    s.cpu_ns = !sched.empty() ? std::strtoll(sched.c_str(), nullptr, 10) : (utime + stime) * tick_ns;
+    s.sys_ns = stime * tick_ns;
+    s.faults = minflt;
+    out[std::strtoull(e->d_name, nullptr, 10)] = std::move(s);
+  }
+  closedir(dir);
+  return out;
+}
+#endif
+
+// --- Writing ---------------------------------------------------------------------
+
+double Percentile(std::vector<double> v, double p) {
+  if (v.empty()) return 0;
+  std::sort(v.begin(), v.end());
+  const double idx = p * double(v.size() - 1);
+  const size_t lo = size_t(idx), hi = std::min(lo + 1, v.size() - 1);
+  return v[lo] + (v[hi] - v[lo]) * (idx - double(lo));
+}
+
+std::string Stamp() {
+  const std::time_t t = std::time(nullptr);
+  std::tm tm{};
+#if defined(_WIN32)
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
+  return buf;
+}
+
+struct ThreadStat {
+  uint64_t tid;
+  std::string name, role;
+  double cpu_ms = 0, avg_core_pct = 0, max_core_pct = 0;
+  double sys_ms = 0, faults = 0;  // kernel time and page faults over the trace (Linux)
+};
+
+// Command stream statistics (SDK patch 0020): the command processor reports
+// each packet header while a trace runs. One thread writes them.
+constexpr int kType0 = 128, kType1 = 129, kType2 = 130, kPacketKinds = 131;
+std::array<std::atomic<uint64_t>, kPacketKinds> g_packets{};
+std::array<std::atomic<uint64_t>, kPacketKinds> g_packet_dwords{};
+std::array<std::atomic<uint64_t>, 0x8000> g_reg_writes{};  // type-0 by first register
+
+void OnGpuPacket(uint32_t packet) {
+  if (packet == 0) return;
+  const uint32_t type = packet >> 30;
+  int kind;
+  uint32_t dwords = 1;
+  switch (type) {
+    case 0:
+      kind = kType0;
+      dwords += ((packet >> 16) & 0x3FFF) + 1;
+      g_reg_writes[packet & 0x7FFF].fetch_add(((packet >> 16) & 0x3FFF) + 1,
+                                              std::memory_order_relaxed);
+      break;
+    case 1:
+      kind = kType1;
+      dwords += 2;
+      break;
+    case 2:
+      kind = kType2;
+      break;
+    default:
+      kind = int((packet >> 8) & 0x7F);
+      dwords += ((packet >> 16) & 0x3FFF) + 1;
+      break;
+  }
+  g_packets[kind].fetch_add(1, std::memory_order_relaxed);
+  g_packet_dwords[kind].fetch_add(dwords, std::memory_order_relaxed);
+}
+
+const char* PacketName(int kind) {
+  switch (kind) {
+    case kType0: return "registers (type 0)";
+    case kType1: return "type 1";
+    case kType2: return "type 2 (nop)";
+    case 0x10: return "NOP";
+    case 0x21: return "REG_RMW";
+    case 0x22: return "DRAW_INDX";
+    case 0x23: return "VIZ_QUERY";
+    case 0x25: return "SET_STATE";
+    case 0x26: return "WAIT_FOR_IDLE";
+    case 0x27: return "IM_LOAD";
+    case 0x2b: return "IM_LOAD_IMMEDIATE";
+    case 0x2d: return "SET_CONSTANT";
+    case 0x2e: return "LOAD_CONSTANT_CONTEXT";
+    case 0x2f: return "LOAD_ALU_CONSTANT";
+    case 0x36: return "DRAW_INDX_2";
+    case 0x37: return "INDIRECT_BUFFER_PFD";
+    case 0x3b: return "INVALIDATE_STATE";
+    case 0x3c: return "WAIT_REG_MEM";
+    case 0x3d: return "MEM_WRITE";
+    case 0x3e: return "REG_TO_MEM";
+    case 0x3f: return "INDIRECT_BUFFER";
+    case 0x44: return "COND_EXEC";
+    case 0x45: return "COND_WRITE";
+    case 0x46: return "EVENT_WRITE";
+    case 0x48: return "ME_INIT";
+    case 0x4a: return "SET_SHADER_BASES";
+    case 0x4b: return "SET_BIN_BASE_OFFSET";
+    case 0x50: return "SET_BIN_MASK";
+    case 0x51: return "SET_BIN_SELECT";
+    case 0x54: return "INTERRUPT";
+    case 0x55: return "SET_CONSTANT2";
+    case 0x56: return "SET_SHADER_CONSTANTS";
+    case 0x58: return "EVENT_WRITE_SHD";
+    case 0x59: return "EVENT_WRITE_CFL";
+    case 0x5a: return "EVENT_WRITE_EXT";
+    case 0x5b: return "EVENT_WRITE_ZPD";
+    case 0x5e: return "CONTEXT_UPDATE";
+    case 0x60: return "SET_BIN_MASK_LO";
+    case 0x61: return "SET_BIN_MASK_HI";
+    case 0x62: return "SET_BIN_SELECT_LO";
+    case 0x63: return "SET_BIN_SELECT_HI";
+    case 0x64: return "XE_SWAP";
+    default: return nullptr;
+  }
+}
+
+std::string PacketSummary(double frames) {
+  struct Entry {
+    int kind;
+    uint64_t packets, dwords;
+  };
+  std::vector<Entry> entries;
+  uint64_t packets = 0, dwords = 0;
+  for (int k = 0; k < kPacketKinds; ++k) {
+    const uint64_t n = g_packets[k].load(std::memory_order_relaxed);
+    if (!n) continue;
+    const uint64_t d = g_packet_dwords[k].load(std::memory_order_relaxed);
+    entries.push_back({k, n, d});
+    packets += n;
+    dwords += d;
+  }
+  if (!packets) return "Command stream: no packets seen (SDK patch 0020 missing?)\n";
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry& a, const Entry& b) { return a.dwords > b.dwords; });
+  std::string s = fmt::format(
+      "Command stream (what the emulated GPU still executes): {:.0f} packets, {:.1f} KB per "
+      "frame\n",
+      double(packets) / frames, double(dwords) * 4.0 / 1024.0 / frames);
+  for (size_t i = 0; i < entries.size() && i < 12; ++i) {
+    const Entry& e = entries[i];
+    const char* name = PacketName(e.kind);
+    s += fmt::format("  {:<22} {:8.1f} packets {:8.1f} KB  {:5.1f}%\n",
+                     name ? std::string(name) : fmt::format("type 3 op {:02X}", e.kind),
+                     double(e.packets) / frames, double(e.dwords) * 4.0 / 1024.0 / frames,
+                     100.0 * double(e.dwords) / double(dwords));
+  }
+  std::vector<std::pair<uint64_t, uint32_t>> regs;
+  for (uint32_t r = 0; r < 0x8000; ++r) {
+    if (const uint64_t n = g_reg_writes[r].load(std::memory_order_relaxed)) regs.push_back({n, r});
+  }
+  std::sort(regs.rbegin(), regs.rend());
+  if (!regs.empty()) {
+    s += "  register writes by first register (per frame):";
+    for (size_t i = 0; i < regs.size() && i < 8; ++i) {
+      s += fmt::format(" {:04X}:{:.0f}", regs[i].second, double(regs[i].first) / frames);
+    }
+    s += "\n";
+  }
+  return s;
+}
+
+void ResetPacketStats() {
+  for (auto& v : g_packets) v.store(0, std::memory_order_relaxed);
+  for (auto& v : g_packet_dwords) v.store(0, std::memory_order_relaxed);
+  for (auto& v : g_reg_writes) v.store(0, std::memory_order_relaxed);
+}
+
+void WriteResults(double seconds, const std::vector<ThreadMap>& samples,
+                  const std::vector<int64_t>& sample_ns) {
+  std::vector<Row> rows;
+  std::vector<int64_t> presents;
+  uint64_t swap_tid, worker_tid;
+  {
+    std::lock_guard lock(g_mutex);
+    rows = g_rows;
+    presents = g_present_ns;
+    swap_tid = g_swap_tid;
+    worker_tid = g_worker_tid;
+  }
+  const auto dir = rex::filesystem::GetExecutableFolder() / "logs";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  const std::string stamp = Stamp();
+  const auto base = dir / ("perf_" + stamp);
+
+  // Per frame.
+  {
+    std::ofstream f(base.string() + ".csv");
+    f << "t_ms,frame_ms,swap_thread_cpu_ms";
+    for (int z = 0; z < kZones; ++z) f << "," << ZoneName(Zone(z)) << "_ms";
+    f << ",worker_cpu_ms,gpu_ms,presents,allocs\n";
+    for (const Row& r : rows) {
+      f << fmt::format("{:.2f},{:.3f},{:.3f}", r.t_ms, r.frame_ms, r.swap_cpu_ms);
+      for (double z : r.zone_ms) f << fmt::format(",{:.3f}", z);
+      f << fmt::format(",{:.3f},{:.3f},{},{}\n", r.worker_ms, r.gpu_ms, r.presents, r.allocs);
+    }
+  }
+
+  // Per thread: totals over the trace and the busiest second.
+  std::vector<ThreadStat> threads;
+  if (samples.size() >= 2) {
+    const ThreadMap& first = samples.front();
+    const ThreadMap& last = samples.back();
+    const double span_ms = double(sample_ns.back() - sample_ns.front()) * 1e-6;
+    for (const auto& [tid, s] : last) {
+      ThreadStat t;
+      t.tid = tid;
+      t.name = s.name;
+      if (tid == g_draw_tid.load()) t.role = "game: issues the draws";
+      if (tid == swap_tid) t.role = t.role.empty() ? "game: calls D3DDevice_Swap"
+                                                  : "game: draws and calls D3DDevice_Swap";
+      if (tid == worker_tid) t.role = "native renderer worker";
+      const auto it = first.find(tid);
+      const int64_t start = it != first.end() ? it->second.cpu_ns : 0;
+      t.cpu_ms = double(s.cpu_ns - start) * 1e-6;
+      if (it != first.end()) {
+        t.sys_ms = double(s.sys_ns - it->second.sys_ns) * 1e-6;
+        t.faults = double(s.faults - it->second.faults);
+      }
+      t.avg_core_pct = span_ms > 0 ? 100.0 * t.cpu_ms / span_ms : 0;
+      for (size_t i = 1; i < samples.size(); ++i) {
+        const auto a = samples[i - 1].find(tid), b = samples[i].find(tid);
+        if (b == samples[i].end()) continue;
+        const int64_t before = a != samples[i - 1].end() ? a->second.cpu_ns : 0;
+        const double dt = double(sample_ns[i] - sample_ns[i - 1]) * 1e-6;
+        if (dt > 0) {
+          t.max_core_pct = std::max(t.max_core_pct, 100.0 * double(b->second.cpu_ns - before) * 1e-6 / dt);
+        }
+      }
+      threads.push_back(std::move(t));
+    }
+    std::sort(threads.begin(), threads.end(),
+              [](const ThreadStat& a, const ThreadStat& b) { return a.cpu_ms > b.cpu_ms; });
+    std::ofstream f(base.string() + "_threads.csv");
+    f << "tid,name,role,cpu_ms,avg_core_pct,max_core_pct_1s,system_ms,page_faults\n";
+    for (const auto& t : threads) {
+      f << fmt::format("{},\"{}\",\"{}\",{:.1f},{:.1f},{:.1f},{:.0f},{:.0f}\n", t.tid, t.name, t.role,
+                       t.cpu_ms, t.avg_core_pct, t.max_core_pct, t.sys_ms, t.faults);
+    }
+  }
+
+  // Summary.
+  std::string s;
+  s += fmt::format("Amped 3 Revamped performance trace {} ({:.0f} s, {} frames)\n", stamp, seconds,
+                   rows.size());
+  s += fmt::format("Settings: native_renderer={} revamped_graphics={} frame_rate_limit={} gpu_backend={}\n",
+                   rex::cvar::GetFlagByName("native_renderer"),
+                   rex::cvar::GetFlagByName("revamped_graphics"),
+                   rex::cvar::GetFlagByName("frame_rate_limit"),
+                   rex::cvar::GetFlagByName("gpu_backend"));
+  if (!rows.empty()) {
+    std::vector<double> frame, cpu;
+    std::array<double, kZones> zone_sum{};
+    double worker_sum = 0, gpu_sum = 0;
+    int worker_n = 0, gpu_n = 0;
+    for (const Row& r : rows) {
+      frame.push_back(r.frame_ms);
+      cpu.push_back(r.swap_cpu_ms);
+      for (int z = 0; z < kZones; ++z) zone_sum[z] += r.zone_ms[z];
+      if (r.worker_ms >= 0) worker_sum += r.worker_ms, ++worker_n;
+      if (r.gpu_ms >= 0) gpu_sum += r.gpu_ms, ++gpu_n;
+    }
+    const double n = double(rows.size());
+    double total = 0;
+    for (double v : frame) total += v;
+    const double p50 = Percentile(frame, 0.5);
+    const double stutter_at = std::max(p50 * 1.5, p50 + 4.0);
+    const auto stutters = std::count_if(frame.begin(), frame.end(),
+                                        [&](double v) { return v > stutter_at; });
+    s += fmt::format(
+        "Game frames: {:.1f} fps; frame time avg {:.2f} ms, p50 {:.2f}, p95 {:.2f}, p99 {:.2f}, "
+        "max {:.2f}; {} stutters (> {:.1f} ms)\n",
+        total > 0 ? 1000.0 * n / total : 0, total / n, p50, Percentile(frame, 0.95),
+        Percentile(frame, 0.99), Percentile(frame, 1.0), stutters, stutter_at);
+    double cpu_total = 0;
+    for (double v : cpu) cpu_total += v;
+    double allocs_total = 0;
+    for (const Row& r : rows) allocs_total += double(r.allocs);
+    s += fmt::format("Swapping thread CPU: avg {:.2f} ms/frame, p95 {:.2f}; {:.0f} heap allocations/frame\n",
+                     cpu_total / n, Percentile(cpu, 0.95), allocs_total / n);
+    s += fmt::format("Recording draws: {:.0f} heap allocations/frame\n",
+                     double(g_record_allocs.load()) / n);
+    s += "Zones (avg ms per frame, share of frame time):\n";
+    for (int z = 0; z < kZones; ++z) {
+      s += fmt::format("  {:<12} {:7.3f} ms  {:5.1f}%\n", ZoneName(Zone(z)), zone_sum[z] / n,
+                       total > 0 ? 100.0 * zone_sum[z] / total : 0);
+    }
+    s += fmt::format("Native renderer worker: {}\n",
+                     worker_n ? fmt::format("{:.2f} ms CPU per frame", worker_sum / worker_n)
+                              : std::string("no frames (renderer off?)"));
+    s += fmt::format("GPU: {}\n", gpu_n ? fmt::format("{:.2f} ms per frame", gpu_sum / gpu_n)
+                                        : std::string("no timings"));
+    s += PacketSummary(n);
+  }
+  if (presents.size() >= 3) {
+    std::vector<double> gaps;
+    for (size_t i = 1; i < presents.size(); ++i) gaps.push_back(double(presents[i] - presents[i - 1]) * 1e-6);
+    const double p50 = Percentile(gaps, 0.5);
+    const auto uneven = std::count_if(gaps.begin(), gaps.end(),
+                                      [&](double v) { return v > std::max(p50 * 1.5, p50 + 4.0); });
+    s += fmt::format(
+        "Presented frames: {}; interval p50 {:.2f} ms, p95 {:.2f}, p99 {:.2f}, max {:.2f}; {} "
+        "uneven\n",
+        presents.size(), p50, Percentile(gaps, 0.95), Percentile(gaps, 0.99),
+        Percentile(gaps, 1.0), uneven);
+  }
+  if (!threads.empty()) {
+    s += "Busiest threads (share of one core: average, busiest second; Linux: of the CPU time, "
+         "the kernel's share, and page faults per frame):\n";
+    const double nframes = std::max<double>(double(rows.size()), 1.0);
+    for (size_t i = 0; i < threads.size() && i < 12; ++i) {
+      const auto& t = threads[i];
+      std::string sys;
+      if (t.sys_ms > 0 || t.faults > 0) {
+        sys = fmt::format("  kernel {:4.1f}%, {:5.0f} faults/frame", t.cpu_ms > 0 ? 100.0 * t.sys_ms / t.cpu_ms : 0.0,
+                          t.faults / nframes);
+      }
+      s += fmt::format("  {:>7} {:<16} {:5.1f}% {:5.1f}%{}  {}\n", t.tid, t.name, t.avg_core_pct,
+                       t.max_core_pct, sys, t.role);
+    }
+  }
+  {
+    std::ofstream f(base.string() + "_summary.txt");
+    f << s;
+  }
+  REXLOG_INFO("Performance trace written to {}_*.csv / _summary.txt:\n{}", base.string(), s);
+}
+
+void RunTrace() {
+  const int seconds = std::max(2, REXCVAR_GET(perf_trace_seconds));
+  std::vector<ThreadMap> samples;
+  std::vector<int64_t> sample_ns;
+  samples.push_back(SampleThreads());
+  sample_ns.push_back(NowNs());
+  const auto end = Clock::now() + std::chrono::seconds(seconds);
+  while (Clock::now() < end) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    samples.push_back(SampleThreads());
+    sample_ns.push_back(NowNs());
+  }
+  g_active.store(false, std::memory_order_release);
+  rex::system::SetGpuPacketHook(nullptr);
+  WriteResults(double(seconds), samples, sample_ns);
+  rex::cvar::SetFlagByName("perf_trace", "false");
+  g_running.store(false, std::memory_order_release);
+}
+
+}  // namespace
+
+const char* ZoneName(Zone zone) {
+  switch (zone) {
+    case Zone::kD3D: return "d3d";
+    case Zone::kFlushState: return "flush_state";
+    case Zone::kRecord: return "record";
+    case Zone::kRecTextures: return "rec_textures";
+    case Zone::kRecSetup: return "rec_setup";
+    case Zone::kRecVertices: return "rec_vertices";
+    case Zone::kRecIndices: return "rec_indices";
+    case Zone::kRecState: return "rec_state";
+    case Zone::kRecNaming: return "rec_naming";
+    case Zone::kFenceWait: return "fence_wait";
+    case Zone::kMakeSpace: return "make_space";
+    case Zone::kSwap: return "swap";
+    case Zone::kLimiter: return "limiter";
+    default: return "?";
+  }
+}
+
+bool Active() { return g_active.load(std::memory_order_relaxed); }
+
+void Add(Zone zone, int64_t ns) {
+  if (Active()) g_zone_ns[int(zone)].fetch_add(ns, std::memory_order_relaxed);
+}
+
+Scope::Scope(Zone zone) : zone_(zone) {
+  if (Active()) start_ = NowNs();
+}
+
+Scope::~Scope() {
+  if (start_) Add(zone_, NowNs() - start_);
+}
+
+int64_t ThreadCpuNs() {
+#if defined(_WIN32)
+  FILETIME c, e, k, u;
+  if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+  const auto v = [](const FILETIME& f) {
+    return (int64_t(f.dwHighDateTime) << 32 | f.dwLowDateTime) * 100;
+  };
+  return v(k) + v(u);
+#else
+  timespec ts{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return int64_t(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
+#endif
+}
+
+void Start() {
+  if (g_running.exchange(true)) return;  // one at a time
+  {
+    std::lock_guard rows_lock(g_mutex);
+    g_rows.clear();
+    g_present_ns.clear();
+    g_start_ns = NowNs();
+  }
+  g_worker_sum_us = 0;
+  g_gpu_sum_us = 0;
+  g_worker_count = 0;
+  g_gpu_count = 0;
+  g_present_count = 0;
+  g_draw_tid = 0;
+  g_record_allocs = 0;
+  REXLOG_INFO("Performance trace: recording {} s", REXCVAR_GET(perf_trace_seconds));
+  ResetPacketStats();
+  rex::system::SetGpuPacketHook(&OnGpuPacket);
+  g_active.store(true, std::memory_order_release);
+  std::thread(RunTrace).detach();
+}
+
+void OnSwap() {
+  const int64_t now = NowNs();
+  if (!Active()) {
+    t_have_prev = false;
+    return;
+  }
+  const int64_t cpu = ThreadCpuNs();
+  std::array<int64_t, kZones> zone{};
+  for (int z = 0; z < kZones; ++z) zone[z] = g_zone_ns[z].load(std::memory_order_relaxed);
+  const int worker_n = g_worker_count.exchange(0);
+  const int64_t worker_us = g_worker_sum_us.exchange(0);
+  const int gpu_n = g_gpu_count.exchange(0);
+  const int64_t gpu_us = g_gpu_sum_us.exchange(0);
+  const int presents = g_present_count.exchange(0);
+  if (t_have_prev) {
+    Row r;
+    r.t_ms = double(now - g_start_ns) * 1e-6;
+    r.frame_ms = double(now - t_prev_ns) * 1e-6;
+    r.swap_cpu_ms = double(cpu - t_prev_cpu_ns) * 1e-6;
+    for (int z = 0; z < kZones; ++z) r.zone_ms[z] = double(zone[z] - t_prev_zone[z]) * 1e-6;
+    if (worker_n) r.worker_ms = double(worker_us) * 1e-3 / worker_n;
+    if (gpu_n) r.gpu_ms = double(gpu_us) * 1e-3 / gpu_n;
+    r.presents = presents;
+    r.allocs = ThreadAllocations() - t_prev_allocs;
+    std::lock_guard lock(g_mutex);
+    g_rows.push_back(r);
+    g_swap_tid = CurrentTid();
+  }
+  t_have_prev = true;
+  t_prev_ns = now;
+  t_prev_cpu_ns = cpu;
+  t_prev_zone = zone;
+  t_prev_allocs = ThreadAllocations();
+}
+
+void OnRenderFrame(double worker_ms) {
+  if (!Active()) return;
+  g_worker_sum_us.fetch_add(int64_t(worker_ms * 1000.0), std::memory_order_relaxed);
+  g_worker_count.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard lock(g_mutex);
+  g_worker_tid = CurrentTid();
+}
+
+void OnGpuFrame(double gpu_ms) {
+  if (!Active() || gpu_ms < 0) return;
+  g_gpu_sum_us.fetch_add(int64_t(gpu_ms * 1000.0), std::memory_order_relaxed);
+  g_gpu_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddRecordAllocations(uint64_t n) {
+  if (Active()) g_record_allocs.fetch_add(n, std::memory_order_relaxed);
+}
+
+void NoteDrawThread() {
+  if (!Active()) return;
+  thread_local bool noted = false;
+  thread_local uint64_t noted_in = 0;  // g_start_ns of the trace it was noted in
+  if (noted && noted_in == uint64_t(g_start_ns)) return;
+  noted = true;
+  noted_in = uint64_t(g_start_ns);
+  g_draw_tid.store(CurrentTid());
+}
+
+void OnPresented() {
+  if (!Active()) return;
+  g_present_count.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard lock(g_mutex);
+  g_present_ns.push_back(NowNs());
+}
+
+void Install() {
+  // A trace still on from a session that ended while recording.
+  if (REXCVAR_GET(perf_trace)) rex::cvar::SetFlagByName("perf_trace", "false");
+  rex::ui::RegisterBind(kBind, "F11", "Record a performance trace to logs (perf_trace_seconds)",
+                        [] { Start(); });
+  rex::cvar::RegisterChangeCallback("perf_trace", [](std::string_view, std::string_view value) {
+    if (value == "true") Start();
+  });
+}
+
+}  // namespace amped3::trace

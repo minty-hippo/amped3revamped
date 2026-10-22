@@ -87,11 +87,16 @@ const std::vector<Tab>& Tabs() {
            {"resolution", "Display Resolution", Kind::kChoice, 0, 0, 0,
             {{"", "Native"}, {"1080p", "1920 x 1080"}, {"1440p", "2560 x 1440"}, {"4k", "3840 x 2160"}}},
            {"native_render_scale", "Render Resolution", Kind::kSlider, 25, 100, 5, {}, true},
-#ifdef _WIN32
            {"native_upscaler", "Upscaler", Kind::kChoice, 0, 0, 0,
+#ifdef _WIN32
             {{"off", "Off"}, {"xess", "Intel XeSS"}, {"fsr", "AMD FSR 3.1"}}},
-           {"native_upscaler_sharpness", "FSR Sharpness", Kind::kSlider, 0.0, 1.0, 0.05},
+#else
+            // Intel ships XeSS for Windows only.
+            {{"off", "Off"}, {"fsr", "AMD FSR 3.1"}}},
 #endif
+           {"native_upscaler_sharpness", "FSR Sharpness", Kind::kSlider, 0.0, 1.0, 0.05},
+           {"native_upscaler_msaa", "Upscaler MSAA"},
+           // Off by default and not part of Revamped Graphics.
            {"native_sharp_fonts", "Sharp Fonts"},
            {"native_upscaled_textures", "Upscaled Textures"},
        }},
@@ -168,6 +173,8 @@ ImFont* PanelFont(float px) {
 }
 
 }  // namespace
+
+ImFont* UiFont(float px) { return PanelFont(px); }
 
 void LoadPanelFonts(ImFontAtlas* atlas) {
   // A clean, condensed sans like the game's menu text; fallbacks in order.
@@ -335,7 +342,7 @@ std::string GraphicsPanel::Hint(const Row& r) const {
                   : "The size the picture is made at. Applies at the next launch.";
   }
   if (!native && (name == "native_render_scale" || name == "native_upscaler" ||
-                  name == "native_upscaler_sharpness")) {
+                  name == "native_upscaler_sharpness" || name == "native_upscaler_msaa")) {
     return "Native renderer only (Options F1 > Native renderer).";
   }
   if (name == "native_render_scale") {
@@ -349,6 +356,11 @@ std::string GraphicsPanel::Hint(const Row& r) const {
   if (name == "native_upscaler_sharpness") {
     return GetString("native_upscaler") == "fsr" ? "Sharpening applied by AMD FSR 3.1."
                                                  : "Used with AMD FSR 3.1 only.";
+  }
+  if (name == "native_upscaler_msaa") {
+    return GetString("native_upscaler") != "off"
+               ? "MSAA under FSR / XeSS. Off: the upscaler smooths edges (faster)."
+               : "Used with FSR or XeSS only.";
   }
   if (name == "native_upscaled_textures") {
     return native ? "Textures upscaled on this PC at install (textures\\upscaled)."
@@ -464,11 +476,15 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     if (tab_ == 0) dim = name != "revamped_graphics" && !revamped;
     if (name == "native_render_scale" || name == "native_upscaler") dim = !native;
     if (name == "native_upscaler_sharpness") dim = !native || upscaler != "fsr";
+    if (name == "native_upscaler_msaa") dim = !native || upscaler == "off";
     if (name == "native_sharp_fonts" || name == "native_upscaled_textures") dim = !native;
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);
     const float ty = y + (row_h - text_px) * 0.5f;
     const float cy = y + row_h * 0.5f;
-    const float indent = (tab_ == 0 && i > 0) || name == "native_upscaler_sharpness" ? pad * 0.8f : 0.0f;
+    const float indent = (tab_ == 0 && i > 0) || name == "native_upscaler_sharpness" ||
+                                 name == "native_upscaler_msaa"
+                             ? pad * 0.8f
+                             : 0.0f;
     dl->AddText(f, text_px, ImVec2(at.x + pad + indent, ty), color, r.label);
     const float label_end =
         at.x + pad + indent + f->CalcTextSizeA(text_px, FLT_MAX, 0.0f, r.label).x;

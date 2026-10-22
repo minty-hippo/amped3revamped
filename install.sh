@@ -124,7 +124,8 @@ BUILD_DIR="$PROJECT_DIR/out/build/linux-$ARCH-$CFG"
 # ---------------------------------------------------------------------------
 step 'Putting the game together'
 copied=0
-for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.*; do
+for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.* \
+         "$BUILD_DIR"/*-LICENSE.txt; do
   [ -e "$f" ] || continue
   # A running game (the launcher's Update) has these mapped: replace the file
   # rather than writing into it.
@@ -137,6 +138,14 @@ fi
 # Where the sources are, for the launcher's Update (update.sh).
 printf '%s\n' "$PROJECT_DIR" > "$INSTALL_DIR/source.path"
 note "$copied file(s) copied"
+
+# The icon: the game's own Xbox 360 dashboard icon, taken from this copy's
+# default.xex (tools/xex-icon; nothing of the game ships with the project).
+ICON="$INSTALL_DIR/amped3-icon.png"
+if [ -x "$BUILD_DIR/amped3-icon" ]; then
+  "$BUILD_DIR/amped3-icon" "$GAME/default.xex" "$INSTALL_DIR" >/dev/null ||
+    warn "Couldn't make the icon from default.xex (the shortcut gets a generic one)."
+fi
 
 # A launcher (what Steam runs) and a desktop entry (Steam's "Add a Non-Steam
 # Game" lists these; on SteamOS steamos-add-to-steam adds it directly).
@@ -162,6 +171,7 @@ Path=$INSTALL_DIR
 Terminal=false
 Categories=Game;
 EOF
+  [ -f "$ICON" ] && printf 'Icon=%s\n' "$ICON" >> "$DESKTOP"
   note "Launcher: $LAUNCHER"
   note "Desktop entry: $DESKTOP"
   if command -v steamos-add-to-steam >/dev/null && ask 'Add Amped 3 Revamped to Steam now?' y; then

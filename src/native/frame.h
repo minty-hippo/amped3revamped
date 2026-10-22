@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -80,6 +81,97 @@ struct GpuState {
   }
 };
 
+// Short resource names from the live recorder fit a std::string's inline
+// buffer (15 characters), so copying them per draw allocates nothing:
+//   T<6>_<7>  texture: fetch constant hash, then contents hash
+//   M<10>     vertex memory (physical address and size)
+//   I<10>     index buffer (address and size)
+// Capture files use the long forms (tex_<16>_<16>, mem_..., ib_...).
+inline std::string ShortName(char tag, uint64_t bits, int chars) {
+  static constexpr char kDigits[] =
+      "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-";
+  std::string s(size_t(chars) + 1, tag);
+  for (int i = chars; i >= 1; --i, bits >>= 6) s[size_t(i)] = kDigits[bits & 63];
+  return s;
+}
+
+// A texture resource (either form); "<name>.base" / ".mips" are its data.
+inline bool IsTextureResource(const std::string& name) {
+  return name.rfind("tex_", 0) == 0 || (name.size() >= 9 && name[0] == 'T' && name[7] == '_');
+}
+
+// A vector that keeps its first N elements inline: a draw's few textures and
+// vertex streams then need no heap allocation (the live recorder makes
+// thousands of draws a frame).
+template <typename T, size_t N>
+class SmallVector {
+ public:
+  T* begin() { return heap_.empty() ? inline_.data() : heap_.data(); }
+  T* end() { return begin() + size_; }
+  const T* begin() const { return heap_.empty() ? inline_.data() : heap_.data(); }
+  const T* end() const { return begin() + size_; }
+  size_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  T& operator[](size_t i) { return begin()[i]; }
+  const T& operator[](size_t i) const { return begin()[i]; }
+  T& back() { return begin()[size_ - 1]; }
+  void clear() {
+    heap_.clear();
+    size_ = 0;
+  }
+  void push_back(T v) {
+    if (heap_.empty() && size_ < N) {
+      inline_[size_++] = std::move(v);
+      return;
+    }
+    if (heap_.empty()) {
+      heap_.reserve(N * 2);
+      for (size_t i = 0; i < size_; ++i) heap_.push_back(std::move(inline_[i]));
+    }
+    heap_.push_back(std::move(v));
+    ++size_;
+  }
+
+ private:
+  std::array<T, N> inline_{};
+  std::vector<T> heap_;  // all elements once there are more than N
+  size_t size_ = 0;
+};
+
+// A small map kept as a sorted SmallVector of pairs (same iteration order and
+// the operations the frame code uses: operator[], count, range-for).
+template <typename K, typename V, size_t N>
+class SmallMap {
+ public:
+  using value_type = std::pair<K, V>;
+  V& operator[](const K& key) {
+    for (auto& e : items_) {
+      if (e.first == key) return e.second;
+    }
+    items_.push_back(value_type{key, V{}});
+    std::sort(items_.begin(), items_.end(),
+              [](const value_type& a, const value_type& b) { return a.first < b.first; });
+    for (auto& e : items_) {
+      if (e.first == key) return e.second;
+    }
+    return items_.back().second;  // not reached
+  }
+  size_t count(const K& key) const {
+    for (const auto& e : items_) {
+      if (e.first == key) return 1;
+    }
+    return 0;
+  }
+  const value_type* begin() const { return items_.begin(); }
+  const value_type* end() const { return items_.end(); }
+  size_t size() const { return items_.size(); }
+  bool empty() const { return items_.empty(); }
+  void clear() { items_.clear(); }
+
+ private:
+  SmallVector<value_type, N> items_;
+};
+
 struct FrameTexture {
   uint32_t slot = 0;
   std::array<uint32_t, 6> raw{};
@@ -94,9 +186,11 @@ struct Draw {
   uint32_t start = 0;  // first vertex (non-indexed) or first index
   uint32_t count = 0;  // vertex or index count
   int32_t base_vertex = 0;
-  std::string vs, ps;  // microcode resource names (ucode_vs_<hash>)
-  std::vector<FrameTexture> textures;
-  std::map<uint32_t, std::string> vmem;  // vertex fetch constant -> vertex memory resource
+  // Microcode resource names: ucode_vs_<hash> / ucode_ps_<hash> in captures;
+  // the live recorder uses short aliases (V<11> / P<11>, see live_renderer.cpp).
+  std::string vs, ps;
+  SmallVector<FrameTexture, 4> textures;
+  SmallMap<uint32_t, std::string, 2> vmem;  // vertex fetch constant -> vertex memory resource
   std::string index_data;                // index resource (ib_ / upi_)
   std::string up_vertices;               // user-pointer vertex resource (upv_)
   bool index_32bit = false;

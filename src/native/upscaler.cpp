@@ -9,7 +9,7 @@
 #include <string>
 
 #if !defined(_WIN32) && !defined(__declspec)
-#define __declspec(x)  // the FidelityFX header assumes Windows (Linux replayer build)
+#define __declspec(x)  // the FidelityFX header assumes Windows
 #endif
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.h>
@@ -30,6 +30,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 namespace amped3::native {
@@ -43,8 +44,16 @@ struct Library {
 #ifdef _WIN32
     handle = reinterpret_cast<void*>(LoadLibraryA(name));
 #else
-    (void)name;  // the vendors ship Windows libraries only
-    handle = nullptr;
+    // Next to the executable first (where the installers put it), then the
+    // usual library search path.
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+      std::string path(exe, size_t(n));
+      path = path.substr(0, path.find_last_of('/') + 1) + name;
+      handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!handle) handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif
     return handle != nullptr;
   }
@@ -287,15 +296,26 @@ PFN_vkVoidFunction VKAPI_PTR FfxGetDeviceProcAddr(VkDevice device, const char* n
 
 class Fsr final : public Upscaler {
  public:
+#ifdef _WIN32
+  static constexpr const char* kLibrary = "amd_fidelityfx_vk.dll";
+#else
+  // Built from the FidelityFX SDK's sources by setup.sh (linux/fidelityfx):
+  // AMD ships the runtime for Windows only.
+  static constexpr const char* kLibrary = "libamd_fidelityfx_vk.so";
+#endif
   bool Load(std::string* error) {
-    if (!lib_.Open("amd_fidelityfx_vk.dll")) {
+    if (!lib_.Open(kLibrary)) {
+#ifdef _WIN32
       *error = "amd_fidelityfx_vk.dll not found (run setup.ps1 to fetch the FidelityFX runtime)";
+#else
+      *error = "libamd_fidelityfx_vk.so not found (setup.sh builds it from AMD's FidelityFX SDK)";
+#endif
       return false;
     }
     bool ok = lib_.Get("ffxCreateContext", &create_) && lib_.Get("ffxDestroyContext", &destroy_) &&
               lib_.Get("ffxQuery", &query_) && lib_.Get("ffxDispatch", &dispatch_);
     if (!ok) {
-      *error = "amd_fidelityfx_vk.dll is not a FidelityFX API runtime";
+      *error = std::string(kLibrary) + " is not a FidelityFX API runtime";
       return false;
     }
     description_ = "FSR";
@@ -373,6 +393,13 @@ class Fsr final : public Upscaler {
     d.motionVectors = resource(in.motion, FFX_API_RESOURCE_USAGE_READ_ONLY,
                                FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     d.output = resource(in.output, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (in.reactive.image) {
+      d.reactive = resource(in.reactive, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                            FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+      // Also as the transparency & composition mask: it stops FSR "locking"
+      // thin bright detail there (a flake's lock kept it in the history).
+      d.transparencyAndComposition = d.reactive;
+    }
     d.jitterOffset = {in.jitter_x, in.jitter_y};
     d.motionVectorScale = {1.0f, 1.0f};
     d.renderSize = {in.render_width, in.render_height};
@@ -475,10 +502,9 @@ void UpscaleJitter(uint32_t index, int phases, float* x, float* y) {
 
 std::unique_ptr<Upscaler> Upscaler::Create(UpscalerKind kind, std::string* error) {
 #ifndef _WIN32
-  // XeSS's and FidelityFX's runtimes are Windows libraries (the test
-  // upscaler still works for the replayer).
-  if (kind == UpscalerKind::kXess || kind == UpscalerKind::kFsr) {
-    *error = "XeSS and FSR 3.1 are Windows only";
+  // Intel ships XeSS for Windows only (no Linux library in the XeSS SDK).
+  if (kind == UpscalerKind::kXess) {
+    *error = "XeSS is Windows only (Intel has no Linux XeSS library)";
     return nullptr;
   }
 #endif

@@ -22,6 +22,8 @@
 # Not redistributable with these sources: Intel's XeSS headers (setup.ps1
 # fetches them), and your own assets such as the game's logo.
 /third_party/xess/
+# AMD's FidelityFX SDK sources (linux/fidelityfx/build.sh fetches them).
+/third_party/fidelityfx-sdk/
 # /assets/local/ holds your own assets (the logo); this repository publishes them.
 
 # Python caches (tools)

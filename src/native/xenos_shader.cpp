@@ -862,7 +862,11 @@ uint xe_vertex_index() {
     uvec2 q = uvec2(gl_FragCoord.xy) & 3u;
     const uint kBayer[16] = uint[16](0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u,
                                      3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
-    float dither = (float(kBayer[q.y * 4u + q.x]) + 0.5) / 16.0;
+    // (bits 30..31: a per-frame phase with one sample per pixel: each pixel's
+    // threshold steps a quarter each frame, so over four frames the
+    // upscaler's accumulation sees the exact coverage, not a fixed pattern)
+    float dither = fract((float(kBayer[q.y * 4u + q.x]) + 0.5) / 16.0 +
+                         float(xe_sys.flags >> 30u) * 0.25);
     uint rot = uint(dither * float(n)) %% n;
     // Camera fade: visibility from the pixel's distance (view depth) and its
     // distance from the screen point the rider sits around, smooth in both.

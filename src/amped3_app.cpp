@@ -4,6 +4,21 @@
 #include "audio_trace.h"
 
 #include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <chrono>
 #include <fstream>
 
@@ -32,19 +47,31 @@
 #include "options_menu.h"
 #include "pad_bridge.h"
 #include "perf_overlay.h"
+#include "perf_trace.h"
 #include "thread_qos.h"
+#include "version.h"
 
 
-// Direct3D 12 on Windows; Vulkan everywhere else (Linux: SteamOS, ARM handhelds).
-#ifdef _WIN32
-#define AMPED3_DEFAULT_GPU_BACKEND "d3d12"
-#else
-#define AMPED3_DEFAULT_GPU_BACKEND "vulkan"
-#endif
-REXCVAR_DEFINE_STRING(gpu_backend, AMPED3_DEFAULT_GPU_BACKEND, "GPU",
-                      "Graphics API for the GPU plugin: d3d12 (Windows) or vulkan")
-    .allowed({"d3d12", "vulkan"})
+// auto: Vulkan while the native renderer draws (its image then reaches the
+// window on the GPU; with Direct3D 12 it goes through the CPU), Direct3D 12 on
+// Windows when the emulation draws; Vulkan everywhere else.
+REXCVAR_DEFINE_STRING(gpu_backend, "auto", "GPU",
+                      "Graphics API for the GPU plugin: auto, d3d12 (Windows) or vulkan. Auto is "
+                      "Vulkan with the native renderer, Direct3D 12 on Windows without it")
+    .allowed({"auto", "d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+std::string EffectiveGpuBackend() {
+  const std::string value = REXCVAR_GET(gpu_backend);
+  if (value != "auto" && !value.empty()) return value;
+#ifdef _WIN32
+  return rex::cvar::GetFlagByName("native_renderer") == "true" ? "vulkan" : "d3d12";
+#else
+  return "vulkan";
+#endif
+}
+}  // namespace
 
 // The SDK's Vulkan presenter prefers IMMEDIATE (no sync, tears) whenever the
 // driver offers it. The game runs at a fixed 30/60 fps, so tearing buys
@@ -123,7 +150,7 @@ void Amped3App::OnPreSetup(rex::RuntimeConfig& config) {
   // Load it here with the API chosen in Options -> Display/Graphics instead;
   // if that fails (no Vulkan driver, say) fall back to the SDK's choice.
   if (!config.graphics) {
-    const std::string backend = REXCVAR_GET(gpu_backend);
+    const std::string backend = EffectiveGpuBackend();
     config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, backend);
     if (!config.graphics) {
       REXLOG_WARN("GPU backend '{}' unavailable; using the default", backend);
@@ -226,7 +253,38 @@ void Amped3App::MoveOldSaves(const std::filesystem::path& from, const std::files
                 " (the old folder is left as a backup)";
 }
 
+bool amped3::AcquireSingleInstance() {
+#if defined(_WIN32)
+  // Held by the process (closed by the system when it exits).
+  HANDLE m = CreateMutexW(nullptr, TRUE, L"Local\\Amped3RevampedRunning");
+  return m && GetLastError() != ERROR_ALREADY_EXISTS;
+#else
+  // An advisory lock on a file in the user's runtime folder: released by the
+  // kernel when the process ends, however it ends.
+  const char* dir = std::getenv("XDG_RUNTIME_DIR");
+  const std::string path = (dir && *dir ? std::string(dir) : std::string("/tmp")) +
+                           "/amped3-revamped-" + std::to_string(getuid()) + ".lock";
+  const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) return true;  // can't tell: run
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    close(fd);
+    return errno != EWOULDBLOCK;
+  }
+  return true;  // fd stays open (and locked) for the process's life
+#endif
+}
+
 void Amped3App::OnPostInitLogging() {
+  REXLOG_INFO("Amped 3 Revamped {}", amped3::version::Text());
+  // Files a reinstall moved aside while the game ran (the installer renames
+  // what it can't replace).
+  {
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(rex::filesystem::GetExecutableFolder(), ec)) {
+      if (entry.path().extension() == ".old") std::filesystem::remove(entry.path(), ec);
+    }
+  }
   // Same folder the SDK writes amped3_NNN.log to.
   amped3::crash::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::capture::Install(rex::filesystem::GetExecutableFolder() / "logs");
@@ -262,6 +320,8 @@ bool Amped3App::OnWantShaderStorage() { return !lean_gpu_; }
 void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // F3: the performance overlay, in place of the SDK's debug overlay.
   amped3::perf::Install(drawer);
+  // F11: performance trace to logs (perf_trace.cpp).
+  amped3::trace::Install();
   // Keyboard shortcut; shows up (and can be rebound) in the F4 settings panel.
   rex::ui::RegisterBind(kMenuBind, "F1", "Open or close the Amped 3 Revamped options menu",
                         [this] { ToggleOptionsMenu(); });
@@ -335,7 +395,7 @@ void Amped3App::OnPostSetup() {
         auto* graphics = runtime() ? runtime()->graphics_system() : nullptr;
         return graphics ? graphics->presenter() : nullptr;
       },
-      REXCVAR_GET(gpu_backend),
+      EffectiveGpuBackend(),
       [this](amped3::live::GammaRamp* ramp) {
         auto* graphics =
             static_cast<rex::graphics::GraphicsSystem*>(runtime() ? runtime()->graphics_system()

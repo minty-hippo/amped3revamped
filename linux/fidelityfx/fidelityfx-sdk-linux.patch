@@ -1,0 +1,412 @@
+diff --git a/ffx-api/src/ffx_provider_fsr3upscale.cpp b/ffx-api/src/ffx_provider_fsr3upscale.cpp
+index c1e140c..d23338c 100644
+--- a/ffx-api/src/ffx_provider_fsr3upscale.cpp
++++ b/ffx-api/src/ffx_provider_fsr3upscale.cpp
+@@ -69,7 +69,7 @@ bool ffxProvider_FSR3Upscale::CanProvide(uint64_t type) const
+ uint64_t ffxProvider_FSR3Upscale::GetId() const
+ {
+     // FSR Scale, version from header
+-    return 0xF5A5'CA1Eui64 << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
++    return 0xF5A5'CA1Eull << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
+ }
+ 
+ const char* ffxProvider_FSR3Upscale::GetVersionName() const
+diff --git a/sdk/include/FidelityFX/host/ffx_fsr3upscaler.h b/sdk/include/FidelityFX/host/ffx_fsr3upscaler.h
+index 25cbef5..ec2a068 100644
+--- a/sdk/include/FidelityFX/host/ffx_fsr3upscaler.h
++++ b/sdk/include/FidelityFX/host/ffx_fsr3upscaler.h
+@@ -55,7 +55,12 @@
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup ffxFsr3Upscaler
++#ifdef _WIN32
+ #define FFX_FSR3UPSCALER_CONTEXT_SIZE (FFX_SDK_DEFAULT_CONTEXT_SIZE)
++#else
++// Linux: wchar_t (the context's resource names) is 4 bytes, not 2.
++#define FFX_FSR3UPSCALER_CONTEXT_SIZE (FFX_SDK_DEFAULT_CONTEXT_SIZE * 2)
++#endif
+ 
+ #if defined(__cplusplus)
+ extern "C" {
+diff --git a/sdk/src/backends/vk/ffx_vk.cpp b/sdk/src/backends/vk/ffx_vk.cpp
+index d914479..a84d8cb 100644
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -272,6 +272,11 @@ typedef struct BackendContext_VK {
+ 
+ } BackendContext_VK;
+ 
++// The arrays in the scratch memory hold structures the compiler may access
++// with 16-byte aligned (SSE) instructions: start each on a 16-byte boundary
++// (the SDK aligns them to 4 bytes, which MSVC tolerates and Clang/GCC don't).
++#define FFX_VK_SCRATCH_ALIGNMENT 16
++
+ FFX_API size_t ffxGetScratchMemorySizeVK(VkPhysicalDevice physicalDevice, size_t maxContexts)
+ {
+     uint32_t numExtensions = 0;
+@@ -280,14 +285,14 @@ FFX_API size_t ffxGetScratchMemorySizeVK(VkPhysicalDevice physicalDevice, size_t
+         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &numExtensions, nullptr);
+ 
+     uint32_t extensionPropArraySize = sizeof(VkExtensionProperties) * numExtensions;
+-    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+-    uint32_t resourceViewArraySize = FFX_ALIGN_UP(((maxContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), sizeof(uint32_t));
+-    uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(maxContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+-    uint32_t pipelineArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+-    uint32_t resourceArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
+-    uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
++    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), FFX_VK_SCRATCH_ALIGNMENT);
++    uint32_t resourceViewArraySize = FFX_ALIGN_UP(((maxContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), FFX_VK_SCRATCH_ALIGNMENT);
++    uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(maxContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, FFX_VK_SCRATCH_ALIGNMENT);
++    uint32_t pipelineArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), FFX_VK_SCRATCH_ALIGNMENT);
++    uint32_t resourceArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), FFX_VK_SCRATCH_ALIGNMENT);
++    uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), FFX_VK_SCRATCH_ALIGNMENT);
+     
+-    return FFX_ALIGN_UP(sizeof(BackendContext_VK) + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
++    return FFX_ALIGN_UP(sizeof(BackendContext_VK) + FFX_VK_SCRATCH_ALIGNMENT + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
+                             pipelineArraySize + resourceArraySize + contextArraySize,
+                         sizeof(uint64_t));
+ }
+@@ -402,13 +407,24 @@ uint32_t findMemoryTypeIndex(VkPhysicalDevice physicalDevice, VkMemoryRequiremen
+     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+ 
+     uint32_t bestCandidate = UINT32_MAX;
++    // Unified memory GPUs (ARM, some integrated ones) have no device-local
++    // type that isn't also host-visible: use one of those then.
++    uint32_t visibleCandidate = UINT32_MAX;
++    VkMemoryPropertyFlags visibleProperties = 0;
+ 
+     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+         if ((memRequirements.memoryTypeBits & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & requestedProperties)) {
+ 
+             // if just device-local memory is requested, make sure this is the invisible heap to prevent over-subscribing the local heap
+             if (requestedProperties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT && (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++            {
++                if (visibleCandidate == UINT32_MAX)
++                {
++                    visibleCandidate  = i;
++                    visibleProperties = memProperties.memoryTypes[i].propertyFlags;
++                }
+                 continue;
++            }
+ 
+             bestCandidate = i;
+             outProperties = memProperties.memoryTypes[i].propertyFlags;
+@@ -419,6 +435,12 @@ uint32_t findMemoryTypeIndex(VkPhysicalDevice physicalDevice, VkMemoryRequiremen
+         }
+     }
+ 
++    if (bestCandidate == UINT32_MAX && visibleCandidate != UINT32_MAX)
++    {
++        bestCandidate = visibleCandidate;
++        outProperties = visibleProperties;
++    }
++
+     return bestCandidate;
+ }
+ 
+@@ -1402,13 +1424,14 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         new (&backendContext->uniformBufferMutex) std::mutex();
+ 
+         // Map all of our pointers
+-        uint32_t gpuJobDescArraySize   = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+-        uint32_t resourceViewArraySize = FFX_ALIGN_UP(((backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), sizeof(uint32_t));
+-        uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+-        uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+-        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
+-        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
++        uint32_t gpuJobDescArraySize   = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), FFX_VK_SCRATCH_ALIGNMENT);
++        uint32_t resourceViewArraySize = FFX_ALIGN_UP(((backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), FFX_VK_SCRATCH_ALIGNMENT);
++        uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, FFX_VK_SCRATCH_ALIGNMENT);
++        uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), FFX_VK_SCRATCH_ALIGNMENT);
++        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), FFX_VK_SCRATCH_ALIGNMENT);
++        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), FFX_VK_SCRATCH_ALIGNMENT);
+         uint8_t* pMem = (uint8_t*)((BackendContext_VK*)(backendContext + 1));
++        pMem = (uint8_t*)FFX_ALIGN_UP((uintptr_t)pMem, (uintptr_t)FFX_VK_SCRATCH_ALIGNMENT);
+ 
+         // Map gpu job array
+         backendContext->pGpuJobs = (FfxGpuJobDescription*)pMem;
+diff --git a/sdk/src/shared/ffx_message.cpp b/sdk/src/shared/ffx_message.cpp
+index 7dd5127..6f5a03e 100644
+--- a/sdk/src/shared/ffx_message.cpp
++++ b/sdk/src/shared/ffx_message.cpp
+@@ -21,6 +21,7 @@
+ // THE SOFTWARE.
+ 
+ #include <FidelityFX/host/ffx_message.h>
++#include <FidelityFX/host/ffx_util.h>
+ 
+ #ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+diff --git a/sdk/tools/ffx_shader_compiler/src/ffx_sc.cpp b/sdk/tools/ffx_shader_compiler/src/ffx_sc.cpp
+index c3ec37f..7cde4d2 100644
+--- a/sdk/tools/ffx_shader_compiler/src/ffx_sc.cpp
++++ b/sdk/tools/ffx_shader_compiler/src/ffx_sc.cpp
+@@ -20,12 +20,16 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ // THE SOFTWARE.
+ 
++#ifdef _WIN32
+ #include "hlsl_compiler.h"
++#endif
+ #include "glsl_compiler.h"
+ #include "utils.h"
+ 
++#ifdef _WIN32
+ #include <Windows.h>
+ #include <pathcch.h>
++#endif
+ #include <vector>
+ #include <string_view>
+ #include <filesystem>
+@@ -34,7 +38,16 @@
+ #include <stdexcept>
+ 
+ 
++#ifdef _WIN32
+ #pragma comment(lib, "pathcch.lib")
++#else
++// Linux build (glslang only): stand-ins for the CRT's wide file functions.
++static int _wfopen_s(FILE** fp, const wchar_t* path, const wchar_t* mode)
++{
++    *fp = fopen(WCharToUTF8(path).c_str(), WCharToUTF8(mode).c_str());
++    return *fp ? 0 : errno;
++}
++#endif
+ 
+ static const wchar_t* const APP_NAME    = L"FidelityFX-SC";
+ static const wchar_t* const EXE_NAME    = L"FidelityFX_SC";
+@@ -309,6 +322,15 @@ void LaunchParameters::ParseCommandLine(int argCount, const wchar_t* const* args
+ 
+ void LaunchParameters::EnsureOutputPathExistsAndMakeCanonical(std::wstring& inoutOutputPath)
+ {
++#ifndef _WIN32
++    fs::path p = fs::absolute(fs::path(WCharToUTF8(inoutOutputPath))).lexically_normal();
++    fs::create_directories(p);
++    std::string out = p.string();
++    if (out.empty() || out.back() != '/')
++        out += '/';
++    inoutOutputPath = UTF8ToWChar(out);
++    return;
++#else
+     std::replace(inoutOutputPath.begin(), inoutOutputPath.end(), L'/', L'\\');
+ 
+     PWSTR canonicalOutputPath = NULL;
+@@ -342,6 +364,7 @@ void LaunchParameters::EnsureOutputPathExistsAndMakeCanonical(std::wstring& inou
+         inoutOutputPath = canonicalOutputPath;
+         LocalFree(canonicalOutputPath);
+     }
++#endif
+ }
+ 
+ void LaunchParameters::ParsePermutationOption(PermutationOption& outPermutationOption, const std::wstring arg)
+@@ -437,6 +460,9 @@ void Application::Process()
+ 
+ std::wstring Application::MakeFullPath(const std::wstring & outputPath, const std::wstring & fileName)
+ {
++#ifndef _WIN32
++    return UTF8ToWChar((fs::path(WCharToUTF8(outputPath)) / WCharToUTF8(fileName)).string());
++#else
+     // Append file name, optionally converting to long path again, because the outputPath alone could be normal path, but when filename is added -- it could become a long path
+     PWSTR canonicalFileNameRaw = NULL;
+     HRESULT hr = PathAllocCombine(outputPath.c_str(), fileName.c_str(), PATHCCH_ALLOW_LONG_PATHS, &canonicalFileNameRaw);
+@@ -448,6 +474,7 @@ std::wstring Application::MakeFullPath(const std::wstring & outputPath, const st
+         return canonicalFileName;
+     }
+     return fileName;
++#endif
+ }
+ 
+ void Application::GenerateMacroPermutations(std::deque<Permutation>& permutations)
+@@ -520,6 +547,12 @@ static bool FindIncludeFilePath(const std::string& includeFile, const std::vecto
+     return false;
+ }
+ 
++#ifdef _WIN32
++#define HLSL_COMPILER(...) m_Compiler = __VA_ARGS__
++#else
++#define HLSL_COMPILER(...) throw std::runtime_error("HLSL compilers are Windows only (Linux build: glslang)")
++#endif
++
+ void Application::OpenSourceFile()
+ {
+     size_t slashPos     = m_Params.inputFile.find_last_of('/');
+@@ -558,8 +591,8 @@ void Application::OpenSourceFile()
+         std::wstring extension    = m_Params.inputFile.substr(extensionPos + 1, m_Params.inputFile.size() - extensionPos - 1);
+ 
+         if (extension == L"hlsl")
+-            m_Compiler = std::unique_ptr<HLSLCompiler>(
+-                new HLSLCompiler(HLSLCompiler::DXC, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
++            HLSL_COMPILER(std::unique_ptr<HLSLCompiler>(
++                new HLSLCompiler(HLSLCompiler::DXC, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile)));
+         else if (extension == L"glsl")
+             m_Compiler = std::unique_ptr<GLSLCompiler>(new GLSLCompiler(glslangExe, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
+         else
+@@ -568,17 +601,17 @@ void Application::OpenSourceFile()
+     else
+     {
+         if (m_Params.compiler == L"dxc")
+-            m_Compiler = std::unique_ptr<HLSLCompiler>(
+-                new HLSLCompiler(HLSLCompiler::DXC, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
++            HLSL_COMPILER(std::unique_ptr<HLSLCompiler>(
++                new HLSLCompiler(HLSLCompiler::DXC, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile)));
+         else if (m_Params.compiler == L"gdk.scarlett.x64")
+-            m_Compiler = std::unique_ptr<HLSLCompiler>(new HLSLCompiler(
+-                HLSLCompiler::GDK_SCARLETT_X64, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
++            HLSL_COMPILER(std::unique_ptr<HLSLCompiler>(new HLSLCompiler(
++                HLSLCompiler::GDK_SCARLETT_X64, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile)));
+         else if (m_Params.compiler == L"gdk.xboxone.x64")
+-            m_Compiler = std::unique_ptr<HLSLCompiler>(new HLSLCompiler(
+-                HLSLCompiler::GDK_XBOXONE_X64, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
++            HLSL_COMPILER(std::unique_ptr<HLSLCompiler>(new HLSLCompiler(
++                HLSLCompiler::GDK_XBOXONE_X64, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile)));
+         else if (m_Params.compiler == L"fxc")
+-            m_Compiler = std::unique_ptr<HLSLCompiler>(
+-                new HLSLCompiler(HLSLCompiler::FXC, d3dDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
++            HLSL_COMPILER(std::unique_ptr<HLSLCompiler>(
++                new HLSLCompiler(HLSLCompiler::FXC, d3dDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile)));
+         else if (m_Params.compiler == L"glslang")
+             m_Compiler = std::unique_ptr<GLSLCompiler>(new GLSLCompiler(glslangExe, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
+         else
+@@ -1084,8 +1117,20 @@ void Application::DumpDepfileMSVC()
+     printf("MSVC depfile not implemented yet.\n");
+ }
+ 
++#ifdef _WIN32
+ int wmain(int argc, wchar_t** argv)
+ {
++#else
++int main(int argc, char** argvUtf8)
++{
++    std::vector<std::wstring> wideArgs;
++    std::vector<wchar_t*>     wideArgv;
++    for (int i = 0; i < argc; i++)
++        wideArgs.push_back(UTF8ToWChar(argvUtf8[i]));
++    for (auto& a : wideArgs)
++        wideArgv.push_back(a.data());
++    wchar_t** argv = wideArgv.data();
++#endif
+     try
+     {
+         if (argc <= 1)
+diff --git a/sdk/tools/ffx_shader_compiler/src/glsl_compiler.cpp b/sdk/tools/ffx_shader_compiler/src/glsl_compiler.cpp
+index 532b192..2fe7da4 100644
+--- a/sdk/tools/ffx_shader_compiler/src/glsl_compiler.cpp
++++ b/sdk/tools/ffx_shader_compiler/src/glsl_compiler.cpp
+@@ -36,7 +36,7 @@ std::string MD5HashString(unsigned char* sig)
+ 
+     for (int i = 0; i < MD5_SIZE; i++)
+     {
+-        std::snprintf(out_ptr, 32, "%02x", sig[i]);
++        std::snprintf(out_ptr, 3, "%02x", sig[i]);
+         out_ptr += 2;
+     }
+ 
+@@ -328,12 +328,25 @@ bool GLSLCompiler::ExtractReflectionData(Permutation& permutation)
+     assert(result == SPV_REFLECT_RESULT_SUCCESS);
+ 
+     uint32_t count = 0;
++#ifdef _WIN32
+     result = spvReflectEnumerateDescriptorSets(&reflectShaderModule, &count, NULL);
+     assert(result == SPV_REFLECT_RESULT_SUCCESS);
+ 
+     std::vector<SpvReflectDescriptorSet*> sets(count);
+     result = spvReflectEnumerateDescriptorSets(&reflectShaderModule, &count, sets.data());
+     assert(result == SPV_REFLECT_RESULT_SUCCESS);
++#else
++    // Linux build: glslang without SPIRV-Tools' optimizer (no -Os) keeps
++    // resources a shader declares but never uses, which the optimizer removes
++    // on Windows. Only the ones the entry point uses statically.
++    const char* entryPoint = reflectShaderModule.entry_point_name;
++    result = spvReflectEnumerateEntryPointDescriptorSets(&reflectShaderModule, entryPoint, &count, NULL);
++    assert(result == SPV_REFLECT_RESULT_SUCCESS);
++
++    std::vector<SpvReflectDescriptorSet*> sets(count);
++    result = spvReflectEnumerateEntryPointDescriptorSets(&reflectShaderModule, entryPoint, &count, sets.data());
++    assert(result == SPV_REFLECT_RESULT_SUCCESS);
++#endif
+ 
+     for (int setIdx = 0; setIdx < sets.size(); setIdx++)
+     {
+diff --git a/sdk/tools/ffx_shader_compiler/src/pch.hpp b/sdk/tools/ffx_shader_compiler/src/pch.hpp
+index c017698..7a105f9 100644
+--- a/sdk/tools/ffx_shader_compiler/src/pch.hpp
++++ b/sdk/tools/ffx_shader_compiler/src/pch.hpp
+@@ -22,13 +22,18 @@
+ 
+ #pragma once
+ 
++#ifdef _WIN32
+ #define NOMINMAX
+ #define WIN32_LEAN_AND_MEAN
+ #include <Windows.h>
+ #include <atlcomcli.h>
+ #include <dxcapi.h>
+ #include <d3dcompiler.h>
++#endif
+ #include <assert.h>
++#include <cmath>
++#include <cstring>
++#include <cwchar>
+ #include <stdio.h>
+ #include <exception>
+ #include <string>
+@@ -44,7 +49,9 @@
+ #include <iostream>
+ #include <algorithm>
+ #include <fstream>
++#ifdef _WIN32
+ #include <d3d12shader.h>
++#endif
+ 
+ #include <filesystem>
+ namespace fs = std::filesystem;
+diff --git a/sdk/tools/ffx_shader_compiler/src/utils.cpp b/sdk/tools/ffx_shader_compiler/src/utils.cpp
+index 0b92936..82579e8 100644
+--- a/sdk/tools/ffx_shader_compiler/src/utils.cpp
++++ b/sdk/tools/ffx_shader_compiler/src/utils.cpp
+@@ -22,6 +22,26 @@
+ 
+ #include "utils.h"
+ 
++#ifndef _WIN32
++// Linux: the tool's wide strings only ever hold ASCII (paths, macro names).
++std::string WCharToUTF8(const std::wstring& wstr)
++{
++    std::string str;
++    str.reserve(wstr.size());
++    for (wchar_t c : wstr)
++        str.push_back(static_cast<char>(c));
++    return str;
++}
++
++std::wstring UTF8ToWChar(const std::string& str)
++{
++    std::wstring wstr;
++    wstr.reserve(str.size());
++    for (char c : str)
++        wstr.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
++    return wstr;
++}
++#else
+ std::string WCharToUTF8(const std::wstring& wstr)
+ {
+     if (wstr.empty())
+@@ -49,3 +69,4 @@ std::wstring UTF8ToWChar(const std::string& str)
+ 
+     return wstr;
+ }
++#endif
+diff --git a/sdk/tools/ffx_shader_compiler/src/utils.h b/sdk/tools/ffx_shader_compiler/src/utils.h
+index ff57b45..88b735a 100644
+--- a/sdk/tools/ffx_shader_compiler/src/utils.h
++++ b/sdk/tools/ffx_shader_compiler/src/utils.h
+@@ -23,7 +23,9 @@
+ #pragma once
+ 
+ #include "pch.hpp"
++#ifdef _WIN32
+ #include "DXBCChecksum.h"
++#endif
+ 
+ std::string WCharToUTF8(const std::wstring& wstr);
+ std::wstring UTF8ToWChar(const std::string& str);
