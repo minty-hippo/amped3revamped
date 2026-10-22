@@ -12,6 +12,14 @@
 // (rebuilt by Sharp fonts) are left alone. Runs again pick up where the last
 // one stopped (existing outputs are kept unless --force).
 //
+// Every result is checked against its original: Real-ESRGAN's Vulkan build
+// returns patches of garbage on some GPUs (seen on Intel Arc: holes, black
+// or missing pieces of icons). Shrunk back to the original's size, the
+// result must match it; where it doesn't, a plain bicubic upscale of the
+// original is blended in, and a texture that is mostly wrong is left out
+// (the game's own is used). Earlier runs' outputs are checked the same way
+// on every run, so running it again repairs them.
+//
 // Sets (--set):
 //   ui     menus, HUD and loading screens: GuiPackages\*.ruirr,
 //          loadingscreen.res, diesel\assets\assets.res (default)
@@ -27,6 +35,7 @@
 // (installer\Upscale-Textures.ps1 downloads Real-ESRGAN and runs this.)
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -39,6 +48,7 @@
 #include <set>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -234,6 +244,161 @@ void BleedColour(std::vector<uint8_t>& rgba, uint32_t w, uint32_t h) {
   }
 }
 
+// Keys bicubic (a = -0.5), 4x, of RGBA8 (colour already spread under the
+// transparent texels, so edges don't darken).
+std::vector<uint8_t> Bicubic4x(const std::vector<uint8_t>& src, uint32_t w, uint32_t h) {
+  constexpr int kS = 4;
+  auto kernel = [](float x) {
+    x = std::fabs(x);
+    constexpr float a = -0.5f;
+    if (x < 1.0f) return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+    if (x < 2.0f) return ((a * x - 5.0f * a) * x + 8.0f * a) * x - 4.0f * a;
+    return 0.0f;
+  };
+  // Taps and weights per output coordinate (the same each row/column).
+  auto taps = [&](uint32_t n, uint32_t out_n, std::vector<int>& idx, std::vector<float>& wt) {
+    idx.resize(size_t(out_n) * 4);
+    wt.resize(size_t(out_n) * 4);
+    for (uint32_t o = 0; o < out_n; ++o) {
+      const float s = (float(o) + 0.5f) / kS - 0.5f;
+      const int i0 = int(std::floor(s));
+      float sum = 0;
+      for (int t = 0; t < 4; ++t) {
+        const int i = i0 - 1 + t;
+        const float k = kernel(s - float(i));
+        idx[o * 4 + t] = std::clamp(i, 0, int(n) - 1);
+        wt[o * 4 + t] = k;
+        sum += k;
+      }
+      for (int t = 0; t < 4; ++t) wt[o * 4 + t] /= sum;
+    }
+  };
+  const uint32_t ow = w * kS, oh = h * kS;
+  std::vector<int> xi, yi;
+  std::vector<float> xw, yw;
+  taps(w, ow, xi, xw);
+  taps(h, oh, yi, yw);
+  std::vector<float> rows(size_t(ow) * h * 4);
+  for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t x = 0; x < ow; ++x) {
+      for (int c = 0; c < 4; ++c) {
+        float v = 0;
+        for (int t = 0; t < 4; ++t) v += xw[x * 4 + t] * src[(size_t(y) * w + xi[x * 4 + t]) * 4 + c];
+        rows[(size_t(y) * ow + x) * 4 + c] = v;
+      }
+    }
+  }
+  std::vector<uint8_t> out(size_t(ow) * oh * 4);
+  for (uint32_t y = 0; y < oh; ++y) {
+    for (uint32_t x = 0; x < ow; ++x) {
+      for (int c = 0; c < 4; ++c) {
+        float v = 0;
+        for (int t = 0; t < 4; ++t) v += yw[y * 4 + t] * rows[(size_t(yi[y * 4 + t]) * ow + x) * 4 + c];
+        out[(size_t(y) * ow + x) * 4 + c] = uint8_t(std::clamp(std::lround(v), 0L, 255L));
+      }
+    }
+  }
+  return out;
+}
+
+// Checks a 4x result `up` (straight RGBA) against its original `orig` and
+// mends what disagrees (see the top of the file). `bled` is the original
+// with its colour spread under the transparent texels (BleedColour). Returns
+// the share of the original's texels that disagreed; 0 leaves `up` as it was.
+double Repair(const std::vector<uint8_t>& orig, const std::vector<uint8_t>& bled, uint32_t w,
+              uint32_t h, uint8_t* up) {
+  constexpr int kS = 4;
+  // Calibrated on Intel Arc output: real upscaling stays under ~25 on
+  // average per texel (premultiplied colour and alpha, 0..255); garbage is
+  // far above it.
+  constexpr float kThreshold = 32.0f;
+  const uint32_t ow = w * kS;
+  std::vector<uint8_t> src = bled;
+  for (size_t i = 0; i < size_t(w) * h; ++i) src[i * 4 + 3] = orig[i * 4 + 3];
+  const std::vector<uint8_t> smooth = Bicubic4x(src, w, h);
+  // How far a 4x image, shrunk back, is from the original at a texel.
+  auto error = [&](const uint8_t* img, uint32_t x, uint32_t y) {
+    float sum[4] = {0, 0, 0, 0};
+    for (int dy = 0; dy < kS; ++dy) {
+      for (int dx = 0; dx < kS; ++dx) {
+        const uint8_t* p = img + (size_t(y * kS + dy) * ow + x * kS + dx) * 4;
+        const float a = p[3] / 255.0f;
+        for (int c = 0; c < 3; ++c) sum[c] += p[c] * a;
+        sum[3] += p[3];
+      }
+    }
+    const uint8_t* o = &orig[(size_t(y) * w + x) * 4];
+    const float oa = o[3] / 255.0f;
+    float rgb = 0;
+    for (int c = 0; c < 3; ++c) rgb += std::fabs(sum[c] / (kS * kS) - o[c] * oa);
+    return rgb / 3.0f * 0.5f + std::fabs(sum[3] / (kS * kS) - o[3]) * 0.5f;
+  };
+  // Wrong where it is far off, and much further off than the plain
+  // upscale (sharp edges move a little in both; a mended texel is no worse
+  // than the plain upscale, so a second check leaves it alone).
+  std::vector<uint8_t> bad(size_t(w) * h, 0);
+  for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t x = 0; x < w; ++x) {
+      const float err = error(up, x, y);
+      bad[size_t(y) * w + x] = err > kThreshold && err > error(smooth.data(), x, y) + 16.0f;
+    }
+  }
+  // One texel around each bad one too.
+  std::vector<float> mask(size_t(w) * h, 0.0f);
+  size_t count = 0;
+  for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t x = 0; x < w; ++x) {
+      bool any = false;
+      for (int dy = -1; dy <= 1 && !any; ++dy) {
+        for (int dx = -1; dx <= 1 && !any; ++dx) {
+          const int xx = int(x) + dx, yy = int(y) + dy;
+          if (xx >= 0 && yy >= 0 && xx < int(w) && yy < int(h)) any = bad[size_t(yy) * w + xx];
+        }
+      }
+      if (any) {
+        mask[size_t(y) * w + x] = 1.0f;
+        ++count;
+      }
+    }
+  }
+  if (!count) return 0.0;
+  // The mask, bilinear at the result's size, so the mend fades in.
+  for (uint32_t y = 0; y < h * kS; ++y) {
+    const float sy = (float(y) + 0.5f) / kS - 0.5f;
+    const int y0 = std::clamp(int(std::floor(sy)), 0, int(h) - 1), y1 = std::min(y0 + 1, int(h) - 1);
+    const float fy = std::clamp(sy - std::floor(sy), 0.0f, 1.0f);
+    for (uint32_t x = 0; x < ow; ++x) {
+      const float sx = (float(x) + 0.5f) / kS - 0.5f;
+      const int x0 = std::clamp(int(std::floor(sx)), 0, int(w) - 1), x1 = std::min(x0 + 1, int(w) - 1);
+      const float fx = std::clamp(sx - std::floor(sx), 0.0f, 1.0f);
+      const float m0 = mask[size_t(y0) * w + x0] * (1 - fx) + mask[size_t(y0) * w + x1] * fx;
+      const float m1 = mask[size_t(y1) * w + x0] * (1 - fx) + mask[size_t(y1) * w + x1] * fx;
+      const float m = std::min(1.0f, (m0 * (1 - fy) + m1 * fy) * 1.5f);
+      if (m <= 0.0f) continue;
+      uint8_t* p = up + (size_t(y) * ow + x) * 4;
+      const uint8_t* s = &smooth[(size_t(y) * ow + x) * 4];
+      for (int c = 0; c < 4; ++c) p[c] = uint8_t(std::lround(p[c] * (1 - m) + s[c] * m));
+    }
+  }
+  return double(count) / double(size_t(w) * h);
+}
+
+// Repair until nothing more is wrong (mending a patch can show the garbage
+// next to it). Returns the share mended in all.
+double RepairAll(const std::vector<uint8_t>& orig, const std::vector<uint8_t>& bled, uint32_t w,
+                 uint32_t h, uint8_t* up) {
+  double total = 0.0;
+  for (int pass = 0; pass < 6; ++pass) {
+    const double wrong = Repair(orig, bled, w, h, up);
+    total += wrong;
+    if (wrong == 0.0) break;
+  }
+  return total;
+}
+
+// More of a texture than this wrong: the game's own is used instead.
+constexpr double kMostlyWrong = 0.35;
+
 int Run(const std::vector<std::string>& args) {
 #ifdef _WIN32
   std::wstring cmd;
@@ -306,7 +471,8 @@ int main(int argc, char** argv) {
 
   // What's there already: hand-made replacements (left alone) and earlier
   // runs' output (kept).
-  std::unordered_set<uint64_t> manual, done;
+  std::unordered_set<uint64_t> manual;
+  std::unordered_map<uint64_t, fs::path> done;
   if (fs::is_directory(o.textures, ec)) {
     for (auto it = fs::recursive_directory_iterator(o.textures, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
@@ -325,7 +491,7 @@ int main(int argc, char** argv) {
   if (!o.force && fs::is_directory(out_dir, ec)) {
     for (const auto& e : fs::directory_iterator(out_dir, ec)) {
       uint64_t h;
-      if (ParseHashName(e.path(), &h)) done.insert(h);
+      if (ParseHashName(e.path(), &h)) done[h] = e.path();
     }
   }
 
@@ -367,6 +533,7 @@ int main(int argc, char** argv) {
     bool alpha;
   };
   std::vector<Job> jobs;
+  std::vector<std::pair<Job, fs::path>> checks;  // earlier runs' results, to check
   std::set<uint64_t> seen;
   size_t skipped_manual = 0, skipped_font = 0, skipped_done = 0, skipped_other = 0;
   for (auto& s : sources) {
@@ -379,7 +546,8 @@ int main(int argc, char** argv) {
     if (!hash || !seen.insert(hash).second) continue;
     if (manual.count(hash)) { ++skipped_manual; continue; }
     if (TextureReplacer::IsFont(hash)) { ++skipped_font; continue; }
-    if (done.count(hash)) { ++skipped_done; continue; }
+    auto done_it = done.find(hash);
+    if (done_it != done.end() && o.list) { ++skipped_done; continue; }
     const uint32_t w = tf.width(), h = tf.height();
     // RGB in natural order, as the renderer expects a pack PNG: only the
     // identity colour swizzle (alpha may read as one).
@@ -406,13 +574,46 @@ int main(int argc, char** argv) {
         break;
       }
     }
+    if (done_it != done.end()) {
+      ++skipped_done;
+      checks.emplace_back(std::move(j), done_it->second);
+      continue;
+    }
     jobs.push_back(std::move(j));
   }
   std::printf("%zu textures found: %zu to upscale; left alone: %zu replaced by hand, %zu fonts, "
               "%zu done before, %zu other (format, size, layout)\n",
               seen.size(), o.list ? 0 : jobs.size(), skipped_manual, skipped_font, skipped_done,
               skipped_other);
-  if (o.list || jobs.empty()) return 0;
+  if (o.list) return 0;
+
+  // Earlier runs' results: mended or removed if the upscaler garbled them.
+  if (!checks.empty()) {
+    size_t mended = 0, removed = 0;
+    for (auto& [j, path] : checks) {
+      int w = 0, h = 0, n = 0;
+      stbi_uc* px = stbi_load(path.string().c_str(), &w, &h, &n, 4);
+      if (!px) continue;
+      if (w == int(j.w * 4) && h == int(j.h * 4)) {
+        std::vector<uint8_t> bled = j.rgba;
+        if (j.alpha) BleedColour(bled, j.w, j.h);
+        const double wrong = RepairAll(j.rgba, bled, j.w, j.h, px);
+        if (wrong > kMostlyWrong) {
+          stbi_image_free(px);
+          px = nullptr;
+          fs::remove(path, ec);
+          ++removed;
+        } else if (wrong > 0.0 && stbi_write_png(path.string().c_str(), w, h, 4, px, w * 4)) {
+          ++mended;
+        }
+      }
+      if (px) stbi_image_free(px);
+    }
+    std::printf("Checked %zu earlier results: %zu mended, %zu removed (mostly garbled; the "
+                "game's own is used)\n",
+                checks.size(), mended, removed);
+  }
+  if (jobs.empty()) return 0;
 
   // Inputs for the upscaler: colour (alpha spread out of view) and, for
   // textures with transparency, the alpha as a grey image of its own.
@@ -464,7 +665,7 @@ int main(int argc, char** argv) {
   }
 
   // Back together: colour, alpha, into upscaled\<name>_<hash>.png.
-  size_t written = 0, failed = 0;
+  size_t written = 0, failed = 0, mended = 0, dropped = 0;
   std::ofstream manifest(out_dir / "manifest.csv", std::ios::app);
   for (const auto& j : jobs) {
     char hex[20];
@@ -489,6 +690,17 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < size_t(w) * h; ++i) rgb[i * 4 + 3] = a[i];
       stbi_image_free(a);
     }
+    {
+      std::vector<uint8_t> bled = j.rgba;
+      if (j.alpha) BleedColour(bled, j.w, j.h);
+      const double wrong = RepairAll(j.rgba, bled, j.w, j.h, rgb);
+      if (wrong > kMostlyWrong) {
+        stbi_image_free(rgb);
+        ++dropped;
+        continue;
+      }
+      if (wrong > 0.0) ++mended;
+    }
     const std::string file = j.name + "_" + hex + ".png";
     if (stbi_write_png((out_dir / file).string().c_str(), w, h, 4, rgb, w * 4)) {
       ++written;
@@ -502,6 +714,11 @@ int main(int argc, char** argv) {
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("%zu textures upscaled into %s in %.0f s%s\n", written, out_dir.string().c_str(), s,
               failed ? (" (" + std::to_string(failed) + " failed)").c_str() : "");
+  if (mended || dropped) {
+    std::printf("The upscaler garbled parts of %zu: %zu mended, %zu left out (the game's own is "
+                "used)\n",
+                mended + dropped, mended, dropped);
+  }
   if (!o.keep_work) fs::remove_all(o.work, ec);
   return failed && !written ? 1 : 0;
 }

@@ -384,9 +384,14 @@ GPU; downloaded once, 45 MB). `Upscale Textures.bat` runs the same step any
 time (`-Set world` adds the characters, boards and levels, experimental;
 `-Force` redoes everything). The results go to `textures\upscaled` and are
 used only where neither the texture pack nor Sharp fonts replace a texture,
-so anything you replace by hand always wins. They're off by default, even
-after upscaling: turn them on with Upscaled Textures (Graphics panel, Display
-tab) or `native_upscaled_textures = true`.
+so anything you replace by hand always wins. Every result is checked against
+the original texture: on some GPUs (seen on Intel Arc) Real-ESRGAN returns
+garbled patches (holes, missing pieces of icons), which are mended with a
+plain smooth upscale, and a texture that comes out mostly garbled is left out.
+Running the step again checks and mends earlier results too. The installer
+switches Upscaled Textures on after upscaling; turn them off or on with
+Upscaled Textures (Graphics panel, Display tab) or
+`native_upscaled_textures`.
 
 The row is added in memory as the game loads its menus; the game's files are
 never changed. Set `patch_game_menus = false` in `amped3.toml` to leave the

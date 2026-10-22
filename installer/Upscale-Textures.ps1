@@ -7,7 +7,9 @@ its known hash; it runs on any Vulkan GPU) and runs amped3-texture-upscale,
 which reads the textures from the game's own files and writes
 <install>\textures\upscaled\<name>_<hash>.png. Textures you replaced by hand
 (any <name>_<hash>.png elsewhere in textures\) and the game's fonts (Sharp
-fonts) are left alone. Running it again only does what's missing; -Force
+fonts) are left alone. Every result is checked against its original and
+garbled patches (some GPUs, e.g. Intel Arc) are mended or the texture left
+out. Running it again does what's missing and checks earlier results; -Force
 redoes everything.
 
   -InstallDir   the portable install (holds amped3.exe and game\)
