@@ -76,6 +76,7 @@ class App {
   void BrowseDisc();
   void BrowseFolder();
   void MakeShortcut();
+  void EnsureIcon();
   std::string VersionText() const;
 
   std::shared_ptr<Shared> s_;
