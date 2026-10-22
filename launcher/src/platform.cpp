@@ -82,10 +82,100 @@ bool IsInstalled(const fs::path& install_dir) {
 
 fs::path DefaultInstallDir() {
   const fs::path games = HomeDir() / "Games";
-  // An install made before the launcher (the installers' suggested folder).
-  if (IsInstalled(games / "Amped 3 Revamped")) return games / "Amped 3 Revamped";
-  // No spaces: the build tools run in a folder inside it.
-  return games / "Amped3Revamped";
+  // Everything in one folder: the game, its build (build\amped3revamped) and
+  // this launcher. An install made by launchers before 0.3.0 (Amped3Revamped)
+  // stays where it is.
+  if (!IsInstalled(games / "Amped 3 Revamped") && IsInstalled(games / "Amped3Revamped")) {
+    return games / "Amped3Revamped";
+  }
+  return games / "Amped 3 Revamped";
+}
+
+fs::path InstalledLauncher(const fs::path& install_dir) {
+#if defined(_WIN32)
+  return install_dir / L"amped3-launcher.exe";
+#else
+  return install_dir / "amped3-launcher";
+#endif
+}
+
+bool RelocateLauncher(const fs::path& install_dir) {
+  std::error_code ec;
+  const fs::path self = ExePath();
+  const fs::path target = InstalledLauncher(install_dir);
+  if (self.empty() || install_dir.empty() || !fs::is_directory(install_dir, ec)) return false;
+  bool moved = fs::exists(target, ec) && fs::equivalent(self, target, ec);
+  if (!moved) {
+    // Same drive: a rename (a running program can be renamed, also on
+    // Windows), so nothing is left behind.
+    fs::rename(self, target, ec);
+    moved = !ec;
+    if (!moved) {
+      // Another drive: a copy; the original goes once nothing runs it.
+      ec.clear();
+      fs::copy_file(self, target, fs::copy_options::overwrite_existing, ec);
+      if (ec) return false;
+#if defined(_WIN32)
+      // Removed by a hidden helper as soon as this launcher exits (Windows
+      // keeps a running program's file), giving up after half an hour.
+      const std::wstring p = self.wstring();
+      std::wstring quoted;
+      for (wchar_t c : p) quoted += c == L'\'' ? std::wstring(L"''") : std::wstring(1, c);
+      std::wstring cmd = L"powershell.exe -NoProfile -WindowStyle Hidden -Command \"$p='" + quoted +
+                         L"';for($i=0;$i -lt 1800 -and (Test-Path -LiteralPath $p);$i++){"
+                         L"Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue;"
+                         L"Start-Sleep 1}\"";
+      STARTUPINFOW si{};
+      si.cb = sizeof(si);
+      PROCESS_INFORMATION pi{};
+      if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                         nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+      }
+#else
+      fs::remove(self, ec);  // a running program's file can go on Linux
+#endif
+    }
+  }
+  // Copies an earlier launcher kept here under its download name: shortcuts
+  // and Steam entries made then still point at them, so they stay, as this
+  // launcher (a link to it on Linux, a copy on Windows).
+  std::vector<fs::path> old;
+  for (const auto& entry : fs::directory_iterator(install_dir, ec)) {
+    const std::string name = PathText(entry.path().filename());
+    if (name.rfind("amped3-launcher-", 0) == 0 && !fs::is_symlink(entry.symlink_status(ec)) &&
+        entry.is_regular_file(ec)) {
+      old.push_back(entry.path());
+    }
+  }
+  for (const auto& p : old) {
+    std::error_code e;
+#if defined(_WIN32)
+    fs::copy_file(target, p, fs::copy_options::overwrite_existing, e);
+#else
+    fs::remove(p, e);
+    fs::create_symlink(target.filename(), p, e);
+#endif
+  }
+  return true;
+}
+
+fs::path NoSpacePath(const fs::path& dir) {
+#if defined(_WIN32)
+  const std::wstring long_path = dir.wstring();
+  if (long_path.find(L' ') == std::wstring::npos) return dir;
+  const DWORD n = GetShortPathNameW(long_path.c_str(), nullptr, 0);
+  if (!n) return dir;
+  std::wstring s(n, L'\0');
+  const DWORD m = GetShortPathNameW(long_path.c_str(), s.data(), n);
+  if (!m || m >= n) return dir;
+  s.resize(m);
+  // No 8.3 names on this drive: the same path back.
+  return s.find(L' ') == std::wstring::npos ? fs::path(s) : dir;
+#else
+  return dir;
+#endif
 }
 
 std::vector<fs::path> FindDiscImages() {

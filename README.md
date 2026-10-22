@@ -119,6 +119,8 @@ The installed game is one portable folder; move it anywhere:
 ```
 <install folder>\
 ├── amped3.exe, *.dll
+├── amped3-launcher.exe ← the launcher (installs from the launcher)
+├── build\            ← the sources and build (installs from the launcher)
 ├── amped3.toml       ← settings
 ├── game\             ← the game's files (from your disc)
 ├── save\             ← saves and profile
@@ -166,11 +168,16 @@ sources from GitHub and builds the game on your computer from your own Amped 3
    home, Downloads, Documents and Desktop folders and on removable drives;
    select the row to browse for another one.
 2. Pick the branch: `main`, or `experimental` for the newest work.
-3. Check the install folder (default `Games/Amped3Revamped` in your user
-   folder). You need about 40 GB free.
+3. Check the install folder (default `Games/Amped 3 Revamped` in your user
+   folder). You need about 40 GB free. Everything goes there: the game, its
+   build (`build/amped3revamped`) and the launcher itself.
 4. Select **Build and install** (twice, to confirm). The build's output
    scrolls in the launcher and is saved to a log. The first build takes about
    an hour on a PC and several hours on a handheld.
+5. Once installed, the launcher moves itself into the install folder as
+   `amped3-launcher(.exe)`, so nothing is left in Downloads; a newer launcher
+   you download later takes its place the first time you run it. (Installs
+   made by launchers before 0.3 stay in `Games/Amped3Revamped`.)
 
 Under the hood it runs the same installers as the manual routes below:
 `Install-Amped3.ps1` on Windows (it offers to install the build tools with
@@ -187,7 +194,7 @@ Armada).
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.
 - **Desktop shortcut** (Windows) or **Add to Steam / menu** (Linux): points
-  at the launcher's copy in the install folder. Its icon is the game's own square
+  at `amped3-launcher` in the install folder. Its icon is the game's own square
   Xbox 360 dashboard logo, taken at install from your `default.xex` by
   `amped3-icon` (`tools/xex-icon`) into `amped3-icon.ico` / `amped3-icon.png`
   in the install folder; nothing of the game ships with the project.

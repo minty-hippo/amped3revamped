@@ -197,7 +197,12 @@ App::App() : s_(std::make_shared<Shared>()) {
   LoadSettings();
   discs_ = FindDiscImages();
   StartBranchList();
-  if (IsInstalled(install_dir_)) StartCheck();
+  if (IsInstalled(install_dir_)) {
+    // A launcher run from elsewhere (a new download) takes the installed
+    // one's place.
+    RelocateLauncher(install_dir_);
+    StartCheck();
+  }
 }
 
 App::~App() {
@@ -481,17 +486,22 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   s->Step(install ? "Extracting the game and building (the first build takes a long time)"
                   : "Building");
   fs::create_directories(install_dir, ec);
+  // The build runs from the sources' path without spaces where the drive
+  // has one (Windows short names: "Amped 3 Revamped" is AMPED3~1), as some
+  // build tools don't take spaces.
+  const fs::path build_src = NoSpacePath(source);
+  if (build_src != source) s->Log("Building in " + PathText(build_src));
   std::vector<std::string> argv;
 #if defined(_WIN32)
   argv = {"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-          PathText(source / "installer" / "Install-Amped3.ps1")};
+          PathText(build_src / "installer" / "Install-Amped3.ps1")};
   if (install) argv.insert(argv.end(), {"-Iso", PathText(iso)});
   else argv.insert(argv.end(), {"-GameDir", PathText(install_dir / "game")});
   argv.insert(argv.end(), {"-InstallDir", PathText(install_dir), "-Yes", "-UpscaleTextures", "no"});
   // (an installer from before the launcher doesn't know it)
   if (FileContains(source / "installer" / "Install-Amped3.ps1", "NoShortcut")) argv.push_back("-NoShortcut");
 #else
-  argv = {"bash", PathText(source / "install.sh")};
+  argv = {"bash", PathText(build_src / "install.sh")};
   if (install) argv.insert(argv.end(), {"--iso", PathText(iso)});
   else argv.insert(argv.end(), {"--game-dir", PathText(install_dir / "game")});
   argv.insert(argv.end(), {"--install-dir", PathText(install_dir), "--yes", "--upscale-textures", "no"});
@@ -499,7 +509,7 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   // install.sh from before the launcher doesn't know it.
   if (FileContains(source / "install.sh", "--update)")) argv.push_back("--update");
 #endif
-  const int code = run(argv, source);
+  const int code = run(argv, build_src);
   if (code != 0) {
     return finish(Shared::Job::kFailed,
                   "The build failed (exit " + std::to_string(code) + "). Its logs are in " +
@@ -511,12 +521,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   }
   WriteKeyValues(install_dir / "amped3-version.txt",
                  {{"branch", branch}, {"commit", head.sha}, {"date", head.date}});
-  // A copy of the launcher in the install folder, for the shortcuts.
-  const fs::path self = ExePath();
-  const fs::path copy = install_dir / self.filename();
-  if (!fs::equivalent(self.parent_path(), install_dir, ec)) {
-    fs::copy_file(self, copy, fs::copy_options::overwrite_existing, ec);
-  }
+  // The launcher moves into the install folder (the shortcuts point there),
+  // leaving nothing in Downloads.
+  RelocateLauncher(install_dir);
   finish(Shared::Job::kDone, "");
 }
 
@@ -550,8 +557,9 @@ void App::EnsureIcon() {
 
 void App::MakeShortcut() {
   EnsureIcon();
-  const fs::path self = fs::exists(install_dir_ / ExePath().filename()) ? install_dir_ / ExePath().filename()
-                                                                        : ExePath();
+  RelocateLauncher(install_dir_);
+  const fs::path self =
+      fs::exists(InstalledLauncher(install_dir_)) ? InstalledLauncher(install_dir_) : ExePath();
 #if defined(_WIN32)
   // The game's dashboard icon, made from default.xex at install.
   std::error_code icon_ec;

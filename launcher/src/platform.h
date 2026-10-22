@@ -15,7 +15,18 @@ namespace fs = std::filesystem;
 fs::path HomeDir();
 fs::path ConfigDir();          // where launcher.ini lives
 fs::path ExePath();            // this launcher
-fs::path DefaultInstallDir();  // <home>/Games/Amped3Revamped (or an existing install)
+fs::path DefaultInstallDir();  // <home>/Games/Amped 3 Revamped (or an existing install)
+
+// The launcher's own copy in an install folder (what shortcuts point at).
+fs::path InstalledLauncher(const fs::path& install_dir);
+// Moves this launcher into the install folder as InstalledLauncher (a rename
+// when on the same drive; else a copy, the original removed once this process
+// is done with it), and removes older launcher downloads kept there. True
+// when this launcher now lives in the install folder.
+bool RelocateLauncher(const fs::path& install_dir);
+// The path without spaces (Windows short 8.3 names) for the build tools, if
+// the drive has them; else the path itself. The folder must exist.
+fs::path NoSpacePath(const fs::path& dir);
 
 // The game's executable in an install folder.
 fs::path GameExe(const fs::path& install_dir);
