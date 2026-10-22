@@ -520,7 +520,36 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   finish(Shared::Job::kDone, "");
 }
 
+// The game's dashboard icon beside the install (amped3-icon.ico / .png). The
+// install scripts make it from the disc's default.xex with amped3-icon, built
+// with the game; an install made before that has none, so it is made here,
+// with the tool from the install or its build folders, when one is there.
+void App::EnsureIcon() {
+  std::error_code ec;
+  if (fs::exists(install_dir_ / "amped3-icon.ico", ec) &&
+      fs::exists(install_dir_ / "amped3-icon.png", ec)) {
+    return;
+  }
+  const fs::path xex = install_dir_ / "game" / "default.xex";
+  if (!fs::exists(xex, ec)) return;
+#if defined(_WIN32)
+  const char* tool_name = "amped3-icon.exe";
+#else
+  const char* tool_name = "amped3-icon";
+#endif
+  std::vector<fs::path> tools{install_dir_ / tool_name};
+  for (const auto& entry : fs::directory_iterator(source_dir_ / "out" / "build", ec)) {
+    if (entry.is_directory(ec)) tools.push_back(entry.path() / tool_name);
+  }
+  for (const auto& tool : tools) {
+    if (!fs::exists(tool, ec)) continue;
+    std::string out, err;
+    if (RunCapture({PathText(tool), PathText(xex), PathText(install_dir_)}, &out, &err) == 0) return;
+  }
+}
+
 void App::MakeShortcut() {
+  EnsureIcon();
   const fs::path self = fs::exists(install_dir_ / ExePath().filename()) ? install_dir_ / ExePath().filename()
                                                                         : ExePath();
 #if defined(_WIN32)
