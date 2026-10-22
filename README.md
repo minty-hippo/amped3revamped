@@ -189,6 +189,11 @@ Armada).
 - **Update branch / Update:** gets the chosen branch and rebuilds. The status
   says whether there's anything new.
 - **Check for updates:** lists the changes on the branch since your install.
+- **Graphics settings:** the in-game Graphics panel's settings (display:
+  fullscreen, frame rate, resolutions, upscaler, MSAA with the upscaler,
+  sharp fonts, upscaled textures; effects: Revamped Graphics and its parts),
+  saved to the install's `amped3.toml` for the next start. New installs start
+  fullscreen.
 - **Start the game directly:** the launcher starts the game at once next
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.

@@ -3,8 +3,9 @@
 # change something, so edit it there rather than here once it exists.
 # Any setting can also be given on the command line, e.g. --resolution_scale=2
 
-# Windowed for the first boots: easier to watch the log and see crashes.
-fullscreen = false
+# Fullscreen from the first start (the options menu, F1 > Display, or the
+# launcher's Graphics settings switch it).
+fullscreen = true
 
 # 16x anisotropic filtering (cheap on any modern GPU).
 anisotropic_override = 5

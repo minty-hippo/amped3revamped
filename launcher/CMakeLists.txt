@@ -66,6 +66,7 @@ add_executable(amped3-launcher WIN32
     src/main.cpp
     src/app.cpp
     src/title_logo.cpp
+    src/game_settings.cpp
     ${TITLE_GIF_C}
     src/platform.cpp
     src/process.cpp

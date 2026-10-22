@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "platform.h"
+#include "game_settings.h"
 #include "title_logo.h"
 
 struct ImFont;
@@ -61,8 +62,15 @@ class App {
   enum Row {
     kRowDisc, kRowBranch, kRowFolder, kRowInstall,                       // setup
     kRowPlay, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut,           // home
-    kRowCancel, kRowQuit
+    kRowCancel, kRowQuit,
+    kRowGraphics, kRowEffects, kRowBack,                                 // settings pages
+    kRowSetting = 100  // + the setting's index on the page
   };
+  enum class Page { kHome, kDisplay, kEffects };
+  Page page_ = Page::kHome;
+  GameConfig config_;
+  const std::vector<GameSetting>& PageSettings() const;
+  void OpenPage(Page page);
 
   std::vector<Row> Rows() const;
   void Activate(Row row);

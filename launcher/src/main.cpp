@@ -122,6 +122,8 @@ int main(int, char**) {
             case SDLK_RETURN:
             case SDLK_KP_ENTER:
             case SDLK_SPACE: press(launcher::Action::kAccept, false); break;
+            case SDLK_ESCAPE:
+            case SDLK_BACKSPACE: press(launcher::Action::kBack, false); break;
             default: break;
           }
           break;
@@ -136,6 +138,7 @@ int main(int, char**) {
             case SDL_GAMEPAD_BUTTON_DPAD_LEFT: press(launcher::Action::kLeft, false); break;
             case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: press(launcher::Action::kRight, false); break;
             case SDL_GAMEPAD_BUTTON_SOUTH: press(launcher::Action::kAccept, false); break;
+            case SDL_GAMEPAD_BUTTON_EAST: press(launcher::Action::kBack, false); break;
             default: break;
           }
           break;

@@ -639,7 +639,28 @@ std::vector<App::Row> App::Rows() const {
   if (!IsInstalled(install_dir_)) {
     return {kRowDisc, kRowBranch, kRowFolder, kRowInstall, kRowQuit};
   }
-  return {kRowPlay, kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut, kRowQuit};
+  if (page_ != Page::kHome) {
+    std::vector<Row> rows;
+    for (size_t i = 0; i < PageSettings().size(); ++i) rows.push_back(Row(kRowSetting + int(i)));
+    if (page_ == Page::kDisplay) rows.push_back(kRowEffects);
+    rows.push_back(kRowBack);
+    return rows;
+  }
+  return {kRowPlay, kRowGraphics, kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut,
+          kRowQuit};
+}
+
+const std::vector<GameSetting>& App::PageSettings() const {
+  return page_ == Page::kEffects ? EffectSettings() : DisplaySettings();
+}
+
+// The graphics pages edit the install's amped3.toml (read again each time a
+// page opens: the game rewrites it when its own menus change something).
+void App::OpenPage(Page page) {
+  page_ = page;
+  cursor_ = 0;
+  confirm_until_ = 0;
+  if (page != Page::kHome) config_.Load(install_dir_ / "amped3.toml");
 }
 
 void App::Change(Row row, int step) {
@@ -658,6 +679,10 @@ void App::Change(Row row, int step) {
     disc_ = (disc_ + step + int(discs_.size())) % int(discs_.size());
   } else if (row == kRowDirect) {
     Activate(row);
+  } else if (row >= kRowSetting && size_t(row - kRowSetting) < PageSettings().size()) {
+    if (!config_.Step(PageSettings()[size_t(row - kRowSetting)], step)) {
+      notice_ = "Couldn't save " + PathText(install_dir_ / "amped3.toml") + ".";
+    }
   }
 }
 
@@ -711,6 +736,18 @@ void App::Activate(Row row) {
     case kRowQuit:
       quit_ = true;
       break;
+    case kRowGraphics:
+      OpenPage(Page::kDisplay);
+      break;
+    case kRowEffects:
+      OpenPage(Page::kEffects);
+      break;
+    case kRowBack:
+      OpenPage(page_ == Page::kEffects ? Page::kDisplay : Page::kHome);
+      break;
+    default:
+      if (row >= kRowSetting) Change(row, 1);
+      break;
   }
 }
 
@@ -735,6 +772,9 @@ void App::OnAction(Action action) {
       break;
     case Action::kAccept:
       Activate(rows[size_t(cursor_)]);
+      break;
+    case Action::kBack:
+      if (page_ != Page::kHome) Activate(kRowBack);
       break;
     default:
       break;
@@ -844,8 +884,11 @@ void App::Draw(ImFont* font) {
     dl->AddText(font, title_px, ImVec2(x0, y), kGold, "AMPED 3 REVAMPED");
     y += title_px * 1.15f;
   }
-  const std::string sub = installed ? "Installed version  " + VersionText()
-                                    : "Build the game from your own Amped 3 (Xbox 360) disc image";
+  const std::string sub =
+      !installed                  ? "Build the game from your own Amped 3 (Xbox 360) disc image"
+      : page_ == Page::kDisplay   ? "Graphics settings: display"
+      : page_ == Page::kEffects   ? "Graphics settings: effects"
+                                  : "Installed version  " + VersionText();
   dl->AddText(font, small_px, ImVec2(x0, y), kDim, sub.c_str());
   y += small_px * 2.0f;
 
@@ -943,6 +986,26 @@ void App::Draw(ImFont* font) {
       case kRowQuit:
         t.label = "Quit";
         break;
+      case kRowGraphics:
+        t.label = "Graphics settings";
+        break;
+      case kRowEffects:
+        t.label = "Effects";
+        t.value = ">";
+        break;
+      case kRowBack:
+        t.label = "Back";
+        break;
+      default:
+        if (r >= kRowSetting && size_t(r - kRowSetting) < PageSettings().size()) {
+          const GameSetting& gs = PageSettings()[size_t(r - kRowSetting)];
+          t.label = gs.label;
+          t.value = config_.Text(gs);
+          if (gs.kind != GameSetting::Kind::kToggle) t.value = "<  " + t.value + "  >";
+          // The effects do nothing while Revamped Graphics is off.
+          if (gs.effect && config_.Get(EffectSettings()[0]) != "true") t.color = kDim;
+        }
+        break;
     }
     texts.push_back(t);
   }
@@ -1023,6 +1086,13 @@ void App::Draw(ImFont* font) {
     const int fit = std::max(0, int((bottom - y) / line_h));
     const size_t from = log_tail.size() > size_t(fit) ? log_tail.size() - size_t(fit) : 0;
     for (size_t i = from; i < log_tail.size(); ++i) line(log_tail[i], kDim);
+  } else if (installed && page_ != Page::kHome) {
+    para("Saved to amped3.toml in the install folder at once; the game uses them the next "
+         "time it starts. The same settings are in the game's own Graphics panel.",
+         kDim);
+    if (page_ == Page::kEffects) {
+      para("The effects are part of Revamped Graphics: off with it.", kDim);
+    }
   } else if (!installed) {
     para("Build and install downloads this project's sources from GitHub and builds Amped 3 "
          "Revamped from your disc image, into the folder above. Nothing from the game is "
@@ -1057,7 +1127,8 @@ void App::Draw(ImFont* font) {
   }
 
   dl->AddText(font, small_px * 0.9f, ImVec2(x0, display.y - small_px * 1.9f), kFaint,
-              "A / Enter: select     Left / Right: change     Mouse works too");
+              page_ != Page::kHome ? "A / Enter: select     Left / Right: change     B / Esc: back"
+                                   : "A / Enter: select     Left / Right: change     Mouse works too");
   ImGui::End();
   ImGui::PopStyleVar(2);
 }
