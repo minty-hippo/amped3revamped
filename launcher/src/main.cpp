@@ -75,6 +75,7 @@ int main(int, char**) {
   }
   SDL_SetRenderVSync(renderer, 1);
   app.SetWindow(window);
+  app.SetRenderer(renderer);
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
@@ -201,7 +202,11 @@ int main(int, char**) {
     static size_t script_at = 0;
     if (script_at < script.size() && frame % 10 == 0) app.OnAction(script[script_at++]);
     if (const char* shot = std::getenv("AMPED3_LAUNCHER_SCREENSHOT");
-        shot && script_at == script.size() && frame >= 30 + int(script.size()) * 10 && !app.Busy()) {
+        shot && script_at == script.size() && frame >= 30 + int(script.size()) * 10 && !app.Busy() &&
+        // AMPED3_LAUNCHER_SCREENSHOT_MS: not before this long after start.
+        SDL_GetTicks() >= uint64_t(std::atoll(std::getenv("AMPED3_LAUNCHER_SCREENSHOT_MS")
+                                                  ? std::getenv("AMPED3_LAUNCHER_SCREENSHOT_MS")
+                                                  : "0"))) {
       if (SDL_Surface* surface = SDL_RenderReadPixels(renderer, nullptr)) {
         SDL_SaveBMP(surface, shot);
         SDL_DestroySurface(surface);
@@ -217,6 +222,7 @@ int main(int, char**) {
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();
   ImGui::DestroyContext();
+  app.SetRenderer(nullptr);  // its texture goes first
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
   SDL_Quit();

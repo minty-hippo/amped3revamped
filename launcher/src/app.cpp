@@ -704,6 +704,11 @@ void App::OnAction(Action action) {
   }
 }
 
+void App::SetRenderer(SDL_Renderer* renderer) {
+  title_.reset();
+  if (renderer) title_ = std::make_unique<TitleLogo>(renderer);
+}
+
 void App::Draw(ImFont* font) {
   // What the dialogs and threads reported.
   {
@@ -787,8 +792,21 @@ void App::Draw(ImFont* font) {
   const float width = std::min(display.x - 2 * pad, 860.0f * unit);
   const float x0 = std::round((display.x - width) * 0.5f);
   float y = std::round(display.y * 0.06f);
-  dl->AddText(font, title_px, ImVec2(x0, y), kGold, "AMPED 3 REVAMPED");
-  y += title_px * 1.15f;
+  // The title: the animated logo (plays once, then holds its last frame);
+  // the name in text if it can't be shown.
+  const float logo_h = std::round(130.0f * unit);
+  SDL_Texture* logo = title_ ? title_->Frame(logo_h) : nullptr;
+  if (logo) {
+    float u0, v0, u1, v1;
+    title_->Uv(&u0, &v0, &u1, &v1);
+    const float logo_w = std::round(logo_h * title_->Aspect());
+    dl->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(logo))), ImVec2(x0, y),
+                 ImVec2(x0 + logo_w, y + logo_h), ImVec2(u0, v0), ImVec2(u1, v1));
+    y += logo_h + small_px * 0.6f;
+  } else {
+    dl->AddText(font, title_px, ImVec2(x0, y), kGold, "AMPED 3 REVAMPED");
+    y += title_px * 1.15f;
+  }
   const std::string sub = installed ? "Installed version  " + VersionText()
                                     : "Build the game from your own Amped 3 (Xbox 360) disc image";
   dl->AddText(font, small_px, ImVec2(x0, y), kDim, sub.c_str());
