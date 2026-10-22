@@ -24,9 +24,11 @@
 #include <vector>
 
 #include "platform.h"
+#include "title_logo.h"
 
 struct ImFont;
 struct SDL_Window;
+struct SDL_Renderer;
 
 namespace launcher {
 
@@ -44,6 +46,9 @@ class App {
   void Play();
 
   void SetWindow(SDL_Window* window) { window_ = window; }
+  // The renderer the title animation's texture lives in (null before it is
+  // destroyed).
+  void SetRenderer(SDL_Renderer* renderer);
   void OnAction(Action action);
   void Draw(ImFont* font);  // inside an ImGui frame
   bool QuitRequested() const { return quit_; }
@@ -75,6 +80,7 @@ class App {
 
   std::shared_ptr<Shared> s_;
   SDL_Window* window_ = nullptr;
+  std::unique_ptr<TitleLogo> title_;
   bool quit_ = false;
   int cursor_ = 0;
   double confirm_until_ = 0;

@@ -44,9 +44,29 @@ FetchContent_Declare(imgui
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
 
+# The title animation, built into the program: assets/title.gif as a C array
+# (written at configure time, again whenever the GIF changes).
+set(TITLE_GIF ${CMAKE_CURRENT_SOURCE_DIR}/assets/title.gif)
+set(TITLE_GIF_C ${CMAKE_CURRENT_BINARY_DIR}/title_gif.c)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TITLE_GIF})
+if(NOT EXISTS ${TITLE_GIF_C} OR ${TITLE_GIF} IS_NEWER_THAN ${TITLE_GIF_C})
+    file(READ ${TITLE_GIF} title_hex HEX)
+    string(LENGTH "${title_hex}" title_hex_len)
+    math(EXPR title_size "${title_hex_len} / 2")
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," title_bytes "${title_hex}")
+    # One line per 32 bytes (some compilers dislike very long lines).
+    string(REGEX REPLACE "((0x[0-9a-f][0-9a-f],){32})" "\\1\n" title_bytes "${title_bytes}")
+    file(WRITE ${TITLE_GIF_C}
+        "/* Generated from assets/title.gif by CMakeLists.txt */\n"
+        "const unsigned char kTitleGif[] = {\n${title_bytes}\n};\n"
+        "const unsigned int kTitleGifSize = ${title_size};\n")
+endif()
+
 add_executable(amped3-launcher WIN32
     src/main.cpp
     src/app.cpp
+    src/title_logo.cpp
+    ${TITLE_GIF_C}
     src/platform.cpp
     src/process.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -56,7 +76,8 @@ add_executable(amped3-launcher WIN32
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp)
 target_include_directories(amped3-launcher PRIVATE
-    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb)
 target_link_libraries(amped3-launcher PRIVATE SDL3::SDL3-static)
 
 if(MSVC)
