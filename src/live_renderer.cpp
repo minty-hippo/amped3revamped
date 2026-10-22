@@ -179,6 +179,10 @@ REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_god_rays_strength, 1.0, "GPU",
                       "Native renderer: god ray strength (0..2)")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_BOOL(native_reactive_debug, false, "GPU",
+                    "Native renderer, diagnostics: with FSR, show the scene (stretched, not "
+                    "upscaled, darkened) with FSR's reactive mask in red: where snow and "
+                    "other particles tell FSR to trust the current frame");
 REXCVAR_DEFINE_BOOL(native_motion_blur_debug, false, "GPU",
                     "Native renderer, diagnostics: show the motion blur's motion instead of the "
                     "picture (red = sideways, green = up/down, blue = object pixels, grey = "
@@ -1738,7 +1742,8 @@ void WorkerMain() {
         }
         renderer->SetMotionBlur(blur, camera, objects, REXCVAR_GET(native_motion_blur_debug));
         renderer->SetUpscaleParams(dt > 0.0 && dt < 0.25 ? float(dt * 1000.0) : 16.7f,
-                                   float(REXCVAR_GET(native_upscaler_sharpness)));
+                                   float(REXCVAR_GET(native_upscaler_sharpness)),
+                                   REXCVAR_GET(native_reactive_debug));
         renderer->SetFog(revamped && REXCVAR_GET(native_fog) ? float(REXCVAR_GET(native_fog_density)) : 0.0f,
                          float(REXCVAR_GET(native_fog_start)));
         renderer->SetFoliageFade(revamped && REXCVAR_GET(native_foliage_fade));

@@ -239,7 +239,7 @@ class Renderer {
   void SetParallelCommands(bool on);
   // Upscaler inputs for the following frames: the time since the last frame
   // (ms) and FSR's sharpening (0..1).
-  void SetUpscaleParams(float frame_ms, float sharpness);
+  void SetUpscaleParams(float frame_ms, float sharpness, bool reactive_debug = false);
   // Speed blur for the following frames: a radial blur toward the direction
   // of travel at the edges of the 3D scene, fading in with the camera's speed
   // (it follows the rider). `strength` scales it (0 = off); `dt` is the time

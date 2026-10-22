@@ -444,7 +444,8 @@ int main(int argc, char** argv) {
   uint32_t max_draws = UINT32_MAX;
   bool dump = false;
   int device = -1;
-  int repeat = 1;  // render the frame this many times (tests the caches)
+  int repeat = 1;
+  bool reactive_debug = false;  // --reactive-debug: show FSR's reactive mask  // render the frame this many times (tests the caches)
   std::string pipeline_cache;  // --pipeline-cache file
   std::string cloud_sprite;    // --cloud-sprite file (RendererOptions::cloud_sprite_path)
   bool async_pipelines = false;
@@ -531,6 +532,8 @@ int main(int argc, char** argv) {
       res_scale = std::stof(argv[++i]);
     } else if (a == "--aniso" && i + 1 < argc) {
       aniso = std::stoi(argv[++i]);
+    } else if (a == "--reactive-debug") {
+      reactive_debug = true;
     } else if (a == "--no-msaa") {
       msaa = false;
     } else if (a == "--motion-blur" && i + 1 < argc) {
@@ -782,6 +785,7 @@ int main(int argc, char** argv) {
                     p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]);
       }
     };
+    if (reactive_debug) renderer.SetUpscaleParams(16.7f, 0.0f, true);
     if (speed_blur >= 0.0f) renderer.SetSpeedBlur(1.0f, 1.0f / 60.0f, speed_blur);
     if (fog > 0.0f) renderer.SetFog(fog, fog_start);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);

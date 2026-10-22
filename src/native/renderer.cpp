@@ -1578,7 +1578,7 @@ struct Renderer::Impl {
     kDepth = 0, kDepthMs = 1, kColorMs = 2, kOutput = 3, kOutputMs = 4, kMotionBlur = 5,
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
-    kClouds = 17, kReactiveMerge = 18
+    kClouds = 17, kReactiveMerge = 18, kReactiveView = 19
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1619,7 +1619,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[19] = {};  // by CopyKind
+  VkShaderModule copy_fs_[20] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -1919,6 +1919,7 @@ struct Renderer::Impl {
   Image reactive_img_;      // this frame's blended draws
   Image reactive_hist_[2];  // what FSR gets: with last frame's, carried along the motion
   uint32_t reactive_flip_ = 0;
+  bool reactive_debug_ = false;  // show the mask over the (stretched) scene
   void QueueReactive(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
                      const VkDescriptorSet* tex_sets, const uint32_t* offsets, bool indexed,
                      VkIndexType index_type, uint32_t first, uint32_t count, const VkRect2D& sc,
@@ -4080,6 +4081,18 @@ void main() {
   o = vec4(max(r, h * 0.85), 0.0, 0.0, 1.0);
 }
 )", true);
+  copy_fs_[19] = CompileBuiltin("builtin_reactive_view", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D mask;
+layout(push_constant) uniform View { vec2 inv_size; } pc;  // 1 / output size
+layout(location = 0) out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.inv_size;
+  vec3 c = texture(scene, uv).rgb;
+  float r = texelFetch(mask, ivec2(uv * vec2(textureSize(mask, 0))), 0).r;
+  o = vec4(mix(c * 0.6, vec3(1.0, 0.0, 0.0), r), 1.0);
+}
+)", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
 )") + clouds_common + R"(
 layout(binding = 2) uniform sampler2D sprite;
@@ -5146,6 +5159,13 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
     return nullptr;
   }
   up_reset_ = false;
+  if (reactive_debug_ && reactive) {
+    // Diagnostics: the scene stretched (not upscaled), red where the mask
+    // tells FSR to trust this frame.
+    const float view_pc[2] = {1.0f / float(up_out_.width), 1.0f / float(up_out_.height)};
+    FullscreenPass(CopyKind::kReactiveView, &up_out_, src, reactive, nullptr, true, view_pc, 2);
+    dyn_ = DynState{};
+  }
   up_result_ = &up_out_;
   return up_result_;
 }
@@ -7587,7 +7607,8 @@ void Renderer::SetSpeedBlur(float strength, float dt, float force_amount) {
   if (force_amount >= 0.0f) impl_->speed_amount_ = force_amount;
 }
 
-void Renderer::SetUpscaleParams(float frame_ms, float sharpness) {
+void Renderer::SetUpscaleParams(float frame_ms, float sharpness, bool reactive_debug) {
+  impl_->reactive_debug_ = reactive_debug;
   impl_->frame_ms_ = std::clamp(frame_ms, 1.0f, 250.0f);
   impl_->up_sharpness_ = std::clamp(sharpness, 0.0f, 1.0f);
 }
