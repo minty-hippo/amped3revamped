@@ -474,3 +474,11 @@ Faint trails were left: this frame's mask now counts 1.5x (faint flakes),
 last frame's fades 15% a frame (was 25%), and the mask is also FSR's
 transparency & composition mask, which keeps FSR from locking a flake's
 bright pixels into its history.
+
+The debug view (`native_reactive_debug`) showed the flakes marked, but softly:
+a flake is a pixel or two at the render size, half covered at its edges, and
+FSR keeps history in proportion to what the mask leaves, so faint trails
+stayed over bright snow and terrain. This frame's mask is now widened by a
+pixel, and small things in it (little around them three pixels out) go
+nearly all-or-nothing; broad soft particles (a spray cloud, a glow) keep
+their own strength so FSR doesn't drop its history over a whole area.

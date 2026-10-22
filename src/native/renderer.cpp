@@ -4059,7 +4059,8 @@ void main() {
   // FSR's reactive mask: this frame's (binding 0) and last frame's (1) at
   // where this pixel was (motion vectors, 2: render pixels, this -> last),
   // the largest of a 3x3 there (flakes move a little of their own), fading
-// 15% a frame; this frame's counts half again (faint flakes).
+// 15% a frame; this frame's widened by a pixel, small things in it (flakes)
+// made nearly all-or-nothing.
   copy_fs_[18] = CompileBuiltin("builtin_reactive_merge", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D cur;
 layout(set = 0, binding = 1) uniform sampler2D last;
@@ -4068,8 +4069,28 @@ layout(location = 0) out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   ivec2 lim = textureSize(cur, 0) - 1;
-  // A faint flake counts more (FSR keeps history in proportion).
-  float r = min(texelFetch(cur, p, 0).r * 1.5, 1.0);
+  // This frame's: a pixel around each flake too (its edge, half covered at
+  // the render size, and the output pixels around it), and nearly all-or-
+  // nothing: FSR keeps history in proportion to what's left, so a faint or
+  // half-covered flake pixel kept a faint trail.
+  float c = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      float v = texelFetch(cur, clamp(p + ivec2(x, y), ivec2(0), lim), 0).r;
+      c = max(c, (x == 0 && y == 0) ? v : v * 0.8);
+    }
+  }
+  // Small things (flakes: little around them three pixels out) go nearly
+  // all-or-nothing; broad soft ones (a spray cloud, a glow) keep their own
+  // strength, or FSR would drop its history over a whole area.
+  float ring = 0.0;
+  for (int i = 0; i < 8; ++i) {
+    ivec2 o8 = ivec2(i < 3 ? -3 : i < 5 ? 0 : 3, i % 3 == 0 ? -3 : i % 3 == 1 ? 0 : 3);
+    if (i == 3) o8 = ivec2(0, -3);
+    if (i == 4) o8 = ivec2(0, 3);
+    ring = max(ring, texelFetch(cur, clamp(p + o8, ivec2(0), lim), 0).r);
+  }
+  float r = max(min(c * 1.5, 1.0), smoothstep(0.01, 0.12, c - ring));
   vec2 mv = texelFetch(motion, p, 0).xy;
   ivec2 q = ivec2(floor(vec2(p) + 0.5 + mv));
   float h = 0.0;
