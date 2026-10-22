@@ -83,12 +83,12 @@ bool IsInstalled(const fs::path& install_dir) {
 fs::path DefaultInstallDir() {
   const fs::path games = HomeDir() / "Games";
   // Everything in one folder: the game, its build (build\amped3revamped) and
-  // this launcher. An install made by launchers before 0.3.0 (Amped3Revamped)
-  // stays where it is.
-  if (!IsInstalled(games / "Amped 3 Revamped") && IsInstalled(games / "Amped3Revamped")) {
-    return games / "Amped3Revamped";
+  // this launcher. No spaces: the build tools run in a folder inside it. An
+  // install in the installers' old suggested folder stays where it is.
+  if (!IsInstalled(games / "Amped3Revamped") && IsInstalled(games / "Amped 3 Revamped")) {
+    return games / "Amped 3 Revamped";
   }
-  return games / "Amped 3 Revamped";
+  return games / "Amped3Revamped";
 }
 
 fs::path InstalledLauncher(const fs::path& install_dir) {

@@ -168,7 +168,7 @@ sources from GitHub and builds the game on your computer from your own Amped 3
    home, Downloads, Documents and Desktop folders and on removable drives;
    select the row to browse for another one.
 2. Pick the branch: `main`, or `experimental` for the newest work.
-3. Check the install folder (default `Games/Amped 3 Revamped` in your user
+3. Check the install folder (default `Games/Amped3Revamped` in your user
    folder). You need about 40 GB free. Everything goes there: the game, its
    build (`build/amped3revamped`) and the launcher itself.
 4. Select **Build and install** (twice, to confirm). The build's output
@@ -176,8 +176,7 @@ sources from GitHub and builds the game on your computer from your own Amped 3
    an hour on a PC and several hours on a handheld.
 5. Once installed, the launcher moves itself into the install folder as
    `amped3-launcher(.exe)`, so nothing is left in Downloads; a newer launcher
-   you download later takes its place the first time you run it. (Installs
-   made by launchers before 0.3 stay in `Games/Amped3Revamped`.)
+   you download later takes its place the first time you run it.
 
 Under the hood it runs the same installers as the manual routes below:
 `Install-Amped3.ps1` on Windows (it offers to install the build tools with

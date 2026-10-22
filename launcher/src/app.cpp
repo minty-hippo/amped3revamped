@@ -486,9 +486,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   s->Step(install ? "Extracting the game and building (the first build takes a long time)"
                   : "Building");
   fs::create_directories(install_dir, ec);
-  // The build runs from the sources' path without spaces where the drive
-  // has one (Windows short names: "Amped 3 Revamped" is AMPED3~1), as some
-  // build tools don't take spaces.
+  // The build runs from the sources' path without spaces (an install folder
+  // picked with spaces; Windows short names: "Amped 3 Revamped" is AMPED3~1),
+  // as some build tools don't take spaces.
   const fs::path build_src = NoSpacePath(source);
   if (build_src != source) s->Log("Building in " + PathText(build_src));
   std::vector<std::string> argv;
