@@ -179,6 +179,15 @@ REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_god_rays_strength, 1.0, "GPU",
                       "Native renderer: god ray strength (0..2)")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_BOOL(native_ambient_occlusion, true, "GPU",
+                    "Native renderer: ambient occlusion: creases, corners and the snow around "
+                    "trees, rails and jumps shaded where the open sky's light can't reach");
+REXCVAR_DEFINE_DOUBLE(native_ambient_occlusion_strength, 1.0, "GPU",
+                      "Native renderer: ambient occlusion strength (0..2)")
+    .range(0.0, 2.0);
+REXCVAR_DEFINE_BOOL(native_ambient_occlusion_debug, false, "GPU",
+                    "Native renderer, diagnostics: show the ambient occlusion alone (white = "
+                    "open)");
 REXCVAR_DEFINE_BOOL(native_reactive_debug, false, "GPU",
                     "Native renderer, diagnostics: with FSR, show the scene (stretched, not "
                     "upscaled, darkened) with FSR's reactive mask in red: where snow and "
@@ -1758,6 +1767,11 @@ void WorkerMain() {
           renderer->SetInCutscene(game_state == 20);  // a story scene
           renderer->SetGameState(int(game_state));
         }
+        renderer->SetAmbientOcclusion(
+            revamped && REXCVAR_GET(native_ambient_occlusion)
+                ? float(REXCVAR_GET(native_ambient_occlusion_strength))
+                : 0.0f,
+            REXCVAR_GET(native_ambient_occlusion_debug));
         renderer->SetGodRays(revamped && REXCVAR_GET(native_god_rays)
                                  ? float(REXCVAR_GET(native_god_rays_strength))
                                  : 0.0f);

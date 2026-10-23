@@ -332,8 +332,8 @@ for the full setup, or turn off **Lean emulation** (`emulated_gpu_lean`) if
 you switch often.
 
 **Revamped Graphics** turns all the visual enhancements on or off at once:
-motion blur, speed blur, distance fog, god rays, branch fade and the trail
-map clouds. Each keeps its own setting for when the switch is back on. Sharp
+motion blur, speed blur, ambient occlusion, distance fog, god rays, branch
+fade and the trail map clouds. Each keeps its own setting for when the switch is back on. Sharp
 fonts and upscaled textures aren't part of it: they're off until you turn them
 on yourself.
 

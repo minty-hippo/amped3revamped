@@ -83,6 +83,7 @@ const std::vector<GameSetting>& EffectSettings() {
        3.0, 0.1, false, true},
       {"native_speed_blur", "Speed blur", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_fog", "Distance fog", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
+      {"native_ambient_occlusion", "Ambient occlusion", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_god_rays", "God rays", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_foliage_fade", "Branch fade", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_map_clouds", "Trail map clouds", Kind::kToggle, "true", {}, 0, 0, 0, false, true},

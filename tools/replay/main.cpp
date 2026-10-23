@@ -451,6 +451,8 @@ int main(int argc, char** argv) {
   bool async_pipelines = false;
   float speed_blur = -1.0f;
   float fog = 0.0f, fog_start = 150.0f;
+  float ao = 0.0f;        // --ao strength [--ao-debug]: ambient occlusion
+  bool ao_debug = false;
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
   fs::path rewrite;  // write the loaded frame back out in capture format (tests the writer)
   // Draw counts to stop at, each drawn by a fresh renderer and dumped to
@@ -494,6 +496,10 @@ int main(int argc, char** argv) {
       rewrite = argv[++i];
     } else if (a == "--god-rays" && i + 1 < argc) {
       god_rays = std::stof(argv[++i]);
+    } else if (a == "--ao" && i + 1 < argc) {
+      ao = std::stof(argv[++i]);
+    } else if (a == "--ao-debug") {
+      ao_debug = true;
     } else if (a == "--fog" && i + 1 < argc) {
       fog = std::stof(argv[++i]);
     } else if (a == "--fog-start" && i + 1 < argc) {
@@ -789,11 +795,13 @@ int main(int argc, char** argv) {
     if (speed_blur >= 0.0f) renderer.SetSpeedBlur(1.0f, 1.0f / 60.0f, speed_blur);
     if (fog > 0.0f) renderer.SetFog(fog, fog_start);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
+    if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
     auto stats = renderer.Render(cap, files, max_draws);
     first_use("first frame", stats);
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";
     if (stats.fogged) std::cout << "Fog applied\n";
     if (stats.god_rays) std::cout << "God rays applied\n";
+    if (stats.ambient_occlusion) std::cout << "Ambient occlusion applied\n";
     std::printf("Nearest character to the camera: %.1f\n", stats.nearest_character);
     if (stats.motion_blurred) std::cout << "Motion blur applied\n";
     if (upscaler) std::cout << "Upscaler: " << stats.upscaler << "\n";

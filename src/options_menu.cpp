@@ -328,7 +328,8 @@ const std::vector<Tab>& Tabs() {
                        /*restart=*/true),
                 Toggle("revamped_graphics", "Revamped Graphics",
                        "All the visual enhancements below at once (motion blur, speed blur, "
-                       "distance fog, god rays, branch fade and the trail map clouds), each "
+                       "ambient occlusion, distance fog, god rays, branch fade and the trail "
+                       "map clouds), each "
                        "as set here. Off draws the game as the console does. Also in the "
                        "game's own menu: Pause > Options > Graphics. Native renderer "
                        "only."),
@@ -391,6 +392,13 @@ const std::vector<Tab>& Tabs() {
                         0.0, 3.0),
                 SliderF("native_fog_start", "Fog start distance",
                         "How far away the fog begins, in metres.", "%.0f m", 0.0, 1000.0),
+                Toggle("native_ambient_occlusion", "Ambient occlusion",
+                       "Shading where the open sky's light can't reach: the snow around tree "
+                       "trunks, rails, jumps and buildings, creases and corners, worked out "
+                       "from the scene's depth each frame (within a few metres, none in the "
+                       "far distance). Native renderer only."),
+                SliderF("native_ambient_occlusion_strength", "Ambient occlusion strength",
+                        "How dark the shading gets (0 = none).", "%.2f", 0.0, 2.0),
                 Toggle("native_god_rays", "God rays",
                        "Shafts of light streaming from the sun (or moon) while it's in or "
                        "near view, broken up by the clouds, trees and peaks in front of it. "

@@ -1578,7 +1578,7 @@ struct Renderer::Impl {
     kDepth = 0, kDepthMs = 1, kColorMs = 2, kOutput = 3, kOutputMs = 4, kMotionBlur = 5,
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
-    kClouds = 17, kReactiveMerge = 18, kReactiveView = 19
+    kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1619,7 +1619,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[20] = {};  // by CopyKind
+  VkShaderModule copy_fs_[23] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -1802,6 +1802,21 @@ struct Renderer::Impl {
   bool smooth_alpha_ = true;
   bool foliage_fade_ = true;  // RendererOptions::foliage_fade (with smooth_alpha_)
   Image* fog_result_ = nullptr;  // this frame's fogged / rayed scene
+  // Ambient occlusion (SetAmbientOcclusion): strength (0 = off), the
+  // occlusion at half size (two images: the estimate and its blur, R = the
+  // light left, G = distance) and the darkened scene.
+  float ao_strength_ = 0.0f;
+  bool ao_debug_ = false;
+  Image ao_img_[2], ao_out_img_;
+  // The scene's depth as the lighting pass reads it: the world alone. The
+  // game resolves depth again at the end of the frame with the riders,
+  // particles that write depth (snow spray) and 3D HUD text in it, which
+  // would cast occlusion where nothing shows.
+  Image ao_depth_;
+  bool ao_depth_ok_ = false;
+  bool ao_done_ = false;
+  Image* ao_result_ = nullptr;
+  Image* OccludedScene(Image* scene);
   Image ray_mask_img_, ray_img_, rays_out_img_;
   // Where the sun is on screen (uv) and how much of it counts (0 behind the
   // camera or far off screen .. 1 on screen).
@@ -2587,8 +2602,9 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
                     prev_valid_;
   const bool radial = speed_strength_ > 0.0f && speed_amount_ > 0.002f;
   const bool fog = (fog_density_ > 0.0f || rays_strength_ > 0.0f) && fog_presence_ > 0.002f;
+  const bool ao = ao_strength_ > 0.0f;
   if (light_seen_ && !tiling_.width && tex_base == scene_base_) composite_seen_ = true;
-  if ((blur || upscaler_ || radial || fog) && light_seen_ && !tiling_.width &&
+  if ((blur || upscaler_ || radial || fog || ao) && light_seen_ && !tiling_.width &&
       tex_base == scene_base_) {
     auto sit = resolved_.find(tex_base);
     if (sit != resolved_.end()) {
@@ -2597,6 +2613,11 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       // the composite's first draw).
       EndRendering();
       MarkPart("scene done (resolves)");
+      // Ambient occlusion first: the fog then covers it in the distance.
+      if (ao) {
+        if (Image* occluded = OccludedScene(scene)) scene = occluded;
+        MarkPart("effect: ambient occlusion");
+      }
       if (fog) {
         if (Image* fogged = FoggedScene(scene)) scene = fogged;
         MarkPart("effect: fog / god rays");
@@ -4118,6 +4139,153 @@ void main() {
   o = vec4(mix(c * 0.6, vec3(1.0, 0.0, 0.0), r), 1.0);
 }
 )", true);
+  // Ambient occlusion, 1 (half size): how much of the open hemisphere above
+  // each point the nearby depth hides (scalable ambient obscurance: points
+  // on a spiral within a world radius, projected onto the screen). R = the
+  // light left (1 = none hidden), G = the point's distance (for the blur and
+  // the upsampling).
+  copy_fs_[20] = CompileBuiltin("builtin_ao", R"(#version 450
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(push_constant) uniform Ao {
+  mat4 m;   // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
+  vec4 cam; // camera position, radius (world units)
+  vec4 a;   // 1 / depth width, 1 / depth height, depth pixels per world unit 1 unit away,
+            // farthest distance
+  vec4 b;   // 1 / output width, 1 / output height, intensity, largest radius (depth pixels)
+} pc;
+layout(location = 0) out vec4 o;
+vec3 World(vec2 uv, out bool sky) {
+  float d = textureLod(depth, uv, 0.0).r;
+  vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  sky = d <= 0.0 || abs(p.w) < 1e-7;
+  return sky ? vec3(0.0) : p.xyz / p.w;
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.b.xy;
+  bool sky;
+  vec3 p = World(uv, sky);
+  float dist = length(p - pc.cam.xyz);
+  if (sky || dist > pc.a.w) {
+    o = vec4(1.0, sky ? 60000.0 : dist, 0.0, 0.0);  // (16-bit float: < 65504)
+    return;
+  }
+  // The surface's normal from its neighbours (the nearer one each way, so
+  // edges don't bend it).
+  vec2 t = pc.a.xy;
+  bool s0, s1;
+  vec3 x1 = World(uv + vec2(t.x, 0.0), s0) - p, x0 = p - World(uv - vec2(t.x, 0.0), s1);
+  vec3 dx = (s0 || (!s1 && dot(x0, x0) < dot(x1, x1))) ? x0 : x1;
+  vec3 y1 = World(uv + vec2(0.0, t.y), s0) - p, y0 = p - World(uv - vec2(0.0, t.y), s1);
+  vec3 dy = (s0 || (!s1 && dot(y0, y0) < dot(y1, y1))) ? y0 : y1;
+  // Steps to both neighbours large for its distance, both ways: a thin or
+  // broken-up surface (stippled foliage, wire, a far edge) whose depth
+  // says little about what's around it; the occlusion fades out there.
+  float step_x = sqrt(min(dot(x0, x0), dot(x1, x1)));
+  float step_y = sqrt(min(dot(y0, y0), dot(y1, y1)));
+  float ragged = smoothstep(0.03, 0.08, max(step_x, step_y) / dist);
+  vec3 n = cross(dx, dy);
+  if (dot(n, n) < 1e-12 || ragged >= 1.0) {
+    o = vec4(1.0, dist, 0.0, 0.0);
+    return;
+  }
+  n = normalize(n);
+  if (dot(n, pc.cam.xyz - p) < 0.0) n = -n;
+  float r = pc.cam.w;
+  float rpx = min(r * pc.a.z / dist, pc.b.w);
+  if (rpx < 2.0) {
+    o = vec4(1.0, dist, 0.0, 0.0);
+    return;
+  }
+  // A different turn of the spiral per pixel (interleaved gradient noise);
+  // the blur evens it out.
+  float spin = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  const int kTaps = 12;
+  float sum = 0.0;
+  for (int i = 0; i < kTaps; ++i) {
+    float f = (float(i) + 0.5) / float(kTaps);
+    float ang = (f * 7.0 + spin) * 6.2831853;
+    vec2 off = vec2(cos(ang), sin(ang)) * (f * rpx) * t;
+    bool sk;
+    vec3 v = World(uv + off, sk) - p;
+    if (sk) continue;
+    float vv = dot(v, v);
+    float falloff = max(1.0 - vv / (r * r), 0.0);
+    // Above a ~9 degree horizon and more than 30 cm proud of the surface:
+    // the gentle folds between the terrain's flat triangles and the board
+    // trails laid on the snow don't count, corners and contacts do.
+    sum += max((dot(v, n) - 0.3) * inversesqrt(vv + 1e-6) - 0.15, 0.0) * falloff;
+  }
+  float ao = clamp(1.0 - pc.b.z * sum * (2.0 / float(kTaps)), 0.0, 1.0);
+  ao = mix(ao, 1.0, ragged);
+  // Gone toward the farthest distance.
+  ao = mix(ao, 1.0, smoothstep(pc.a.w * 0.6, pc.a.w, dist));
+  o = vec4(ao, dist, 0.0, 0.0);
+}
+)", true);
+  // Ambient occlusion, 2: blurred one way (a.xy: the step), only across
+  // points at about the same distance.
+  copy_fs_[21] = CompileBuiltin("builtin_ao_blur", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D ao;
+layout(push_constant) uniform Blur { vec4 a; } pc;  // step (texels), -
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 size = textureSize(ao, 0);
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec2 here = texelFetch(ao, c, 0).rg;
+  float tol = 0.04 * here.y + 0.05;
+  float sum = 0.0, wsum = 0.0;
+  for (int i = -4; i <= 4; ++i) {
+    vec2 s = texelFetch(ao, clamp(c + ivec2(pc.a.xy) * i, ivec2(0), size - 1), 0).rg;
+    float w = exp(-float(i * i) / 10.0) * exp(-abs(s.y - here.y) / tol);
+    sum += s.x * w;
+    wsum += w;
+  }
+  o = vec4(sum / max(wsum, 1e-6), here.y, 0.0, 0.0);
+}
+)", true);
+  // Ambient occlusion, 3: the scene darkened by it (the half-size result
+  // brought up to size from the neighbours at the pixel's own distance).
+  copy_fs_[22] = CompileBuiltin("builtin_ao_apply", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2) uniform sampler2D ao;
+layout(push_constant) uniform Apply {
+  mat4 m;   // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
+  vec4 cam; // camera position, -
+  vec4 a;   // 1 / width, 1 / height, debug view (1), -
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.a.xy;
+  vec4 c = texture(scene, uv);
+  float d = texture(depth, uv).r;
+  vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  if (d <= 0.0 || abs(p.w) < 1e-7) {
+    o = pc.a.z > 0.5 ? vec4(1.0) : c;
+    return;
+  }
+  float dist = length(p.xyz / p.w - pc.cam.xyz);
+  vec2 hs = vec2(textureSize(ao, 0));
+  vec2 f = uv * hs - 0.5;
+  ivec2 i0 = ivec2(floor(f));
+  vec2 fr = f - floor(f);
+  float tol = 0.04 * dist + 0.05;
+  float sum = 0.0, wsum = 0.0;
+  for (int k = 0; k < 4; ++k) {
+    ivec2 off = ivec2(k & 1, k >> 1);
+    vec2 s = texelFetch(ao, clamp(i0 + off, ivec2(0), ivec2(hs) - 1), 0).rg;
+    float bw = (off.x == 1 ? fr.x : 1.0 - fr.x) * (off.y == 1 ? fr.y : 1.0 - fr.y);
+    float e = (s.y - dist) / tol;
+    float w = bw * exp(-e * e);
+    sum += s.x * w;
+    wsum += w;
+  }
+  // None of the four at this pixel's distance: something drawn in front
+  // after the occlusion's depth (a rider, snow spray) - left as it is.
+  float a = mix(1.0, sum / max(wsum, 1e-6), clamp(wsum * 4.0, 0.0, 1.0));
+  o = pc.a.z > 0.5 ? vec4(vec3(a), 1.0) : vec4(c.rgb * a, c.a);
+}
+)", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
 )") + clouds_common + R"(
 layout(binding = 2) uniform sampler2D sprite;
@@ -4660,6 +4828,29 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   scene_base_ = scene.base_address() & 0x1FFFFFFF;
   depth_base_ = depth.base_address() & 0x1FFFFFFF;
   light_seen_ = true;
+  // Ambient occlusion: the world's depth, kept before it's resolved again.
+  ao_depth_ok_ = false;
+  if (ao_strength_ > 0.0f) {
+    auto dit = resolved_.find(depth_base_);
+    if (dit != resolved_.end() && dit->second.format == VK_FORMAT_R32_SFLOAT) {
+      Image& src = dit->second;
+      EndRendering();
+      if (!ao_depth_.image || ao_depth_.width != src.width || ao_depth_.height != src.height) {
+        if (ao_depth_.image) Retire(ao_depth_);
+        ao_depth_ = gpu_.CreateImage(src.width, src.height, VK_FORMAT_R32_SFLOAT, false, "ao_depth");
+        ToGeneral(cb_, ao_depth_);
+      }
+      Barrier();
+      VkImageCopy region{};
+      region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      region.extent = {src.width, src.height, 1};
+      vk::vkCmdCopyImage(cb_, src.image, VK_IMAGE_LAYOUT_GENERAL, ao_depth_.image,
+                         VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+      Barrier();
+      ao_depth_ok_ = true;
+    }
+  }
 }
 
 Image* Renderer::Impl::BlurredScene(Image* scene) {
@@ -4888,6 +5079,96 @@ bool Renderer::Impl::SunOnScreen(float uv[2], float* visible) const {
   const double edge = std::max(std::fabs(x), std::fabs(y));
   *visible = float(std::clamp(1.0 - (edge - 1.0) / 0.6, 0.0, 1.0));
   return *visible > 0.0f;
+}
+
+Image* Renderer::Impl::OccludedScene(Image* scene) {
+  if (ao_done_) return ao_result_;
+  ao_done_ = true;
+  ao_result_ = nullptr;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
+      dit->second.width != scene->width || dit->second.height != scene->height ||
+      scene->samples > 1) {
+    return nullptr;
+  }
+  // The camera's vertical field of view from the inverse view-projection:
+  // the rays through the middle and the top of the screen.
+  float px_per_unit = 0.0f;
+  {
+    double mid[3], top[3];
+    for (int k = 0; k < 2; ++k) {
+      const double ndc[4] = {0.0, k ? 1.0 : 0.0, 0.5, 1.0};
+      double wp[4];
+      for (int r = 0; r < 4; ++r) {
+        wp[r] = 0;
+        for (int c = 0; c < 4; ++c) wp[r] += inv_vp_[r * 4 + c] * ndc[c];
+      }
+      if (std::fabs(wp[3]) < 1e-12) return nullptr;
+      double* out = k ? top : mid;
+      for (int r = 0; r < 3; ++r) out[r] = wp[r] / wp[3] - cam_pos_[r];
+    }
+    const double dm = std::sqrt(mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]);
+    const double dt = std::sqrt(top[0] * top[0] + top[1] * top[1] + top[2] * top[2]);
+    if (dm < 1e-9 || dt < 1e-9) return nullptr;
+    const double cos_a =
+        std::clamp((mid[0] * top[0] + mid[1] * top[1] + mid[2] * top[2]) / (dm * dt), -1.0, 1.0);
+    const double tan_half = std::tan(std::acos(cos_a));
+    if (!(tan_half > 1e-4) || !std::isfinite(tan_half)) return nullptr;
+    px_per_unit = float(0.5 * double(scene->height) / tan_half);
+  }
+  Image* depth = &dit->second;
+  // The occlusion from the world's depth (see ao_depth_); the final depth
+  // only keeps it off what was drawn in front afterwards (riders, spray).
+  Image* world_depth = ao_depth_ok_ && ao_depth_.width == depth->width &&
+                               ao_depth_.height == depth->height
+                           ? &ao_depth_
+                           : depth;
+  const uint32_t w = scene->width, h = scene->height;
+  const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
+  EndRendering();
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(ao_img_[0], hw, hh, VK_FORMAT_R16G16_SFLOAT, "ao");
+  ensure(ao_img_[1], hw, hh, VK_FORMAT_R16G16_SFLOAT, "ao_blur");
+  ensure(ao_out_img_, w, h, scene->format, "ambient_occlusion");
+  ao_out_img_.scaled = scene->scaled;
+  ao_out_img_.scale = scene->scale;
+  Barrier();
+  float pc[32] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
+  }
+  pc[16] = cam_pos_[0];
+  pc[17] = cam_pos_[1];
+  pc[18] = cam_pos_[2];
+  // A few metres: where the snow meets trees, rails, jumps and buildings.
+  pc[19] = 2.5f;
+  pc[20] = 1.0f / float(w);
+  pc[21] = 1.0f / float(h);
+  pc[22] = px_per_unit;
+  pc[23] = 150.0f;  // none farther away (the fog takes over)
+  pc[24] = 1.0f / float(hw);
+  pc[25] = 1.0f / float(hh);
+  pc[26] = 4.5f * ao_strength_;
+  pc[27] = 0.06f * float(h);  // the screen radius, at most
+  FullscreenPass(CopyKind::kAo, &ao_img_[0], nullptr, world_depth, nullptr, false, pc, 28);
+  float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
+  FullscreenPass(CopyKind::kAoBlur, &ao_img_[1], &ao_img_[0], nullptr, nullptr, false, bx, 4);
+  FullscreenPass(CopyKind::kAoBlur, &ao_img_[0], &ao_img_[1], nullptr, nullptr, false, by, 4);
+  float ap[24] = {};
+  std::memcpy(ap, pc, sizeof(float) * 20);
+  ap[20] = 1.0f / float(w);
+  ap[21] = 1.0f / float(h);
+  ap[22] = ao_debug_ ? 1.0f : 0.0f;
+  FullscreenPass(CopyKind::kAoApply, &ao_out_img_, scene, depth, &ao_img_[0], false, ap, 24);
+  dyn_ = DynState{};
+  ++stats_.ambient_occlusion;
+  ao_result_ = &ao_out_img_;
+  return ao_result_;
 }
 
 Image* Renderer::Impl::FoggedScene(Image* scene) {
@@ -7235,6 +7516,10 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ray_mask_img_);
   gpu_.DestroyImage(ray_img_);
   gpu_.DestroyImage(rays_out_img_);
+  gpu_.DestroyImage(ao_img_[0]);
+  gpu_.DestroyImage(ao_img_[1]);
+  gpu_.DestroyImage(ao_out_img_);
+  gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(vel_img_);
   gpu_.DestroyImage(motion_img_);
   gpu_.DestroyImage(tile_rows_img_);
@@ -7330,6 +7615,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   up_result_ = nullptr;
   radial_done_ = false;
   fog_done_ = false;
+  ao_done_ = false;
+  ao_depth_ok_ = false;
   nearest_character_ = 1e9f;
   if (upscaler_) {
     ++jitter_index_;
@@ -7620,6 +7907,11 @@ void Renderer::SetFoliageFade(bool on) {
   impl_->foliage_fade_ = on && !impl_->Diag("nofade");
 }
 void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(strength, 0.0f); }
+
+void Renderer::SetAmbientOcclusion(float strength, bool debug) {
+  impl_->ao_strength_ = std::max(strength, 0.0f);
+  impl_->ao_debug_ = debug && strength > 0.0f;
+}
 
 void Renderer::SetFog(float density, float start) {
   impl_->fog_density_ = std::max(density, 0.0f);

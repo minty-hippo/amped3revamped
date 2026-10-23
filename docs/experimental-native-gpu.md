@@ -482,3 +482,28 @@ stayed over bright snow and terrain. This frame's mask is now widened by a
 pixel, and small things in it (little around them three pixels out) go
 nearly all-or-nothing; broad soft particles (a spray cloud, a glow) keep
 their own strength so FSR doesn't drop its history over a whole area.
+
+## Ambient occlusion
+
+Screen-space ambient occlusion (Revamped Graphics: Ambient occlusion, with
+a strength slider), applied to the finished scene before the fog so the fog
+covers it in the distance.
+
+- **Depth:** the world's depth as the game's lighting pass reads it, copied
+  aside then. The game resolves depth to the same address again at the end
+  of the frame with the riders, snow spray (particles that write depth with
+  nothing visible) and 3D HUD text in it; occlusion from that one showed
+  dark wedges and halos where nothing is drawn. The final depth only keeps
+  the shading off what was drawn in front afterwards (riders, spray).
+- **Estimate (half size):** 12 points on a spiral within 2.5 m, projected
+  onto the screen (at most 6% of its height); each counts by how far it
+  rises above the surface's horizon (normal from the nearer neighbours).
+  Points less than 30 cm proud of the surface or under a ~9 degree horizon
+  don't count: the folds between the terrain's flat triangles and the board
+  trails laid on the snow otherwise draw lines across the slope. Stippled
+  foliage (depth broken up at every pixel) is left out. None past 150 m.
+- **Blur and upsampling:** a 9-tap blur each way across points at about the
+  same distance, then brought to full size from the four neighbours at the
+  pixel's own distance.
+- The debug view (`native_ambient_occlusion_debug`, or `--ao <strength>
+  --ao-debug` in the replayer) shows the occlusion alone.

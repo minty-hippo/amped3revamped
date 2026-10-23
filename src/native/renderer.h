@@ -156,6 +156,7 @@ struct RenderStats {
   // Distance fog applied to the scene this frame (SetFog).
   uint32_t fogged = 0;
   uint32_t god_rays = 0;  // god rays added this frame (SetGodRays)
+  uint32_t ambient_occlusion = 0;  // ambient occlusion applied (SetAmbientOcclusion)
   // The nearest character to the camera (world units; 1e9: none).
   float nearest_character = 1e9f;
   // Object motion blur: scene draws given motion vectors, and of those the
@@ -254,6 +255,11 @@ class Renderer {
   // sun (or moon) while it's in or near view, blocked by the scenery;
   // `strength` scales them (0 = off). Fade out without a rider nearby.
   void SetGodRays(float strength);
+  // Ambient occlusion for the following frames: creases, corners and the
+  // ground around objects darkened from the scene's depth (screen space,
+  // within a few metres, none past 150 m); `strength` scales it (0 = off).
+  // `debug` shows the occlusion alone (white = open).
+  void SetAmbientOcclusion(float strength, bool debug = false);
   // Foliage camera fade for the following frames (RendererOptions::foliage_fade).
   void SetFoliageFade(bool on);
   // Cartoon clouds that part when the view cuts to or from the trail map

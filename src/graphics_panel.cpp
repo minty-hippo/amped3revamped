@@ -67,6 +67,7 @@ const std::vector<Tab>& Tabs() {
            {"native_camera_motion_blur_strength", "Motion Blur Strength", Kind::kSlider, 0.0, 3.0, 0.1},
            {"native_speed_blur", "Speed Blur"},
            {"native_fog", "Distance Fog"},
+           {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_god_rays", "God Rays"},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
