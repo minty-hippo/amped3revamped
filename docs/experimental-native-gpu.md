@@ -489,19 +489,26 @@ Screen-space ambient occlusion (Revamped Graphics: Ambient occlusion, with
 a strength slider), applied to the finished scene before the fog so the fog
 covers it in the distance.
 
-- **Depth:** the world's depth as the game's lighting pass reads it, copied
-  aside then. The game resolves depth to the same address again at the end
-  of the frame with the riders, snow spray (particles that write depth with
-  nothing visible) and 3D HUD text in it; occlusion from that one showed
-  dark wedges and halos where nothing is drawn. The final depth only keeps
-  the shading off what was drawn in front afterwards (riders, spray).
+- **Depth:** the world's depth as the game's lighting pass reads it,
+  copied aside then, with the riders added: after the lighting the game
+  draws depth-only character passes (render target 0 untouched, depth test
+  less and greater in pairs: shadow volumes or similar) whose depth lands
+  where nothing shows, then the riders and their boards, then see-through
+  draws that write depth (snow spray, in-world labels and icons). The depth
+  is copied before and after the depth-only passes and again before the
+  first see-through draw; a pixel takes the late depth where the riders
+  changed it after those passes, else the depth from before them. The
+  end-of-frame depth (which has all of it) only keeps the shading off what
+  was drawn in front afterwards.
 - **Estimate (half size):** 12 points on a spiral within 2.5 m, projected
-  onto the screen (at most 6% of its height); each counts by how far it
-  rises above the surface's horizon (normal from the nearer neighbours).
-  Points less than 30 cm proud of the surface or under a ~9 degree horizon
-  don't count: the folds between the terrain's flat triangles and the board
-  trails laid on the snow otherwise draw lines across the slope. Stippled
-  foliage (depth broken up at every pixel) is left out. None past 150 m.
+  onto the screen (at most a quarter of its height, so up close the world
+  radius shrinks); each counts by how far it rises above the surface's
+  horizon (normal from the nearer neighbours). Points under a 30 degree
+  horizon, or less than an eighth of the radius proud of the surface, don't
+  count: the folds between the terrain's flat triangles, the foot of a snow
+  ramp and the board trails laid on the snow otherwise draw lines across the
+  slope; trunks, riders, walls and corners do. Stippled foliage (depth
+  broken up at every pixel) is left out. None past 150 m.
 - **Blur and upsampling:** a 9-tap blur each way across points at about the
   same distance, then brought to full size from the four neighbours at the
   pixel's own distance.

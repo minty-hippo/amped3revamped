@@ -1814,9 +1814,19 @@ struct Renderer::Impl {
   // would cast occlusion where nothing shows.
   Image ao_depth_;
   bool ao_depth_ok_ = false;
+  // ... and with what's drawn after the lighting up to the first
+  // see-through draw that writes depth (snow spray, in-world labels): the
+  // riders and their boards, which do cast occlusion.
+  Image ao_late_depth_;
+  bool ao_late_ok_ = false, ao_late_done_ = false;
+  // Around the depth-only character passes: 0 none yet, 1 in them, 2 after.
+  Image ao_before_hidden_, ao_after_hidden_;
+  int ao_hidden_state_ = 0;
+  bool ao_before_ok_ = false, ao_hidden_ok_ = false;
   bool ao_done_ = false;
   Image* ao_result_ = nullptr;
   Image* OccludedScene(Image* scene);
+  bool SnapshotDepth(Image* depth, bool float_depth, Image& out, const char* name);
   Image ray_mask_img_, ray_img_, rays_out_img_;
   // Where the sun is on screen (uv) and how much of it counts (0 behind the
   // camera or far off screen .. 1 on screen).
@@ -4145,7 +4155,9 @@ void main() {
   // light left (1 = none hidden), G = the point's distance (for the blur and
   // the upsampling).
   copy_fs_[20] = CompileBuiltin("builtin_ao", R"(#version 450
-layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 0) uniform sampler2D late;    // with the riders
+layout(set = 0, binding = 1) uniform sampler2D depth;   // before the depth-only passes
+layout(set = 0, binding = 2) uniform sampler2D hidden;  // after them
 layout(push_constant) uniform Ao {
   mat4 m;   // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
   vec4 cam; // camera position, radius (world units)
@@ -4161,7 +4173,10 @@ layout(location = 0) out vec4 o;
 ivec2 kSize;
 vec3 World(ivec2 t, out bool sky) {
   t = clamp(t, ivec2(0), kSize - 1);
-  float d = texelFetch(depth, t, 0).r;
+  // What was drawn after the depth-only passes (riders), else what was
+  // there before them: what they wrote alone shows nowhere.
+  float late_d = texelFetch(late, t, 0).r;
+  float d = late_d != texelFetch(hidden, t, 0).r ? late_d : texelFetch(depth, t, 0).r;
   vec2 uv = (vec2(t) + 0.5) * pc.a.xy;
   vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
   sky = d <= 0.0 || abs(p.w) < 1e-7;
@@ -4198,8 +4213,11 @@ void main() {
   }
   n = normalize(n);
   if (dot(n, pc.cam.xyz - p) < 0.0) n = -n;
-  float r = pc.cam.w;
-  float rpx = min(r * pc.a.z / dist, pc.b.w);
+  // The radius on screen, at most pc.b.w pixels: up close that's less
+  // than pc.cam.w in the world, and the thresholds below follow it (or a
+  // rider a few metres away would cast nothing).
+  float rpx = min(pc.cam.w * pc.a.z / dist, pc.b.w);
+  float r = rpx * dist / pc.a.z;
   if (rpx < 2.0) {
     o = vec4(1.0, dist, 0.0, 0.0);
     return;
@@ -4219,10 +4237,11 @@ void main() {
     if (sk) continue;
     float vv = dot(v, v);
     float falloff = max(1.0 - vv / (r * r), 0.0);
-    // Above a ~9 degree horizon and more than 30 cm proud of the surface:
-    // the gentle folds between the terrain's flat triangles and the board
-    // trails laid on the snow don't count, corners and contacts do.
-    sum += max((dot(v, n) - 0.3) * inversesqrt(vv + 1e-6) - 0.15, 0.0) * falloff;
+    // Above a ~20 degree horizon and proud of the surface by more than an
+    // eighth of the radius (30 cm at the full 2.5 m), and 20 cm: the folds between the
+    // terrain's flat triangles, the foot of a snow ramp and the board trails
+    // laid on the snow don't count; walls, trunks, riders and corners do.
+    sum += max((dot(v, n) - 0.12 * r) * inversesqrt(vv + 1e-6) - 0.5, 0.0) * falloff;
   }
   float ao = clamp(1.0 - pc.b.z * sum * (2.0 / float(kTaps)), 0.0, 1.0);
   ao = mix(ao, 1.0, ragged);
@@ -5091,6 +5110,22 @@ bool Renderer::Impl::SunOnScreen(float uv[2], float* visible) const {
   return *visible > 0.0f;
 }
 
+bool Renderer::Impl::SnapshotDepth(Image* depth, bool float_depth, Image& out,
+                                   const char* name) {
+  EndRendering();
+  if (!out.image || out.width != depth->width || out.height != depth->height) {
+    if (out.image) Retire(out);
+    out = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R32_SFLOAT, false, name);
+    ToGeneral(cb_, out);
+  }
+  const VkRect2D read{{0, 0}, {depth->width, depth->height}};
+  ResolveBarrier(depth, read);
+  CopyDepth(depth, &out, 0, float_depth, 0, 0, 0, 0, 0, depth->width, depth->height);
+  Barrier();
+  dyn_ = DynState{};
+  return true;
+}
+
 Image* Renderer::Impl::OccludedScene(Image* scene) {
   if (ao_done_) return ao_result_;
   ao_done_ = true;
@@ -5133,6 +5168,17 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
                                ao_depth_.height == depth->height
                            ? &ao_depth_
                            : depth;
+  auto fits = [&](bool ok, const Image& im) {
+    return ok && im.width == depth->width && im.height == depth->height;
+  };
+  // With the riders (kept at the scene's size), else the world again; and
+  // the depth before and after the depth-only passes (the world twice when
+  // there were none).
+  Image* late_depth = fits(ao_late_ok_, ao_late_depth_) ? &ao_late_depth_ : world_depth;
+  const bool hidden = fits(ao_before_ok_, ao_before_hidden_) &&
+                      fits(ao_hidden_ok_, ao_after_hidden_) && late_depth != world_depth;
+  Image* before_hidden = hidden ? &ao_before_hidden_ : world_depth;
+  Image* after_hidden = hidden ? &ao_after_hidden_ : world_depth;
   const uint32_t w = scene->width, h = scene->height;
   const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
   EndRendering();
@@ -5163,9 +5209,10 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
   pc[23] = 150.0f;  // none farther away (the fog takes over)
   pc[24] = 1.0f / float(hw);
   pc[25] = 1.0f / float(hh);
-  pc[26] = 4.5f * ao_strength_;
-  pc[27] = 0.06f * float(h);  // the screen radius, at most
-  FullscreenPass(CopyKind::kAo, &ao_img_[0], nullptr, world_depth, nullptr, false, pc, 28);
+  pc[26] = 9.0f * ao_strength_;
+  pc[27] = 0.25f * float(h);  // the screen radius, at most
+  FullscreenPass(CopyKind::kAo, &ao_img_[0], late_depth, before_hidden, after_hidden, false, pc,
+                 28);
   float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
   FullscreenPass(CopyKind::kAoBlur, &ao_img_[1], &ao_img_[0], nullptr, nullptr, false, bx, 4);
   FullscreenPass(CopyKind::kAoBlur, &ao_img_[0], &ao_img_[1], nullptr, nullptr, false, by, 4);
@@ -6277,6 +6324,42 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     index_count = uint32_t(out_indices.size());
   }
 
+  // Ambient occlusion: the scene's depth with the riders. Kept before the
+  // first see-through draw that writes depth after the lighting (snow
+  // spray, in-world labels); around the character passes that write depth
+  // but no picture (render target 0 untouched: the riders drawn through
+  // another view, whose depth lands where nothing shows), the depth before
+  // and after them, to tell what they wrote from the riders drawn later.
+  if (ao_strength_ > 0.0f && light_seen_ && !ao_late_done_ && depth && tiling_.width &&
+      ps->info.ucode_hash != kLightingPixelShader && ((st.reg(0x2200) & 6) == 6) &&
+      max_draws_ == UINT32_MAX) {
+    const bool float_depth = (st.reg(0x2002) >> 16) & 1;
+    const uint32_t blend0 = st.reg(0x2201);
+    // (Characters draw see-through parts too, hair: those stay.)
+    const bool blended = (blend0 & 0x1FFF1FFF) != 0x00010001 && mask_bits &&
+                         !vs->info.dynamic_constants;
+    const bool label_or_icon =
+        (!d.up_vertices.empty() && d.prim == 13) ||
+        (vs->info.ucode_hash == 0x6DA245E02A477C07ull && ps->info.ucode_hash == 0x2C0355A9D2589300ull);
+    const bool no_picture = (mask_bits & 0xF) == 0;
+    if (blended || label_or_icon) {
+      if (Diag("ao")) std::fprintf(stderr, "ao: late depth before draw %u\n", number);
+      ao_late_done_ = true;
+      if (ao_hidden_state_ == 1) {  // (still in them: what they wrote so far)
+        ao_hidden_ok_ = SnapshotDepth(depth, float_depth, ao_after_hidden_, "ao_after_hidden");
+        ao_hidden_state_ = 2;
+      }
+      ao_late_ok_ = SnapshotDepth(depth, float_depth, ao_late_depth_, "ao_late_depth");
+    } else if (no_picture && ao_hidden_state_ == 0) {
+      if (Diag("ao")) std::fprintf(stderr, "ao: depth-only passes from draw %u\n", number);
+      ao_hidden_state_ = 1;
+      ao_before_ok_ = SnapshotDepth(depth, float_depth, ao_before_hidden_, "ao_before_hidden");
+    } else if (!no_picture && ao_hidden_state_ == 1) {
+      if (Diag("ao")) std::fprintf(stderr, "ao: depth-only passes end before draw %u\n", number);
+      ao_hidden_state_ = 2;
+      ao_hidden_ok_ = SnapshotDepth(depth, float_depth, ao_after_hidden_, "ao_after_hidden");
+    }
+  }
   mark(6);
   keep_target_clears_ = true;
   BeginRendering(colors, depth);
@@ -7530,6 +7613,9 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_img_[1]);
   gpu_.DestroyImage(ao_out_img_);
   gpu_.DestroyImage(ao_depth_);
+  gpu_.DestroyImage(ao_late_depth_);
+  gpu_.DestroyImage(ao_before_hidden_);
+  gpu_.DestroyImage(ao_after_hidden_);
   gpu_.DestroyImage(vel_img_);
   gpu_.DestroyImage(motion_img_);
   gpu_.DestroyImage(tile_rows_img_);
@@ -7627,6 +7713,10 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   fog_done_ = false;
   ao_done_ = false;
   ao_depth_ok_ = false;
+  ao_late_ok_ = false;
+  ao_late_done_ = false;
+  ao_hidden_state_ = 0;
+  ao_before_ok_ = ao_hidden_ok_ = false;
   nearest_character_ = 1e9f;
   if (upscaler_) {
     ++jitter_index_;
