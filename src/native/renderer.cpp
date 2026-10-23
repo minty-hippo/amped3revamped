@@ -4154,16 +4154,25 @@ layout(push_constant) uniform Ao {
   vec4 b;   // 1 / output width, 1 / output height, intensity, largest radius (depth pixels)
 } pc;
 layout(location = 0) out vec4 o;
-vec3 World(vec2 uv, out bool sky) {
-  float d = textureLod(depth, uv, 0.0).r;
+// Depth texels read by their integer position and placed at their centres:
+// a half-size pixel's centre falls exactly between two depth texels, and
+// which one a sampler picks there differs between GPUs (and from row to
+// row), which put lines of wrong normals across the snow on Intel Arc.
+ivec2 kSize;
+vec3 World(ivec2 t, out bool sky) {
+  t = clamp(t, ivec2(0), kSize - 1);
+  float d = texelFetch(depth, t, 0).r;
+  vec2 uv = (vec2(t) + 0.5) * pc.a.xy;
   vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
   sky = d <= 0.0 || abs(p.w) < 1e-7;
   return sky ? vec3(0.0) : p.xyz / p.w;
 }
 void main() {
-  vec2 uv = gl_FragCoord.xy * pc.b.xy;
+  kSize = textureSize(depth, 0);
+  // The depth texel this half-size pixel covers (top left of its 2 x 2).
+  ivec2 c = ivec2(gl_FragCoord.xy) * 2;
   bool sky;
-  vec3 p = World(uv, sky);
+  vec3 p = World(c, sky);
   float dist = length(p - pc.cam.xyz);
   if (sky || dist > pc.a.w) {
     o = vec4(1.0, sky ? 60000.0 : dist, 0.0, 0.0);  // (16-bit float: < 65504)
@@ -4171,11 +4180,10 @@ void main() {
   }
   // The surface's normal from its neighbours (the nearer one each way, so
   // edges don't bend it).
-  vec2 t = pc.a.xy;
   bool s0, s1;
-  vec3 x1 = World(uv + vec2(t.x, 0.0), s0) - p, x0 = p - World(uv - vec2(t.x, 0.0), s1);
+  vec3 x1 = World(c + ivec2(1, 0), s0) - p, x0 = p - World(c - ivec2(1, 0), s1);
   vec3 dx = (s0 || (!s1 && dot(x0, x0) < dot(x1, x1))) ? x0 : x1;
-  vec3 y1 = World(uv + vec2(0.0, t.y), s0) - p, y0 = p - World(uv - vec2(0.0, t.y), s1);
+  vec3 y1 = World(c + ivec2(0, 1), s0) - p, y0 = p - World(c - ivec2(0, 1), s1);
   vec3 dy = (s0 || (!s1 && dot(y0, y0) < dot(y1, y1))) ? y0 : y1;
   // Steps to both neighbours large for its distance, both ways: a thin or
   // broken-up surface (stippled foliage, wire, a far edge) whose depth
@@ -4204,9 +4212,10 @@ void main() {
   for (int i = 0; i < kTaps; ++i) {
     float f = (float(i) + 0.5) / float(kTaps);
     float ang = (f * 7.0 + spin) * 6.2831853;
-    vec2 off = vec2(cos(ang), sin(ang)) * (f * rpx) * t;
+    ivec2 off = ivec2(round(vec2(cos(ang), sin(ang)) * (f * rpx)));
+    if (off == ivec2(0)) continue;
     bool sk;
-    vec3 v = World(uv + off, sk) - p;
+    vec3 v = World(c + off, sk) - p;
     if (sk) continue;
     float vv = dot(v, v);
     float falloff = max(1.0 - vv / (r * r), 0.0);
@@ -4256,9 +4265,10 @@ layout(push_constant) uniform Apply {
 } pc;
 layout(location = 0) out vec4 o;
 void main() {
-  vec2 uv = gl_FragCoord.xy * pc.a.xy;
-  vec4 c = texture(scene, uv);
-  float d = texture(depth, uv).r;
+  ivec2 px = ivec2(gl_FragCoord.xy);
+  vec2 uv = (vec2(px) + 0.5) * pc.a.xy;
+  vec4 c = texelFetch(scene, px, 0);
+  float d = texelFetch(depth, px, 0).r;
   vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
   if (d <= 0.0 || abs(p.w) < 1e-7) {
     o = pc.a.z > 0.5 ? vec4(1.0) : c;

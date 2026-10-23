@@ -505,5 +505,13 @@ covers it in the distance.
 - **Blur and upsampling:** a 9-tap blur each way across points at about the
   same distance, then brought to full size from the four neighbours at the
   pixel's own distance.
+- **Depth read by whole texels:** the half-size pass reads depth with
+  `texelFetch` at integer positions (and places each at its texel's
+  centre). Sampled at the half-size pixel's centre, the coordinate falls
+  exactly between two depth texels; at render scales that aren't a whole
+  multiple of the game's 1280 x 720 (70% of 1080p is 1344 x 756) the
+  sampler picked one or the other row by row, and wrong normals drew
+  evenly spaced horizontal lines across the snow (seen on Intel Arc with
+  XeSS; reproduced in the replayer with `--scale 1.05`).
 - The debug view (`native_ambient_occlusion_debug`, or `--ao <strength>
   --ao-debug` in the replayer) shows the occlusion alone.
