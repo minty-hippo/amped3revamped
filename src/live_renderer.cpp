@@ -194,9 +194,12 @@ REXCVAR_DEFINE_INT32(native_shadow_softness, 100, "GPU",
                      "ground, softer the farther it is above it (percent; 0: an even blur "
                      "like the game's)")
     .range(0, 300);
-REXCVAR_DEFINE_BOOL(native_tree_shadows, true, "GPU",
-                    "Native renderer: the trees and objects near the slope cast real sun "
-                    "shadows (into the game's shadow map), dappled through the branches");
+REXCVAR_DEFINE_INT32(native_world_shadows, 2, "GPU",
+                     "Native renderer: the world's sun shadows (trees, rocks, props, the "
+                     "slopes themselves) baked again in-game at this many times the painted "
+                     "map's resolution as you ride (0: the game's painted shadows; 2 or 4), "
+                     "riders shaded by them too")
+    .range(0, 4);
 REXCVAR_DEFINE_BOOL(native_ambient_occlusion, true, "GPU",
                     "Native renderer: ambient occlusion: creases, corners and the snow around "
                     "trees, rails and jumps shaded where the open sky's light can't reach");
@@ -1789,7 +1792,7 @@ void WorkerMain() {
         renderer->SetShadows(
             revamped ? float(REXCVAR_GET(native_shadow_resolution)) / 100.0f : 1.0f,
             revamped ? float(REXCVAR_GET(native_shadow_distance)) : 0.0f);
-        renderer->SetTreeShadows(revamped && REXCVAR_GET(native_tree_shadows) ? 1.0f : 0.0f);
+        renderer->SetWorldShadows(revamped ? int(REXCVAR_GET(native_world_shadows)) : 0);
         renderer->SetShadowSoftness(
             revamped ? float(REXCVAR_GET(native_shadow_softness)) / 100.0f : 0.0f);
         renderer->SetAmbientOcclusion(

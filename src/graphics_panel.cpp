@@ -76,7 +76,8 @@ const std::vector<Tab>& Tabs() {
              {"200", "200 m"}, {"300", "300 m"}}},
            {"native_shadow_softness", "Shadow Softness", Kind::kStops, 0, 0, 0,
             {{"0", "Even"}, {"50", "Subtle"}, {"100", "Natural"}, {"200", "Soft"}}},
-           {"native_tree_shadows", "Tree Shadows"},
+           {"native_world_shadows", "World Shadows", Kind::kStops, 0, 0, 0,
+            {{"0", "Painted"}, {"2", "Baked 2x"}, {"4", "Baked 4x"}}},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
@@ -383,8 +384,8 @@ std::string GraphicsPanel::Hint(const Row& r) const {
     return native ? "Sharp at the caster's feet, softer farther from the ground."
                   : "Native renderer only (Options F1 > Native renderer).";
   }
-  if (name == "native_tree_shadows") {
-    return native ? "Trees and props cast real sun shadows, as far as Shadow Distance."
+  if (name == "native_world_shadows") {
+    return native ? "Trees, rocks and slopes' shadows baked again in-game, sharper; riders shaded."
                   : "Native renderer only (Options F1 > Native renderer).";
   }
   if (name == "native_upscaled_textures") {
@@ -504,7 +505,7 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     if (name == "native_upscaler_msaa") dim = !native || upscaler == "off";
     if (name == "native_sharp_fonts" || name == "native_upscaled_textures") dim = !native;
     if (name == "native_shadow_resolution" || name == "native_shadow_distance" ||
-        name == "native_tree_shadows" || name == "native_shadow_softness") {
+        name == "native_world_shadows" || name == "native_shadow_softness") {
       dim = !native || !revamped;
     }
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);

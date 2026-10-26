@@ -425,11 +425,16 @@ const std::vector<Tab>& Tabs() {
                          {"50", "Subtle"},
                          {"100", "Natural"},
                          {"200", "Soft"}}),
-                Toggle("native_tree_shadows", "Tree shadows",
-                       "The trees, rocks and props cast real sun shadows, dappled through "
-                       "the branches, in place of the shadows painted into the slopes "
-                       "(those fade back in at the edge of Shadow distance). Every tree seen "
-                       "keeps its shadow when you look away. Native renderer only."),
+                Choices("native_world_shadows", "World shadows",
+                        "The shadows painted into the slopes (trees, rocks, jumps, the "
+                        "slopes themselves) baked again in-game, sharper, as you ride: from "
+                        "the world as it's drawn, seen from the sun, dappled through the "
+                        "branches. What's baked stays. Riders and other moving things are "
+                        "shaded when they pass through them. Part of Revamped Graphics (off: "
+                        "the painted ones). Native renderer only.",
+                        {{"0", "Painted (the game's)"},
+                         {"2", "Baked, 2x"},
+                         {"4", "Baked, 4x"}}),
                 Toggle("native_ambient_occlusion", "Ambient occlusion",
                        "Shading where the open sky's light can't reach: the snow around tree "
                        "trunks, rails, jumps and buildings, creases and corners, worked out "

@@ -452,7 +452,7 @@ int main(int argc, char** argv) {
   float speed_blur = -1.0f;
   float fog = 0.0f, fog_start = 150.0f;
   float shadow_res = 0.0f, shadow_distance = 0.0f;  // --shadow-res x, --shadow-distance m
-  float tree_shadows = 0.0f;                          // --tree-shadows strength
+  int world_shadows = 0;                              // --world-shadows detail
   float shadow_softness = 0.0f;                       // --shadow-softness scale
   float ao = 0.0f;        // --ao strength [--ao-debug]: ambient occlusion
   bool ao_debug = false;
@@ -503,8 +503,8 @@ int main(int argc, char** argv) {
       shadow_res = std::stof(argv[++i]);
     } else if (a == "--shadow-softness" && i + 1 < argc) {
       shadow_softness = std::stof(argv[++i]);
-    } else if (a == "--tree-shadows" && i + 1 < argc) {
-      tree_shadows = std::stof(argv[++i]);
+    } else if (a == "--world-shadows" && i + 1 < argc) {
+      world_shadows = std::stoi(argv[++i]);
     } else if (a == "--shadow-distance" && i + 1 < argc) {
       shadow_distance = std::stof(argv[++i]);
     } else if (a == "--ao" && i + 1 < argc) {
@@ -808,7 +808,7 @@ int main(int argc, char** argv) {
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
     if (shadow_res > 0.0f || shadow_distance > 0.0f) renderer.SetShadows(shadow_res, shadow_distance);
-    if (tree_shadows > 0.0f) renderer.SetTreeShadows(tree_shadows);
+    if (world_shadows > 0) renderer.SetWorldShadows(world_shadows);
     if (shadow_softness > 0.0f) renderer.SetShadowSoftness(shadow_softness);
     auto stats = renderer.Render(cap, files, max_draws);
     first_use("first frame", stats);
@@ -832,7 +832,7 @@ int main(int argc, char** argv) {
     }
     if (stats.tree_shadow_draws)
       std::cout << "Sun shadows: " << stats.tree_shadow_draws << " filtered, " << stats.tree_casters
-                << " tree casters, " << stats.sun_receivers << " ground draws, "
+                << " world draws, " << stats.sun_receivers << " ground draws, "
                 << stats.sun_map_resets << " tree map resets\n";
     std::cout << "Recorded " << stats.draws_done << " of " << stats.draws << " draws\n";
     std::cout << "Render passes " << stats.passes << "; clears: " << stats.clear_passes

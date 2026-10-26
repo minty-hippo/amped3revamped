@@ -39,6 +39,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
 #include <thread>
 #include <deque>
 #include <mutex>
@@ -1025,11 +1026,8 @@ bool IsShadowCaster(uint64_t vs_hash) {
 constexpr uint64_t kTrailVertexShader = 0xCBEB0B975321F043ull;
 // The shadow map's blur (two passes over the map read as 8_8_8_8).
 constexpr uint64_t kShadowBlurPixelShader = 0x7A84B7E8B62F305Eull;
-// The shadow pass's terrain: its vertex shader (world-space vertices, the
-// light's view-projection in c0-c3).
-constexpr uint64_t kTerrainShadowVertexShader = 0x7FB9597D0D8178C1ull;
-// The scene pass's terrain (world-space vertices).
-constexpr uint64_t kTerrainVertexShader = 0x9BD0F06927F4EA3Bull;
+// The shadow pass's terrain's pixel shader (what it draws doesn't cast).
+constexpr uint64_t kTerrainShadowPixelShader = 0x515E86DBD1D61732ull;
 
 struct Shader {
   VkShaderModule module = VK_NULL_HANDLE;
@@ -1352,12 +1350,11 @@ struct Renderer::Impl {
   float shadow_av_ = 1.0f, shadow_fade_ = 1.0f;
   // Sun shadows (DrawSunShadows): the game's shadow map filtered again
   // with penumbras that widen away from the caster (SetShadowSoftness), and
-  // the trees' shadows (SetTreeShadows), from a map of the trees seen from
-  // the sun that stays put in the world and keeps every tree drawn since
-  // (so a tree's shadow stays when the camera turns away from it).
-  float tree_shadow_ = 0.0f;      // strength, 0 = off
+  // the world's shadows baked again (SetWorldShadows) from maps of the world
+  // seen from the sun that stay put and keep everything drawn since.
+  int world_detail_ = 0;          // World shadows: the bake's size (x the painted map), 0 = off
   float shadow_softness_ = 0.0f;  // penumbra scale, 0 = an even blur
-  bool SunShadowsOn() const { return tree_shadow_ > 0.0f || shadow_softness_ > 0.0f; }
+  bool SunShadowsOn() const { return world_detail_ > 0 || shadow_softness_ > 0.0f; }
   struct CasterDraw {
     VkPipeline pipeline;
     VkDescriptorSet tex_sets[2];
@@ -1368,8 +1365,12 @@ struct Renderer::Impl {
     uint32_t first, count;
     SystemConstants sys;  // as drawn; reprojected when drawn again
   };
-  std::vector<CasterDraw> caster_draws_;    // trees and props (scene pass)
-  std::vector<CasterDraw> ground_draws_;    // terrain (scene pass)
+  std::vector<CasterDraw> env_draws_;     // what stays put (scene pass)
+  std::vector<CasterDraw> height_draws_;  // the same without the trees
+  std::vector<CasterDraw> ground_draws_;  // terrain (scene pass)
+  std::unordered_set<uint64_t> shadow_caster_vs_;
+  std::map<uint64_t, uint32_t> sun_rec_counts_;  // diagnostics ("sunrec")  // the shadow pass's casters' shaders
+  std::vector<std::array<double, 16>> light_candidates_;  // shadow pass c0-c3
   // This frame's shadow pass: its depth target, the light's view-projection
   // (rows; the terrain's vertex shader has it in c0-c3) and viewport.
   Image* sun_depth_target_ = nullptr;
@@ -1385,19 +1386,27 @@ struct Renderer::Impl {
   // the camera stays near: the trees (and props), and the ground. Their size
   // follows the Shadow resolution setting (1024 texels a side at 1x).
   static constexpr double kSunDepth = 2000.0;  // metres the depth spans
-  Image sun_trees_, sun_ground_, sun_scratch_;
-  uint64_t sun_trees_drawn_ = 0;  // frames that drew trees into the map
-  bool sun_map_ok_ = false;
+  Image sun_env_, sun_ground_, sun_height_, sun_scratch_;
+  Image sun_seen_, sun_seen_scratch_;  // R8: rays whose sunward side has been in view
+  uint64_t sun_world_drawn_ = 0;  // frames that drew into the world map
+  bool sun_map_ok_ = false, sun_frame_ok_ = false;
+  bool sun_map_frame_ = true;  // this frame draws the world into the sun maps
   double sun_f_[3] = {}, sun_e1_[3] = {}, sun_e2_[3] = {}, sun_c0_[3] = {};
-  int64_t sun_ci_ = 0, sun_cj_ = 0;
-  double sun_r_ = 0.0, sun_ref_ = 0.0, sun_last_cam_[3] = {};
-  // The slopes' painted shadows, faded out around the camera (a copy the
-  // lighting reads instead of its tf2).
+  int64_t sun_ci_ = 0, sun_cj_ = 0, sun_hi_ = 0, sun_hj_ = 0;
+  double sun_r_ = 0.0, sun_ref_ = 0.0, sun_href_ = 0.0, sun_last_cam_[3] = {};
+  double sun_O_[16] = {};  // this frame's sun map rows
+  // World shadows: the slopes' shadow map baked again (BakeWorldShadows), a
+  // copy the lighting reads instead of its tf2.
   Image baked_;
   Image* baked_src_ = nullptr;
-  VkRect2D baked_last_{};
   bool baked_ok_ = false;
-  void FadeBakedShadows(const Draw& d, const GpuState& st, double reach);
+  void BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16], bool bake);
+  void ShiftMap(Image* map, Image* scratch, int64_t dx, int64_t dy);
+  // Riders (drawn after the lighting) shaded by the world (ShadedMovers).
+  Image movers_pos_, movers_shade_, movers_out_;
+  bool movers_done_ = false;
+  Image* movers_result_ = nullptr;
+  Image* ShadedMovers(Image* scene);
   void DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map, const double O[16]);
   void PrepareSunShadows(const Draw& d, const GpuState& st);
   void DrawSunShadows(const Draw& d, const GpuState& st);
@@ -1665,7 +1674,8 @@ struct Renderer::Impl {
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
-    kSunPrep = 23, kSunPcss = 24, kBakedFade = 25
+    kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
+    kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1706,7 +1716,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[26] = {};  // by CopyKind
+  VkShaderModule copy_fs_[32] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -1764,7 +1774,7 @@ struct Renderer::Impl {
   Image player_rows_img_;  // 4 x 1: pixel offset from the player = rows * v / w
   void FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image* b1, Image* b2,
                       bool linear0, const float* pc, uint32_t floats,
-                      const VkRect2D* rect = nullptr);
+                      const VkRect2D* rect = nullptr, Image* b3 = nullptr);
   VkSampler linear_sampler_ = VK_NULL_HANDLE;
   void NoteLightingPass(const Draw& d, const GpuState& st);
   Image* BlurredScene(Image* scene);
@@ -2701,8 +2711,9 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   const bool radial = speed_strength_ > 0.0f && speed_amount_ > 0.002f;
   const bool fog = (fog_density_ > 0.0f || rays_strength_ > 0.0f) && fog_presence_ > 0.002f;
   const bool ao = ao_strength_ > 0.0f;
+  const bool movers = world_detail_ > 0;
   if (light_seen_ && !tiling_.width && tex_base == scene_base_) composite_seen_ = true;
-  if ((blur || upscaler_ || radial || fog || ao) && light_seen_ && !tiling_.width &&
+  if ((blur || upscaler_ || radial || fog || ao || movers) && light_seen_ && !tiling_.width &&
       tex_base == scene_base_) {
     auto sit = resolved_.find(tex_base);
     if (sit != resolved_.end()) {
@@ -2711,6 +2722,11 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       // the composite's first draw).
       EndRendering();
       MarkPart("scene done (resolves)");
+      // Riders in the world's shade first (they're lit by themselves).
+      if (movers) {
+        if (Image* shaded = ShadedMovers(scene)) scene = shaded;
+        MarkPart("effect: shaded riders");
+      }
       // Ambient occlusion first: the fog then covers it in the distance.
       if (ao) {
         if (Image* occluded = OccludedScene(scene)) scene = occluded;
@@ -3607,11 +3623,12 @@ void Renderer::Impl::CreateOnce() {
   vk::Check(vk::vkCreateSampler(dev, &si, nullptr, &linear_sampler_), "sampler");
 
   // Depth -> color copy (depth resolves).
-  VkDescriptorSetLayoutBinding cbnd[3] = {
+  VkDescriptorSetLayoutBinding cbnd[4] = {
       {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-      {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
-  lci.bindingCount = 3;  // binding 2: motion blur only
+      {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+  lci.bindingCount = 4;  // binding 2: motion blur and a few more; 3: the world shadows' bake
   lci.pBindings = cbnd;
   vk::Check(vk::vkCreateDescriptorSetLayout(dev, &lci, nullptr, &copy_set_layout_), "copy layout");
   VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};  // 128: motion blur
@@ -4451,19 +4468,218 @@ void main() {
   o = vec4(dr, dso, st);
 }
 )", true);
-  // The slopes' painted shadows faded out around the camera (FadeBakedShadows):
-  // c5: world x, z -> u, v; cam: x, z, fade from / to (m).
-  copy_fs_[25] = CompileBuiltin("builtin_baked_fade", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D src;
-layout(push_constant) uniform Fade { vec4 c5; vec4 cam; } pc;
+  // World shadows (BakeWorldShadows), 1: the slopes' painted shadow map
+  // magnified (its x: 1 lit).
+  copy_fs_[25] = CompileBuiltin("builtin_bake_init", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;  // linear
+layout(push_constant) uniform Init { vec4 a; } pc;   // 1 / this image's size
 layout(location = 0) out vec4 o;
 void main() {
-  ivec2 size = textureSize(src, 0);
-  ivec2 p = ivec2(gl_FragCoord.xy);
-  vec2 uv = (vec2(p) + 0.5) / vec2(size);
+  o = vec4(textureLod(src, gl_FragCoord.xy * pc.a.xy, 0.0).r);
+}
+)", true);
+  // World shadows, 2: each texel's surface (the height map) seen from the
+  // sun through the world map: percentage-closer soft shadows, the casters
+  // found against the ground's own slope (a receiver plane from the ground
+  // map), so slopes don't shade themselves.
+  // c5: world x, z -> u, v. hm: the height map (1 / R, -x0 / R, -z0 / R,
+  // height at depth 0.5). o0-o2: the sun maps' rows. p: penumbra radius per
+  // metre, smallest radius (m), metres per unit of depth, half width (m).
+  // q: baked within (m) of the camera x, z. sz: this image's size.
+  copy_fs_[26] = CompileBuiltin("builtin_bake", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D heights;  // from above: depth, 1 = nothing
+layout(set = 0, binding = 1) uniform sampler2D world;    // from the sun: depth, 1 = nothing
+layout(set = 0, binding = 2) uniform sampler2D ground;   // the terrain alone, from the sun
+layout(set = 0, binding = 3) uniform sampler2D seen;     // rays whose sunward side was in view
+layout(push_constant) uniform Bake {
+  vec4 c5; vec4 hm; vec4 o0; vec4 o1; vec4 o2; vec4 p; vec4 q; vec4 sz;
+} pc;
+layout(location = 0) out vec4 o;
+vec2 Disc(int i, int n) {
+  float r = sqrt((float(i) + 0.5) / float(n));
+  float t = float(i) * 2.39996323;
+  return r * vec2(cos(t), sin(t));
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy / pc.sz.xy;
   vec2 xz = (uv - pc.c5.zw) / pc.c5.xy;
-  float keep = smoothstep(pc.cam.z, pc.cam.w, length(xz - pc.cam.xy));
-  o = mix(vec4(1.0), texelFetch(src, p, 0), keep);
+  if (length(xz - pc.q.yz) > pc.q.x) discard;
+  ivec2 hn = textureSize(heights, 0);
+  vec2 ht = (0.5 + 0.5 * (xz * pc.hm.x + pc.hm.yz)) * vec2(hn);
+  if (any(lessThan(ht, vec2(0.0))) || any(greaterThanEqual(ht, vec2(hn)))) discard;
+  float hz = texelFetch(heights, ivec2(ht), 0).r;
+  if (hz >= 1.0) discard;  // not seen yet: as it was
+  vec4 P = vec4(xz.x, pc.hm.w + (0.5 - hz) * pc.p.z, xz.y, 1.0);
+  vec2 st = vec2(dot(pc.o0, P), dot(pc.o1, P));
+  float zr = dot(pc.o2, P);
+  ivec2 n = textureSize(world, 0);
+  vec2 tc = (0.5 + 0.5 * st) * vec2(n);
+  if (any(lessThan(tc, vec2(1.0))) || any(greaterThanEqual(tc, vec2(n) - 1.0))) discard;
+  // Pass 1 (q.w = 0): rays whose sunward side has been in view (what casts
+  // on them has been drawn): baked outright. Pass 2 (q.w = 1): the rest,
+  // only ever darker than the painted map (blended by min): whatever casts
+  // on them may not have been drawn yet (a tree's crown above the view).
+  bool sunward_seen = texelFetch(seen, ivec2(tc), 0).r > 0.5;
+  if (sunward_seen == (pc.q.w > 0.5)) discard;
+  float tm = 2.0 * pc.p.w / float(n.x);  // metres per texel
+  float zpm = 1.0 / pc.p.z;               // depth per metre
+  // The ground's slope along the sun (depth per texel), for the receiver.
+  ivec2 c = ivec2(tc);
+  float gx0 = texelFetch(ground, c - ivec2(1, 0), 0).r, gx1 = texelFetch(ground, c + ivec2(1, 0), 0).r;
+  float gy0 = texelFetch(ground, c - ivec2(0, 1), 0).r, gy1 = texelFetch(ground, c + ivec2(0, 1), 0).r;
+  // (The gentler side each way, at most 2 m per metre: edges don't tilt it.)
+  float g0 = texelFetch(ground, c, 0).r;
+  vec2 grad = vec2(0.0);
+  if (g0 < 1.0) {
+    float ax = gx0 < 1.0 && gx1 < 1.0 ? (abs(gx1 - g0) < abs(g0 - gx0) ? gx1 - g0 : g0 - gx0) : 0.0;
+    float ay = gy0 < 1.0 && gy1 < 1.0 ? (abs(gy1 - g0) < abs(g0 - gy0) ? gy1 - g0 : g0 - gy0) : 0.0;
+    float lim = 2.0 * tm * zpm;
+    grad = clamp(vec2(ax, ay), vec2(-lim), vec2(lim));
+  }
+  float bias = (0.25 + 1.5 * tm) * zpm;
+  // (Searched a few metres around at least.)
+  float reach = clamp(max(pc.p.x * 30.0, 4.0) / tm, 2.0, 64.0);
+  float bs = 0.0, bn = 0.0;
+  for (int i = 0; i < 24; ++i) {
+    vec2 off = Disc(i, 24) * reach;
+    float z = texelFetch(world, ivec2(tc + off), 0).r;
+    if (z < 1.0 && z < zr + dot(grad, off) - bias) {
+      bs += zr - z;
+      bn += 1.0;
+    }
+  }
+  if (bn == 0.0) {
+    if (pc.q.w > 0.5) discard;
+    o = vec4(1.0);
+    return;
+  }
+  float dist = min(bs / bn * pc.p.z, 60.0);
+  float rad = clamp((pc.p.x * dist + pc.p.y) / tm, 0.75, 48.0);
+  float sh = 0.0;
+  for (int i = 0; i < 32; ++i) {
+    vec2 off = Disc(i, 32) * rad;
+    float z = texelFetch(world, ivec2(tc + off), 0).r;
+    sh += (z < 1.0 && z < zr + dot(grad, off) - bias) ? 1.0 : 0.0;
+  }
+  o = vec4(1.0 - sh / 32.0);
+}
+)", true);
+  // Shaded riders, 1: the pixels drawn after the lighting pass (riders and
+  // the like: the late depth differs from the world's, and from what the
+  // depth-only passes left), as world positions (w = 1).
+  copy_fs_[27] = CompileBuiltin("builtin_movers_pos", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D late;
+layout(set = 0, binding = 1) uniform sampler2D world;
+layout(set = 0, binding = 2) uniform sampler2D hidden;
+layout(push_constant) uniform Pos { mat4 m; } pc;  // ndc (x, y, 1 - depth, 1) -> world
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec2 uv = (vec2(p) + 0.5) / vec2(textureSize(late, 0));
+  float l = texelFetch(late, p, 0).r;
+  if (l <= 0.0 || l == texelFetch(world, p, 0).r || l == texelFetch(hidden, p, 0).r) {
+    o = vec4(0.0);
+    return;
+  }
+  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - l, 1.0);
+  o = abs(w.w) < 1e-7 ? vec4(0.0) : vec4(w.xyz / w.w, 1.0);
+}
+)", true);
+  // Shaded riders, 2: each one's light seen from the sun through the world
+  // map (soft as the world's shadows), as a factor (1: in the sun).
+  // o0-o2: the sun maps' rows; p: metres per unit of depth, half width (m),
+  // penumbra radius per metre, how much of their light the shade takes.
+  copy_fs_[28] = CompileBuiltin("builtin_movers_shade", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D pos;
+layout(set = 0, binding = 1) uniform sampler2D world;
+layout(set = 0, binding = 2) uniform sampler2D ground;  // the terrain alone, from the sun
+layout(push_constant) uniform Shade { vec4 o0; vec4 o1; vec4 o2; vec4 p; } pc;
+layout(location = 0) out vec4 o;
+vec2 Disc(int i, int n) {
+  float r = sqrt((float(i) + 0.5) / float(n));
+  float t = float(i) * 2.39996323;
+  return r * vec2(cos(t), sin(t));
+}
+void main() {
+  vec4 q = texelFetch(pos, ivec2(gl_FragCoord.xy), 0);
+  o = vec4(1.0);
+  if (q.w < 0.5) return;
+  vec4 P = vec4(q.xyz, 1.0);
+  ivec2 n = textureSize(world, 0);
+  vec2 tc = (0.5 + 0.5 * vec2(dot(pc.o0, P), dot(pc.o1, P))) * vec2(n);
+  if (any(lessThan(tc, vec2(1.0))) || any(greaterThanEqual(tc, vec2(n) - 1.0))) return;
+  float zr = dot(pc.o2, P);
+  float tm = 2.0 * pc.p.y / float(n.x);
+  float bias = (0.3 + 1.5 * tm) / pc.p.x;
+  // The slope of the ground below along the sun: neighbouring rays meet it
+  // nearer or farther (not shade).
+  ivec2 c = ivec2(tc);
+  float gx0 = texelFetch(ground, c - ivec2(1, 0), 0).r, gx1 = texelFetch(ground, c + ivec2(1, 0), 0).r;
+  float gy0 = texelFetch(ground, c - ivec2(0, 1), 0).r, gy1 = texelFetch(ground, c + ivec2(0, 1), 0).r;
+  // (The gentler side each way, at most 2 m per metre: edges don't tilt it.)
+  float g0 = texelFetch(ground, c, 0).r;
+  vec2 grad = vec2(0.0);
+  if (g0 < 1.0) {
+    float ax = gx0 < 1.0 && gx1 < 1.0 ? (abs(gx1 - g0) < abs(g0 - gx0) ? gx1 - g0 : g0 - gx0) : 0.0;
+    float ay = gy0 < 1.0 && gy1 < 1.0 ? (abs(gy1 - g0) < abs(g0 - gy0) ? gy1 - g0 : g0 - gy0) : 0.0;
+    float lim = 2.0 * tm * (1.0 / pc.p.x);
+    grad = clamp(vec2(ax, ay), vec2(-lim), vec2(lim));
+  }
+  float reach = clamp(pc.p.z * 30.0 / tm, 2.0, 48.0);
+  float bs = 0.0, bn = 0.0;
+  for (int i = 0; i < 16; ++i) {
+    vec2 off = Disc(i, 16) * reach;
+    float z = texelFetch(world, ivec2(tc + off), 0).r;
+    if (z < 1.0 && z < zr + dot(grad, off) - bias) {
+      bs += zr - z;
+      bn += 1.0;
+    }
+  }
+  if (bn == 0.0) return;
+  if (pc.p.w < 0.0) {  // diagnostics: the casters' distance (/ 30 m), how many found
+    o = vec4(min(bs / bn * pc.p.x / 30.0, 1.0));
+    return;
+  }
+  float rad = clamp((pc.p.z * min(bs / bn * pc.p.x, 60.0) + 0.05) / tm, 0.75, 48.0);
+  float sh = 0.0;
+  for (int i = 0; i < 24; ++i) {
+    vec2 off = Disc(i, 24) * rad;
+    float z = texelFetch(world, ivec2(tc + off), 0).r;
+    sh += (z < 1.0 && z < zr + dot(grad, off) - bias) ? 1.0 : 0.0;
+  }
+  o = vec4(1.0 - pc.p.w * sh / 24.0);
+}
+)", true);
+  // The sun maps' rays whose sunward side (the ground and 45 m towards the
+  // sun) is in view this frame, marked (what's left stays as it was).
+  // a: the maps' ndc and depth -> world; vp: world -> the camera's clip.
+  copy_fs_[31] = CompileBuiltin("builtin_sun_seen", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D ground;
+layout(push_constant) uniform Seen { mat4 a; mat4 vp; } pc;
+layout(location = 0) out vec4 o;
+bool InView(vec4 w) {
+  vec4 c = pc.vp * vec4(w.xyz / w.w, 1.0);
+  return c.w > 0.1 && all(lessThan(abs(c.xy), vec2(0.97 * c.w)));
+}
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  ivec2 n = textureSize(ground, 0);
+  float g = texelFetch(ground, p, 0).r;
+  if (g >= 1.0) discard;
+  vec2 ndc = (vec2(p) + 0.5) / vec2(n) * 2.0 - 1.0;
+  if (!InView(pc.a * vec4(ndc, g, 1.0)) || !InView(pc.a * vec4(ndc, g - 0.0225, 1.0))) discard;
+  o = vec4(1.0);
+}
+)", true);
+  // Shaded riders, 3: the scene times that factor.
+  copy_fs_[29] = CompileBuiltin("builtin_movers_apply", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D shade;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(scene, p, 0);
+  o = vec4(c.rgb * texelFetch(shade, p, 0).r, c.a);
 }
 )", true);
   // Sun shadows, 2: the map filtered with penumbras that widen with the
@@ -4511,6 +4727,8 @@ void main() {
   }
   float rad = pc.a.z;
   if (bn > 0.0) rad = clamp(pc.a.x * min(bs / bn, 40.0) / mpt, pc.a.z, pc.a.w);
+  // Without the casters' heights this frame: a rider's height, about.
+  else if (pc.c.z > 0.5) rad = clamp(pc.a.x * 1.5 / mpt, pc.a.z, pc.a.w);
   float lit = 0.0;
   for (int i = 0; i < 24; ++i) lit += texture(raw, (vec2(p) + 0.5 + Disc(i, 24) * rad) * inv).b;
   float g = lit / 24.0;
@@ -4941,7 +5159,7 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
     stages[0].module = kind == CopyKind::kClouds ? clouds_vs_ : copy_vs_;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = copy_fs_[int(kind)];
+    stages[1].module = copy_fs_[int(kind == CopyKind::kBakeMin ? CopyKind::kBake : kind)];
     stages[1].pName = "main";
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -4954,6 +5172,12 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState att{};
     att.colorWriteMask = 15;
+    if (kind == CopyKind::kBakeMin) {  // only ever darker
+      att.blendEnable = VK_TRUE;
+      att.srcColorBlendFactor = att.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.srcAlphaBlendFactor = att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.colorBlendOp = att.alphaBlendOp = VK_BLEND_OP_MIN;
+    }
     if (kind == CopyKind::kClouds) {  // drawn over the output
       att.blendEnable = VK_TRUE;
       att.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -5093,7 +5317,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   DrawSunShadows(d, st);
   // Ambient occlusion: the world's depth, kept before it's resolved again.
   ao_depth_ok_ = false;
-  if (ao_strength_ > 0.0f) {
+  if (ao_strength_ > 0.0f || world_detail_ > 0) {
     auto dit = resolved_.find(depth_base_);
     if (dit != resolved_.end() && dit->second.format == VK_FORMAT_R32_SFLOAT) {
       Image& src = dit->second;
@@ -5346,15 +5570,15 @@ bool Renderer::Impl::SunOnScreen(float uv[2], float* visible) const {
 
 // The shadow map's inputs, kept at its first blur (which blurs it in place):
 // the unblurred map (b: the stencil byte, 0 where a caster is nearest the
-// sun) and the shadow pass's depth (the casters' height, when this frame's
-// light view-projection is known).
+// sun) and the shadow pass's depth (the casters' height, when the light's
+// view-projection is found at the lighting pass).
 void Renderer::Impl::PrepareSunShadows(const Draw& d, const GpuState& st) {
   std::string note;
   Image* raw = TextureFor(d, 0, st, &note);
   Image* depth = sun_depth_target_;
   if (Diag("sun")) {
-    std::fprintf(stderr, "sun: prepare raw %d depth %ux%u light %d\n", int(raw != nullptr),
-                 depth ? depth->width : 0, depth ? depth->height : 0, int(sun_light_ok_));
+    std::fprintf(stderr, "sun: prepare raw %d depth %ux%u\n", int(raw != nullptr),
+                 depth ? depth->width : 0, depth ? depth->height : 0);
   }
   if (!raw || raw->depth) return;
   const uint32_t w = raw->width, h = raw->height;
@@ -5381,10 +5605,9 @@ void Renderer::Impl::PrepareSunShadows(const Draw& d, const GpuState& st) {
   sun_inputs_ok_ = true;
 }
 
-// Draws recorded from the scene pass into one of the sun maps (trees or
-// ground): each reprojected in its vertex shader, camera clip -> world (the
-// lighting's inverse view-projection, which takes x, y, 1 - depth) -> the
-// map (rows O).
+// Draws recorded from the scene pass into one of the sun maps: each
+// reprojected in its vertex shader, camera clip -> world (the lighting's
+// inverse view-projection, which takes x, y, 1 - depth) -> the map (rows O).
 void Renderer::Impl::DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map,
                                     const double O[16]) {
   if (draws.empty()) return;
@@ -5452,29 +5675,56 @@ void Renderer::Impl::DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map,
   dyn_ = DynState{};
 }
 
-// At the lighting pass: the game's (blurred) shadow map replaced by the
-// unblurred one filtered with penumbras that widen away from the caster,
-// with the trees' shadows from the tree map; the slopes' painted shadows
-// faded out within the shadows' reach.
-void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
-  std::vector<CasterDraw> casters, ground;
-  casters.swap(caster_draws_);
-  ground.swap(ground_draws_);
-  baked_ok_ = false;
-  if (Diag("sun")) {
-    std::fprintf(stderr, "sun: on %d inputs %d light %d depth %d trees %zu ground %zu\n",
-                 int(SunShadowsOn()), int(sun_inputs_ok_), int(sun_light_ok_),
-                 int(sun_depth_ok_), casters.size(), ground.size());
+// A sun map's contents moved by (dx, dy) texels (through a scratch of the
+// same format), what comes in from outside cleared (far / not seen).
+void Renderer::Impl::ShiftMap(Image* map, Image* scratch, int64_t dx, int64_t dy) {
+  const float zero[4] = {0, 0, 0, 0};
+  const int64_t n = int64_t(map->width);
+  const VkImageAspectFlags aspect = map->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+  ClearImage(scratch, zero, 1.0f, 0, !map->depth, map->depth, map->depth);
+  FlushPendingClears();
+  if (std::llabs(dx) < n && std::llabs(dy) < n) {
+    VkImageCopy r{};
+    r.srcSubresource = {aspect, 0, 0, 1};
+    r.dstSubresource = {aspect, 0, 0, 1};
+    r.srcOffset = {int32_t(std::max<int64_t>(dx, 0)), int32_t(std::max<int64_t>(dy, 0)), 0};
+    r.dstOffset = {int32_t(std::max<int64_t>(-dx, 0)), int32_t(std::max<int64_t>(-dy, 0)), 0};
+    r.extent = {uint32_t(n - std::llabs(dx)), uint32_t(n - std::llabs(dy)), 1};
+    Barrier();
+    vk::vkCmdCopyImage(cb_, map->image, VK_IMAGE_LAYOUT_GENERAL, scratch->image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &r);
   }
-  if (!SunShadowsOn() || !sun_inputs_ok_) return;
-  std::string note;
-  Image* shadow = TextureFor(d, 0, st, &note);
-  if (!shadow || shadow->depth) return;
-  const uint32_t w = shadow->width, h = shadow->height;
-  if (w != sun_raw_.width || h != sun_raw_.height || shadow->format != sun_raw_.format) return;
-  // The lighting's lookup into the map: u = c6.p / c9.p, v = c7.p / c9.p
-  // (v remapped with the shadow distance).
-  double c6[4], c7[4], c9[4];
+  Barrier();
+  VkImageCopy all{};
+  all.srcSubresource = {aspect, 0, 0, 1};
+  all.dstSubresource = {aspect, 0, 0, 1};
+  all.extent = {map->width, map->height, 1};
+  vk::vkCmdCopyImage(cb_, scratch->image, VK_IMAGE_LAYOUT_GENERAL, map->image,
+                     VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+  Barrier();
+}
+
+// At the lighting pass:
+// - the sun maps brought up to date (the world, the ground along the sun,
+//   the heights from above), around the camera;
+// - the world's shadows baked from them into the slopes' shadow map (the
+//   lighting's tf2) at a higher resolution (World shadows);
+// - the game's (blurred) shadow map of riders and objects replaced by the
+//   unblurred one filtered with penumbras that widen away from the caster
+//   (Shadow softness).
+void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
+  std::vector<CasterDraw> env, height, ground;
+  env.swap(env_draws_);
+  height.swap(height_draws_);
+  ground.swap(ground_draws_);
+  std::vector<std::array<double, 16>> candidates;
+  candidates.swap(light_candidates_);
+  baked_ok_ = false;
+  sun_frame_ok_ = false;
+  if (!SunShadowsOn()) return;
+  // The lighting's lookup into the shadow map: u = c6.p / c9.p,
+  // v = c7.p / c9.p (v remapped with the shadow distance).
+  double c6[4], c7[4], c7o[4], c9[4];
   for (int i = 0; i < 4; ++i) {
     float a, b, c;
     std::memcpy(&a, &st.ps_consts[6 * 4 + i], 4);
@@ -5482,6 +5732,7 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     std::memcpy(&c, &st.ps_consts[9 * 4 + i], 4);
     c6[i] = a;
     c9[i] = c;
+    c7o[i] = b;
     c7[i] = shadow_av_ * (b - c) + c;
   }
   auto dot3 = [](const double* p, const double* q) { return p[0] * q[0] + p[1] * q[1] + p[2] * q[2]; };
@@ -5508,23 +5759,87 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
       for (double& v : f) v = -v;
     }
   }
+  // The light's view-projection: a shadow pass draw whose c0-c3 rows x, y, w
+  // are the lighting's (x = 2 c6 - c9, y = c9 - 2 c7, w = c9, give or take
+  // half a texel): one with world-space vertices.
+  sun_light_ok_ = false;
+  {
+    double best = 1e30;
+    for (const auto& m : candidates) {
+      double err = 0, scale = 0;
+      for (int i = 0; i < 4; ++i) {
+        err += std::fabs(m[0 * 4 + i] - (2.0 * c6[i] - c9[i])) +
+               std::fabs(m[1 * 4 + i] - (c9[i] - 2.0 * c7o[i])) + std::fabs(m[3 * 4 + i] - c9[i]);
+        scale += std::fabs(c9[i]);
+      }
+      err /= std::max(scale, 1e-9);
+      if (err < best) {
+        best = err;
+        if (err < 0.01) {
+          std::memcpy(sun_light_vp_, m.data(), sizeof(sun_light_vp_));
+          sun_light_ok_ = true;
+        }
+      }
+    }
+  }
+  if (Diag("sunrec")) {
+    for (auto& [h, n] : sun_rec_counts_) std::fprintf(stderr, "sun: world %016llX %u\n", (unsigned long long)h, n);
+    for (uint64_t h : shadow_caster_vs_) std::fprintf(stderr, "sun: game caster %016llX\n", (unsigned long long)h);
+    sun_rec_counts_.clear();
+  }
+  if (Diag("sun")) {
+    std::fprintf(stderr,
+                 "sun: inputs %d light %d (of %zu) depth %d world %zu heights %zu ground %zu\n",
+                 int(sun_inputs_ok_), int(sun_light_ok_), candidates.size(), int(sun_depth_ok_),
+                 env.size(), height.size(), ground.size());
+  }
   EndRendering();
   ++stats_.tree_shadow_draws;
-  // The sun maps: depth along the sun, centred near the camera, as wide as
-  // the shadows reach, the Shadow resolution setting's texels (2048 at 2x).
+  // The sun maps: centred near the camera, as wide as the shadows reach,
+  // the Shadow resolution setting's texels (2048 at 2x).
   const double reach = shadow_distance_ > 0.0f ? double(shadow_distance_) : 45.0;
-  const double R = std::clamp(reach * 1.15, 30.0, 180.0);
+  // Wide (100 m and more), centred ahead of the camera: trees are drawn
+  // only while in view, and their crowns leave the top of the view well
+  // before the camera reaches them.
+  const double R = std::clamp(std::max(reach * 1.15, 100.0), 100.0, 180.0);
   const float res = shadow_res_ > 0.0f ? shadow_res_ : 2.0f;
-  const uint32_t n_texels = uint32_t(std::clamp(std::lround(1024.0f * res / 256.0f) * 256, 1024L, 4096L));
+  const uint32_t n_texels =
+      uint32_t(std::clamp(std::lround(1024.0f * res / 256.0f) * 256, 1024L, 4096L));
   const double N = double(n_texels);
   const double texel = 2.0 * R / N;
   const double cam[3] = {cam_pos_[0], cam_pos_[1], cam_pos_[2]};
-  for (Image* im : {&sun_trees_, &sun_ground_, &sun_scratch_}) {
+  // Where the camera looks (on the level): the screen's centre, far.
+  double ahead[3] = {cam[0], cam[1], cam[2]};
+  {
+    double wp[4];
+    const double ndc[4] = {0.0, 0.0, 0.5, 1.0};
+    for (int r = 0; r < 4; ++r) {
+      wp[r] = 0;
+      for (int c = 0; c < 4; ++c) wp[r] += inv_vp_[r * 4 + c] * ndc[c];
+    }
+    if (std::fabs(wp[3]) > 1e-12) {
+      double dx = wp[0] / wp[3] - cam[0], dz = wp[2] / wp[3] - cam[2];
+      const double n = std::sqrt(dx * dx + dz * dz);
+      if (n > 1e-6) {
+        ahead[0] += 0.35 * R * dx / n;
+        ahead[2] += 0.35 * R * dz / n;
+      }
+    }
+  }
+  const bool world = world_detail_ > 0;
+  for (Image* im : {&sun_env_, &sun_ground_, &sun_height_, &sun_scratch_, &sun_seen_,
+                    &sun_seen_scratch_}) {
+    const bool color = im == &sun_seen_ || im == &sun_seen_scratch_;
+    if (!world && im != &sun_ground_ && im != &sun_scratch_) continue;
     if (!im->image || im->width != n_texels) {
       if (im->image) Retire(*im);
-      *im = gpu_.CreateImage(n_texels, n_texels, VK_FORMAT_D32_SFLOAT_S8_UINT, true,
-                             im == &sun_trees_ ? "sun_trees" : im == &sun_ground_ ? "sun_ground"
-                                                                                : "sun_scratch");
+      *im = gpu_.CreateImage(n_texels, n_texels,
+                             color ? VK_FORMAT_R8_UNORM : VK_FORMAT_D32_SFLOAT_S8_UINT, !color,
+                             im == &sun_env_      ? "sun_world"
+                             : im == &sun_ground_ ? "sun_ground"
+                             : im == &sun_height_ ? "sun_heights"
+                             : im == &sun_seen_   ? "sun_seen"
+                                                  : "sun_scratch");
       ToGeneral(cb_, *im);
       sun_map_ok_ = false;
     }
@@ -5532,11 +5847,12 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   const double moved = std::sqrt((cam[0] - sun_last_cam_[0]) * (cam[0] - sun_last_cam_[0]) +
                                  (cam[1] - sun_last_cam_[1]) * (cam[1] - sun_last_cam_[1]) +
                                  (cam[2] - sun_last_cam_[2]) * (cam[2] - sun_last_cam_[2]));
-  // Started over when the sun moves (a different mountain: its direction is
+  // Started over when the sun moves (another mountain: its direction is
   // fixed per mountain), the camera jumps (a restart, another run) or the
-  // map's size changes.
+  // maps' size changes.
   const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < 0.9997 || R != sun_r_ || moved > 0.5 * R ||
-                     std::fabs(dot3(cam, sun_f_) - sun_ref_) > 0.3 * kSunDepth;
+                     std::fabs(dot3(cam, sun_f_) - sun_ref_) > 0.3 * kSunDepth ||
+                     std::fabs(cam[1] - sun_href_) > 0.3 * kSunDepth;
   const float far_depth[4] = {0, 0, 0, 0};
   if (reset) {
     const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
@@ -5548,64 +5864,52 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     std::memcpy(sun_f_, f, sizeof(f));
     std::memcpy(sun_e1_, e1, sizeof(e1));
     std::memcpy(sun_e2_, e2, sizeof(e2));
-    std::memcpy(sun_c0_, cam, sizeof(cam));
-    sun_ci_ = sun_cj_ = 0;
+    std::memcpy(sun_c0_, ahead, sizeof(ahead));
+    sun_ci_ = sun_cj_ = sun_hi_ = sun_hj_ = 0;
     sun_r_ = R;
     sun_ref_ = dot3(cam, f);
-    ClearImage(&sun_trees_, far_depth, 1.0f, 0, false, true, true);
-    ClearImage(&sun_ground_, far_depth, 1.0f, 0, false, true, true);
+    sun_href_ = cam[1];
+    for (Image* im : {&sun_env_, &sun_ground_, &sun_height_}) {
+      if (im->image) ClearImage(im, far_depth, 1.0f, 0, false, true, true);
+    }
+    if (sun_seen_.image) ClearImage(&sun_seen_, far_depth, 0.0f, 0, true, false, false);
     FlushPendingClears();
     sun_map_ok_ = true;
     ++stats_.sun_map_resets;
     if (Diag("sun")) std::fprintf(stderr, "sun: maps started over (%u texels)\n", n_texels);
   }
-  // Kept to the direction they were started with (the same to a fraction of
-  // a degree).
   std::memcpy(f, sun_f_, sizeof(f));
   std::memcpy(sun_last_cam_, cam, sizeof(cam));
-  // Moved along when the camera is an eighth of the map from their centre
-  // (the contents shifted a whole number of texels, through the scratch).
+  // Moved along when the camera is an eighth of the maps from their centre
+  // (the contents shifted a whole number of texels).
   {
-    const double rel[3] = {cam[0] - sun_c0_[0], cam[1] - sun_c0_[1], cam[2] - sun_c0_[2]};
+    const int64_t limit = int64_t(n_texels) / 8;
+    const double rel[3] = {ahead[0] - sun_c0_[0], ahead[1] - sun_c0_[1], ahead[2] - sun_c0_[2]};
     const int64_t ai = std::llround(dot3(rel, sun_e1_) / texel);
     const int64_t aj = std::llround(dot3(rel, sun_e2_) / texel);
-    const int64_t limit = int64_t(n_texels) / 8;
     if (std::llabs(ai - sun_ci_) > limit || std::llabs(aj - sun_cj_) > limit) {
-      const int64_t dx = ai - sun_ci_, dy = aj - sun_cj_;
-      const int64_t n = int64_t(n_texels);
-      for (Image* map : {&sun_trees_, &sun_ground_}) {
-        ClearImage(&sun_scratch_, far_depth, 1.0f, 0, false, true, true);
-        FlushPendingClears();
-        if (std::llabs(dx) < n && std::llabs(dy) < n) {
-          VkImageCopy r{};
-          r.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-          r.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-          r.srcOffset = {int32_t(std::max<int64_t>(dx, 0)), int32_t(std::max<int64_t>(dy, 0)), 0};
-          r.dstOffset = {int32_t(std::max<int64_t>(-dx, 0)), int32_t(std::max<int64_t>(-dy, 0)), 0};
-          r.extent = {uint32_t(n - std::llabs(dx)), uint32_t(n - std::llabs(dy)), 1};
-          Barrier();
-          vk::vkCmdCopyImage(cb_, map->image, VK_IMAGE_LAYOUT_GENERAL, sun_scratch_.image,
-                             VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-        }
-        Barrier();
-        VkImageCopy all{};
-        all.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-        all.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-        all.extent = {n_texels, n_texels, 1};
-        vk::vkCmdCopyImage(cb_, sun_scratch_.image, VK_IMAGE_LAYOUT_GENERAL, map->image,
-                           VK_IMAGE_LAYOUT_GENERAL, 1, &all);
-        Barrier();
+      for (Image* map : {&sun_env_, &sun_ground_}) {
+        if (map->image) ShiftMap(map, &sun_scratch_, ai - sun_ci_, aj - sun_cj_);
       }
+      if (sun_seen_.image) ShiftMap(&sun_seen_, &sun_seen_scratch_, ai - sun_ci_, aj - sun_cj_);
       sun_ci_ = ai;
       sun_cj_ = aj;
     }
+    const int64_t hi = std::llround(rel[0] / texel), hj = std::llround(rel[2] / texel);
+    if (std::llabs(hi - sun_hi_) > limit || std::llabs(hj - sun_hj_) > limit) {
+      if (sun_height_.image) ShiftMap(&sun_height_, &sun_scratch_, hi - sun_hi_, hj - sun_hj_);
+      sun_hi_ = hi;
+      sun_hj_ = hj;
+    }
   }
-  // The maps' centre and rows (world -> their ndc x, y and depth).
+  // The sun maps' rows (world -> their ndc x, y and depth along the sun),
+  // and the height map's (world -> x, z from above; depth from the top).
   double C[3];
   for (int i = 0; i < 3; ++i) {
     C[i] = sun_c0_[i] + double(sun_ci_) * texel * sun_e1_[i] + double(sun_cj_) * texel * sun_e2_[i];
   }
-  double O[16] = {};
+  double* O = sun_O_;
+  std::fill(O, O + 16, 0.0);
   for (int i = 0; i < 3; ++i) {
     O[0 * 4 + i] = sun_e1_[i] / R;
     O[1 * 4 + i] = sun_e2_[i] / R;
@@ -5615,18 +5919,49 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   O[1 * 4 + 3] = -dot3(C, sun_e2_) / R;
   O[2 * 4 + 3] = 0.5 - sun_ref_ / kSunDepth;
   O[15] = 1.0;
-  const bool trees = tree_shadow_ > 0.0f;
-  if (trees) {
-    DrawIntoSunMap(casters, &sun_trees_, O);
-    stats_.tree_casters += uint32_t(casters.size());
-    if (!casters.empty()) ++sun_trees_drawn_;
+  const double hx = sun_c0_[0] + double(sun_hi_) * texel, hz = sun_c0_[2] + double(sun_hj_) * texel;
+  double H[16] = {1.0 / R, 0, 0, -hx / R,
+                  0, 0, 1.0 / R, -hz / R,
+                  0, -1.0 / kSunDepth, 0, 0.5 + sun_href_ / kSunDepth,
+                  0, 0, 0, 1};
+  if (world) {
+    DrawIntoSunMap(env, &sun_env_, O);
+    DrawIntoSunMap(height, &sun_height_, H);
+    stats_.tree_casters += uint32_t(env.size());
+    if (!env.empty()) ++sun_world_drawn_;
   }
   DrawIntoSunMap(ground, &sun_ground_, O);
   stats_.sun_receivers += uint32_t(ground.size());
+  // The rays whose sunward side is in view this frame (with the world drawn
+  // into the maps): what casts on them has been drawn.
+  if (world && !env.empty() && sun_seen_.image) {
+    double Oinv[16], vp[16];
+    if (Invert4(O, Oinv) && Invert4(inv_vp_, vp)) {
+      float spc[32];
+      for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+          spc[c * 4 + r] = float(Oinv[r * 4 + c]);  // column-major
+          spc[16 + c * 4 + r] = float(vp[r * 4 + c]);
+        }
+      }
+      const VkRect2D all{{0, 0}, {n_texels, n_texels}};
+      FullscreenPass(CopyKind::kSunSeen, &sun_seen_, &sun_ground_, nullptr, nullptr, false, spc, 32,
+                     &all);
+    }
+  }
+  sun_frame_ok_ = true;
+  // The world's shadows, baked into the slopes' shadow map around the camera.
+  if (world) BakeWorldShadows(d, st, H, !env.empty() || Diag("sunevery"));
+  if (!sun_inputs_ok_) return;
+  std::string note;
+  Image* shadow = TextureFor(d, 0, st, &note);
+  if (!shadow || shadow->depth) return;
+  const uint32_t w = shadow->width, h = shadow->height;
+  if (w != sun_raw_.width || h != sun_raw_.height || shadow->format != sun_raw_.format) return;
   // Pass 1: per texel of the shadow map, where its ray is in the sun maps
   // (the lighting's rows inverted on the maps' plane: map (u, v) -> their
-  // ndc), the ground it lands on, and the caster's height when this frame's
-  // light view-projection is known.
+  // ndc), the ground it lands on, and the caster's height when the light's
+  // view-projection is known.
   auto ensure = [&](Image& im, VkFormat fmt, const char* name) {
     if (im.image && im.width == w && im.height == h && im.format == fmt) return;
     if (im.image) Retire(im);
@@ -5643,19 +5978,19 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     const double Ch[4] = {C[0], C[1], C[2], 1.0};
     const double* rows[3] = {c6, c7, c9};
     double M[16] = {};
+    auto dot4 = [](const double* p, const double* q) {
+      return p[0] * q[0] + p[1] * q[1] + p[2] * q[2] + p[3] * q[3];
+    };
     for (int r = 0; r < 3; ++r) {
-      auto dot4 = [](const double* p, const double* q) {
-        return p[0] * q[0] + p[1] * q[1] + p[2] * q[2] + p[3] * q[3];
-      };
       M[r * 4 + 0] = dot4(rows[r], E1);
       M[r * 4 + 1] = dot4(rows[r], E2);
       M[r * 4 + 2] = dot4(rows[r], Ch);
     }
     M[15] = 1.0;
-    double H[16];
-    if (!Invert4(M, H)) return;
+    double Hm[16];
+    if (!Invert4(M, Hm)) return;
     for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) prep_pc[r * 4 + c] = float(H[r * 4 + c]);
+      for (int c = 0; c < 3; ++c) prep_pc[r * 4 + c] = float(Hm[r * 4 + c]);
     }
     prep_pc[3] = float(sun_ref_);
     prep_pc[7] = float(kSunDepth);
@@ -5684,15 +6019,16 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   FullscreenPass(CopyKind::kSunPrep, &sun_prep_, heights ? &sun_zo_ : nullptr, &sun_ground_,
                  &sun_raw_, false, prep_pc, 32);
   // Pass 2: the filter. Penumbra radius = k * (caster to ground) + the
-  // smallest (about the game's blur, a texel or two of its map).
+  // smallest (about the game's blur, a texel or two of its map). Without
+  // the casters' heights this frame: the penumbra of the last frame that
+  // had them (no popping between frames).
   const float k = 0.04f * shadow_softness_;
   const float search = std::max(k * 40.0f, 0.25f);
   const float min_texels = std::clamp(1.5f * float(w) / 1280.0f, 1.0f, 3.0f) * 0.75f;
   float pc[12] = {k, search, min_texels, 32.0f,
                   float(R), float(N), float(sun_ref_), float(kSunDepth),
-                  trees ? tree_shadow_ : 0.0f, 0.15f, 0.0f, 0.0f};
-  FullscreenPass(CopyKind::kSunPcss, &sun_out_, &sun_raw_, &sun_prep_,
-                 trees ? &sun_trees_ : nullptr, true, pc, 12);
+                  0.0f, 0.15f, heights ? 0.0f : 1.0f, 0.0f};
+  FullscreenPass(CopyKind::kSunPcss, &sun_out_, &sun_raw_, &sun_prep_, nullptr, true, pc, 12);
   VkImageCopy region{};
   region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -5701,55 +6037,146 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
                      VK_IMAGE_LAYOUT_GENERAL, 1, &region);
   Barrier();
   dyn_ = DynState{};
-  // The slopes' painted shadows (the lighting's tf2, over the whole
-  // mountain: u, v = world x, z times c5.xy plus c5.zw), faded out within
-  // the real shadows' reach (and back in towards its edge), in a copy the
-  // lighting reads instead. Only the texels around the camera are redone
-  // each frame (last frame's area put back too).
-  if (trees) FadeBakedShadows(d, st, reach);
 }
 
-void Renderer::Impl::FadeBakedShadows(const Draw& d, const GpuState& st, double reach) {
+// World shadows: the slopes' painted shadow map (the lighting's tf2, over
+// the whole mountain: u, v = world x, z times c5.xy plus c5.zw) replaced
+// for the lighting by a copy World shadows times larger, first the painted
+// one magnified, then baked again around the camera as the camera goes:
+// each texel's surface (the height map, from above) looked at from the sun
+// through the world map, with penumbras that widen away from the caster.
+// What's baked stays (until another mountain).
+void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16],
+                                      bool bake) {
   std::string note;
   Image* src = TextureFor(d, 2, st, &note);
   if (!src || src->depth || src->samples > 1) return;
   float c5[4];
   std::memcpy(c5, &st.ps_consts[5 * 4], 16);
   if (!(std::fabs(c5[0]) > 1e-9f) || !(std::fabs(c5[1]) > 1e-9f)) return;
-  const uint32_t w = src->width, h = src->height;
-  bool full = false;
+  const uint32_t mult = uint32_t(world_detail_);
+  const uint32_t w = std::min(src->width * mult, 16384u), h = std::min(src->height * mult, 16384u);
   if (!baked_.image || baked_.width != w || baked_.height != h || baked_src_ != src) {
     if (baked_.image) Retire(baked_);
-    baked_ = gpu_.CreateImage(w, h, VK_FORMAT_R8G8B8A8_UNORM, false, "baked_shadows_faded");
+    baked_ = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, "world_shadows");
+    // Read as all four channels (whichever the lighting's fetch picks).
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = baked_.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8_UNORM;
+    vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                      VK_COMPONENT_SWIZZLE_R};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk::Check(vk::vkCreateImageView(gpu_.device, &vci, nullptr, &baked_.sample_view),
+              "world shadows view");
     ToGeneral(cb_, baked_);
     baked_src_ = src;
-    full = true;
+    // The painted map, magnified.
+    const float inv[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
+    FullscreenPass(CopyKind::kBakeInit, &baked_, src, nullptr, nullptr, true, inv, 4);
+    if (Diag("sun")) std::fprintf(stderr, "sun: world shadows %ux%u\n", w, h);
   }
-  // The faded area: texels within the reach of the camera (x, z).
-  const double r_out = reach, r_in = reach * 0.7;
+  // Baked again: the texels within 80% of the sun maps' reach of the camera.
+  const double reach = 0.8 * sun_r_;
   const double cu = cam_pos_[0] * c5[0] + c5[2], cv = cam_pos_[2] * c5[1] + c5[3];
-  const double du = r_out * std::fabs(c5[0]) * w + 2.0, dv = r_out * std::fabs(c5[1]) * h + 2.0;
+  const double du = reach * std::fabs(c5[0]) * w + 2.0, dv = reach * std::fabs(c5[1]) * h + 2.0;
   auto clampi = [](double v, uint32_t hi) { return int32_t(std::clamp(v, 0.0, double(hi))); };
-  VkRect2D now{};
-  {
-    const int32_t x0 = clampi(cu * w - du, w), x1 = clampi(cu * w + du + 1.0, w);
-    const int32_t y0 = clampi(cv * h - dv, h), y1 = clampi(cv * h + dv + 1.0, h);
-    now = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
+  const int32_t x0 = clampi(cu * w - du, w), x1 = clampi(cu * w + du + 1.0, w);
+  const int32_t y0 = clampi(cv * h - dv, h), y1 = clampi(cv * h + dv + 1.0, h);
+  const VkRect2D rect{{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
+  if (bake && rect.extent.width && rect.extent.height && !Diag("nobake")) {
+    // c5; the height map's rows x, z and its depth -> height; the world
+    // map's rows; penumbra radius per metre, smallest radius (m), reach (m),
+    // the bake's texel (m).
+    float pc[32] = {};
+    for (int i = 0; i < 4; ++i) pc[i] = c5[i];
+    pc[4] = float(H[0 * 4 + 0]);  // 1 / R
+    pc[5] = float(H[0 * 4 + 3]);  // -hx / R
+    pc[6] = float(H[1 * 4 + 3]);  // -hz / R
+    pc[7] = float(sun_href_);
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 4; ++c) pc[8 + r * 4 + c] = float(sun_O_[r * 4 + c]);
+    }
+    const float k = 0.04f * std::max(shadow_softness_, 0.25f);
+    const float bake_texel = float(1.0 / (std::fabs(c5[0]) * double(w)));
+    pc[20] = k;
+    pc[21] = std::max(0.5f * bake_texel, 0.05f);
+    pc[22] = float(kSunDepth);
+    pc[23] = float(sun_r_);
+    pc[24] = float(reach);
+    pc[25] = float(cam_pos_[0]);
+    pc[26] = float(cam_pos_[2]);
+    pc[28] = float(w);
+    pc[29] = float(h);
+    pc[27] = 0.0f;
+    FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_ground_, false, pc,
+                   32, &rect, &sun_seen_);
+    pc[27] = 1.0f;
+    FullscreenPass(CopyKind::kBakeMin, &baked_, &sun_height_, &sun_env_, &sun_ground_, false, pc,
+                   32, &rect, &sun_seen_);
   }
-  auto pass = [&](const VkRect2D& rect) {
-    if (!rect.extent.width || !rect.extent.height) return;
-    const float pc[8] = {c5[0], c5[1], c5[2], c5[3], cam_pos_[0], cam_pos_[2], float(r_in),
-                         float(r_out)};
-    FullscreenPass(CopyKind::kBakedFade, &baked_, src, nullptr, nullptr, false, pc, 8, &rect);
-  };
-  if (full) {
-    pass({{0, 0}, {w, h}});
-  } else {
-    pass(baked_last_);
-    pass(now);
-  }
-  baked_last_ = now;
+  dyn_ = DynState{};
   baked_ok_ = true;
+}
+
+// Riders and whatever else is drawn after the lighting pass (it doesn't
+// light them: they're shaded by themselves) darkened where the world shades
+// them: each such pixel looked at from the sun through the world map.
+Image* Renderer::Impl::ShadedMovers(Image* scene) {
+  if (movers_done_) return movers_result_;
+  movers_done_ = true;
+  movers_result_ = nullptr;
+  if (world_detail_ <= 0 || !sun_frame_ok_ || !sun_env_.image) return nullptr;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
+      dit->second.width != scene->width || dit->second.height != scene->height ||
+      scene->samples > 1 || !ao_depth_ok_ || ao_depth_.width != scene->width ||
+      ao_depth_.height != scene->height) {
+    return nullptr;
+  }
+  Image* depth = &dit->second;
+  auto fits = [&](bool ok, const Image& im) {
+    return ok && im.width == depth->width && im.height == depth->height;
+  };
+  // As the ambient occlusion: the riders' depth (late), told from what the
+  // depth-only passes wrote where nothing shows.
+  Image* late = fits(ao_late_ok_, ao_late_depth_) ? &ao_late_depth_ : depth;
+  const bool hidden = fits(ao_hidden_ok_, ao_after_hidden_);
+  Image* after_hidden = hidden ? &ao_after_hidden_ : &ao_depth_;
+  const uint32_t w = scene->width, h = scene->height;
+  EndRendering();
+  auto ensure = [&](Image& im, VkFormat f, const char* name) {
+    if (im.image && im.width == w && im.height == h && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(w, h, f, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(movers_pos_, VK_FORMAT_R32G32B32A32_SFLOAT, "movers_position");
+  ensure(movers_shade_, VK_FORMAT_R8_UNORM, "movers_shade");
+  ensure(movers_out_, scene->format, "movers_shaded");
+  movers_out_.scaled = scene->scaled;
+  movers_out_.scale = scene->scale;
+  Barrier();
+  float pc[16];
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
+  }
+  FullscreenPass(CopyKind::kMoverPos, &movers_pos_, late, &ao_depth_, after_hidden, false, pc, 16);
+  float sp[16] = {};
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 4; ++c) sp[r * 4 + c] = float(sun_O_[r * 4 + c]);
+  }
+  sp[12] = float(kSunDepth);
+  sp[13] = float(sun_r_);
+  sp[14] = 0.04f * std::max(shadow_softness_, 0.25f);
+  sp[15] = Diag("moverdbg") ? -1.0f : 0.5f;  // how much of their light the shade takes
+  FullscreenPass(CopyKind::kMoverShade, &movers_shade_, &movers_pos_, &sun_env_, &sun_ground_, false,
+                 sp, 16);
+  FullscreenPass(CopyKind::kMoverApply, &movers_out_, scene, &movers_shade_, nullptr, false,
+                 nullptr, 0);
+  dyn_ = DynState{};
+  movers_result_ = &movers_out_;
+  return movers_result_;
 }
 
 void Renderer::Impl::UpdateShadowReach(const GpuState& st) {
@@ -6233,7 +6660,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
 // missing ones the dummy image; binding 0 filtered when `linear0`).
 void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image* b1, Image* b2,
                                     bool linear0, const float* pc, uint32_t floats,
-                                    const VkRect2D* rect) {
+                                    const VkRect2D* rect, Image* b3) {
   FlushPendingClears();  // what it reads or writes may have a clear waiting
   VkPipeline p = CopyPipeline(kind, dst->format);
   VkDescriptorSet set;
@@ -6242,21 +6669,23 @@ void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image*
   ai.descriptorSetCount = 1;
   ai.pSetLayouts = &copy_set_layout_;
   vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &set), "fullscreen pass set");
-  VkDescriptorImageInfo ii[3] = {
+  VkDescriptorImageInfo ii[4] = {
       {linear0 ? linear_sampler_ : point_sampler_, (b0 ? b0 : &dummy_)->sample_view,
        VK_IMAGE_LAYOUT_GENERAL},
       {point_sampler_, (b1 ? b1 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL},
-      {point_sampler_, (b2 ? b2 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL}};
+      {point_sampler_, (b2 ? b2 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL},
+      {point_sampler_, (b3 ? b3 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL}};
   VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
   wr.dstSet = set;
-  wr.descriptorCount = 3;
+  wr.descriptorCount = 4;
   wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   wr.pImageInfo = ii;
   vk::vkUpdateDescriptorSets(gpu_.device, 1, &wr, 0, nullptr);
   VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   att.imageView = dst->view;
   att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-  att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  // (A part of the image: what the shader leaves (discard) stays.)
+  att.loadOp = rect ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
   const VkRect2D area = rect ? *rect : VkRect2D{{0, 0}, {dst->width, dst->height}};
@@ -6700,8 +7129,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
       im = hit->second.image;
       cached_sampler = hit->second.sampler;
-      // The lighting's painted slope shadows: the copy faded out around the
-      // camera (FadeBakedShadows).
+      // The lighting's painted slope shadows: the copy baked again around the
+      // camera (BakeWorldShadows).
       if (baked_ok_ && stage == 1 && b.fetch_constant == 2 && im == baked_src_ &&
           ps->info.ucode_hash == kLightingPixelShader) {
         im = &baked_;
@@ -7092,7 +7521,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // but no picture (render target 0 untouched: the riders drawn through
   // another view, whose depth lands where nothing shows), the depth before
   // and after them, to tell what they wrote from the riders drawn later.
-  if (ao_strength_ > 0.0f && light_seen_ && !ao_late_done_ && depth && tiling_.width &&
+  if ((ao_strength_ > 0.0f || world_detail_ > 0) && light_seen_ && !ao_late_done_ && depth &&
+      tiling_.width &&
       ps->info.ucode_hash != kLightingPixelShader && ((st.reg(0x2200) & 6) == 6) &&
       max_draws_ == UINT32_MAX) {
     const bool float_depth = (st.reg(0x2002) >> 16) & 1;
@@ -7245,19 +7675,31 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
       to.push_back(c);
     };
-    // (Diagnostics, "sunkeep": the trees drawn into the map once only, to
-    // check that their shadows stay.)
-    if (tree_shadow_ > 0.0f && !light_seen_ && tiling_.width &&
-        IsShadowCaster(vs->info.ucode_hash) && sun_trees_.image &&
-        !(Diag("sunkeep") && sun_trees_drawn_ > 0)) {
-      static const std::vector<Image*> kNoColors;
-      const VkPipeline cp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_trees_, 0, false, false,
+    // The scene pass (before the lighting): what stays put, drawn again
+    // into the sun maps. Into the world map: everything opaque that the
+    // game doesn't already cast from (its shadow pass's casters: riders,
+    // rails, objects), so trees, rocks, props and the terrain itself. Into
+    // the height map (from above) and the ground map (from the sun): the
+    // same without the trees (the surfaces shadows lie on).
+    // (Diagnostics, "sunkeep": the world drawn into the maps once only, to
+    // check that its shadows stay.)
+    // (Every third frame: the world stays put, and the maps keep it.)
+    const bool scene_pass = !light_seen_ && tiling_.width && (st.reg(0x2200) & 6) == 6 &&
+                            sun_map_frame_ && !(Diag("sunkeep") && sun_world_drawn_ > 0);
+    const uint64_t vh = vs->info.ucode_hash;
+    static const std::vector<Image*> kNoColors;
+    if (scene_pass && world_detail_ > 0 && sun_env_.image && !shadow_caster_vs_.count(vh)) {
+      const VkPipeline cp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_env_, 0, false, false,
                                         false, true);
-      if (cp) keep(cp, caster_draws_, true);
+      if (cp) keep(cp, env_draws_, true);
+      if (Diag("sunrec")) ++sun_rec_counts_[vh];
+      if (!IsShadowCaster(vh) && sun_height_.image) {
+        const VkPipeline hp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_height_, 0, false,
+                                          false, false, true);
+        if (hp) keep(hp, height_draws_, true);
+      }
     }
-    if (!light_seen_ && tiling_.width && vs->info.ucode_hash == kTerrainVertexShader &&
-        sun_ground_.image) {
-      static const std::vector<Image*> kNoColors;
+    if (scene_pass && !shadow_caster_vs_.count(vh) && !IsShadowCaster(vh) && sun_ground_.image) {
       const VkPipeline gp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_ground_, 0, false, false,
                                         false, true);
       if (gp) keep(gp, ground_draws_, false);
@@ -7266,14 +7708,22 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
         ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
       sun_depth_target_ = depth;
       sun_float_depth_ = (st.reg(0x2002) >> 16) & 1;
-      if (vs->info.ucode_hash == kTerrainShadowVertexShader && !sun_light_ok_) {
+      sun_light_sys_ = sys;
+      // Its casters' shaders (not the terrain's): the game casts those.
+      if (ps->info.ucode_hash != kTerrainShadowPixelShader) shadow_caster_vs_.insert(vh);
+      // The light's view-projection: c0-c3 of a draw with world-space
+      // vertices (found at the lighting pass among these).
+      if (light_candidates_.size() < 256) {
+        std::array<double, 16> m;
         for (int k = 0; k < 16; ++k) {
           float f;
           std::memcpy(&f, &st.vs_consts[k], 4);
-          sun_light_vp_[k] = f;
+          m[k] = f;
         }
-        sun_light_sys_ = sys;
-        sun_light_ok_ = true;
+        if (std::find(light_candidates_.begin(), light_candidates_.end(), m) ==
+            light_candidates_.end()) {
+          light_candidates_.push_back(m);
+        }
       }
     }
   }
@@ -7812,7 +8262,7 @@ Image Renderer::Impl::Downsample(Image* im) {
                                false, im->name + "_downsampled");
   // Its own command buffer and descriptor pool: the frame's are finished.
   VkDescriptorPool frame_pool = pool_;
-  VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3};  // copy_set_layout_
+  VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};  // copy_set_layout_
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpi.maxSets = 1;
   dpi.poolSizeCount = 1;
@@ -8441,8 +8891,10 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_out_img_);
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
-  for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_trees_, &sun_ground_,
-                    &sun_scratch_, &baked_}) {
+  for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_, &sun_ground_,
+                    &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &baked_,
+                    &movers_pos_, &movers_shade_,
+                    &movers_out_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(ao_before_hidden_);
@@ -8548,8 +9000,15 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   ao_late_done_ = false;
   ao_hidden_state_ = 0;
   ao_before_ok_ = ao_hidden_ok_ = false;
-  caster_draws_.clear();
+  env_draws_.clear();
+  height_draws_.clear();
   ground_draws_.clear();
+  shadow_caster_vs_.clear();
+  light_candidates_.clear();
+  movers_done_ = false;
+  movers_result_ = nullptr;
+  sun_frame_ok_ = false;
+  sun_map_frame_ = frame_number_ % 3 == 0 || !sun_map_ok_ || Diag("sunevery");
   sun_depth_target_ = nullptr;
   sun_light_ok_ = sun_prepared_ = sun_inputs_ok_ = sun_depth_ok_ = false;
   baked_ok_ = false;
@@ -8846,7 +9305,7 @@ void Renderer::SetFoliageFade(bool on) {
 }
 void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(strength, 0.0f); }
 
-void Renderer::SetTreeShadows(float strength) { impl_->tree_shadow_ = std::max(strength, 0.0f); }
+void Renderer::SetWorldShadows(int detail) { impl_->world_detail_ = std::clamp(detail, 0, 4); }
 
 void Renderer::SetShadowSoftness(float softness) {
   impl_->shadow_softness_ = std::max(softness, 0.0f);
@@ -8989,6 +9448,13 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   for (auto& [k, im] : impl_->resolved_packed_) out.push_back(Describe(&im));
   if (impl_->reactive_img_.image) out.push_back(Describe(&impl_->reactive_img_));
   if (impl_->sun_out_.image) out.push_back(Describe(&impl_->sun_out_));
+  if (impl_->baked_.image && impl_->Diag("dumpbake")) out.push_back(Describe(&impl_->baked_));
+  if (impl_->Diag("dumpbake")) {
+    for (auto* im : {&impl_->sun_height_, &impl_->sun_env_, &impl_->sun_ground_,
+                     &impl_->movers_shade_}) {
+      if (im->image) out.push_back(Describe(im));
+    }
+  }
   return out;
 }
 

@@ -271,10 +271,11 @@ class Renderer {
   // and the lighting's shadow fade out to about that far ahead (0: the
   // game's, about 40 m). Only what the game draws into the map casts shadows.
   void SetShadows(float resolution, float distance);
-  // Tree shadows for the following frames: the scene's trees and props drawn
-  // again from the sun into the shadow map (`strength` 0..1, 0 = off). The
-  // mask is made the first frame and used from the next.
-  void SetTreeShadows(float strength);
+  // World shadows: the slopes' painted shadow map baked again in-game at
+  // `detail` times its size (2 or 4; 0 = the game's), from the world as
+  // drawn (terrain, trees, props) seen from the sun; riders shaded by it
+  // too.
+  void SetWorldShadows(int detail);
   // Penumbras that widen with the distance from the caster to the ground
   // (0: an even blur, 1: natural, 2: soft).
   void SetShadowSoftness(float softness);

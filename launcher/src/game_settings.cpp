@@ -95,7 +95,9 @@ const std::vector<GameSetting>& EffectSettings() {
       {"native_shadow_softness", "Shadow softness", Kind::kChoice, "100",
        {{"0", "Even (the game's)"}, {"50", "Subtle"}, {"100", "Natural"}, {"200", "Soft"}},
        0, 0, 0, false, true},
-      {"native_tree_shadows", "Tree shadows", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
+      {"native_world_shadows", "World shadows", Kind::kChoice, "2",
+       {{"0", "Painted (the game's)"}, {"2", "Baked, 2x"}, {"4", "Baked, 4x"}},
+       0, 0, 0, false, true},
       {"native_foliage_fade", "Branch fade", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_map_clouds", "Trail map clouds", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
   };
