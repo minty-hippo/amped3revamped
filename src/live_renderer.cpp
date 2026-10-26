@@ -1777,8 +1777,10 @@ void WorkerMain() {
           renderer->SetInCutscene(game_state == 20);  // a story scene
           renderer->SetGameState(int(game_state));
         }
-        renderer->SetShadows(float(REXCVAR_GET(native_shadow_resolution)) / 100.0f,
-                             float(REXCVAR_GET(native_shadow_distance)));
+        // Without Revamped Graphics: the game's shadow map (1x, its reach).
+        renderer->SetShadows(
+            revamped ? float(REXCVAR_GET(native_shadow_resolution)) / 100.0f : 1.0f,
+            revamped ? float(REXCVAR_GET(native_shadow_distance)) : 0.0f);
         renderer->SetAmbientOcclusion(
             revamped && REXCVAR_GET(native_ambient_occlusion)
                 ? float(REXCVAR_GET(native_ambient_occlusion_strength))

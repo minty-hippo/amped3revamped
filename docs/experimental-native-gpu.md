@@ -549,5 +549,11 @@ into a 4096 x 4096 map of the slopes (the lighting's tf2), not drawn.
   points that far ahead along the view (and to the sides). Only what the game
   draws into the map casts shadows; in the captures some riders, rails and
   objects lie beyond the game's own reach and now cast them.
+- Both are part of Revamped Graphics (Effects tab): with it off the map is
+  drawn at 1x (1280 x 720, whatever the scene's resolution) with the game's
+  reach.
+- The painted slope shadows: a 4096 x 4096 BC1 mask over the whole mountain
+  (about 0.95 m per texel, u, v = world x, z times c5.xy plus c5.zw), from
+  the sun as the level's artists baked it.
 - The replayer: `--shadow-res <x> --shadow-distance <m>` (with `--repeat 2`:
   the map is recognised from the previous frame).

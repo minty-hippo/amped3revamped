@@ -69,6 +69,11 @@ const std::vector<Tab>& Tabs() {
            {"native_fog", "Distance Fog"},
            {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_god_rays", "God Rays"},
+           {"native_shadow_resolution", "Shadow Resolution", Kind::kStops, 0, 0, 0,
+            {{"100", "1x"}, {"150", "1.5x"}, {"200", "2x"}, {"300", "3x"}, {"400", "4x"}}},
+           {"native_shadow_distance", "Shadow Distance", Kind::kStops, 0, 0, 0,
+            {{"0", "Game"}, {"75", "75 m"}, {"100", "100 m"}, {"150", "150 m"},
+             {"200", "200 m"}, {"300", "300 m"}}},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
@@ -96,11 +101,6 @@ const std::vector<Tab>& Tabs() {
             {{"off", "Off"}, {"fsr", "AMD FSR 3.1"}}},
 #endif
            {"native_upscaler_sharpness", "FSR Sharpness", Kind::kSlider, 0.0, 1.0, 0.05},
-           {"native_shadow_resolution", "Shadow Resolution", Kind::kStops, 0, 0, 0,
-            {{"100", "1x"}, {"150", "1.5x"}, {"200", "2x"}, {"300", "3x"}, {"400", "4x"}}},
-           {"native_shadow_distance", "Shadow Distance", Kind::kStops, 0, 0, 0,
-            {{"0", "Game"}, {"75", "75 m"}, {"100", "100 m"}, {"150", "150 m"},
-             {"200", "200 m"}, {"300", "300 m"}}},
            {"native_upscaler_msaa", "Upscaler MSAA"},
            // Off by default and not part of Revamped Graphics.
            {"native_sharp_fonts", "Sharp Fonts"},
@@ -491,9 +491,9 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     if (name == "native_render_scale" || name == "native_upscaler") dim = !native;
     if (name == "native_upscaler_sharpness") dim = !native || upscaler != "fsr";
     if (name == "native_upscaler_msaa") dim = !native || upscaler == "off";
-    if (name == "native_sharp_fonts" || name == "native_upscaled_textures" ||
-        name == "native_shadow_resolution" || name == "native_shadow_distance") {
-      dim = !native;
+    if (name == "native_sharp_fonts" || name == "native_upscaled_textures") dim = !native;
+    if (name == "native_shadow_resolution" || name == "native_shadow_distance") {
+      dim = !native || !revamped;
     }
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);
     const float ty = y + (row_h - text_px) * 0.5f;

@@ -396,7 +396,8 @@ const std::vector<Tab>& Tabs() {
                         "The sun's shadow map (riders, rails, jumps and objects; the trees' and "
                         "mountains' shadows are painted into the slopes), drawn larger than the "
                         "game's 1280 x 720: sharper, more detailed shadow edges. Independent of "
-                        "the render resolution. Native renderer only.",
+                        "the render resolution. Part of Revamped Graphics (off: 1x). Native "
+                        "renderer only.",
                         {{"100", "1x (1280 x 720, the game's)"},
                          {"150", "1.5x (1920 x 1080)"},
                          {"200", "2x (2560 x 1440)"},
@@ -407,7 +408,7 @@ const std::vector<Tab>& Tabs() {
                         "40 m of the slope ahead; farther spreads it thinner (raise Shadow "
                         "resolution with it). Only what the game draws into its shadow map "
                         "casts shadows, so far away that's mostly riders, rails and objects. "
-                        "Native renderer only.",
+                        "Part of Revamped Graphics (off: the game's). Native renderer only.",
                         {{"0", "The game's (about 40 m)"},
                          {"75", "75 m"},
                          {"100", "100 m"},
