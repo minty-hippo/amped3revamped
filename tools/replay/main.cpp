@@ -451,6 +451,7 @@ int main(int argc, char** argv) {
   bool async_pipelines = false;
   float speed_blur = -1.0f;
   float fog = 0.0f, fog_start = 150.0f;
+  float shadow_res = 0.0f, shadow_distance = 0.0f;  // --shadow-res x, --shadow-distance m
   float ao = 0.0f;        // --ao strength [--ao-debug]: ambient occlusion
   bool ao_debug = false;
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
@@ -496,6 +497,10 @@ int main(int argc, char** argv) {
       rewrite = argv[++i];
     } else if (a == "--god-rays" && i + 1 < argc) {
       god_rays = std::stof(argv[++i]);
+    } else if (a == "--shadow-res" && i + 1 < argc) {
+      shadow_res = std::stof(argv[++i]);
+    } else if (a == "--shadow-distance" && i + 1 < argc) {
+      shadow_distance = std::stof(argv[++i]);
     } else if (a == "--ao" && i + 1 < argc) {
       ao = std::stof(argv[++i]);
     } else if (a == "--ao-debug") {
@@ -796,6 +801,7 @@ int main(int argc, char** argv) {
     if (fog > 0.0f) renderer.SetFog(fog, fog_start);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
+    if (shadow_res > 0.0f || shadow_distance > 0.0f) renderer.SetShadows(shadow_res, shadow_distance);
     auto stats = renderer.Render(cap, files, max_draws);
     first_use("first frame", stats);
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";

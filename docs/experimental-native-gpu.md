@@ -522,3 +522,32 @@ covers it in the distance.
   XeSS; reproduced in the replayer with `--scale 1.05`).
 - The debug view (`native_ambient_occlusion_debug`, or `--ao <strength>
   --ao-debug` in the replayer) shows the occlusion alone.
+
+## Sun shadows: resolution and reach
+
+How the game does them (from captures): the first ~460 draws of a riding
+frame go into a 1280 x 720 depth/stencil surface **from the sun**, through a
+perspective warp that follows the camera (light-space perspective): the
+terrain, objects, rails and riders, with a stencil ID per kind of object. The
+depth is resolved, read back as 8_8_8_8 and blurred twice (5 taps 1.25 texels
+apart, `ps 7A84B7E8B62F305E`); the lighting pass (`ps C17CD159D811B298`)
+projects each pixel's world position into it (rows c6, c7 over c9: u, v) and
+fades the shadows out between raw scene depths c11.x and c10.x (0.02 to
+0.015: about 30-40 m). The trees' and mountains' long shadows are painted
+into a 4096 x 4096 map of the slopes (the lighting's tf2), not drawn.
+
+- **Shadow resolution** (`native_shadow_resolution`, percent of 1280 x 720,
+  default 200): the shadow map's scale, apart from the scene's (it was the
+  scene's: 1.05x at XeSS 70% of 1080p). The blur's step (c255.xy) is divided
+  by the same factor, so edges get sharper rather than staying the game's
+  width.
+- **Shadow distance** (`native_shadow_distance`, metres, 0 = the game's):
+  the map's v is remapped, v' = av (v - 1) + 1 (the edge at the camera
+  kept), in the shadow draws' viewport transform and in the lighting's c7
+  (c7' = av (c7 - c9) + c9); c10.x and c11.x are scaled to the raw depth at
+  that distance. av comes from the last frame's lighting constants: the v of
+  points that far ahead along the view (and to the sides). Only what the game
+  draws into the map casts shadows; in the captures some riders, rails and
+  objects lie beyond the game's own reach and now cast them.
+- The replayer: `--shadow-res <x> --shadow-distance <m>` (with `--repeat 2`:
+  the map is recognised from the previous frame).

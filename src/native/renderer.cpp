@@ -1013,6 +1013,8 @@ static_assert(offsetof(SystemConstants, tex_scale) == 80, "XeSystem std140 layou
 // Amped 3's deferred lighting pixel shader (camera motion blur reads its
 // constants and textures).
 constexpr uint64_t kLightingPixelShader = 0xC17CD159D811B298ull;
+// The shadow map's blur (two passes over the map read as 8_8_8_8).
+constexpr uint64_t kShadowBlurPixelShader = 0x7A84B7E8B62F305Eull;
 
 struct Shader {
   VkShaderModule module = VK_NULL_HANDLE;
@@ -1301,22 +1303,39 @@ struct Renderer::Impl {
   // Whether a tiled pass is the scene is known once its lighting pass is
   // drawn, so it goes by the last frame.
   // The scale a render target is drawn at: the 3D scene's inside its tiled
-  // pass, else the output's. Screen-sized passes drawn before the scene
-  // (Amped 3's depth pre-pass, about 500 draws, blurred and sampled by the
-  // scene) are at the scene's scale too: the scene samples them at its own
-  // resolution, so drawing them at the output's (2x the scene's each way with
-  // an upscaler) only cost GPU time.
+  // pass, else the output's; the sun's shadow map (drawn before the scene,
+  // about 500 draws, see ShadowMapTarget) at the Shadow resolution setting,
+  // or the scene's without one.
   float TargetScale(const TargetKey& k) const {
     if (tiling_.width) return tiled_scale_;
-    if (!scene_begun_ && last_frame_lit_ && last_tiling_.width && k.samples == 1 &&
-        k.pitch == last_tiling_.width) {
-      TargetKey hk = k;
-      hk.scale_id = 0;
-      auto h = target_heights_.find(hk);
-      if (h != target_heights_.end() && h->second == last_tiling_.height) return scale_;
-    }
+    if (ShadowMapTarget(k)) return shadow_res_ > 0.0f ? shadow_res_ : scale_;
     return out_scale_;
   }
+  // Amped 3's sun shadow map: drawn before the scene into a surface the
+  // scene's size (1280 x 720), from the sun through a perspective warp that
+  // follows the camera (about 40 m of the slope ahead fill it); depth plus a
+  // stencil ID per kind of object, read back as 8_8_8_8, blurred twice and
+  // looked up by the lighting pass.
+  bool ShadowMapTarget(const TargetKey& k) const {
+    if (tiling_.width || scene_begun_ || !last_frame_lit_ || !last_tiling_.width ||
+        k.samples != 1 || k.pitch != last_tiling_.width) {
+      return false;
+    }
+    TargetKey hk = k;
+    hk.scale_id = 0;
+    auto h = target_heights_.find(hk);
+    return h != target_heights_.end() && h->second == last_tiling_.height;
+  }
+  // Shadow settings (SetShadows): the map's scale (0: the scene's) and how
+  // far it reaches (metres, 0: the game's).
+  float shadow_res_ = 0.0f, shadow_distance_ = 0.0f;
+  // This frame's reach, worked out from the last frame's lighting pass:
+  // the map's v remapped as v' = av (v - 1) + 1 (the edge at the camera
+  // kept, the far edge pushed out), and the lighting's shadow fade (c10, c11:
+  // raw scene depths where shadows fade out) scaled by fade.
+  float shadow_av_ = 1.0f, shadow_fade_ = 1.0f;
+  float next_shadow_av_ = 1.0f, next_shadow_fade_ = 1.0f;
+  void UpdateShadowReach(const GpuState& st);
   bool scene_begun_ = false;  // this frame's tiled pass has begun
   Tiling last_tiling_;        // the last tiled pass's area
   bool last_frame_lit_ = true;
@@ -4857,6 +4876,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   scene_base_ = scene.base_address() & 0x1FFFFFFF;
   depth_base_ = depth.base_address() & 0x1FFFFFFF;
   light_seen_ = true;
+  UpdateShadowReach(st);
   // Ambient occlusion: the world's depth, kept before it's resolved again.
   ao_depth_ok_ = false;
   if (ao_strength_ > 0.0f) {
@@ -5108,6 +5128,60 @@ bool Renderer::Impl::SunOnScreen(float uv[2], float* visible) const {
   const double edge = std::max(std::fabs(x), std::fabs(y));
   *visible = float(std::clamp(1.0 - (edge - 1.0) / 0.6, 0.0, 1.0));
   return *visible > 0.0f;
+}
+
+void Renderer::Impl::UpdateShadowReach(const GpuState& st) {
+  next_shadow_av_ = 1.0f;
+  next_shadow_fade_ = 1.0f;
+  if (shadow_distance_ <= 0.0f) return;
+  auto c = [&](int i, float* v) { std::memcpy(v, st.ps_consts.data() + i * 4, 16); };
+  float c6[4], c7[4], c9[4], c10[4];
+  c(6, c6);
+  c(7, c7);
+  c(9, c9);
+  c(10, c10);
+  double vp[16];
+  if (!Invert4(inv_vp_, vp)) return;
+  // The camera's view direction, level.
+  double mid[4] = {0, 0, 0, 0};
+  for (int r = 0; r < 4; ++r) {
+    const double ndc[4] = {0.0, 0.0, 0.5, 1.0};
+    for (int k = 0; k < 4; ++k) mid[r] += inv_vp_[r * 4 + k] * ndc[k];
+  }
+  if (std::fabs(mid[3]) < 1e-12) return;
+  double f[3];
+  for (int i = 0; i < 3; ++i) f[i] = mid[i] / mid[3] - cam_pos_[i];
+  const double fh = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+  if (fh < 1e-6) return;
+  // Points out to the distance, ahead and to the sides along the view (its
+  // slope as the camera looks down the hill): the map must reach them all.
+  const double d = shadow_distance_;
+  double v_min = 1.0, depth_far = 1.0;
+  bool any = false;
+  for (int side = -1; side <= 1; ++side) {
+    const double p[4] = {cam_pos_[0] + (f[0] - side * 0.6 * f[2]) / fh * d,
+                         cam_pos_[1] + f[1] / fh * d,
+                         cam_pos_[2] + (f[2] + side * 0.6 * f[0]) / fh * d, 1.0};
+    auto dot = [&](const float* r) { return r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3]; };
+    const double w = dot(c9);
+    if (w <= 1e-6) continue;
+    v_min = std::min(v_min, dot(c7) / w);
+    double clip[4] = {0, 0, 0, 0};
+    for (int r = 0; r < 4; ++r) {
+      for (int k = 0; k < 4; ++k) clip[r] += vp[r * 4 + k] * p[k];
+    }
+    if (clip[3] > 1e-6) depth_far = std::min(depth_far, 1.0 - clip[2] / clip[3]);
+    any = true;
+  }
+  if (!any) return;
+  // Only ever farther than the game's own (av <= 1), and not past four times
+  // its extent.
+  const double v0 = std::min(v_min - 0.02, 0.0);
+  next_shadow_av_ = float(std::clamp(1.0 / (1.0 - v0), 0.25, 1.0));
+  // The fade where the reach ends (raw depth: larger is nearer).
+  if (c10[0] > 0.0f && depth_far > 0.0 && depth_far < c10[0]) {
+    next_shadow_fade_ = float(depth_far / c10[0]);
+  }
 }
 
 bool Renderer::Impl::SnapshotDepth(Image* depth, bool float_depth, Image& out,
@@ -6064,6 +6138,15 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   sys.scaled_textures = scaled_textures;
   std::memcpy(sys.tex_scale, tex_scales, sizeof(tex_scales));
   sys.ndc_offset[2] = zo;
+  // Shadow reach: the map's v remapped (v' = av (v - 1) + 1, the near edge
+  // kept) to take in more of the slope ahead (see ShadowReach).
+  // (Its geometry only: not the blur passes' full-screen quads.)
+  if (shadow_av_ != 1.0f && (st.reg(0x2200) & 2) &&
+      ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
+    // ndc = 2 v - 1  ->  ndc' = av (ndc - 1) + 1
+    sys.ndc_scale[1] *= shadow_av_;
+    sys.ndc_offset[1] = shadow_av_ * (sys.ndc_offset[1] - 1.0f) + 1.0f;
+  }
   // Upscaler jitter: the scene's depth-tested geometry, on its full-size
   // targets (not shadow maps or full-screen passes).
   if (upscaler_ && tiling_.width && (st.reg(0x2200) & 2) &&
@@ -6185,6 +6268,42 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   offsets[0] = last_sys_offset_;
   offsets[1] = ConstantsFor(0, st.vs_consts, *vs);
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
+  if (shadow_res_ > 1.0f && ps->info.ucode_hash == kShadowBlurPixelShader &&
+      ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
+    // The shadow map's blur (5 taps 1.25 texels apart, c255.xy = 1 / size):
+    // kept to the same number of texels of the sharper map, so its edges
+    // get sharper rather than staying as soft as the game's.
+    uint8_t* out;
+    offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
+    std::memcpy(out, st.ps_consts.data(), ConstBytes(*ps));
+    float c255[4];
+    std::memcpy(c255, st.ps_consts.data() + 255 * 4, 16);
+    c255[0] /= shadow_res_;
+    c255[1] /= shadow_res_;
+    std::memcpy(out + 255 * 16, c255, 16);
+  }
+  if ((shadow_av_ != 1.0f || shadow_fade_ != 1.0f) && ps->info.ucode_hash == kLightingPixelShader) {
+    // The lighting pass's lookup into the shadow map (rows c6, c7 over c9:
+    // u, v), remapped the same way: v' = av (v - 1) + 1.
+    uint8_t* out;
+    offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
+    const uint32_t* src = st.ps_consts.data();
+    std::memcpy(out, src, ConstBytes(*ps));
+    float c7[4], c9[4];
+    std::memcpy(c7, src + 7 * 4, 16);
+    std::memcpy(c9, src + 9 * 4, 16);
+    for (int i = 0; i < 4; ++i) c7[i] = shadow_av_ * (c7[i] - c9[i]) + c9[i];
+    std::memcpy(out + 7 * 16, c7, 16);
+    // The fade (shadows gone at raw scene depth c10.x, whole from c11.x)
+    // moved out with the reach.
+    float c10[4], c11[4];
+    std::memcpy(c10, src + 10 * 4, 16);
+    std::memcpy(c11, src + 11 * 4, 16);
+    c10[0] *= shadow_fade_;
+    c11[0] *= shadow_fade_;
+    std::memcpy(out + 10 * 16, c10, 16);
+    std::memcpy(out + 11 * 16, c11, 16);
+  }
   if (st.bool_loop.version() != bool_loop_version_) {
     bool_loop_version_ = st.bool_loop.version();
     bool_loop_offset_ = WriteUniform(st.bool_loop.data(), 160);
@@ -7717,6 +7836,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   ao_late_done_ = false;
   ao_hidden_state_ = 0;
   ao_before_ok_ = ao_hidden_ok_ = false;
+  shadow_av_ = shadow_distance_ > 0.0f ? next_shadow_av_ : 1.0f;
+  shadow_fade_ = shadow_distance_ > 0.0f ? next_shadow_fade_ : 1.0f;
   nearest_character_ = 1e9f;
   if (upscaler_) {
     ++jitter_index_;
@@ -8007,6 +8128,11 @@ void Renderer::SetFoliageFade(bool on) {
   impl_->foliage_fade_ = on && !impl_->Diag("nofade");
 }
 void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(strength, 0.0f); }
+
+void Renderer::SetShadows(float resolution, float distance) {
+  impl_->shadow_res_ = resolution > 0.0f ? std::clamp(resolution, 0.5f, 4.0f) : 0.0f;
+  impl_->shadow_distance_ = std::max(distance, 0.0f);
+}
 
 void Renderer::SetAmbientOcclusion(float strength, bool debug) {
   impl_->ao_strength_ = std::max(strength, 0.0f);

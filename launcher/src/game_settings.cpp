@@ -68,6 +68,11 @@ const std::vector<GameSetting>& DisplaySettings() {
 #endif
       {"native_upscaler_sharpness", "FSR sharpness", Kind::kSlider, "0.3", {}, 0.0, 1.0, 0.05},
       {"native_upscaler_msaa", "MSAA with the upscaler", Kind::kToggle, "false"},
+      {"native_shadow_resolution", "Shadow resolution", Kind::kChoice, "200",
+       {{"100", "1x (the game's)"}, {"150", "1.5x"}, {"200", "2x"}, {"300", "3x"}, {"400", "4x"}}},
+      {"native_shadow_distance", "Shadow distance", Kind::kChoice, "0",
+       {{"0", "The game's (40 m)"}, {"75", "75 m"}, {"100", "100 m"}, {"150", "150 m"},
+        {"200", "200 m"}, {"300", "300 m"}}},
       {"native_sharp_fonts", "Sharp fonts", Kind::kToggle, "false"},
       {"native_upscaled_textures", "Upscaled textures", Kind::kToggle, "false"},
   };

@@ -260,6 +260,13 @@ class Renderer {
   // within a few metres, none past 150 m); `strength` scales it (0 = off).
   // `debug` shows the occlusion alone (white = open).
   void SetAmbientOcclusion(float strength, bool debug = false);
+  // The sun's shadows for the following frames: `resolution` scales the
+  // game's shadow map (1280 x 720, drawn from the sun through a warp that
+  // follows the camera) independently of the scene's resolution (0: at the
+  // scene's scale, as before); `distance` (metres) pushes the map's far edge
+  // and the lighting's shadow fade out to about that far ahead (0: the
+  // game's, about 40 m). Only what the game draws into the map casts shadows.
+  void SetShadows(float resolution, float distance);
   // Foliage camera fade for the following frames (RendererOptions::foliage_fade).
   void SetFoliageFade(bool on);
   // Cartoon clouds that part when the view cuts to or from the trail map

@@ -179,6 +179,16 @@ REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_god_rays_strength, 1.0, "GPU",
                       "Native renderer: god ray strength (0..2)")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_INT32(native_shadow_resolution, 200, "GPU",
+                     "Native renderer: the sun's shadow map, in percent of the game's "
+                     "(1280 x 720), whatever the scene's resolution: higher gives sharper, more "
+                     "detailed shadows from riders, rails and objects")
+    .range(100, 400);
+REXCVAR_DEFINE_INT32(native_shadow_distance, 0, "GPU",
+                     "Native renderer: how far ahead the sun's shadows reach, in metres (0: the "
+                     "game's, about 40 m). Only what the game draws into its shadow map casts "
+                     "shadows; farther reach spreads the map thinner")
+    .range(0, 300);
 REXCVAR_DEFINE_BOOL(native_ambient_occlusion, true, "GPU",
                     "Native renderer: ambient occlusion: creases, corners and the snow around "
                     "trees, rails and jumps shaded where the open sky's light can't reach");
@@ -1767,6 +1777,8 @@ void WorkerMain() {
           renderer->SetInCutscene(game_state == 20);  // a story scene
           renderer->SetGameState(int(game_state));
         }
+        renderer->SetShadows(float(REXCVAR_GET(native_shadow_resolution)) / 100.0f,
+                             float(REXCVAR_GET(native_shadow_distance)));
         renderer->SetAmbientOcclusion(
             revamped && REXCVAR_GET(native_ambient_occlusion)
                 ? float(REXCVAR_GET(native_ambient_occlusion_strength))

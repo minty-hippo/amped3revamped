@@ -196,6 +196,7 @@ Armada).
 - **Check for updates:** lists the changes on the branch since your install.
 - **Graphics settings:** the in-game Graphics panel's settings (display:
   fullscreen, frame rate, resolutions, upscaler, MSAA with the upscaler,
+  shadow resolution and distance,
   sharp fonts, upscaled textures; effects: Revamped Graphics and its parts),
   saved to the install's `amped3.toml` for the next start. New installs start
   fullscreen.
