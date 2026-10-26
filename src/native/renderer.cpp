@@ -1013,6 +1013,8 @@ static_assert(offsetof(SystemConstants, tex_scale) == 80, "XeSystem std140 layou
 // Amped 3's deferred lighting pixel shader (camera motion blur reads its
 // constants and textures).
 constexpr uint64_t kLightingPixelShader = 0xC17CD159D811B298ull;
+// The snow trails' vertex shader (it projects into the shadow map, c9-c12).
+constexpr uint64_t kTrailVertexShader = 0xCBEB0B975321F043ull;
 // The shadow map's blur (two passes over the map read as 8_8_8_8).
 constexpr uint64_t kShadowBlurPixelShader = 0x7A84B7E8B62F305Eull;
 
@@ -6267,6 +6269,19 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   }
   offsets[0] = last_sys_offset_;
   offsets[1] = ConstantsFor(0, st.vs_consts, *vs);
+  if (shadow_av_ != 1.0f && vs->info.ucode_hash == kTrailVertexShader) {
+    // The snow trails take the riders' shadows from the map too (rows c9,
+    // c10 over c12: u, v): the same remap, v' = av (v - 1) + 1.
+    uint8_t* out;
+    offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
+    const uint32_t* src = st.vs_consts.data();
+    std::memcpy(out, src, ConstBytes(*vs));
+    float c10[4], c12[4];
+    std::memcpy(c10, src + 10 * 4, 16);
+    std::memcpy(c12, src + 12 * 4, 16);
+    for (int i = 0; i < 4; ++i) c10[i] = shadow_av_ * (c10[i] - c12[i]) + c12[i];
+    std::memcpy(out + 10 * 16, c10, 16);
+  }
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
   if (shadow_res_ > 1.0f && ps->info.ucode_hash == kShadowBlurPixelShader &&
       ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
