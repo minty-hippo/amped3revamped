@@ -189,6 +189,11 @@ REXCVAR_DEFINE_INT32(native_shadow_distance, 0, "GPU",
                      "game's, about 40 m). Only what the game draws into its shadow map casts "
                      "shadows; farther reach spreads the map thinner")
     .range(0, 300);
+REXCVAR_DEFINE_INT32(native_shadow_softness, 100, "GPU",
+                     "Native renderer: the sun's shadows sharp where the caster meets the "
+                     "ground, softer the farther it is above it (percent; 0: an even blur "
+                     "like the game's)")
+    .range(0, 300);
 REXCVAR_DEFINE_BOOL(native_tree_shadows, true, "GPU",
                     "Native renderer: the trees and objects near the slope cast real sun "
                     "shadows (into the game's shadow map), dappled through the branches");
@@ -1785,6 +1790,8 @@ void WorkerMain() {
             revamped ? float(REXCVAR_GET(native_shadow_resolution)) / 100.0f : 1.0f,
             revamped ? float(REXCVAR_GET(native_shadow_distance)) : 0.0f);
         renderer->SetTreeShadows(revamped && REXCVAR_GET(native_tree_shadows) ? 1.0f : 0.0f);
+        renderer->SetShadowSoftness(
+            revamped ? float(REXCVAR_GET(native_shadow_softness)) / 100.0f : 0.0f);
         renderer->SetAmbientOcclusion(
             revamped && REXCVAR_GET(native_ambient_occlusion)
                 ? float(REXCVAR_GET(native_ambient_occlusion_strength))

@@ -157,8 +157,10 @@ struct RenderStats {
   uint32_t fogged = 0;
   uint32_t god_rays = 0;  // god rays added this frame (SetGodRays)
   uint32_t ambient_occlusion = 0;  // ambient occlusion applied (SetAmbientOcclusion)
-  uint32_t tree_shadow_draws = 0;  // tree shadow masks drawn (SetTreeShadows)
-  uint32_t tree_casters = 0;       // draws in them
+  uint32_t tree_shadow_draws = 0;  // sun shadows filtered (SetTreeShadows, SetShadowSoftness)
+  uint32_t tree_casters = 0;       // trees drawn into the tree map
+  uint32_t sun_receivers = 0;      // terrain drawn again from the sun
+  uint32_t sun_map_resets = 0;     // tree map started over
   // The nearest character to the camera (world units; 1e9: none).
   float nearest_character = 1e9f;
   // Object motion blur: scene draws given motion vectors, and of those the
@@ -273,6 +275,9 @@ class Renderer {
   // again from the sun into the shadow map (`strength` 0..1, 0 = off). The
   // mask is made the first frame and used from the next.
   void SetTreeShadows(float strength);
+  // Penumbras that widen with the distance from the caster to the ground
+  // (0: an even blur, 1: natural, 2: soft).
+  void SetShadowSoftness(float softness);
   // Foliage camera fade for the following frames (RendererOptions::foliage_fade).
   void SetFoliageFade(bool on);
   // Cartoon clouds that part when the view cuts to or from the trail map

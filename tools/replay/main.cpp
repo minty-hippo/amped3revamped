@@ -453,6 +453,7 @@ int main(int argc, char** argv) {
   float fog = 0.0f, fog_start = 150.0f;
   float shadow_res = 0.0f, shadow_distance = 0.0f;  // --shadow-res x, --shadow-distance m
   float tree_shadows = 0.0f;                          // --tree-shadows strength
+  float shadow_softness = 0.0f;                       // --shadow-softness scale
   float ao = 0.0f;        // --ao strength [--ao-debug]: ambient occlusion
   bool ao_debug = false;
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
@@ -500,6 +501,8 @@ int main(int argc, char** argv) {
       god_rays = std::stof(argv[++i]);
     } else if (a == "--shadow-res" && i + 1 < argc) {
       shadow_res = std::stof(argv[++i]);
+    } else if (a == "--shadow-softness" && i + 1 < argc) {
+      shadow_softness = std::stof(argv[++i]);
     } else if (a == "--tree-shadows" && i + 1 < argc) {
       tree_shadows = std::stof(argv[++i]);
     } else if (a == "--shadow-distance" && i + 1 < argc) {
@@ -806,6 +809,7 @@ int main(int argc, char** argv) {
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
     if (shadow_res > 0.0f || shadow_distance > 0.0f) renderer.SetShadows(shadow_res, shadow_distance);
     if (tree_shadows > 0.0f) renderer.SetTreeShadows(tree_shadows);
+    if (shadow_softness > 0.0f) renderer.SetShadowSoftness(shadow_softness);
     auto stats = renderer.Render(cap, files, max_draws);
     first_use("first frame", stats);
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";
@@ -827,8 +831,9 @@ int main(int argc, char** argv) {
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
     }
     if (stats.tree_shadow_draws)
-      std::cout << "Tree shadows: " << stats.tree_shadow_draws << " masks, " << stats.tree_casters
-                << " casters\n";
+      std::cout << "Sun shadows: " << stats.tree_shadow_draws << " filtered, " << stats.tree_casters
+                << " tree casters, " << stats.sun_receivers << " ground draws, "
+                << stats.sun_map_resets << " tree map resets\n";
     std::cout << "Recorded " << stats.draws_done << " of " << stats.draws << " draws\n";
     std::cout << "Render passes " << stats.passes << "; clears: " << stats.clear_passes
               << " passes of their own, " << stats.clears_merged << " folded into a load op, "

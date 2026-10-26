@@ -416,11 +416,20 @@ const std::vector<Tab>& Tabs() {
                          {"150", "150 m"},
                          {"200", "200 m"},
                          {"300", "300 m"}}),
+                Choices("native_shadow_softness", "Shadow softness",
+                        "Sun shadows sharp where they touch whatever casts them and softer "
+                        "the farther it is above the ground (a rider's feet against their "
+                        "head, a trunk against the branches), as real shadows are. Part of "
+                        "Revamped Graphics (off: the game's even blur). Native renderer only.",
+                        {{"0", "Even (the game's)"},
+                         {"50", "Subtle"},
+                         {"100", "Natural"},
+                         {"200", "Soft"}}),
                 Toggle("native_tree_shadows", "Tree shadows",
-                       "The trees, rocks and props near you cast real sun shadows, dappled "
-                       "through the branches and moving with the light, on top of the shadows "
-                       "painted into the slopes. Reaches as far as Shadow distance. Native "
-                       "renderer only."),
+                       "The trees, rocks and props cast real sun shadows, dappled through "
+                       "the branches, on top of the shadows painted into the slopes. Every "
+                       "tree seen keeps its shadow when you look away. Reaches as far as "
+                       "Shadow distance (up to about 150 m). Native renderer only."),
                 Toggle("native_ambient_occlusion", "Ambient occlusion",
                        "Shading where the open sky's light can't reach: the snow around tree "
                        "trunks, rails, jumps and buildings, creases and corners, worked out "

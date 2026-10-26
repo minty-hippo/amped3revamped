@@ -1025,6 +1025,10 @@ bool IsShadowCaster(uint64_t vs_hash) {
 constexpr uint64_t kTrailVertexShader = 0xCBEB0B975321F043ull;
 // The shadow map's blur (two passes over the map read as 8_8_8_8).
 constexpr uint64_t kShadowBlurPixelShader = 0x7A84B7E8B62F305Eull;
+// The shadow pass's terrain: its vertex shader (world-space vertices, the
+// light's view-projection in c0-c3) and the pixel shader of all of it.
+constexpr uint64_t kTerrainShadowVertexShader = 0x7FB9597D0D8178C1ull;
+constexpr uint64_t kTerrainShadowPixelShader = 0x515E86DBD1D61732ull;
 
 struct Shader {
   VkShaderModule module = VK_NULL_HANDLE;
@@ -1345,11 +1349,14 @@ struct Renderer::Impl {
   // kept, the far edge pushed out), and the lighting's shadow fade (c10, c11:
   // raw scene depths where shadows fade out) scaled by fade.
   float shadow_av_ = 1.0f, shadow_fade_ = 1.0f;
-  // Tree shadows (SetTreeShadows): the trees and objects of the scene pass
-  // (drawn before the lighting), drawn again from the sun into a mask the
-  // size of the shadow map, blurred and merged into the game's blurred
-  // shadow map just before the lighting pass reads it.
-  float tree_shadow_ = 0.0f;  // strength, 0 = off
+  // Sun shadows (DrawSunShadows): the game's shadow map filtered again
+  // with penumbras that widen away from the caster (SetShadowSoftness), and
+  // the trees' shadows (SetTreeShadows), from a map of the trees seen from
+  // the sun that stays put in the world and keeps every tree drawn since
+  // (so a tree's shadow stays when the camera turns away from it).
+  float tree_shadow_ = 0.0f;      // strength, 0 = off
+  float shadow_softness_ = 0.0f;  // penumbra scale, 0 = an even blur
+  bool SunShadowsOn() const { return tree_shadow_ > 0.0f || shadow_softness_ > 0.0f; }
   struct CasterDraw {
     VkPipeline pipeline;
     VkDescriptorSet tex_sets[2];
@@ -1360,10 +1367,30 @@ struct Renderer::Impl {
     uint32_t first, count;
     SystemConstants sys;  // as drawn; reprojected when drawn again
   };
-  std::vector<CasterDraw> caster_draws_;
-  Image tree_mask_, tree_blur_, tree_tmp_;
-  std::vector<Image*> caster_colors_;
-  void DrawTreeShadows(const Draw& d, const GpuState& st);
+  std::vector<CasterDraw> caster_draws_;    // trees and props (scene pass)
+  std::vector<CasterDraw> receiver_draws_;  // terrain (shadow pass)
+  // This frame's shadow pass: its depth target, the light's view-projection
+  // (rows; the terrain's vertex shader has it in c0-c3) and viewport.
+  Image* sun_depth_target_ = nullptr;
+  bool sun_float_depth_ = false;
+  bool sun_light_ok_ = false, sun_prepared_ = false, sun_inputs_ok_ = false;
+  double sun_light_vp_[16] = {};
+  SystemConstants sun_light_sys_{};
+  // Kept at the first blur: the unblurred map, its depth, the terrain's.
+  Image sun_raw_, sun_zo_, sun_zr_, sun_prep_, sun_out_;
+  // The tree map: depth along the sun (D32), centred near the camera, moved
+  // a whole number of texels at a time (copied across: ping-pong).
+  static constexpr uint32_t kSunMapSize = 2048;
+  static constexpr double kSunDepth = 2000.0;  // metres the depth spans
+  Image sun_trees_[2];
+  int sun_cur_ = 0;
+  uint64_t sun_trees_drawn_ = 0;  // frames that drew trees into the map
+  bool sun_map_ok_ = false;
+  double sun_f_[3] = {}, sun_e1_[3] = {}, sun_e2_[3] = {}, sun_c0_[3] = {};
+  int64_t sun_ci_ = 0, sun_cj_ = 0;
+  double sun_r_ = 0.0, sun_ref_ = 0.0, sun_last_cam_[3] = {};
+  void PrepareSunShadows(const Draw& d, const GpuState& st);
+  void DrawSunShadows(const Draw& d, const GpuState& st);
   float next_shadow_av_ = 1.0f, next_shadow_fade_ = 1.0f;
   void UpdateShadowReach(const GpuState& st);
   bool scene_begun_ = false;  // this frame's tiled pass has begun
@@ -1628,7 +1655,7 @@ struct Renderer::Impl {
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
-    kTreeBlur = 23, kTreeMerge = 24
+    kSunPrep = 23, kSunPcss = 24
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -3005,7 +3032,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   rs.frontFace = (mode & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
   // Polygon offset (PA_SU_SC_MODE_CNTL poly_offset_front/back_enable); the
   // values are dynamic (DoDraw).
-  rs.depthBiasEnable = (mode & (3u << 11)) != 0;
+  rs.depthBiasEnable = (mode & (3u << 11)) != 0 && !caster;
   if (Diag("nobias")) rs.depthBiasEnable = VK_FALSE;
   if (Diag("clamp")) rs.depthClampEnable = VK_TRUE;
   rs.lineWidth = 1.0f;
@@ -3033,6 +3060,13 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       ds.depthTestEnable = VK_TRUE;
       ds.depthWriteEnable = VK_FALSE;
       ds.depthCompareOp = VK_COMPARE_OP_EQUAL;
+      ds.stencilTestEnable = VK_FALSE;
+    }
+    if (caster) {
+      // The tree map: depth along the sun, the nearest kept.
+      ds.depthTestEnable = VK_TRUE;
+      ds.depthWriteEnable = VK_TRUE;
+      ds.depthCompareOp = VK_COMPARE_OP_LESS;
       ds.stencilTestEnable = VK_FALSE;
     }
     if (velocity) {
@@ -3076,18 +3110,6 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       // The velocity image's w = 1 (builtin_exempt).
       a.blendEnable = VK_FALSE;
       a.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
-    }
-    if (caster) {
-      // Tree shadow mask (R8, cleared to 1): 0 wherever the draw leaves a
-      // fragment (its own alpha test cuts the foliage out).
-      a.blendEnable = VK_TRUE;
-      a.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-      a.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-      a.colorBlendOp = VK_BLEND_OP_ADD;
-      a.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-      a.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-      a.alphaBlendOp = VK_BLEND_OP_ADD;
-      a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     }
     if (reactive) {
       // The upscaler's reactive mask (R8): how much the draw adds to the
@@ -4380,38 +4402,112 @@ void main() {
   o = pc.a.z > 0.5 ? vec4(vec3(a), 1.0) : vec4(c.rgb * a, c.a);
 }
 )", true);
-  // Tree shadows, 2: the mask blurred one way (a.xy: the step in texels,
-  // a.z: taps each side), a gaussian.
-  copy_fs_[23] = CompileBuiltin("builtin_tree_blur", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D mask;
-layout(push_constant) uniform Blur { vec4 a; } pc;
+  // Sun shadows, 1 (DrawSunShadows): for each texel of the game's shadow map
+  // (one ray of sunlight), the ground it lands on and the nearest thing
+  // casting onto it, as distances along the sun's direction (metres), and
+  // where the ground is in the tree map (x: ground, y: caster or 1e9, zw:
+  // the tree map's ndc). a: map texel (u, v, depth) -> world; f: the sun's
+  // direction (travelling); e1, e2: the tree map's rows.
+  copy_fs_[23] = CompileBuiltin("builtin_sun_prep", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D zo;   // the shadow pass's depth
+layout(set = 0, binding = 1) uniform sampler2D zr;   // its terrain alone (0: none)
+layout(set = 0, binding = 2) uniform sampler2D raw;  // the map unblurred: b = stencil (0: caster)
+layout(push_constant) uniform Prep { mat4 a; vec4 f; vec4 e1; vec4 e2; } pc;
 layout(location = 0) out vec4 o;
 void main() {
-  ivec2 size = textureSize(mask, 0);
-  ivec2 c = ivec2(gl_FragCoord.xy);
-  int n = int(pc.a.z);
-  float sigma = max(float(n) * 0.5, 0.5);
-  float sum = 0.0, wsum = 0.0;
-  for (int i = -n; i <= n; ++i) {
-    float w = exp(-float(i * i) / (2.0 * sigma * sigma));
-    sum += texelFetch(mask, clamp(c + ivec2(pc.a.xy) * i, ivec2(0), size - 1), 0).r * w;
-    wsum += w;
-  }
-  o = vec4(sum / wsum, 0.0, 0.0, 1.0);
+  ivec2 size = textureSize(zo, 0);
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec2 uv = (vec2(p) + 0.5) / vec2(size);
+  float d_o = texelFetch(zo, p, 0).r;
+  float d_r = texelFetch(zr, p, 0).r;
+  if (d_r <= 0.0) d_r = d_o;
+  vec4 wo = pc.a * vec4(uv, d_o, 1.0);
+  vec4 wr = pc.a * vec4(uv, d_r, 1.0);
+  vec3 po = wo.xyz / wo.w, pr = wr.xyz / wr.w;
+  bool caster = texelFetch(raw, p, 0).b < 0.5;
+  o = vec4(dot(pr, pc.f.xyz), caster ? dot(po, pc.f.xyz) : 1e9,
+           dot(vec4(pr, 1.0), pc.e1), dot(vec4(pr, 1.0), pc.e2));
 }
 )", true);
-  // Tree shadows, 3: the game's blurred shadow map (8_8_8_8: the lighting
-  // reads its .z, 1 = lit) darkened where the trees' mask is.
-  copy_fs_[24] = CompileBuiltin("builtin_tree_merge", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D mask;    // the same size, R8: 1 = lit
-layout(set = 0, binding = 1) uniform sampler2D shadow;  // the game's
-layout(push_constant) uniform Merge { vec4 a; } pc;     // strength
+  // Sun shadows, 2: the map filtered with penumbras that widen with the
+  // distance from the caster to the ground (percentage-closer soft shadows:
+  // the casters' average distance found first, then a disc that size), the
+  // riders' and objects' from the game's map, the trees' from the tree map.
+  // The stencil byte (b: 1 lit, 0 in shadow) is what the lighting reads.
+  // a: penumbra radius per metre, search radius (m), radius min / max (texels)
+  // b: tree map half width (m), size (texels), depth -> metres (ref, scale)
+  // c: tree shadow strength, bias (m)
+  copy_fs_[24] = CompileBuiltin("builtin_sun_pcss", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D raw;    // linear
+layout(set = 0, binding = 1) uniform sampler2D prep;
+layout(set = 0, binding = 2) uniform sampler2D trees;  // depth, 1 = nothing
+layout(push_constant) uniform Pcss { vec4 a; vec4 b; vec4 c; } pc;
 layout(location = 0) out vec4 o;
+vec2 Disc(int i, int n) {
+  float r = sqrt((float(i) + 0.5) / float(n));
+  float t = float(i) * 2.39996323;
+  return r * vec2(cos(t), sin(t));
+}
 void main() {
+  ivec2 size = textureSize(prep, 0);
   ivec2 p = ivec2(gl_FragCoord.xy);
-  vec4 s = texelFetch(shadow, p, 0);
-  float m = 1.0 - texelFetch(mask, p, 0).r;
-  o = vec4(s.rgb * (1.0 - clamp(m * pc.a.x, 0.0, 1.0)), s.a);
+  vec4 c = texelFetch(raw, p, 0);
+  vec4 q = texelFetch(prep, p, 0);
+  float dr = q.x;
+  ivec2 px = ivec2(p.x + (p.x + 1 < size.x ? 1 : -1), p.y);
+  ivec2 py = ivec2(p.x, p.y + (p.y + 1 < size.y ? 1 : -1));
+  float mpt = max(length(texelFetch(prep, px, 0).zw - q.zw),
+                  length(texelFetch(prep, py, 0).zw - q.zw)) * pc.b.x;
+  mpt = clamp(mpt, 1e-3, 10.0);
+  vec2 inv = 1.0 / vec2(size);
+  // The riders' and objects' shadows (the game's map).
+  float bias = pc.c.y + 2.0 * mpt;
+  float reach = clamp(pc.a.y / mpt, 1.0, pc.a.w);
+  float bs = 0.0, bn = 0.0;
+  for (int i = 0; i < 16; ++i) {
+    ivec2 s = clamp(p + ivec2(round(Disc(i, 16) * reach)), ivec2(0), size - 1);
+    float od = texelFetch(prep, s, 0).y;
+    if (od < dr - bias) {
+      bs += dr - od;
+      bn += 1.0;
+    }
+  }
+  float rad = pc.a.z;
+  if (bn > 0.0) rad = clamp(pc.a.x * (bs / bn) / mpt, pc.a.z, pc.a.w);
+  float lit = 0.0;
+  for (int i = 0; i < 24; ++i) lit += texture(raw, (vec2(p) + 0.5 + Disc(i, 24) * rad) * inv).b;
+  float g = lit / 24.0;
+  // The trees' (the tree map).
+  float t = 1.0;
+  vec2 tuv = 0.5 + 0.5 * q.zw;
+  if (pc.c.x > 0.0 && all(greaterThan(tuv, vec2(0.0))) && all(lessThan(tuv, vec2(1.0)))) {
+    float n = pc.b.y;
+    float tm = 2.0 * pc.b.x / n;
+    vec2 tc = tuv * n;
+    float tbias = pc.c.y + 2.0 * tm;
+    float treach = clamp(pc.a.y / tm, 1.0, pc.a.w);
+    bs = 0.0;
+    bn = 0.0;
+    for (int i = 0; i < 16; ++i) {
+      float z = texelFetch(trees, ivec2(tc + Disc(i, 16) * treach), 0).r;
+      float od = pc.b.z + (z - 0.5) * pc.b.w;
+      if (z < 1.0 && od < dr - tbias) {
+        bs += dr - od;
+        bn += 1.0;
+      }
+    }
+    if (bn > 0.0) {
+      float trad = clamp(pc.a.x * (bs / bn) / tm, 0.75, pc.a.w);
+      float sh = 0.0;
+      for (int i = 0; i < 32; ++i) {
+        float z = texelFetch(trees, ivec2(tc + Disc(i, 32) * trad), 0).r;
+        float od = pc.b.z + (z - 0.5) * pc.b.w;
+        sh += (z < 1.0 && od < dr - tbias) ? 1.0 : 0.0;
+      }
+      t = 1.0 - pc.c.x * sh / 32.0;
+    }
+  }
+  o = vec4(c.r, c.g, g * t, c.a);
 }
 )", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
@@ -4957,7 +5053,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   depth_base_ = depth.base_address() & 0x1FFFFFFF;
   light_seen_ = true;
   UpdateShadowReach(st);
-  DrawTreeShadows(d, st);
+  DrawSunShadows(d, st);
   // Ambient occlusion: the world's depth, kept before it's resolved again.
   ao_depth_ok_ = false;
   if (ao_strength_ > 0.0f) {
@@ -5211,130 +5307,379 @@ bool Renderer::Impl::SunOnScreen(float uv[2], float* visible) const {
   return *visible > 0.0f;
 }
 
-void Renderer::Impl::DrawTreeShadows(const Draw& d, const GpuState& st) {
-  // The game's blurred shadow map, as the lighting pass reads it (tf0).
-  amped3::native::TextureFetch tf;
-  std::memcpy(tf.words, FetchWords(d, 0, st), sizeof(tf.words));
-  auto sit = resolved_.find(tf.base_address() & 0x1FFFFFFF);
-  Image* shadow = sit != resolved_.end() ? &sit->second : nullptr;
-  const uint32_t w = shadow ? shadow->width : 0, h = shadow ? shadow->height : 0;
-  // The mask follows the shadow map's size (made now, used from the next
-  // frame's scene pass on: its pipelines are built against it).
-  if (tree_shadow_ <= 0.0f || !shadow || !w || !h) {
-    caster_draws_.clear();
+// The shadow map's inputs, kept at its first blur (which blurs it in place):
+// the unblurred map (b: the stencil byte, 0 where a caster is nearest the
+// sun), the shadow pass's depth, and the terrain drawn again alone into a
+// depth of its own (the ground under the riders and objects).
+void Renderer::Impl::PrepareSunShadows(const Draw& d, const GpuState& st) {
+  std::string note;
+  Image* raw = TextureFor(d, 0, st, &note);
+  Image* depth = sun_depth_target_;
+  if (Diag("sun")) {
+    std::fprintf(stderr, "sun: prepare raw %d depth %p %ux%u receivers %zu\n",
+                 int(raw != nullptr), (void*)depth, depth ? depth->width : 0,
+                 depth ? depth->height : 0, receiver_draws_.size());
+  }
+  if (!raw || raw->depth || !depth || depth->samples > 1) {
+    receiver_draws_.clear();
     return;
   }
-  auto ensure = [&](Image& im, VkFormat f, const char* name) {
-    if (im.image && im.width == w && im.height == h && im.format == f) return false;
-    if (im.image) Retire(im);
-    im = gpu_.CreateImage(w, h, f, false, name);
-    ToGeneral(cb_, im);
-    return true;
-  };
+  const uint32_t w = raw->width, h = raw->height;
   EndRendering();
-  ensure(tree_mask_, VK_FORMAT_R8_UNORM, "tree_mask");
-  ensure(tree_blur_, VK_FORMAT_R8_UNORM, "tree_mask_blur");
-  ensure(tree_tmp_, shadow->format, "tree_shadow_merged");
-  if (caster_draws_.empty()) return;
-  // Camera clip -> world (the lighting's inverse view-projection, which
-  // takes x, y, 1 - depth) -> the shadow map (the lighting's rows c6, c7
-  // over c9: u, v; v remapped with the shadow distance), as Vulkan clip.
-  float c6[4], c7[4], c9[4];
-  std::memcpy(c6, st.ps_consts.data() + 6 * 4, 16);
-  std::memcpy(c7, st.ps_consts.data() + 7 * 4, 16);
-  std::memcpy(c9, st.ps_consts.data() + 9 * 4, 16);
-  double L[16];
-  for (int i = 0; i < 4; ++i) {
-    const double v = shadow_av_ * (c7[i] - c9[i]) + c9[i];
-    L[0 * 4 + i] = 2.0 * c6[i] - c9[i];
-    L[1 * 4 + i] = 2.0 * v - c9[i];
-    L[2 * 4 + i] = 0.5 * c9[i];
-    L[3 * 4 + i] = c9[i];
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, bool is_depth,
+                    const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, is_depth, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(sun_raw_, w, h, raw->format, false, "sun_raw");
+  ensure(sun_zr_, depth->width, depth->height, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "sun_ground");
+  if (depth->width != w || depth->height != h) {
+    receiver_draws_.clear();
+    return;
   }
-  double LI[16];  // L * inv_vp_
-  for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      double v = 0;
-      for (int k = 0; k < 4; ++k) v += L[r * 4 + k] * inv_vp_[k * 4 + c];
-      LI[r * 4 + c] = v;
-    }
-  }
-  const float one[4] = {1, 1, 1, 1};
-  ClearImage(&tree_mask_, one, 0, 0, true, false, false);
-  BeginRendering({&tree_mask_}, nullptr);
-  vk::vkCmdSetBlendConstants(cb_, one);
+  FlushPendingClears();
+  const VkRect2D all{{0, 0}, {w, h}};
+  ResolveBarrier(raw, all);
+  VkImageCopy region{};
+  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.extent = {w, h, 1};
+  vk::vkCmdCopyImage(cb_, raw->image, VK_IMAGE_LAYOUT_GENERAL, sun_raw_.image,
+                     VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  Barrier();
+  SnapshotDepth(depth, sun_float_depth_, sun_zo_, "sun_depth");
+  // The terrain alone (the game's depth test: nearer the sun is larger).
+  const float zero[4] = {0, 0, 0, 0};
+  ClearImage(&sun_zr_, zero, 0.0f, 0, false, true, true);
+  static const std::vector<Image*> kNoColors;
+  BeginRendering(kNoColors, &sun_zr_);
   vk::vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
   vk::vkCmdSetStencilCompareMask(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
   vk::vkCmdSetStencilWriteMask(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
   vk::vkCmdSetDepthBias(cb_, 0.0f, 0.0f, 0.0f);
+  const float one[4] = {1, 1, 1, 1};
+  vk::vkCmdSetBlendConstants(cb_, one);
   VkViewport vp{0, 0, float(w), float(h), 0.0f, 1.0f};
   vk::vkCmdSetViewport(cb_, 0, 1, &vp);
   VkRect2D sc{{0, 0}, {w, h}};
   vk::vkCmdSetScissor(cb_, 0, 1, &sc);
   VkPipeline bound = VK_NULL_HANDLE;
-  VkIndexType bound_type = VK_INDEX_TYPE_UINT32;
-  VkBuffer bound_buffer = VK_NULL_HANDLE;
-  for (CasterDraw& c : caster_draws_) {
-    // The draw's clip position as the game gave it (the viewport's z scale
-    // and offset make its depth: 1 - depth = (1 - zo) w - zs z), then L.
-    const double zs = c.sys.ndc_scale[2], zo = c.sys.ndc_offset[2];
-    double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -zs, 1.0 - zo, 0, 0, 0, 1};
-    SystemConstants sys = c.sys;
-    for (int r = 0; r < 4; ++r) {
-      for (int col = 0; col < 4; ++col) {
-        double v = 0;
-        for (int k = 0; k < 4; ++k) v += LI[r * 4 + k] * K[k * 4 + col];
-        sys.reproject[col * 4 + r] = float(v);  // column-major
-      }
-    }
-    sys.ndc_scale[0] = sys.ndc_scale[1] = sys.ndc_scale[2] = 1.0f;
-    sys.ndc_offset[0] = sys.ndc_offset[1] = sys.ndc_offset[2] = 0.0f;
-    // No MSAA coverage, camera fade or dither here; the alpha test stays.
-    sys.flags &= 0x7Fu | 128u;
-    sys.flags |= 16384u;  // XE_FLAG_REPROJECT
-    sys.res_scale = 1.0f;
-    sys.rt_inv_size[0] = 1.0f / float(w);
-    sys.rt_inv_size[1] = 1.0f / float(h);
-    uint32_t offsets[5];
-    std::memcpy(offsets, c.offsets, sizeof(offsets));
-    offsets[0] = WriteUniform(&sys, sizeof(sys));
+  for (const CasterDraw& c : receiver_draws_) {
     if (c.pipeline != bound) {
       vk::vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipeline);
       bound = c.pipeline;
     }
     VkDescriptorSet sets[4] = {set0_, set1_, c.tex_sets[0], c.tex_sets[1]};
     vk::vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 4, sets, 5,
-                                offsets);
+                                c.offsets);
     if (c.indexed) {
-      if (c.index_type != bound_type || c.index_buffer != bound_buffer) {
-        vk::vkCmdBindIndexBuffer(cb_, c.index_buffer, 0, c.index_type);
-        bound_type = c.index_type;
-        bound_buffer = c.index_buffer;
-      }
+      vk::vkCmdBindIndexBuffer(cb_, c.index_buffer, 0, c.index_type);
       vk::vkCmdDrawIndexed(cb_, c.count, 1, c.first, 0, 0);
     } else {
       vk::vkCmdDraw(cb_, c.count, 1, 0, 0);
     }
   }
+  stats_.sun_receivers += uint32_t(receiver_draws_.size());
+  receiver_draws_.clear();
   EndRendering();
   Barrier();
   dyn_ = DynState{};
+  sun_inputs_ok_ = true;
+}
+
+// At the lighting pass: the game's (blurred) shadow map replaced by the
+// unblurred one filtered with penumbras that widen away from the caster,
+// the trees' shadows added from the tree map (drawn into first).
+void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
+  std::vector<CasterDraw> casters;
+  casters.swap(caster_draws_);
+  if (Diag("sun")) {
+    std::fprintf(stderr, "sun: on %d inputs %d light %d casters %zu\n", int(SunShadowsOn()),
+                 int(sun_inputs_ok_), int(sun_light_ok_), casters.size());
+  }
+  if (!SunShadowsOn() || !sun_inputs_ok_ || !sun_light_ok_) return;
+  amped3::native::TextureFetch tf;
+  std::memcpy(tf.words, FetchWords(d, 0, st), sizeof(tf.words));
+  auto sit = resolved_.find(tf.base_address() & 0x1FFFFFFF);
+  if (sit == resolved_.end()) return;
+  Image* shadow = &sit->second;
+  const uint32_t w = shadow->width, h = shadow->height;
+  if (Diag("sun")) {
+    std::fprintf(stderr, "sun: map %ux%u fmt %d raw %ux%u fmt %d zo %ux%u\n", w, h,
+                 int(shadow->format), sun_raw_.width, sun_raw_.height, int(sun_raw_.format),
+                 sun_zo_.width, sun_zo_.height);
+  }
+  if (w != sun_raw_.width || h != sun_raw_.height || shadow->format != sun_raw_.format ||
+      sun_zo_.width != w || sun_zo_.height != h) {
+    return;
+  }
+  // The sun's direction: the light's rows x, y, w (u = x / w, v = y / w)
+  // are the same all along a ray of sunlight, so the direction is what
+  // they all take to zero.
+  const double* V = sun_light_vp_;
+  double f[3];
+  {
+    const double* rx = V;
+    const double* ry = V + 4;
+    const double* rw = V + 12;
+    // The direction (x, y, z, 0) with rx.d = ry.d = rw.d = 0: the cross
+    // product of their xyz parts... in 3D the kernel of a 3x3 matrix; use
+    // the two best-conditioned rows' cross product, checked on the third.
+    const double a[3] = {rx[0], rx[1], rx[2]}, b[3] = {ry[0], ry[1], ry[2]},
+                 c[3] = {rw[0], rw[1], rw[2]};
+    auto cross = [](const double* p, const double* q, double* o) {
+      o[0] = p[1] * q[2] - p[2] * q[1];
+      o[1] = p[2] * q[0] - p[0] * q[2];
+      o[2] = p[0] * q[1] - p[1] * q[0];
+    };
+    double k1[3], k2[3], k3[3];
+    cross(a, b, k1);
+    cross(a, c, k2);
+    cross(b, c, k3);
+    auto len = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+    const double* best = k1;
+    if (len(k2) > len(best)) best = k2;
+    if (len(k3) > len(best)) best = k3;
+    const double n = len(best);
+    if (!(n > 1e-12)) return;
+    for (int i = 0; i < 3; ++i) f[i] = best[i] / n;
+    if (f[1] > 0.0) {  // travelling down from the sun
+      for (double& v : f) v = -v;
+    }
+  }
+  double Vinv[16];
+  if (!Invert4(V, Vinv)) return;
+  EndRendering();
   ++stats_.tree_shadow_draws;
-  stats_.tree_casters += uint32_t(caster_draws_.size());
-  caster_draws_.clear();
-  // Soft edges, about as wide as the game's own shadows' (a few of its
-  // 1280-wide texels, whatever the map's size).
-  const float taps = std::clamp(std::round(3.0f * float(w) / 1280.0f), 1.0f, 12.0f);
-  float bx[4] = {1, 0, taps, 0}, by[4] = {0, 1, taps, 0};
-  FullscreenPass(CopyKind::kTreeBlur, &tree_blur_, &tree_mask_, nullptr, nullptr, false, bx, 4);
-  FullscreenPass(CopyKind::kTreeBlur, &tree_mask_, &tree_blur_, nullptr, nullptr, false, by, 4);
-  float pc[4] = {tree_shadow_, 0, 0, 0};
-  FullscreenPass(CopyKind::kTreeMerge, &tree_tmp_, &tree_mask_, shadow, nullptr, false, pc, 4);
+  // The tree map: centred near the camera, as wide as the shadows reach.
+  const double reach = shadow_distance_ > 0.0f ? double(shadow_distance_) : 45.0;
+  const double R = std::clamp(reach * 1.15, 30.0, 180.0);
+  const double N = double(kSunMapSize);
+  const double texel = 2.0 * R / N;
+  const double cam[3] = {cam_pos_[0], cam_pos_[1], cam_pos_[2]};
+  auto dot3 = [](const double* p, const double* q) { return p[0] * q[0] + p[1] * q[1] + p[2] * q[2]; };
+  const bool trees = tree_shadow_ > 0.0f;
+  if (trees) {
+    for (Image& im : sun_trees_) {
+      if (!im.image) {
+        im = gpu_.CreateImage(kSunMapSize, kSunMapSize, VK_FORMAT_D32_SFLOAT_S8_UINT, true,
+                              "sun_trees");
+        ToGeneral(cb_, im);
+        sun_map_ok_ = false;
+      }
+    }
+    const double moved = std::sqrt((cam[0] - sun_last_cam_[0]) * (cam[0] - sun_last_cam_[0]) +
+                                   (cam[1] - sun_last_cam_[1]) * (cam[1] - sun_last_cam_[1]) +
+                                   (cam[2] - sun_last_cam_[2]) * (cam[2] - sun_last_cam_[2]));
+    const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < 0.99999 || R != sun_r_ ||
+                       moved > 0.5 * R || std::fabs(dot3(cam, f) - sun_ref_) > 0.3 * kSunDepth;
+    const float far_depth[4] = {0, 0, 0, 0};
+    if (reset) {
+      // Axes across the sun's direction.
+      const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
+      const double* ref_axis = std::fabs(f[1]) < 0.9 ? up : side;
+      double e1[3] = {ref_axis[1] * f[2] - ref_axis[2] * f[1], ref_axis[2] * f[0] - ref_axis[0] * f[2],
+                      ref_axis[0] * f[1] - ref_axis[1] * f[0]};
+      const double n1 = std::sqrt(dot3(e1, e1));
+      for (double& v : e1) v /= n1;
+      const double e2[3] = {f[1] * e1[2] - f[2] * e1[1], f[2] * e1[0] - f[0] * e1[2],
+                            f[0] * e1[1] - f[1] * e1[0]};
+      std::memcpy(sun_f_, f, sizeof(f));
+      std::memcpy(sun_e1_, e1, sizeof(e1));
+      std::memcpy(sun_e2_, e2, sizeof(e2));
+      std::memcpy(sun_c0_, cam, sizeof(cam));
+      sun_ci_ = sun_cj_ = 0;
+      sun_r_ = R;
+      sun_ref_ = dot3(cam, f);
+      ClearImage(&sun_trees_[sun_cur_], far_depth, 1.0f, 0, false, true, true);
+      FlushPendingClears();
+      sun_map_ok_ = true;
+      ++stats_.sun_map_resets;
+    } else {
+      // Kept to the sun's direction it was started with (the same to a
+      // fraction of a degree).
+      std::memcpy(f, sun_f_, sizeof(f));
+    }
+    std::memcpy(sun_last_cam_, cam, sizeof(cam));
+    // Moved along when the camera is an eighth of the map from its centre.
+    const double rel[3] = {cam[0] - sun_c0_[0], cam[1] - sun_c0_[1], cam[2] - sun_c0_[2]};
+    const int64_t ai = std::llround(dot3(rel, sun_e1_) / texel);
+    const int64_t aj = std::llround(dot3(rel, sun_e2_) / texel);
+    const int64_t limit = int64_t(kSunMapSize) / 8;
+    if (std::llabs(ai - sun_ci_) > limit || std::llabs(aj - sun_cj_) > limit) {
+      const int64_t dx = ai - sun_ci_, dy = aj - sun_cj_;
+      Image& src = sun_trees_[sun_cur_];
+      Image& dst = sun_trees_[sun_cur_ ^ 1];
+      ClearImage(&dst, far_depth, 1.0f, 0, false, true, true);
+      FlushPendingClears();
+      const int64_t n = int64_t(kSunMapSize);
+      if (std::llabs(dx) < n && std::llabs(dy) < n) {
+        VkImageCopy r{};
+        r.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        r.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        r.srcOffset = {int32_t(std::max<int64_t>(dx, 0)), int32_t(std::max<int64_t>(dy, 0)), 0};
+        r.dstOffset = {int32_t(std::max<int64_t>(-dx, 0)), int32_t(std::max<int64_t>(-dy, 0)), 0};
+        r.extent = {uint32_t(n - std::llabs(dx)), uint32_t(n - std::llabs(dy)), 1};
+        Barrier();
+        vk::vkCmdCopyImage(cb_, src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        Barrier();
+      }
+      sun_cur_ ^= 1;
+      sun_ci_ = ai;
+      sun_cj_ = aj;
+    }
+  }
+  if (!trees) {
+    // No tree map: the same frame, here only to measure the shadow map's
+    // texels in metres (the filter's radii).
+    const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
+    const double* ref_axis = std::fabs(f[1]) < 0.9 ? up : side;
+    double e1[3] = {ref_axis[1] * f[2] - ref_axis[2] * f[1], ref_axis[2] * f[0] - ref_axis[0] * f[2],
+                    ref_axis[0] * f[1] - ref_axis[1] * f[0]};
+    const double n1 = std::sqrt(dot3(e1, e1));
+    for (double& v : e1) v /= n1;
+    const double e2[3] = {f[1] * e1[2] - f[2] * e1[1], f[2] * e1[0] - f[0] * e1[2],
+                          f[0] * e1[1] - f[1] * e1[0]};
+    std::memcpy(sun_f_, f, sizeof(f));
+    std::memcpy(sun_e1_, e1, sizeof(e1));
+    std::memcpy(sun_e2_, e2, sizeof(e2));
+    std::memcpy(sun_c0_, cam, sizeof(cam));
+    sun_ci_ = sun_cj_ = 0;
+    sun_ref_ = dot3(cam, f);
+    sun_map_ok_ = false;  // started over when trees are back
+  }
+  // The tree map's centre and rows (world -> its ndc x, y and depth).
+  double C[3];
+  for (int i = 0; i < 3; ++i) {
+    C[i] = sun_c0_[i] + double(sun_ci_) * texel * sun_e1_[i] + double(sun_cj_) * texel * sun_e2_[i];
+  }
+  double O[16] = {};
+  for (int i = 0; i < 3; ++i) {
+    O[0 * 4 + i] = sun_e1_[i] / R;
+    O[1 * 4 + i] = sun_e2_[i] / R;
+    O[2 * 4 + i] = sun_f_[i] / kSunDepth;
+  }
+  O[0 * 4 + 3] = -dot3(C, sun_e1_) / R;
+  O[1 * 4 + 3] = -dot3(C, sun_e2_) / R;
+  O[2 * 4 + 3] = 0.5 - sun_ref_ / kSunDepth;
+  O[15] = 1.0;
+  if (trees && sun_map_ok_ && !casters.empty()) {
+    Image* map = &sun_trees_[sun_cur_];
+    // Camera clip -> world (the lighting's inverse view-projection, which
+    // takes x, y, 1 - depth) -> the tree map.
+    double OI[16];
+    for (int r = 0; r < 4; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        double v = 0;
+        for (int k = 0; k < 4; ++k) v += O[r * 4 + k] * inv_vp_[k * 4 + c];
+        OI[r * 4 + c] = v;
+      }
+    }
+    static const std::vector<Image*> kNoColors;
+    BeginRendering(kNoColors, map);
+    const float one[4] = {1, 1, 1, 1};
+    vk::vkCmdSetBlendConstants(cb_, one);
+    vk::vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vk::vkCmdSetStencilCompareMask(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vk::vkCmdSetStencilWriteMask(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vk::vkCmdSetDepthBias(cb_, 0.0f, 0.0f, 0.0f);
+    VkViewport vp{0, 0, float(kSunMapSize), float(kSunMapSize), 0.0f, 1.0f};
+    vk::vkCmdSetViewport(cb_, 0, 1, &vp);
+    VkRect2D sc{{0, 0}, {kSunMapSize, kSunMapSize}};
+    vk::vkCmdSetScissor(cb_, 0, 1, &sc);
+    VkPipeline bound = VK_NULL_HANDLE;
+    for (CasterDraw& c : casters) {
+      // The draw's clip position as the game gave it (the viewport's z
+      // scale and offset make its depth: 1 - depth = (1 - zo) w - zs z).
+      const double zs = c.sys.ndc_scale[2], zo = c.sys.ndc_offset[2];
+      const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -zs, 1.0 - zo, 0, 0, 0, 1};
+      SystemConstants sys = c.sys;
+      for (int r = 0; r < 4; ++r) {
+        for (int col = 0; col < 4; ++col) {
+          double v = 0;
+          for (int k = 0; k < 4; ++k) v += OI[r * 4 + k] * K[k * 4 + col];
+          sys.reproject[col * 4 + r] = float(v);  // column-major
+        }
+      }
+      sys.ndc_scale[0] = sys.ndc_scale[1] = sys.ndc_scale[2] = 1.0f;
+      sys.ndc_offset[0] = sys.ndc_offset[1] = sys.ndc_offset[2] = 0.0f;
+      // No MSAA coverage, camera fade or dither here; the alpha test stays.
+      sys.flags &= 0x7Fu | 128u;
+      sys.flags |= 16384u;  // XE_FLAG_REPROJECT
+      sys.res_scale = 1.0f;
+      sys.rt_inv_size[0] = sys.rt_inv_size[1] = 1.0f / float(kSunMapSize);
+      uint32_t offsets[5];
+      std::memcpy(offsets, c.offsets, sizeof(offsets));
+      offsets[0] = WriteUniform(&sys, sizeof(sys));
+      if (c.pipeline != bound) {
+        vk::vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipeline);
+        bound = c.pipeline;
+      }
+      VkDescriptorSet sets[4] = {set0_, set1_, c.tex_sets[0], c.tex_sets[1]};
+      vk::vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 4, sets, 5,
+                                  offsets);
+      if (c.indexed) {
+        vk::vkCmdBindIndexBuffer(cb_, c.index_buffer, 0, c.index_type);
+        vk::vkCmdDrawIndexed(cb_, c.count, 1, c.first, 0, 0);
+      } else {
+        vk::vkCmdDraw(cb_, c.count, 1, 0, 0);
+      }
+    }
+    stats_.tree_casters += uint32_t(casters.size());
+    ++sun_trees_drawn_;
+    EndRendering();
+    Barrier();
+    dyn_ = DynState{};
+  }
+  // Pass 1: per texel of the map, the ground and the caster along its ray.
+  // Map texel (u, v, depth) -> the light's ndc (its viewport undone) ->
+  // world through the light's inverse view-projection.
+  auto ensure = [&](Image& im, VkFormat fmt, const char* name) {
+    if (im.image && im.width == w && im.height == h && im.format == fmt) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(w, h, fmt, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(sun_prep_, VK_FORMAT_R32G32B32A32_SFLOAT, "sun_prep");
+  ensure(sun_out_, shadow->format, "sun_shadows");
+  const SystemConstants& ls = sun_light_sys_;
+  const double D[16] = {2.0 / ls.ndc_scale[0], 0, 0, (-1.0 - ls.ndc_offset[0]) / ls.ndc_scale[0],
+                        0, 2.0 / ls.ndc_scale[1], 0, (-1.0 - ls.ndc_offset[1]) / ls.ndc_scale[1],
+                        0, 0, 1.0 / ls.ndc_scale[2], -ls.ndc_offset[2] / ls.ndc_scale[2],
+                        0, 0, 0, 1};
+  float prep_pc[28];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      double v = 0;
+      for (int k = 0; k < 4; ++k) v += Vinv[r * 4 + k] * D[k * 4 + c];
+      prep_pc[c * 4 + r] = float(v);  // column-major
+    }
+  }
+  for (int i = 0; i < 3; ++i) prep_pc[16 + i] = float(f[i]);
+  prep_pc[19] = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    prep_pc[20 + i] = float(O[0 * 4 + i]);
+    prep_pc[24 + i] = float(O[1 * 4 + i]);
+  }
+  FullscreenPass(CopyKind::kSunPrep, &sun_prep_, &sun_zo_, &sun_zr_, &sun_raw_, false, prep_pc, 28);
+  // Pass 2: the filter. Penumbra radius = k * (caster to ground) + the
+  // smallest (about the game's blur, a texel or two of its map).
+  const float k = 0.04f * shadow_softness_;
+  const float search = std::max(k * 40.0f, 0.25f);
+  const float min_texels = std::clamp(1.5f * float(w) / 1280.0f, 1.0f, 3.0f) * 0.75f;
+  float pc[12] = {k, search, min_texels, 32.0f,
+                  float(R), N, float(sun_ref_), float(kSunDepth),
+                  trees && sun_map_ok_ ? tree_shadow_ : 0.0f, 0.15f, 0.0f, 0.0f};
+  FullscreenPass(CopyKind::kSunPcss, &sun_out_, &sun_raw_, &sun_prep_,
+                 trees && sun_map_ok_ ? &sun_trees_[sun_cur_] : nullptr, true, pc, 12);
   VkImageCopy region{};
   region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.extent = {w, h, 1};
-  vk::vkCmdCopyImage(cb_, tree_tmp_.image, VK_IMAGE_LAYOUT_GENERAL, shadow->image,
+  vk::vkCmdCopyImage(cb_, sun_out_.image, VK_IMAGE_LAYOUT_GENERAL, shadow->image,
                      VK_IMAGE_LAYOUT_GENERAL, 1, &region);
   Barrier();
   dyn_ = DynState{};
@@ -6702,6 +7047,14 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       ao_hidden_ok_ = SnapshotDepth(depth, float_depth, ao_after_hidden_, "ao_after_hidden");
     }
   }
+  // Sun shadows: the inputs kept at the shadow map's first blur (it blurs
+  // the map in place).
+  if (SunShadowsOn() && !sun_prepared_ && max_draws_ == UINT32_MAX && !light_seen_ &&
+      ps->info.ucode_hash == kShadowBlurPixelShader &&
+      ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
+    sun_prepared_ = true;
+    PrepareSunShadows(d, st);
+  }
   mark(6);
   keep_target_clears_ = true;
   BeginRendering(colors, depth);
@@ -6792,35 +7145,59 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // need their own motion; the scenery before it is static, and the
   // camera's motion from the depth is exact for it. That skips nearly all
   // of the scene's draws (recording each one twice cost a few ms a frame).
-  // Tree shadows: the scene pass's trees and objects (before the lighting),
-  // kept to be drawn again from the sun (DrawTreeShadows).
-  if (tree_shadow_ > 0.0f && !light_seen_ && tiling_.width && depth && max_draws_ == UINT32_MAX &&
-      d.up_vertices.empty() && IsShadowCaster(vs->info.ucode_hash) &&
+  // Sun shadows: the scene pass's trees and props (before the lighting),
+  // kept to be drawn again from the sun into the tree map; the shadow
+  // pass's terrain, to be drawn again alone (the ground under the casters).
+  if (SunShadowsOn() && max_draws_ == UINT32_MAX && depth && d.up_vertices.empty() &&
       (d.prim == 4 || d.prim == 5 || d.prim == 6 || d.prim == 13)) {
-    if (tree_mask_.image) {
-      caster_colors_.assign(1, &tree_mask_);
-      const VkPipeline cp = PipelineFor(d, st, *vs, *ps, caster_colors_, nullptr, 1, false, false,
-                                        false, true);
-      if (cp) {
-        CasterDraw c{};
-        c.pipeline = cp;
-        c.tex_sets[0] = tex_sets[0];
-        c.tex_sets[1] = tex_sets[1];
-        std::memcpy(c.offsets, offsets, sizeof(offsets));
-        c.indexed = indexed;
-        c.index_type = index_type;
-        c.index_buffer = cur_index_buffer_;
-        c.first = first_index;
-        c.count = indexed ? index_count : d.count;
-        c.sys = sys;
-        // Cut-outs by alpha to coverage (MSAA) become an alpha test: the
-        // mask has one sample.
-        const uint32_t colorctl = st.reg(0x2202);
-        if (colorctl & 0x10) {
-          c.sys.alpha_func = 6;  // greater or equal
-          c.sys.alpha_ref = 0.5f;
+    auto keep = [&](VkPipeline pl, std::vector<CasterDraw>& to, bool alpha_test) {
+      CasterDraw c{};
+      c.pipeline = pl;
+      c.tex_sets[0] = tex_sets[0];
+      c.tex_sets[1] = tex_sets[1];
+      std::memcpy(c.offsets, offsets, sizeof(offsets));
+      c.indexed = indexed;
+      c.index_type = index_type;
+      c.index_buffer = cur_index_buffer_;
+      c.first = first_index;
+      c.count = indexed ? index_count : d.count;
+      c.sys = sys;
+      // Cut-outs by alpha to coverage (MSAA) become an alpha test: the
+      // maps have one sample.
+      if (alpha_test && (st.reg(0x2202) & 0x10)) {
+        c.sys.alpha_func = 6;  // greater or equal
+        c.sys.alpha_ref = 0.5f;
+      }
+      to.push_back(c);
+    };
+    // (Diagnostics, "sunkeep": the trees drawn into the map once only, to
+    // check that their shadows stay.)
+    if (tree_shadow_ > 0.0f && !light_seen_ && tiling_.width &&
+        IsShadowCaster(vs->info.ucode_hash) && sun_trees_[sun_cur_].image &&
+        !(Diag("sunkeep") && sun_trees_drawn_ > 0)) {
+      static const std::vector<Image*> kNoColors;
+      const VkPipeline cp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_trees_[sun_cur_], 0,
+                                        false, false, false, true);
+      if (cp) keep(cp, caster_draws_, true);
+    }
+    if (!light_seen_ && (st.reg(0x2200) & 2) &&
+        ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
+      sun_depth_target_ = depth;
+      sun_float_depth_ = (st.reg(0x2002) >> 16) & 1;
+      if (vs->info.ucode_hash == kTerrainShadowVertexShader && !sun_light_ok_) {
+        for (int k = 0; k < 16; ++k) {
+          float f;
+          std::memcpy(&f, &st.vs_consts[k], 4);
+          sun_light_vp_[k] = f;
         }
-        caster_draws_.push_back(c);
+        sun_light_sys_ = sys;
+        sun_light_ok_ = true;
+      }
+      if (ps->info.ucode_hash == kTerrainShadowPixelShader && sun_zr_.image &&
+          sun_zr_.width == depth->width && sun_zr_.height == depth->height) {
+        static const std::vector<Image*> kNoColors;
+        const VkPipeline rp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_zr_, 0);
+        if (rp) keep(rp, receiver_draws_, false);
       }
     }
   }
@@ -7988,9 +8365,10 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_out_img_);
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
-  gpu_.DestroyImage(tree_mask_);
-  gpu_.DestroyImage(tree_blur_);
-  gpu_.DestroyImage(tree_tmp_);
+  for (Image* im : {&sun_raw_, &sun_zo_, &sun_zr_, &sun_prep_, &sun_out_, &sun_trees_[0],
+                    &sun_trees_[1]}) {
+    gpu_.DestroyImage(*im);
+  }
   gpu_.DestroyImage(ao_before_hidden_);
   gpu_.DestroyImage(ao_after_hidden_);
   gpu_.DestroyImage(vel_img_);
@@ -8095,6 +8473,9 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   ao_hidden_state_ = 0;
   ao_before_ok_ = ao_hidden_ok_ = false;
   caster_draws_.clear();
+  receiver_draws_.clear();
+  sun_depth_target_ = nullptr;
+  sun_light_ok_ = sun_prepared_ = sun_inputs_ok_ = false;
   shadow_av_ = shadow_distance_ > 0.0f ? next_shadow_av_ : 1.0f;
   shadow_fade_ = shadow_distance_ > 0.0f ? next_shadow_fade_ : 1.0f;
   nearest_character_ = 1e9f;
@@ -8390,6 +8771,10 @@ void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(str
 
 void Renderer::SetTreeShadows(float strength) { impl_->tree_shadow_ = std::max(strength, 0.0f); }
 
+void Renderer::SetShadowSoftness(float softness) {
+  impl_->shadow_softness_ = std::max(softness, 0.0f);
+}
+
 void Renderer::SetShadows(float resolution, float distance) {
   impl_->shadow_res_ = resolution > 0.0f ? std::clamp(resolution, 0.5f, 4.0f) : 0.0f;
   impl_->shadow_distance_ = std::max(distance, 0.0f);
@@ -8526,7 +8911,7 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   for (auto& [k, im] : impl_->resolved_) out.push_back(Describe(&im));
   for (auto& [k, im] : impl_->resolved_packed_) out.push_back(Describe(&im));
   if (impl_->reactive_img_.image) out.push_back(Describe(&impl_->reactive_img_));
-  if (impl_->tree_mask_.image) out.push_back(Describe(&impl_->tree_mask_));
+  if (impl_->sun_out_.image) out.push_back(Describe(&impl_->sun_out_));
   return out;
 }
 
