@@ -5671,7 +5671,7 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   const float search = std::max(k * 40.0f, 0.25f);
   const float min_texels = std::clamp(1.5f * float(w) / 1280.0f, 1.0f, 3.0f) * 0.75f;
   float pc[12] = {k, search, min_texels, 32.0f,
-                  float(R), N, float(sun_ref_), float(kSunDepth),
+                  float(R), float(N), float(sun_ref_), float(kSunDepth),
                   trees && sun_map_ok_ ? tree_shadow_ : 0.0f, 0.15f, 0.0f, 0.0f};
   FullscreenPass(CopyKind::kSunPcss, &sun_out_, &sun_raw_, &sun_prep_,
                  trees && sun_map_ok_ ? &sun_trees_[sun_cur_] : nullptr, true, pc, 12);
