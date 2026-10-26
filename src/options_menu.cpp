@@ -427,9 +427,9 @@ const std::vector<Tab>& Tabs() {
                          {"200", "Soft"}}),
                 Toggle("native_tree_shadows", "Tree shadows",
                        "The trees, rocks and props cast real sun shadows, dappled through "
-                       "the branches, on top of the shadows painted into the slopes. Every "
-                       "tree seen keeps its shadow when you look away. Reaches as far as "
-                       "Shadow distance (up to about 150 m). Native renderer only."),
+                       "the branches, in place of the shadows painted into the slopes "
+                       "(those fade back in at the edge of Shadow distance). Every tree seen "
+                       "keeps its shadow when you look away. Native renderer only."),
                 Toggle("native_ambient_occlusion", "Ambient occlusion",
                        "Shading where the open sky's light can't reach: the snow around tree "
                        "trunks, rails, jumps and buildings, creases and corners, worked out "

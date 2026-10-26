@@ -566,40 +566,46 @@ the casters from the sun into a depth/stencil surface; casters write stencil
 caster is the nearest thing to the sun. The depth is resolved and read back
 as 8_8_8_8 (the stencil byte is the lighting's `.z`), blurred twice in place,
 and the lighting multiplies by it. There's no depth comparison: the shadow
-lands on whatever is under the caster.
+lands on whatever is under the caster. The light is directional, its
+direction fixed per mountain (the one the map's rows u, v, w all take to
+zero).
 
 With **Shadow softness** or **Tree shadows** (both part of Revamped
 Graphics) the native renderer replaces the blurred map at the lighting pass:
 
-- At the map's first blur it keeps the unblurred map, the shadow pass's
-  depth, and the pass's terrain (pixel shader `515E86DBD1D61732`) drawn again
-  alone into a depth of its own: the ground under every caster. The light's
-  view-projection comes from the terrain's vertex shader (`7FB9597D0D8178C1`,
-  c0-c3), so each texel's ground and caster are world points; the sun's
-  direction is the one the map's rows u, v, w all take to zero.
+- **Sun maps**: two orthographic depth maps along the sun, anchored in the
+  world and never cleared while the camera stays near: the scene pass's
+  trees, rocks and props (vertex shaders `5919B6B651142594`,
+  `9BAF953BF548C874`, `BEF747C713765676`, `8D6CC76801E89D1A`), and its
+  terrain (`9BD0F06927F4EA3B`). Every tree and slope drawn since stays in
+  them, so turning away from a tree (the game then culls it) doesn't take its
+  shadow away. Each draw is reprojected in its vertex shader
+  (`XE_FLAG_REPROJECT`): camera clip -> world (`inv_vp_`) -> the map. Their
+  size follows **Shadow resolution** (1024 texels a side at 1x, 2048 at 2x,
+  4096 at 4x); they cover 1.15 x the shadows' reach (Shadow distance, 45 m
+  by default; 30-180 m), are moved a whole number of texels at a time when
+  the camera gets an eighth of the way off centre, and start over when the
+  sun's direction changes (another mountain), the camera jumps, or their
+  size changes.
+- Each texel of the game's map is a ray; the lighting's own rows (c6, c7,
+  c9), inverted on the maps' plane, say where that ray is in the sun maps,
+  so the ground it lands on comes from the ground map without needing the
+  light's full view-projection. The casters' (riders', objects') heights do:
+  it's taken from the shadow pass's terrain vertex shader
+  (`7FB9597D0D8178C1`, c0-c3) when that's drawn; without it that frame they
+  get an even, narrow blur.
 - **Shadow softness** (`native_shadow_softness`, percent, default 100):
-  percentage-closer soft shadows. Per texel, the casters near it (stencil 0)
-  give their average distance above the ground along the sun, d; the stencil
-  is then averaged over a disc of radius 0.04 x softness x d metres (at least
-  about a texel). Sharp at a rider's feet, soft at the head; 0 keeps an even
-  blur of about a texel.
-- **Tree shadows** (`native_tree_shadows`): the scene pass's trees, rocks and
-  props (vertex shaders `5919B6B651142594`, `9BAF953BF548C874`,
-  `BEF747C713765676`, `8D6CC76801E89D1A`) are drawn again into a **tree map**:
-  2048 x 2048 depth along the sun, orthographic, anchored in the world and
-  never cleared while the camera stays near. Every tree drawn since keeps its
-  shadow, so turning the camera away from a tree (the game then culls it)
-  doesn't take its shadow off the slope. The map is centred near the camera
-  (moved a whole number of texels, the contents copied across, when it gets
-  an eighth of the way off), as wide as the shadows reach (1.15 x Shadow
-  distance, 45 m by default, 30-180 m), and started over when the sun moves,
-  the camera jumps or the reach changes. Each draw is reprojected in its
-  vertex shader (`XE_FLAG_REPROJECT`): camera clip -> world (`inv_vp_`) ->
-  the tree map. The trees' shadows get the same contact-hardening filter
-  (blockers nearer the sun than the texel's ground, then a disc).
-- Riders aren't lit by the lighting pass (they're drawn after it), so the
-  ground is the only receiver; trails read the same map.
+  percentage-closer soft shadows. The casters near a texel give their
+  average height above the ground along the sun, d; the shadow is averaged
+  over a disc of radius 0.04 x softness x d metres (at least about a
+  texel): sharp at a rider's feet, soft at the head, the same for the trees.
+- **Painted shadows faded**: with Tree shadows on, the slopes' painted
+  shadow map (the lighting's tf2, 4096 x 4096 over the whole mountain, u, v =
+  world x, z x c5.xy + c5.zw) is replaced for the lighting by a copy faded to
+  lit within 70% of the reach (by x, z distance from the camera), back to
+  the painted one at the reach. Only the texels around the camera are redone
+  each frame. (The painted map also has the mountains' own shadows; those
+  aren't drawn in real time, so they go too within the reach.)
 - The replayer: `--tree-shadows <strength> --shadow-softness <scale>` (with
-  `--repeat 3`: the map is recognised from the previous frame and the tree
-  map needs a frame), `--diag sun` (what was found), `--diag sunkeep` (trees
-  drawn into the tree map in the first frame only: their shadows must stay).
+  `--repeat 3`), `--diag sun` (what was found), `--diag sunkeep` (trees drawn
+  into the map the first time only; with `--repeat 4` the frame must match).
