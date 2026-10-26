@@ -557,3 +557,28 @@ into a 4096 x 4096 map of the slopes (the lighting's tf2), not drawn.
   the sun as the level's artists baked it.
 - The replayer: `--shadow-res <x> --shadow-distance <m>` (with `--repeat 2`:
   the map is recognised from the previous frame).
+
+## Tree shadows
+
+The game never draws its trees into the shadow map (their shadows are the
+painted slope map's, fixed and blurry). With **Tree shadows**
+(`native_tree_shadows`, part of Revamped Graphics) the native renderer keeps
+the scene pass's draws of trees, distant trees, rocks and props (vertex
+shaders `5919B6B651142594`, `9BAF953BF548C874`, `BEF747C713765676`,
+`8D6CC76801E89D1A`; not the terrain) and, at the lighting pass, draws them
+again from the sun:
+
+- Each draw's clip position is taken back to the world through the
+  lighting's inverse view-projection (`inv_vp_`, after undoing the draw's
+  own depth range) and on into the shadow map through the lighting's rows c6,
+  c7 (remapped with Shadow distance) and c9: one matrix per draw, applied in
+  the vertex shader epilogue (`XE_FLAG_REPROJECT`, `xe_sys.reproject`).
+- They go into an R8 mask the size of the game's blurred shadow map (cleared
+  to 1, a draw's fragments write 0; no culling, alpha to coverage turned into
+  an alpha test at 0.5, so the branches' cut-outs come through), which is
+  blurred (a gaussian about 3 of the game's texels wide) and multiplied into
+  the shadow map just before the lighting reads it. So the shadows fade out
+  with the game's at the map's reach (Shadow distance), and the painted map
+  still does the far slopes.
+- About 1,600-1,900 extra draws in the forest captures. The replayer:
+  `--tree-shadows <strength>` (with `--repeat 2`).

@@ -1004,6 +1004,7 @@ struct SystemConstants {  // std140 layout of XeSystem
   uint32_t scaled_textures;  // VS bindings in bits 0..15, PS in 16..31
   float rt_inv_size[2];      // 1 / render target size (std140: the array starts at 80)
   float tex_scale[32];       // per binding (VS 0..15, PS 16..31): 1, or the image's scale
+  float reproject[16];       // VS, XE_FLAG_REPROJECT (16384): column-major mat4
 };
 static_assert(offsetof(SystemConstants, tex_scale) == 80, "XeSystem std140 layout");
 
@@ -1013,6 +1014,13 @@ static_assert(offsetof(SystemConstants, tex_scale) == 80, "XeSystem std140 layou
 // Amped 3's deferred lighting pixel shader (camera motion blur reads its
 // constants and textures).
 constexpr uint64_t kLightingPixelShader = 0xC17CD159D811B298ull;
+// The scene pass's trees and objects (vertex shaders), drawn again from the
+// sun for tree shadows: trunks and foliage, distant trees, rocks and props.
+// Not the terrain (it would shade itself everywhere).
+bool IsShadowCaster(uint64_t vs_hash) {
+  return vs_hash == 0x5919B6B651142594ull || vs_hash == 0x9BAF953BF548C874ull ||
+         vs_hash == 0xBEF747C713765676ull || vs_hash == 0x8D6CC76801E89D1Aull;
+}
 // The snow trails' vertex shader (it projects into the shadow map, c9-c12).
 constexpr uint64_t kTrailVertexShader = 0xCBEB0B975321F043ull;
 // The shadow map's blur (two passes over the map read as 8_8_8_8).
@@ -1225,7 +1233,8 @@ struct Renderer::Impl {
                        float lod_bias = 0.0f);
   VkPipeline PipelineFor(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
                          const std::vector<Image*>& colors, Image* depth, uint32_t color_mask_bits,
-                         bool velocity = false, bool mask = false, bool reactive = false);
+                         bool velocity = false, bool mask = false, bool reactive = false,
+                         bool caster = false);
   void Prepass();
   void CreateOnce();
   void BeginFrame();
@@ -1336,6 +1345,25 @@ struct Renderer::Impl {
   // kept, the far edge pushed out), and the lighting's shadow fade (c10, c11:
   // raw scene depths where shadows fade out) scaled by fade.
   float shadow_av_ = 1.0f, shadow_fade_ = 1.0f;
+  // Tree shadows (SetTreeShadows): the trees and objects of the scene pass
+  // (drawn before the lighting), drawn again from the sun into a mask the
+  // size of the shadow map, blurred and merged into the game's blurred
+  // shadow map just before the lighting pass reads it.
+  float tree_shadow_ = 0.0f;  // strength, 0 = off
+  struct CasterDraw {
+    VkPipeline pipeline;
+    VkDescriptorSet tex_sets[2];
+    uint32_t offsets[5];
+    bool indexed;
+    VkIndexType index_type;
+    VkBuffer index_buffer;
+    uint32_t first, count;
+    SystemConstants sys;  // as drawn; reprojected when drawn again
+  };
+  std::vector<CasterDraw> caster_draws_;
+  Image tree_mask_, tree_blur_, tree_tmp_;
+  std::vector<Image*> caster_colors_;
+  void DrawTreeShadows(const Draw& d, const GpuState& st);
   float next_shadow_av_ = 1.0f, next_shadow_fade_ = 1.0f;
   void UpdateShadowReach(const GpuState& st);
   bool scene_begun_ = false;  // this frame's tiled pass has begun
@@ -1599,7 +1627,8 @@ struct Renderer::Impl {
     kDepth = 0, kDepthMs = 1, kColorMs = 2, kOutput = 3, kOutputMs = 4, kMotionBlur = 5,
     kMotion = 6, kTileMax = 7, kNeighborMax = 8, kRows = 9, kMotionVectors = 10,
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
-    kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22
+    kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
+    kTreeBlur = 23, kTreeMerge = 24
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1640,7 +1669,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[23] = {};  // by CopyKind
+  VkShaderModule copy_fs_[25] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2874,7 +2903,7 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
 VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const Shader& vs,
                                  const Shader& ps, const std::vector<Image*>& colors, Image* depth,
                                  uint32_t color_mask_bits, bool velocity, bool mask,
-                                 bool reactive) {
+                                 bool reactive, bool caster) {
   const uint32_t mode = st.reg(0x2205);        // PA_SU_SC_MODE_CNTL
   const uint32_t depth_ctl = st.reg(0x2200);   // RB_DEPTHCONTROL
   uint32_t blend[4] = {st.reg(0x2201), st.reg(0x2209), st.reg(0x220A), st.reg(0x220B)};
@@ -2928,7 +2957,8 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       if (aa_mask & (1u << i)) sample_mask |= ((1u << scale) - 1) << (i * scale);
     }
     // Done by the shader's sample mask instead when smoothing (DoDraw).
-    alpha_to_coverage = !velocity && !mask && !smooth_alpha_ && (st.reg(0x2202) & 0x10) != 0;
+    alpha_to_coverage =
+        !velocity && !mask && !caster && !smooth_alpha_ && (st.reg(0x2202) & 0x10) != 0;
     put(0x4D530000u | host_samples);
     put(sample_mask);
     put(alpha_to_coverage ? 1u : 0u);
@@ -2938,6 +2968,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   if (velocity) put(0x56454Cu);
   if (mask) put(0x4D41534Bu);
   if (reactive) put(0x52454143u);
+  if (caster) put(0x43535452u);
   const std::string_view key(key_buf, std::min(key_len, sizeof(key_buf)));
   last_pipeline_pending_ = false;
   auto it = pipelines_.find(key);
@@ -2970,6 +3001,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   auto& rs = build->rs;
   rs.polygonMode = VK_POLYGON_MODE_FILL;
   rs.cullMode = ((mode & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((mode & 2) ? VK_CULL_MODE_BACK_BIT : 0);
+  if (caster) rs.cullMode = VK_CULL_MODE_NONE;  // seen from the sun: either side
   rs.frontFace = (mode & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
   // Polygon offset (PA_SU_SC_MODE_CNTL poly_offset_front/back_enable); the
   // values are dynamic (DoDraw).
@@ -3044,6 +3076,18 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       // The velocity image's w = 1 (builtin_exempt).
       a.blendEnable = VK_FALSE;
       a.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
+    }
+    if (caster) {
+      // Tree shadow mask (R8, cleared to 1): 0 wherever the draw leaves a
+      // fragment (its own alpha test cuts the foliage out).
+      a.blendEnable = VK_TRUE;
+      a.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+      a.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+      a.colorBlendOp = VK_BLEND_OP_ADD;
+      a.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      a.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      a.alphaBlendOp = VK_BLEND_OP_ADD;
+      a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     }
     if (reactive) {
       // The upscaler's reactive mask (R8): how much the draw adds to the
@@ -4336,6 +4380,40 @@ void main() {
   o = pc.a.z > 0.5 ? vec4(vec3(a), 1.0) : vec4(c.rgb * a, c.a);
 }
 )", true);
+  // Tree shadows, 2: the mask blurred one way (a.xy: the step in texels,
+  // a.z: taps each side), a gaussian.
+  copy_fs_[23] = CompileBuiltin("builtin_tree_blur", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D mask;
+layout(push_constant) uniform Blur { vec4 a; } pc;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 size = textureSize(mask, 0);
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  int n = int(pc.a.z);
+  float sigma = max(float(n) * 0.5, 0.5);
+  float sum = 0.0, wsum = 0.0;
+  for (int i = -n; i <= n; ++i) {
+    float w = exp(-float(i * i) / (2.0 * sigma * sigma));
+    sum += texelFetch(mask, clamp(c + ivec2(pc.a.xy) * i, ivec2(0), size - 1), 0).r * w;
+    wsum += w;
+  }
+  o = vec4(sum / wsum, 0.0, 0.0, 1.0);
+}
+)", true);
+  // Tree shadows, 3: the game's blurred shadow map (8_8_8_8: the lighting
+  // reads its .z, 1 = lit) darkened where the trees' mask is.
+  copy_fs_[24] = CompileBuiltin("builtin_tree_merge", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D mask;    // the same size, R8: 1 = lit
+layout(set = 0, binding = 1) uniform sampler2D shadow;  // the game's
+layout(push_constant) uniform Merge { vec4 a; } pc;     // strength
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 s = texelFetch(shadow, p, 0);
+  float m = 1.0 - texelFetch(mask, p, 0).r;
+  o = vec4(s.rgb * (1.0 - clamp(m * pc.a.x, 0.0, 1.0)), s.a);
+}
+)", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
 )") + clouds_common + R"(
 layout(binding = 2) uniform sampler2D sprite;
@@ -4879,6 +4957,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   depth_base_ = depth.base_address() & 0x1FFFFFFF;
   light_seen_ = true;
   UpdateShadowReach(st);
+  DrawTreeShadows(d, st);
   // Ambient occlusion: the world's depth, kept before it's resolved again.
   ao_depth_ok_ = false;
   if (ao_strength_ > 0.0f) {
@@ -5130,6 +5209,135 @@ bool Renderer::Impl::SunOnScreen(float uv[2], float* visible) const {
   const double edge = std::max(std::fabs(x), std::fabs(y));
   *visible = float(std::clamp(1.0 - (edge - 1.0) / 0.6, 0.0, 1.0));
   return *visible > 0.0f;
+}
+
+void Renderer::Impl::DrawTreeShadows(const Draw& d, const GpuState& st) {
+  // The game's blurred shadow map, as the lighting pass reads it (tf0).
+  amped3::native::TextureFetch tf;
+  std::memcpy(tf.words, FetchWords(d, 0, st), sizeof(tf.words));
+  auto sit = resolved_.find(tf.base_address() & 0x1FFFFFFF);
+  Image* shadow = sit != resolved_.end() ? &sit->second : nullptr;
+  const uint32_t w = shadow ? shadow->width : 0, h = shadow ? shadow->height : 0;
+  // The mask follows the shadow map's size (made now, used from the next
+  // frame's scene pass on: its pipelines are built against it).
+  if (tree_shadow_ <= 0.0f || !shadow || !w || !h) {
+    caster_draws_.clear();
+    return;
+  }
+  auto ensure = [&](Image& im, VkFormat f, const char* name) {
+    if (im.image && im.width == w && im.height == h && im.format == f) return false;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(w, h, f, false, name);
+    ToGeneral(cb_, im);
+    return true;
+  };
+  EndRendering();
+  ensure(tree_mask_, VK_FORMAT_R8_UNORM, "tree_mask");
+  ensure(tree_blur_, VK_FORMAT_R8_UNORM, "tree_mask_blur");
+  ensure(tree_tmp_, shadow->format, "tree_shadow_merged");
+  if (caster_draws_.empty()) return;
+  // Camera clip -> world (the lighting's inverse view-projection, which
+  // takes x, y, 1 - depth) -> the shadow map (the lighting's rows c6, c7
+  // over c9: u, v; v remapped with the shadow distance), as Vulkan clip.
+  float c6[4], c7[4], c9[4];
+  std::memcpy(c6, st.ps_consts.data() + 6 * 4, 16);
+  std::memcpy(c7, st.ps_consts.data() + 7 * 4, 16);
+  std::memcpy(c9, st.ps_consts.data() + 9 * 4, 16);
+  double L[16];
+  for (int i = 0; i < 4; ++i) {
+    const double v = shadow_av_ * (c7[i] - c9[i]) + c9[i];
+    L[0 * 4 + i] = 2.0 * c6[i] - c9[i];
+    L[1 * 4 + i] = 2.0 * v - c9[i];
+    L[2 * 4 + i] = 0.5 * c9[i];
+    L[3 * 4 + i] = c9[i];
+  }
+  double LI[16];  // L * inv_vp_
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      double v = 0;
+      for (int k = 0; k < 4; ++k) v += L[r * 4 + k] * inv_vp_[k * 4 + c];
+      LI[r * 4 + c] = v;
+    }
+  }
+  const float one[4] = {1, 1, 1, 1};
+  ClearImage(&tree_mask_, one, 0, 0, true, false, false);
+  BeginRendering({&tree_mask_}, nullptr);
+  vk::vkCmdSetBlendConstants(cb_, one);
+  vk::vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+  vk::vkCmdSetStencilCompareMask(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+  vk::vkCmdSetStencilWriteMask(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+  vk::vkCmdSetDepthBias(cb_, 0.0f, 0.0f, 0.0f);
+  VkViewport vp{0, 0, float(w), float(h), 0.0f, 1.0f};
+  vk::vkCmdSetViewport(cb_, 0, 1, &vp);
+  VkRect2D sc{{0, 0}, {w, h}};
+  vk::vkCmdSetScissor(cb_, 0, 1, &sc);
+  VkPipeline bound = VK_NULL_HANDLE;
+  VkIndexType bound_type = VK_INDEX_TYPE_UINT32;
+  VkBuffer bound_buffer = VK_NULL_HANDLE;
+  for (CasterDraw& c : caster_draws_) {
+    // The draw's clip position as the game gave it (the viewport's z scale
+    // and offset make its depth: 1 - depth = (1 - zo) w - zs z), then L.
+    const double zs = c.sys.ndc_scale[2], zo = c.sys.ndc_offset[2];
+    double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -zs, 1.0 - zo, 0, 0, 0, 1};
+    SystemConstants sys = c.sys;
+    for (int r = 0; r < 4; ++r) {
+      for (int col = 0; col < 4; ++col) {
+        double v = 0;
+        for (int k = 0; k < 4; ++k) v += LI[r * 4 + k] * K[k * 4 + col];
+        sys.reproject[col * 4 + r] = float(v);  // column-major
+      }
+    }
+    sys.ndc_scale[0] = sys.ndc_scale[1] = sys.ndc_scale[2] = 1.0f;
+    sys.ndc_offset[0] = sys.ndc_offset[1] = sys.ndc_offset[2] = 0.0f;
+    // No MSAA coverage, camera fade or dither here; the alpha test stays.
+    sys.flags &= 0x7Fu | 128u;
+    sys.flags |= 16384u;  // XE_FLAG_REPROJECT
+    sys.res_scale = 1.0f;
+    sys.rt_inv_size[0] = 1.0f / float(w);
+    sys.rt_inv_size[1] = 1.0f / float(h);
+    uint32_t offsets[5];
+    std::memcpy(offsets, c.offsets, sizeof(offsets));
+    offsets[0] = WriteUniform(&sys, sizeof(sys));
+    if (c.pipeline != bound) {
+      vk::vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipeline);
+      bound = c.pipeline;
+    }
+    VkDescriptorSet sets[4] = {set0_, set1_, c.tex_sets[0], c.tex_sets[1]};
+    vk::vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 4, sets, 5,
+                                offsets);
+    if (c.indexed) {
+      if (c.index_type != bound_type || c.index_buffer != bound_buffer) {
+        vk::vkCmdBindIndexBuffer(cb_, c.index_buffer, 0, c.index_type);
+        bound_type = c.index_type;
+        bound_buffer = c.index_buffer;
+      }
+      vk::vkCmdDrawIndexed(cb_, c.count, 1, c.first, 0, 0);
+    } else {
+      vk::vkCmdDraw(cb_, c.count, 1, 0, 0);
+    }
+  }
+  EndRendering();
+  Barrier();
+  dyn_ = DynState{};
+  ++stats_.tree_shadow_draws;
+  stats_.tree_casters += uint32_t(caster_draws_.size());
+  caster_draws_.clear();
+  // Soft edges, about as wide as the game's own shadows' (a few of its
+  // 1280-wide texels, whatever the map's size).
+  const float taps = std::clamp(std::round(3.0f * float(w) / 1280.0f), 1.0f, 12.0f);
+  float bx[4] = {1, 0, taps, 0}, by[4] = {0, 1, taps, 0};
+  FullscreenPass(CopyKind::kTreeBlur, &tree_blur_, &tree_mask_, nullptr, nullptr, false, bx, 4);
+  FullscreenPass(CopyKind::kTreeBlur, &tree_mask_, &tree_blur_, nullptr, nullptr, false, by, 4);
+  float pc[4] = {tree_shadow_, 0, 0, 0};
+  FullscreenPass(CopyKind::kTreeMerge, &tree_tmp_, &tree_mask_, shadow, nullptr, false, pc, 4);
+  VkImageCopy region{};
+  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.extent = {w, h, 1};
+  vk::vkCmdCopyImage(cb_, tree_tmp_.image, VK_IMAGE_LAYOUT_GENERAL, shadow->image,
+                     VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  Barrier();
+  dyn_ = DynState{};
 }
 
 void Renderer::Impl::UpdateShadowReach(const GpuState& st) {
@@ -6584,6 +6792,38 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // need their own motion; the scenery before it is static, and the
   // camera's motion from the depth is exact for it. That skips nearly all
   // of the scene's draws (recording each one twice cost a few ms a frame).
+  // Tree shadows: the scene pass's trees and objects (before the lighting),
+  // kept to be drawn again from the sun (DrawTreeShadows).
+  if (tree_shadow_ > 0.0f && !light_seen_ && tiling_.width && depth && max_draws_ == UINT32_MAX &&
+      d.up_vertices.empty() && IsShadowCaster(vs->info.ucode_hash) &&
+      (d.prim == 4 || d.prim == 5 || d.prim == 6 || d.prim == 13)) {
+    if (tree_mask_.image) {
+      caster_colors_.assign(1, &tree_mask_);
+      const VkPipeline cp = PipelineFor(d, st, *vs, *ps, caster_colors_, nullptr, 1, false, false,
+                                        false, true);
+      if (cp) {
+        CasterDraw c{};
+        c.pipeline = cp;
+        c.tex_sets[0] = tex_sets[0];
+        c.tex_sets[1] = tex_sets[1];
+        std::memcpy(c.offsets, offsets, sizeof(offsets));
+        c.indexed = indexed;
+        c.index_type = index_type;
+        c.index_buffer = cur_index_buffer_;
+        c.first = first_index;
+        c.count = indexed ? index_count : d.count;
+        c.sys = sys;
+        // Cut-outs by alpha to coverage (MSAA) become an alpha test: the
+        // mask has one sample.
+        const uint32_t colorctl = st.reg(0x2202);
+        if (colorctl & 0x10) {
+          c.sys.alpha_func = 6;  // greater or equal
+          c.sys.alpha_ref = 0.5f;
+        }
+        caster_draws_.push_back(c);
+      }
+    }
+  }
   // Speed blur: how close the nearest character is (the rider, when riding).
   if (light_seen_ && tiling_.width && depth && vs->info.dynamic_constants &&
       max_draws_ == UINT32_MAX) {
@@ -7748,6 +7988,9 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_out_img_);
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
+  gpu_.DestroyImage(tree_mask_);
+  gpu_.DestroyImage(tree_blur_);
+  gpu_.DestroyImage(tree_tmp_);
   gpu_.DestroyImage(ao_before_hidden_);
   gpu_.DestroyImage(ao_after_hidden_);
   gpu_.DestroyImage(vel_img_);
@@ -7851,6 +8094,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   ao_late_done_ = false;
   ao_hidden_state_ = 0;
   ao_before_ok_ = ao_hidden_ok_ = false;
+  caster_draws_.clear();
   shadow_av_ = shadow_distance_ > 0.0f ? next_shadow_av_ : 1.0f;
   shadow_fade_ = shadow_distance_ > 0.0f ? next_shadow_fade_ : 1.0f;
   nearest_character_ = 1e9f;
@@ -8144,6 +8388,8 @@ void Renderer::SetFoliageFade(bool on) {
 }
 void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(strength, 0.0f); }
 
+void Renderer::SetTreeShadows(float strength) { impl_->tree_shadow_ = std::max(strength, 0.0f); }
+
 void Renderer::SetShadows(float resolution, float distance) {
   impl_->shadow_res_ = resolution > 0.0f ? std::clamp(resolution, 0.5f, 4.0f) : 0.0f;
   impl_->shadow_distance_ = std::max(distance, 0.0f);
@@ -8280,6 +8526,7 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   for (auto& [k, im] : impl_->resolved_) out.push_back(Describe(&im));
   for (auto& [k, im] : impl_->resolved_packed_) out.push_back(Describe(&im));
   if (impl_->reactive_img_.image) out.push_back(Describe(&impl_->reactive_img_));
+  if (impl_->tree_mask_.image) out.push_back(Describe(&impl_->tree_mask_));
   return out;
 }
 

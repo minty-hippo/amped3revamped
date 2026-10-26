@@ -157,6 +157,8 @@ struct RenderStats {
   uint32_t fogged = 0;
   uint32_t god_rays = 0;  // god rays added this frame (SetGodRays)
   uint32_t ambient_occlusion = 0;  // ambient occlusion applied (SetAmbientOcclusion)
+  uint32_t tree_shadow_draws = 0;  // tree shadow masks drawn (SetTreeShadows)
+  uint32_t tree_casters = 0;       // draws in them
   // The nearest character to the camera (world units; 1e9: none).
   float nearest_character = 1e9f;
   // Object motion blur: scene draws given motion vectors, and of those the
@@ -267,6 +269,10 @@ class Renderer {
   // and the lighting's shadow fade out to about that far ahead (0: the
   // game's, about 40 m). Only what the game draws into the map casts shadows.
   void SetShadows(float resolution, float distance);
+  // Tree shadows for the following frames: the scene's trees and props drawn
+  // again from the sun into the shadow map (`strength` 0..1, 0 = off). The
+  // mask is made the first frame and used from the next.
+  void SetTreeShadows(float strength);
   // Foliage camera fade for the following frames (RendererOptions::foliage_fade).
   void SetFoliageFade(bool on);
   // Cartoon clouds that part when the view cuts to or from the trail map

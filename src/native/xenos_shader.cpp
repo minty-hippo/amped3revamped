@@ -522,6 +522,7 @@ bool Translator::Run(TranslateResult& out) {
        "  uint scaled_textures;  // bit per binding (VS 0..15, PS 16..31): a scaled image\n"
        "  vec2 rt_inv_size;     // 1 / render target size in pixels\n"
        "  vec4 tex_scale[8];    // per binding (VS 0..15, PS 16..31): its image's scale\n"
+       "  mat4 reproject;       // VS, XE_FLAG_REPROJECT: applied to the clip position\n"
        "} xe_sys;\n";
   g += "const uint XE_FLAG_XY_DIVIDED = 1u;      // position.xy already divided by w\n"
        "const uint XE_FLAG_Z_DIVIDED = 2u;       // position.z already divided by w\n"
@@ -532,6 +533,8 @@ bool Translator::Run(TranslateResult& out) {
        "const uint XE_FLAG_POINT = 128u;         // PS: point primitive (param gen)\n"
        "const uint XE_FLAG_ALPHA_TO_COVERAGE = 256u;  // PS: RB_COLORCONTROL alpha_to_mask\n"
        "const uint XE_FLAG_DEBUG_STORE = 512u;  // VS: store positions (diagnostics)\n"
+       "const uint XE_FLAG_REPROJECT = 16384u;  // VS: clip position times xe_sys.reproject\n"
+       "                                        // (another view: tree shadow casters)\n"
        "const uint XE_FLAG_SMOOTH_COVERAGE = 8192u;  // PS: alpha test / to coverage as a\n"
        "                                             // sample mask (count in bits 16..20)\n"
        "const uint XE_FLAG_CAMERA_FADE = 536870912u;  // PS: with smooth coverage, fade\n"
@@ -754,6 +757,7 @@ uint xe_vertex_index() {
          "  if ((xe_sys.flags & XE_FLAG_W_RECIPROCAL) != 0u) p.w = 1.0 / p.w;\n"
          "  if ((xe_sys.flags & XE_FLAG_XY_DIVIDED) != 0u) p.xy *= p.w;\n"
          "  if ((xe_sys.flags & XE_FLAG_Z_DIVIDED) != 0u) p.z *= p.w;\n"
+         "  if ((xe_sys.flags & XE_FLAG_REPROJECT) != 0u) p = xe_sys.reproject * p;\n"
          "  p.xyz = p.xyz * xe_sys.ndc_scale.xyz + xe_sys.ndc_offset.xyz * p.w;\n"
          "  return p;\n"
          "}\n\n";
@@ -793,6 +797,7 @@ uint xe_vertex_index() {
   if ((xe_sys.flags & XE_FLAG_W_RECIPROCAL) != 0u) p.w = 1.0 / p.w;
   if ((xe_sys.flags & XE_FLAG_XY_DIVIDED) != 0u) p.xy *= p.w;
   if ((xe_sys.flags & XE_FLAG_Z_DIVIDED) != 0u) p.z *= p.w;
+  if ((xe_sys.flags & XE_FLAG_REPROJECT) != 0u) p = xe_sys.reproject * p;
   p.xyz = p.xyz * xe_sys.ndc_scale.xyz + xe_sys.ndc_offset.xyz * p.w;
   gl_Position = p;
 )";

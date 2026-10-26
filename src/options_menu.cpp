@@ -393,8 +393,9 @@ const std::vector<Tab>& Tabs() {
                 SliderF("native_fog_start", "Fog start distance",
                         "How far away the fog begins, in metres.", "%.0f m", 0.0, 1000.0),
                 Choices("native_shadow_resolution", "Shadow resolution",
-                        "The sun's shadow map (riders, rails, jumps and objects; the trees' and "
-                        "mountains' shadows are painted into the slopes), drawn larger than the "
+                        "The sun's shadow map (riders, rails, jumps and objects, and the trees "
+                        "with Tree shadows; the mountains' shadows are painted into the slopes), "
+                        "drawn larger than the "
                         "game's 1280 x 720: sharper, more detailed shadow edges. Independent of "
                         "the render resolution. Part of Revamped Graphics (off: 1x). Native "
                         "renderer only.",
@@ -415,6 +416,11 @@ const std::vector<Tab>& Tabs() {
                          {"150", "150 m"},
                          {"200", "200 m"},
                          {"300", "300 m"}}),
+                Toggle("native_tree_shadows", "Tree shadows",
+                       "The trees, rocks and props near you cast real sun shadows, dappled "
+                       "through the branches and moving with the light, on top of the shadows "
+                       "painted into the slopes. Reaches as far as Shadow distance. Native "
+                       "renderer only."),
                 Toggle("native_ambient_occlusion", "Ambient occlusion",
                        "Shading where the open sky's light can't reach: the snow around tree "
                        "trunks, rails, jumps and buildings, creases and corners, worked out "

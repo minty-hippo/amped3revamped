@@ -92,6 +92,7 @@ const std::vector<GameSetting>& EffectSettings() {
        {{"0", "The game's (40 m)"}, {"75", "75 m"}, {"100", "100 m"}, {"150", "150 m"},
         {"200", "200 m"}, {"300", "300 m"}},
        0, 0, 0, false, true},
+      {"native_tree_shadows", "Tree shadows", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_foliage_fade", "Branch fade", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_map_clouds", "Trail map clouds", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
   };

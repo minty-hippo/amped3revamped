@@ -74,6 +74,7 @@ const std::vector<Tab>& Tabs() {
            {"native_shadow_distance", "Shadow Distance", Kind::kStops, 0, 0, 0,
             {{"0", "Game"}, {"75", "75 m"}, {"100", "100 m"}, {"150", "150 m"},
              {"200", "200 m"}, {"300", "300 m"}}},
+           {"native_tree_shadows", "Tree Shadows"},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
@@ -376,6 +377,10 @@ std::string GraphicsPanel::Hint(const Row& r) const {
     return native ? "How far ahead shadows reach (the game's: about 40 m)."
                   : "Native renderer only (Options F1 > Native renderer).";
   }
+  if (name == "native_tree_shadows") {
+    return native ? "Trees and props cast real sun shadows, as far as Shadow Distance."
+                  : "Native renderer only (Options F1 > Native renderer).";
+  }
   if (name == "native_upscaled_textures") {
     return native ? "Textures upscaled on this PC at install (textures\\upscaled)."
                   : "Native renderer only (Options F1 > Native renderer).";
@@ -492,7 +497,8 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     if (name == "native_upscaler_sharpness") dim = !native || upscaler != "fsr";
     if (name == "native_upscaler_msaa") dim = !native || upscaler == "off";
     if (name == "native_sharp_fonts" || name == "native_upscaled_textures") dim = !native;
-    if (name == "native_shadow_resolution" || name == "native_shadow_distance") {
+    if (name == "native_shadow_resolution" || name == "native_shadow_distance" ||
+        name == "native_tree_shadows") {
       dim = !native || !revamped;
     }
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);
