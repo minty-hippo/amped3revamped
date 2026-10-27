@@ -1,25 +1,46 @@
 ![alt text](https://github.com/minty-hippo/amped3revamped/blob/c53b30d0c8b10f9b75d2b94623ab7c9efb844b0a/Amped3Revamped%20logo.png "Amped 3 Revamped")
 # Amped 3 Revamped
 
-This is a recompilation of Amped 3 that has made use of ReXGlue and Claude to port the Xbox 360 code to modern platforms.
+This is a recompilation of Amped 3 that has made use of ReXGlue and Claude to port the Xbox 360 code to modern platforms. Current build targets include x86 Windows and Linux, as well as ARM Linux.
 
 Features:
  - High resolution support, with display output settings, render resolution slider, XeSS and FSR options for upscaling the graphics.
- - Enhanced visuals, including camera and object-based motion blur (toggleable with intensity slider), speed blur, atmospheric fog, crepuscular sun rays, and a fog animation when entering and leaving the Trail Map.
+ - Enhanced visuals, including:
+    - Camera and object-based motion blur (toggleable with intensity slider)
+    - Speed blur
+    - Atmospheric fog
+    - Enhanced shadows with penumbra (shadows appear sharp at base of object, but smooth out with distance)
+    - Ambient occlusion
+    - Crepuscular sun rays
+    - A cloud animation when entering and leaving the Trail Map.
+    - User-generated texture upscaling support
+    - A remade title screen logo
  - EXPERIMENTAL high framerate support with some fixes for various minigames, this is still being worked on against a full playthrough of the game and all activities. Supports 30, 40, 60, 90, 120 and unlocked frame rates.
  - Modern Controller Support via xinput or SDL.
+ - Analog trigger pulls for the crouch/speed-up mechanic. The rider will gradually crouch and speed up based upon how hard the twin trigger pull is.
  - An in-game options menu that's controller navigable. F1 still works to access every option, as well as F4 for debug options.
 
 What's been tested:
  - Northstar and Snowbird have been extensively tested, but I've yet to have tried the other parts of the game. Amped 3 Revamped includes a level and cutscene menu to replay completed story missions and cutscenes, as well as any that haven't been unlocked through normal gameplay.
- - It runs well on my Intel i7 358H laptop with 32gb of ram, around 60fps at a 50% resolution scale at 1080p or at 1440p with XESS.
- - The game runs via proton in SteamOS on a Ryzen 7700, 9070xt machine well, and less well but still functional on an Ayn Odin 3 running Armada.
+ - It runs well on my Intel i7 358H laptop with 32gb of ram, north of 60 fps at native 1080p with Revamped graphics on. XeSS and FSR also offer plenty of performance flexibility: 540p with XeSS still looks decent at 1080p and runs at 120fps.
+ - The game runs at 4k120 in SteamOS on a Ryzen 7700, 9070xt machine, and north of 60fps at 1080p with FSR 3 (540p internal) on an Ayn Odin 3 running Armada.
 
 WIP Features:
-  - A texture upscaling system that runs on the host's device, allowing for higher resolution assets. I'm working on manually recreating the fonts and have remade the title logo at a higher resolution.
   - High framerate support is mostly working, but some side missions have had issues. The injury minigame has a scoring fix in place, as does turning of sleds and the hangglider at higher resolutions matching the turn speed of the standard game. 30 fps is consistent.
-  - An x86/ARM Linux port, as I would like to test on a SteamOS desktop and on Armada on an AYN Odin 3. Proton works for both of these devices, but less translation would be preferable.
-  - It seems like the launch Xbox 360 games might be single-threaded? Going to investigate further and see if multi-threading can be enabled to improve performance even further.
+  - Improved shadows: there is now the option to render the world geometry shadows in real-time with various resolution settings, but this coverage needs to be iterated upon and optimized. Since there's no dynamic time-of-day, it would be possible to bake the static scenery shadows and lighting with a user's chosen settings.
+  - Upscaled textures: this is already implemented as a user-generated option in the launcher. Quality is a little uneven, so it could use further refinement.
+
+Wishlist/Yet to be Implemented Features and Changes:
+  - Light bounce, indirect lighting, self-shadowing, and subsurface scattering will also be explored.
+  - Fonts and other UI elements that have low-resolution assets are going to be redrawn to look better at higher resolutions.
+  - Input latency, jump and spin, and trick mechanics. These mirror the original game but I would like to improve on them in an optional way to make jumping, spinning and tricking feel more precise with user input, especially now that higher framerates are unlocked. The current implementation is sticky and not responsive. For jumping, increasing the jumping window to include letting go of A slightly off of a ramp or slope will still allow the user to jump, similar to Tony Hawk.
+  - Upscaled videos: these are crucial to the identity of the game, so I want to find an approach that can be generated on the user's machine without distributing the cutscenes with this project. I'll have to see what open-source tools will work best for improving the viewing experience on modern screens without distracting artifacts.
+
+Noted oddities and behavior relative to the original game:
+  - Your crew's AI seems sporadic during the opening sequence, glitching behind your rider.
+  - On Northstar, the one two-tiered railing close to the start will have the rider stick to it's end which slopes to the ground. This behavior is consistent with the original game.
+  - Trick transitions while grinding are fast, but seem to mimic the behavior of the original game.
+  - The awesomeness meter is only visible before you get 100% of stoked riders in map, similar to the original game. Maybe we want to keep this meter persistent? An alternative way to use this meter afterwards would be to have it act as a multiplier for trick point totals while active.
 
 # Claude generated output below...
 
