@@ -275,7 +275,14 @@ class Renderer {
   // `detail` times its size (2 or 4; 0 = the game's), from the world as
   // drawn (terrain, trees, props) seen from the sun; riders shaded by it
   // too.
-  void SetWorldShadows(int detail);
+  // `saved_only`: once this mountain's bake has been read from disk, no
+  // more updates (no cost but the riders' shading); else baked as you ride
+  // and saved (SetWorldShadowsFolder).
+  void SetWorldShadows(int detail, bool saved_only = false);
+  // Where world shadows are kept on disk (one file per mountain and size);
+  // empty: not kept. By default, a "world_shadows" folder next to
+  // RendererOptions::pipeline_cache_path.
+  void SetWorldShadowsFolder(const std::string& folder);
   // Penumbras that widen with the distance from the caster to the ground
   // (0: an even blur, 1: natural, 2: soft).
   void SetShadowSoftness(float softness);

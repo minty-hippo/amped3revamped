@@ -453,6 +453,8 @@ int main(int argc, char** argv) {
   float fog = 0.0f, fog_start = 150.0f;
   float shadow_res = 0.0f, shadow_distance = 0.0f;  // --shadow-res x, --shadow-distance m
   int world_shadows = 0;                              // --world-shadows detail
+  bool world_saved_only = false;                      // --world-saved-only
+  std::string bake_dir;                               // --bake-dir folder
   float shadow_softness = 0.0f;                       // --shadow-softness scale
   float ao = 0.0f;        // --ao strength [--ao-debug]: ambient occlusion
   bool ao_debug = false;
@@ -503,6 +505,10 @@ int main(int argc, char** argv) {
       shadow_res = std::stof(argv[++i]);
     } else if (a == "--shadow-softness" && i + 1 < argc) {
       shadow_softness = std::stof(argv[++i]);
+    } else if (a == "--world-saved-only") {
+      world_saved_only = true;
+    } else if (a == "--bake-dir" && i + 1 < argc) {
+      bake_dir = argv[++i];
     } else if (a == "--world-shadows" && i + 1 < argc) {
       world_shadows = std::stoi(argv[++i]);
     } else if (a == "--shadow-distance" && i + 1 < argc) {
@@ -808,7 +814,8 @@ int main(int argc, char** argv) {
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
     if (shadow_res > 0.0f || shadow_distance > 0.0f) renderer.SetShadows(shadow_res, shadow_distance);
-    if (world_shadows > 0) renderer.SetWorldShadows(world_shadows);
+    if (world_shadows > 0) renderer.SetWorldShadows(world_shadows, world_saved_only);
+    if (!bake_dir.empty()) renderer.SetWorldShadowsFolder(bake_dir);
     if (shadow_softness > 0.0f) renderer.SetShadowSoftness(shadow_softness);
     auto stats = renderer.Render(cap, files, max_draws);
     first_use("first frame", stats);

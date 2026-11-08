@@ -42,6 +42,7 @@
 #include <array>
 #include <thread>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <condition_variable>
 #include <vector>
@@ -52,6 +53,7 @@
 #include "xenos_texture.h"
 #include "upscaler.h"
 #include "texture_replace.h"
+#include "../../third_party/miniz/miniz.h"
 
 namespace amped3::native {
 namespace {
@@ -1087,6 +1089,11 @@ struct Renderer::Impl {
     gpu_.Init(options_.device_index, options_.match_device_uuid ? options_.device_uuid : nullptr,
               &upscaler_, &upscaler_status_);
     gpu_.CreatePipelineCache(options_.pipeline_cache_path);
+    {
+      const std::string& pcp = options_.pipeline_cache_path;
+      const size_t slash = pcp.find_last_of("/\\");
+      if (slash != std::string::npos) bake_dir_ = pcp.substr(0, slash) + "/world_shadows";
+    }
     LoadCloudSprite();
     if (options_.texture_pack || options_.hd_fonts || options_.upscaled_textures) {
       const std::string& pc = options_.pipeline_cache_path;
@@ -1367,7 +1374,6 @@ struct Renderer::Impl {
   };
   std::vector<CasterDraw> env_draws_;     // what stays put (scene pass)
   std::vector<CasterDraw> height_draws_;  // the same without the trees
-  std::vector<CasterDraw> ground_draws_;  // terrain (scene pass)
   std::unordered_set<uint64_t> shadow_caster_vs_;
   std::map<uint64_t, uint32_t> sun_rec_counts_;  // diagnostics ("sunrec")  // the shadow pass's casters' shaders
   std::vector<std::array<double, 16>> light_candidates_;  // shadow pass c0-c3
@@ -1386,11 +1392,46 @@ struct Renderer::Impl {
   // the camera stays near: the trees (and props), and the ground. Their size
   // follows the Shadow resolution setting (1024 texels a side at 1x).
   static constexpr double kSunDepth = 2000.0;  // metres the depth spans
-  Image sun_env_, sun_ground_, sun_height_, sun_scratch_;
+  Image sun_env_, sun_height_, sun_scratch_;
   Image sun_seen_, sun_seen_scratch_;  // R8: rays whose sunward side has been in view
   uint64_t sun_world_drawn_ = 0;  // frames that drew into the world map
   bool sun_map_ok_ = false, sun_frame_ok_ = false;
-  bool sun_map_frame_ = true;  // this frame draws the world into the sun maps
+  // Updates (SunCycle): -1 none this frame; 0-2 a third of the world's draws
+  // (by their order this frame); 3 all of them.
+  int sun_phase_ = -1, sun_next_phase_ = 0;
+  uint32_t sun_draw_seq_ = 0;
+  double sun_cycle_cam_[3] = {}, sun_cycle_dir_[3] = {};
+  void SunCycle(const double cam[3], const double dir[3]);
+  // The game's shadow map (this frame): world -> its texel (u, v, depth), and
+  // its depth per metre towards the sun (0: unknown): the riders' own
+  // shadows (ShadedMovers).
+  double sun_tex_from_world_[16] = {};
+  double sun_depth_per_m_ = 0.0;
+  Image sun_tiles_, sun_tiles2_;
+  // World shadows kept on disk (per mountain, per size): loaded when the
+  // mountain's painted map is first seen, saved as more is baked.
+  bool bake_saved_only_ = false;   // SetWorldShadows: no updates, what's saved
+  std::string bake_dir_;
+  uint64_t bake_key_ = 0;          // the painted map's TextureHash
+  bool bake_dirty_ = false;
+  uint64_t bake_last_save_ = 0;    // frame
+  struct BakeIo {
+    Buffer buffer;                 // host: download or upload
+    std::thread thread;
+    std::atomic<int> state{0};     // 0 idle, 1 waiting for the GPU (save), 2 working, 3 done
+    bool upload = false;
+    bool ok = false;
+    uint64_t frame = 0;
+    uint32_t w = 0, h = 0;
+    std::string path;
+  };
+  BakeIo bake_io_;
+  std::vector<std::pair<uint64_t, Buffer>> bake_retired_;  // (frame, buffer)
+  bool bake_loaded_ = false;
+  float bake_c5_[4] = {};  // the saved one is in (no updates needed in saved-only mode)
+  void BakeIoTick(Image* src);
+  void BakeSave();
+  std::string BakePath(uint32_t w, uint32_t h) const;
   double sun_f_[3] = {}, sun_e1_[3] = {}, sun_e2_[3] = {}, sun_c0_[3] = {};
   int64_t sun_ci_ = 0, sun_cj_ = 0, sun_hi_ = 0, sun_hj_ = 0;
   double sun_r_ = 0.0, sun_ref_ = 0.0, sun_href_ = 0.0, sun_last_cam_[3] = {};
@@ -1675,7 +1716,7 @@ struct Renderer::Impl {
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
-    kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31
+    kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1716,7 +1757,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[32] = {};  // by CopyKind
+  VkShaderModule copy_fs_[33] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -4432,17 +4473,16 @@ void main() {
 )", true);
   // Sun shadows, 1 (DrawSunShadows): for each texel of the game's shadow map
   // (one ray of sunlight), the ground it lands on and the nearest thing
-  // casting onto it, as distances along the sun's direction (metres), and
-  // where the ground is in the tree map (x: ground, y: caster or 1e9, zw:
-  // the tree map's ndc). a: map texel (u, v, depth) -> world; f: the sun's
-  // direction (travelling); e1, e2: the tree map's rows.
+  // casting onto it, as distances along the sun's direction (metres): x the
+  // ground (what the world map meets first along the ray, else what the
+  // shadow pass met), y the caster (1e9: none). h0-h2: map (u, v, 1) -> the
+  // world map's ndc (homogeneous); h0.w, h1.w: its depth -> metres (ref,
+  // scale). a: map (u, v, depth) -> world; f: the sun's direction, w = 1
+  // when a (the casters' height) is known.
   copy_fs_[23] = CompileBuiltin("builtin_sun_prep", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D zo;      // the shadow pass's depth
-layout(set = 0, binding = 1) uniform sampler2D ground;  // the sun's view of the ground: depth
-layout(set = 0, binding = 2) uniform sampler2D raw;     // the map unblurred: b = stencil (0: caster)
-// h0-h2: map (u, v, 1) -> the sun maps' ndc (homogeneous); h0.w, h1.w: their
-// depth -> metres along the sun (ref, scale). a: map (u, v, depth) -> world;
-// f: the sun's direction, w = 1 when a (the casters' height) is known.
+layout(set = 0, binding = 0) uniform sampler2D zo;     // the shadow pass's depth
+layout(set = 0, binding = 1) uniform sampler2D world;  // the world map: depth, 1 = nothing
+layout(set = 0, binding = 2) uniform sampler2D raw;    // the map unblurred: b = stencil (0: caster)
 layout(push_constant) uniform Prep { vec4 h0; vec4 h1; vec4 h2; mat4 a; vec4 f; } pc;
 layout(location = 0) out vec4 o;
 void main() {
@@ -4451,11 +4491,11 @@ void main() {
   vec3 uv1 = vec3((vec2(p) + 0.5) / vec2(size), 1.0);
   vec3 s3 = vec3(dot(pc.h0.xyz, uv1), dot(pc.h1.xyz, uv1), dot(pc.h2.xyz, uv1));
   vec2 st = s3.xy / s3.z;
-  ivec2 gsize = textureSize(ground, 0);
+  ivec2 gsize = textureSize(world, 0);
   vec2 g = (0.5 + 0.5 * st) * vec2(gsize);
   float gz = 1.0;
-  if (all(greaterThanEqual(g, vec2(0.0))) && all(lessThan(g, vec2(gsize)))) {
-    gz = texelFetch(ground, ivec2(g), 0).r;
+  if (pc.h2.w > 0.5 && all(greaterThanEqual(g, vec2(0.0))) && all(lessThan(g, vec2(gsize)))) {
+    gz = texelFetch(world, ivec2(g), 0).r;
   }
   float dr = gz < 1.0 ? pc.h0.w + (gz - 0.5) * pc.h1.w : 1e9;
   float dso = 1e9;
@@ -4463,9 +4503,30 @@ void main() {
     vec4 wo = pc.a * vec4(uv1.xy, texelFetch(zo, p, 0).r, 1.0);
     float d = dot(wo.xyz / wo.w, pc.f.xyz);
     if (texelFetch(raw, p, 0).b < 0.5) dso = d;
-    if (gz >= 1.0) dr = d;  // ground not seen yet: what the ray meets first
+    if (gz >= 1.0) dr = d;  // not in the world map: what the ray meets first
   }
-  o = vec4(dr, dso, st);
+  o = vec4(dr, dso, 0.0, 0.0);
+}
+)", true);
+  // Sun shadows, 1b: where the game's casters are, coarsely (1/8 size: the
+  // least stencil of each 8 x 8 block), then that spread over 4 blocks each
+  // way: the filter skips everywhere else (most of the map).
+  copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(push_constant) uniform Tiles { vec4 a; } pc;  // a.x: block size (8: from the map; 1: spread)
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 size = textureSize(src, 0);
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  float m = 1.0;
+  if (pc.a.x > 1.5) {
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) m = min(m, texelFetch(src, min(p * 8 + ivec2(x, y), size - 1), 0).b);
+  } else {
+    for (int y = -4; y <= 4; ++y)
+      for (int x = -4; x <= 4; ++x) m = min(m, texelFetch(src, clamp(p + ivec2(x, y), ivec2(0), size - 1), 0).r);
+  }
+  o = vec4(m);
 }
 )", true);
   // World shadows (BakeWorldShadows), 1: the slopes' painted shadow map
@@ -4489,8 +4550,7 @@ void main() {
   copy_fs_[26] = CompileBuiltin("builtin_bake", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D heights;  // from above: depth, 1 = nothing
 layout(set = 0, binding = 1) uniform sampler2D world;    // from the sun: depth, 1 = nothing
-layout(set = 0, binding = 2) uniform sampler2D ground;   // the terrain alone, from the sun
-layout(set = 0, binding = 3) uniform sampler2D seen;     // rays whose sunward side was in view
+layout(set = 0, binding = 2) uniform sampler2D seen;     // rays whose sunward side was in view
 layout(push_constant) uniform Bake {
   vec4 c5; vec4 hm; vec4 o0; vec4 o1; vec4 o2; vec4 p; vec4 q; vec4 sz;
 } pc;
@@ -4523,19 +4583,24 @@ void main() {
   if (sunward_seen == (pc.q.w > 0.5)) discard;
   float tm = 2.0 * pc.p.w / float(n.x);  // metres per texel
   float zpm = 1.0 / pc.p.z;               // depth per metre
-  // The ground's slope along the sun (depth per texel), for the receiver.
-  ivec2 c = ivec2(tc);
-  float gx0 = texelFetch(ground, c - ivec2(1, 0), 0).r, gx1 = texelFetch(ground, c + ivec2(1, 0), 0).r;
-  float gy0 = texelFetch(ground, c - ivec2(0, 1), 0).r, gy1 = texelFetch(ground, c + ivec2(0, 1), 0).r;
-  // (The gentler side each way, at most 2 m per metre: edges don't tilt it.)
-  float g0 = texelFetch(ground, c, 0).r;
-  vec2 grad = vec2(0.0);
-  if (g0 < 1.0) {
-    float ax = gx0 < 1.0 && gx1 < 1.0 ? (abs(gx1 - g0) < abs(g0 - gx0) ? gx1 - g0 : g0 - gx0) : 0.0;
-    float ay = gy0 < 1.0 && gy1 < 1.0 ? (abs(gy1 - g0) < abs(g0 - gy0) ? gy1 - g0 : g0 - gy0) : 0.0;
-    float lim = 2.0 * tm * zpm;
-    grad = clamp(vec2(ax, ay), vec2(-lim), vec2(lim));
-  }
+  // The surface's slope (from the height map: the gentler side each way, so
+  // edges don't tilt it) as a plane seen along the sun: how much nearer or
+  // farther the neighbouring rays meet it (depth per texel, at most 2 m per
+  // metre), so slopes don't shade themselves.
+  ivec2 hc = ivec2(ht);
+  float hstep = 2.0 / (pc.hm.x * float(hn.x));  // metres per height texel
+  float hx0 = texelFetch(heights, clamp(hc - ivec2(1, 0), ivec2(0), hn - 1), 0).r;
+  float hx1 = texelFetch(heights, clamp(hc + ivec2(1, 0), ivec2(0), hn - 1), 0).r;
+  float hy0 = texelFetch(heights, clamp(hc - ivec2(0, 1), ivec2(0), hn - 1), 0).r;
+  float hy1 = texelFetch(heights, clamp(hc + ivec2(0, 1), ivec2(0), hn - 1), 0).r;
+  float dx = (hx0 < 1.0 && hx1 < 1.0) ? (abs(hx1 - hz) < abs(hz - hx0) ? hz - hx1 : hx0 - hz) : 0.0;
+  float dz = (hy0 < 1.0 && hy1 < 1.0) ? (abs(hy1 - hz) < abs(hz - hy0) ? hz - hy1 : hy0 - hz) : 0.0;
+  // (depth from above falls as the height rises: dh = -dz * D)
+  vec3 nrm = normalize(vec3(-dx * pc.p.z / hstep, 1.0, -dz * pc.p.z / hstep));
+  vec3 e1 = normalize(pc.o0.xyz), e2 = normalize(pc.o1.xyz), fd = normalize(pc.o2.xyz);
+  float nf = dot(nrm, fd);
+  vec2 grad = abs(nf) > 0.05 ? -vec2(dot(nrm, e1), dot(nrm, e2)) / nf : vec2(0.0);
+  grad = clamp(grad, vec2(-2.0), vec2(2.0)) * tm * zpm;
   float bias = (0.25 + 1.5 * tm) * zpm;
   // (Searched a few metres around at least.)
   float reach = clamp(max(pc.p.x * 30.0, 4.0) / tm, 2.0, 64.0);
@@ -4564,9 +4629,9 @@ void main() {
   o = vec4(1.0 - sh / 32.0);
 }
 )", true);
-  // Shaded riders, 1: the pixels drawn after the lighting pass (riders and
-  // the like: the late depth differs from the world's, and from what the
-  // depth-only passes left), as world positions (w = 1).
+  // Shaded riders, 1 (half size): the pixels drawn after the lighting pass
+  // (riders and the like: the late depth differs from the world's, and from
+  // what the depth-only passes left), as world positions (w = 1).
   copy_fs_[27] = CompileBuiltin("builtin_movers_pos", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D late;
 layout(set = 0, binding = 1) uniform sampler2D world;
@@ -4574,26 +4639,43 @@ layout(set = 0, binding = 2) uniform sampler2D hidden;
 layout(push_constant) uniform Pos { mat4 m; } pc;  // ndc (x, y, 1 - depth, 1) -> world
 layout(location = 0) out vec4 o;
 void main() {
-  ivec2 p = ivec2(gl_FragCoord.xy);
-  vec2 uv = (vec2(p) + 0.5) / vec2(textureSize(late, 0));
-  float l = texelFetch(late, p, 0).r;
-  if (l <= 0.0 || l == texelFetch(world, p, 0).r || l == texelFetch(hidden, p, 0).r) {
-    o = vec4(0.0);
-    return;
+  ivec2 size = textureSize(late, 0);
+  // Of the 2 x 2 pixels, the one nearest the camera that's a mover.
+  o = vec4(0.0);
+  float best = 0.0;
+  ivec2 bp = ivec2(0);
+  for (int k = 0; k < 4; ++k) {
+    ivec2 p = min(ivec2(gl_FragCoord.xy) * 2 + ivec2(k & 1, k >> 1), size - 1);
+    float l = texelFetch(late, p, 0).r;
+    if (l <= best || l == texelFetch(world, p, 0).r || l == texelFetch(hidden, p, 0).r) continue;
+    best = l;
+    bp = p;
   }
-  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - l, 1.0);
-  o = abs(w.w) < 1e-7 ? vec4(0.0) : vec4(w.xyz / w.w, 1.0);
+  if (best <= 0.0) return;
+  vec2 uv = (vec2(bp) + 0.5) / vec2(size);
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec4 w = pc.m * vec4(ndc, 1.0 - best, 1.0);
+  // w: 1e5 + the height of what's behind it (the ground near it, about).
+  vec4 g = pc.m * vec4(ndc, 1.0 - texelFetch(world, bp, 0).r, 1.0);
+  float gy = abs(g.w) > 1e-7 ? g.y / g.w : w.y / w.w;
+  if (abs(w.w) > 1e-7) o = vec4(w.xyz / w.w, 1e5 + min(gy, w.y / w.w));
 }
 )", true);
-  // Shaded riders, 2: each one's light seen from the sun through the world
-  // map (soft as the world's shadows), as a factor (1: in the sun).
-  // o0-o2: the sun maps' rows; p: metres per unit of depth, half width (m),
-  // penumbra radius per metre, how much of their light the shade takes.
+  // Shaded riders, 2 (half size): each one's light seen from the sun,
+  // through the world map (soft as the world's shadows) and through the
+  // game's own shadow map (the riders themselves: an arm on the body, the
+  // body on the legs), as a factor (1: in the sun). Only on the surfaces
+  // facing the sun: those facing away are already dark.
+  // o0-o2: the world map's rows (world -> ndc, depth). l: world -> the shadow
+  // map's texel (u, v, depth). p: penumbra radius per metre, the shadow map's
+  // depth per metre towards the sun (0: none this frame), how much light the
+  // shade takes, diagnostics.
   copy_fs_[28] = CompileBuiltin("builtin_movers_shade", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D pos;
-layout(set = 0, binding = 1) uniform sampler2D world;
-layout(set = 0, binding = 2) uniform sampler2D ground;  // the terrain alone, from the sun
-layout(push_constant) uniform Shade { vec4 o0; vec4 o1; vec4 o2; vec4 p; } pc;
+layout(set = 0, binding = 1) uniform sampler2D world;  // depth, 1 = nothing
+layout(set = 0, binding = 2) uniform sampler2D zo;     // the shadow pass's depth (nearer the sun: more)
+layout(set = 0, binding = 3) uniform sampler2D baked;  // the world shadows (p.w = 2)
+layout(push_constant) uniform Shade { vec4 o0; vec4 o1; vec4 o2; mat4 l; vec4 p; } pc;
 layout(location = 0) out vec4 o;
 vec2 Disc(int i, int n) {
   float r = sqrt((float(i) + 0.5) / float(n));
@@ -4601,60 +4683,98 @@ vec2 Disc(int i, int n) {
   return r * vec2(cos(t), sin(t));
 }
 void main() {
-  vec4 q = texelFetch(pos, ivec2(gl_FragCoord.xy), 0);
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec4 q = texelFetch(pos, c, 0);
   o = vec4(1.0);
   if (q.w < 0.5) return;
   vec4 P = vec4(q.xyz, 1.0);
-  ivec2 n = textureSize(world, 0);
-  vec2 tc = (0.5 + 0.5 * vec2(dot(pc.o0, P), dot(pc.o1, P))) * vec2(n);
-  if (any(lessThan(tc, vec2(1.0))) || any(greaterThanEqual(tc, vec2(n) - 1.0))) return;
-  float zr = dot(pc.o2, P);
-  float tm = 2.0 * pc.p.y / float(n.x);
-  float bias = (0.3 + 1.5 * tm) / pc.p.x;
-  // The slope of the ground below along the sun: neighbouring rays meet it
-  // nearer or farther (not shade).
-  ivec2 c = ivec2(tc);
-  float gx0 = texelFetch(ground, c - ivec2(1, 0), 0).r, gx1 = texelFetch(ground, c + ivec2(1, 0), 0).r;
-  float gy0 = texelFetch(ground, c - ivec2(0, 1), 0).r, gy1 = texelFetch(ground, c + ivec2(0, 1), 0).r;
-  // (The gentler side each way, at most 2 m per metre: edges don't tilt it.)
-  float g0 = texelFetch(ground, c, 0).r;
-  vec2 grad = vec2(0.0);
-  if (g0 < 1.0) {
-    float ax = gx0 < 1.0 && gx1 < 1.0 ? (abs(gx1 - g0) < abs(g0 - gx0) ? gx1 - g0 : g0 - gx0) : 0.0;
-    float ay = gy0 < 1.0 && gy1 < 1.0 ? (abs(gy1 - g0) < abs(g0 - gy0) ? gy1 - g0 : g0 - gy0) : 0.0;
-    float lim = 2.0 * tm * (1.0 / pc.p.x);
-    grad = clamp(vec2(ax, ay), vec2(-lim), vec2(lim));
-  }
-  float reach = clamp(pc.p.z * 30.0 / tm, 2.0, 48.0);
-  float bs = 0.0, bn = 0.0;
-  for (int i = 0; i < 16; ++i) {
-    vec2 off = Disc(i, 16) * reach;
-    float z = texelFetch(world, ivec2(tc + off), 0).r;
-    if (z < 1.0 && z < zr + dot(grad, off) - bias) {
-      bs += zr - z;
-      bn += 1.0;
+  vec3 fd = normalize(pc.p.w > 1.5 ? pc.o1.xyz : pc.o2.xyz);  // the sun's direction (travelling)
+  float D = 1.0 / length(pc.o2.xyz), R = 1.0 / length(pc.o0.xyz);
+  // The surface's normal (from its neighbours) and how much it faces the sun.
+  ivec2 ps = textureSize(pos, 0);
+  vec4 qx = texelFetch(pos, min(c + ivec2(1, 0), ps - 1), 0);
+  vec4 qy = texelFetch(pos, min(c + ivec2(0, 1), ps - 1), 0);
+  vec4 qx0 = texelFetch(pos, max(c - ivec2(1, 0), ivec2(0)), 0);
+  vec4 qy0 = texelFetch(pos, max(c - ivec2(0, 1), ivec2(0)), 0);
+  vec3 dx = qx.w > 0.5 ? qx.xyz - q.xyz : (qx0.w > 0.5 ? q.xyz - qx0.xyz : vec3(0.0));
+  vec3 dy = qy.w > 0.5 ? qy.xyz - q.xyz : (qy0.w > 0.5 ? q.xyz - qy0.xyz : vec3(0.0));
+  // (Screen right x screen down points away from the camera: the other way.)
+  vec3 n = cross(dy, dx);
+  float ndl = dot(n, n) > 1e-10 ? dot(normalize(n), -fd) : 0.5;
+  float facing = smoothstep(0.05, 0.45, ndl);
+  // The world (trees, slopes): the world map; or, with only what's saved
+  // (p.w = 2: o0 is c5, o1 the sun's direction), the baked shadows where the
+  // sun's ray through it meets the ground.
+  float world_sh = 0.0;
+  ivec2 wn = textureSize(world, 0);
+  vec2 tc = (0.5 + 0.5 * vec2(dot(pc.o0, P), dot(pc.o1, P))) * vec2(wn);
+  if (pc.p.w > 1.5) {
+    fd = normalize(pc.o1.xyz);
+    float above = max(q.y - (q.w - 1e5), 0.0);
+    vec2 xz = q.xz + fd.xz * above / max(-fd.y, 0.1);
+    world_sh = 1.0 - textureLod(baked, xz * pc.o0.xy + pc.o0.zw, 0.0).r;
+  } else if (all(greaterThanEqual(tc, vec2(1.0))) && all(lessThan(tc, vec2(wn) - 1.0))) {
+    float zr = dot(pc.o2, P);
+    float tm = 2.0 * R / float(wn.x);
+    float bias = (0.3 + 1.5 * tm) / D;
+    // The ground behind it along the sun tilts (the world map's own slope
+    // there, the gentler side): neighbouring rays meet it nearer or farther.
+    ivec2 t = ivec2(tc);
+    float g0 = texelFetch(world, t, 0).r;
+    float gx0 = texelFetch(world, t - ivec2(1, 0), 0).r, gx1 = texelFetch(world, t + ivec2(1, 0), 0).r;
+    float gy0 = texelFetch(world, t - ivec2(0, 1), 0).r, gy1 = texelFetch(world, t + ivec2(0, 1), 0).r;
+    vec2 grad = vec2(abs(gx1 - g0) < abs(g0 - gx0) ? gx1 - g0 : g0 - gx0,
+                     abs(gy1 - g0) < abs(g0 - gy0) ? gy1 - g0 : g0 - gy0);
+    grad = max(max(g0, max(gx0, gx1)), max(gy0, gy1)) < 1.0
+               ? clamp(grad, vec2(-2.0 * tm / D), vec2(2.0 * tm / D)) : vec2(0.0);
+    float reach = clamp(pc.p.x * 30.0 / tm, 2.0, 48.0);
+    float bs = 0.0, bn = 0.0;
+    for (int i = 0; i < 16; ++i) {
+      vec2 off = Disc(i, 16) * reach;
+      float z = texelFetch(world, ivec2(tc + off), 0).r;
+      if (z < 1.0 && z < zr + dot(grad, off) - bias) {
+        bs += zr - z;
+        bn += 1.0;
+      }
+    }
+    if (bn > 0.0) {
+      if (pc.p.w > 0.5 && pc.p.w < 1.5) {  // diagnostics: the casters' distance (/ 30 m)
+        o = vec4(min(bs / bn * D / 30.0, 1.0));
+        return;
+      }
+      float rad = clamp((pc.p.x * min(bs / bn * D, 60.0) + 0.05) / tm, 0.75, 48.0);
+      for (int i = 0; i < 24; ++i) {
+        vec2 off = Disc(i, 24) * rad;
+        float z = texelFetch(world, ivec2(tc + off), 0).r;
+        world_sh += (z < 1.0 && z < zr + dot(grad, off) - bias) ? 1.0 / 24.0 : 0.0;
+      }
     }
   }
-  if (bn == 0.0) return;
-  if (pc.p.w < 0.0) {  // diagnostics: the casters' distance (/ 30 m), how many found
-    o = vec4(min(bs / bn * pc.p.x / 30.0, 1.0));
-    return;
+  // Themselves (and the riders, rails, objects the game casts): its map.
+  float self_sh = 0.0;
+  if (pc.p.y > 0.0) {
+    vec4 m = pc.l * P;
+    vec3 s = m.xyz / m.w;  // texel u, v (0..1) and depth
+    ivec2 zn = textureSize(zo, 0);
+    if (all(greaterThan(s.xy, vec2(0.0))) && all(lessThan(s.xy, vec2(1.0)))) {
+      // (More where the surface is steep to the sun: its own depth varies
+      // over a texel.)
+      float bias = (0.12 + 0.2 * (1.0 - clamp(ndl, 0.0, 1.0))) * pc.p.y;
+      for (int i = 0; i < 12; ++i) {
+        vec2 uv = s.xy + Disc(i, 12) * 2.5 / vec2(zn);
+        float z = texelFetch(zo, ivec2(uv * vec2(zn)), 0).r;
+        self_sh += z > s.z + bias ? 1.0 / 12.0 : 0.0;
+      }
+    }
   }
-  float rad = clamp((pc.p.z * min(bs / bn * pc.p.x, 60.0) + 0.05) / tm, 0.75, 48.0);
-  float sh = 0.0;
-  for (int i = 0; i < 24; ++i) {
-    vec2 off = Disc(i, 24) * rad;
-    float z = texelFetch(world, ivec2(tc + off), 0).r;
-    sh += (z < 1.0 && z < zr + dot(grad, off) - bias) ? 1.0 : 0.0;
-  }
-  o = vec4(1.0 - pc.p.w * sh / 24.0);
+  o = vec4(1.0 - pc.p.z * max(world_sh, self_sh) * facing);
 }
 )", true);
   // The sun maps' rays whose sunward side (the ground and 45 m towards the
   // sun) is in view this frame, marked (what's left stays as it was).
   // a: the maps' ndc and depth -> world; vp: world -> the camera's clip.
   copy_fs_[31] = CompileBuiltin("builtin_sun_seen", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D ground;
+layout(set = 0, binding = 0) uniform sampler2D ground;  // the world map (what each ray meets first)
 layout(push_constant) uniform Seen { mat4 a; mat4 vp; } pc;
 layout(location = 0) out vec4 o;
 bool InView(vec4 w) {
@@ -4671,50 +4791,63 @@ void main() {
   o = vec4(1.0);
 }
 )", true);
-  // Shaded riders, 3: the scene times that factor.
+  // Shaded riders, 3: the scene times that factor (from the half size
+  // one) where a mover is (the late depth differs from the world's).
   copy_fs_[29] = CompileBuiltin("builtin_movers_apply", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D scene;
-layout(set = 0, binding = 1) uniform sampler2D shade;
+layout(set = 0, binding = 0) uniform sampler2D shade;  // linear, half size
+layout(set = 0, binding = 1) uniform sampler2D scene;
+layout(set = 0, binding = 2) uniform sampler2D late;
+layout(set = 0, binding = 3) uniform sampler2D world;
 layout(location = 0) out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 c = texelFetch(scene, p, 0);
-  o = vec4(c.rgb * texelFetch(shade, p, 0).r, c.a);
+  float l = texelFetch(late, p, 0).r;
+  float f = (l > 0.0 && l != texelFetch(world, p, 0).r)
+                ? textureLod(shade, gl_FragCoord.xy / vec2(textureSize(scene, 0)), 0.0).r : 1.0;
+  o = vec4(c.rgb * f, c.a);
 }
 )", true);
   // Sun shadows, 2: the map filtered with penumbras that widen with the
   // distance from the caster to the ground (percentage-closer soft shadows:
-  // the casters' average distance found first, then a disc that size), the
-  // riders' and objects' from the game's map, the trees' from the tree map.
-  // The stencil byte (b: 1 lit, 0 in shadow) is what the lighting reads.
-  // a: penumbra radius per metre, search radius (m), radius min / max (texels)
-  // b: tree map half width (m), size (texels), depth -> metres (ref, scale)
-  // c: tree shadow strength, bias (m)
+  // the casters' average distance found first, then a disc that size). The
+  // stencil byte (b: 1 lit, 0 in shadow) is what the lighting reads.
+  // a: penumbra radius per metre, search radius (m), radius min / max
+  // (texels). h0-h2: map (u, v, 1) -> the world map's ndc (to measure the
+  // map's texels in metres); h0.w: the world map's half width (m), h1.w:
+  // bias (m), h2.w: 1 when the casters' heights aren't known this frame.
   copy_fs_[24] = CompileBuiltin("builtin_sun_pcss", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D raw;    // linear
 layout(set = 0, binding = 1) uniform sampler2D prep;
-layout(set = 0, binding = 2) uniform sampler2D trees;  // depth, 1 = nothing
-layout(push_constant) uniform Pcss { vec4 a; vec4 b; vec4 c; } pc;
+layout(set = 0, binding = 2) uniform sampler2D tiles;  // casters nearby (1/8 size; 1: none)
+layout(push_constant) uniform Pcss { vec4 a; vec4 h0; vec4 h1; vec4 h2; } pc;
 layout(location = 0) out vec4 o;
 vec2 Disc(int i, int n) {
   float r = sqrt((float(i) + 0.5) / float(n));
   float t = float(i) * 2.39996323;
   return r * vec2(cos(t), sin(t));
 }
+vec2 Plane(vec2 uv) {
+  vec3 u1 = vec3(uv, 1.0);
+  vec3 s3 = vec3(dot(pc.h0.xyz, u1), dot(pc.h1.xyz, u1), dot(pc.h2.xyz, u1));
+  return s3.xy / s3.z;
+}
 void main() {
   ivec2 size = textureSize(prep, 0);
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 c = texelFetch(raw, p, 0);
-  vec4 q = texelFetch(prep, p, 0);
-  float dr = q.x;
-  ivec2 px = ivec2(p.x + (p.x + 1 < size.x ? 1 : -1), p.y);
-  ivec2 py = ivec2(p.x, p.y + (p.y + 1 < size.y ? 1 : -1));
-  float mpt = max(length(texelFetch(prep, px, 0).zw - q.zw),
-                  length(texelFetch(prep, py, 0).zw - q.zw)) * pc.b.x;
-  mpt = clamp(mpt, 1e-3, 10.0);
+  // No caster within reach: the stencil as it is (lit).
+  if (texelFetch(tiles, p / 8, 0).r > 0.999) {
+    o = c;
+    return;
+  }
   vec2 inv = 1.0 / vec2(size);
-  // The riders' and objects' shadows (the game's map).
-  float bias = pc.c.y + 2.0 * mpt;
+  vec2 uv = (vec2(p) + 0.5) * inv;
+  vec2 s0 = Plane(uv);
+  float mpt = max(length(Plane(uv + vec2(inv.x, 0.0)) - s0), length(Plane(uv + vec2(0.0, inv.y)) - s0)) * pc.h0.w;
+  mpt = clamp(mpt, 1e-3, 10.0);
+  float dr = texelFetch(prep, p, 0).x;
+  float bias = pc.h1.w + 2.0 * mpt;
   float reach = clamp(pc.a.y / mpt, 1.0, pc.a.w);
   float bs = 0.0, bn = 0.0;
   for (int i = 0; i < 16; ++i) {
@@ -4728,41 +4861,10 @@ void main() {
   float rad = pc.a.z;
   if (bn > 0.0) rad = clamp(pc.a.x * min(bs / bn, 40.0) / mpt, pc.a.z, pc.a.w);
   // Without the casters' heights this frame: a rider's height, about.
-  else if (pc.c.z > 0.5) rad = clamp(pc.a.x * 1.5 / mpt, pc.a.z, pc.a.w);
+  else if (pc.h2.w > 0.5) rad = clamp(pc.a.x * 1.5 / mpt, pc.a.z, pc.a.w);
   float lit = 0.0;
   for (int i = 0; i < 24; ++i) lit += texture(raw, (vec2(p) + 0.5 + Disc(i, 24) * rad) * inv).b;
-  float g = lit / 24.0;
-  // The trees' (the tree map).
-  float t = 1.0;
-  vec2 tuv = 0.5 + 0.5 * q.zw;
-  if (pc.c.x > 0.0 && all(greaterThan(tuv, vec2(0.0))) && all(lessThan(tuv, vec2(1.0)))) {
-    float n = pc.b.y;
-    float tm = 2.0 * pc.b.x / n;
-    vec2 tc = tuv * n;
-    float tbias = pc.c.y + 2.0 * tm;
-    float treach = clamp(pc.a.y / tm, 1.0, pc.a.w);
-    bs = 0.0;
-    bn = 0.0;
-    for (int i = 0; i < 16; ++i) {
-      float z = texelFetch(trees, ivec2(tc + Disc(i, 16) * treach), 0).r;
-      float od = pc.b.z + (z - 0.5) * pc.b.w;
-      if (z < 1.0 && od < dr - tbias) {
-        bs += dr - od;
-        bn += 1.0;
-      }
-    }
-    if (bn > 0.0) {
-      float trad = clamp(pc.a.x * min(bs / bn, 40.0) / tm, 0.75, pc.a.w);
-      float sh = 0.0;
-      for (int i = 0; i < 32; ++i) {
-        float z = texelFetch(trees, ivec2(tc + Disc(i, 32) * trad), 0).r;
-        float od = pc.b.z + (z - 0.5) * pc.b.w;
-        sh += (z < 1.0 && od < dr - tbias) ? 1.0 : 0.0;
-      }
-      t = 1.0 - pc.c.x * sh / 32.0;
-    }
-  }
-  o = vec4(c.r, c.g, g * t, c.a);
+  o = vec4(c.r, c.g, lit / 24.0, c.a);
 }
 )", true);
   copy_fs_[17] = CompileBuiltin("builtin_clouds", std::string(R"(#version 450
@@ -5712,15 +5814,48 @@ void Renderer::Impl::ShiftMap(Image* map, Image* scratch, int64_t dx, int64_t dy
 // - the game's (blurred) shadow map of riders and objects replaced by the
 //   unblurred one filtered with penumbras that widen away from the caster
 //   (Shadow softness).
+// Updates of the sun maps: when the camera has moved 2.5 m or turned 6
+// degrees since the last one (or the maps started over), the world's draws
+// are drawn into them over the next three frames, a third each (no frame
+// pays for all of them), and the shadows baked from them on the third.
+void Renderer::Impl::SunCycle(const double cam[3], const double dir[3]) {
+  if (sun_phase_ >= 0 && sun_phase_ < 2) {
+    sun_next_phase_ = sun_phase_ + 1;
+    return;
+  }
+  // What's saved (and while it's being read).
+  if (bake_saved_only_ && (bake_loaded_ || (bake_io_.upload && bake_io_.state.load() != 0)) &&
+      !Diag("sunevery")) {
+    return;
+  }
+  const double dx = cam[0] - sun_cycle_cam_[0], dy = cam[1] - sun_cycle_cam_[1],
+               dz = cam[2] - sun_cycle_cam_[2];
+  const double turned = dir[0] * sun_cycle_dir_[0] + dir[1] * sun_cycle_dir_[1] +
+                        dir[2] * sun_cycle_dir_[2];
+  if (!sun_map_ok_ || dx * dx + dy * dy + dz * dz > 2.5 * 2.5 || turned < 0.9945) {
+    std::memcpy(sun_cycle_cam_, cam, sizeof(sun_cycle_cam_));
+    std::memcpy(sun_cycle_dir_, dir, sizeof(sun_cycle_dir_));
+    sun_next_phase_ = 0;
+  }
+}
+
+// At the lighting pass:
+// - the sun maps brought up to date (the world from the sun, the heights
+//   from above), around the camera, when an update goes (SunCycle);
+// - the world's shadows baked from them into the slopes' shadow map (the
+//   lighting's tf2) at a higher resolution (World shadows), kept on disk;
+// - the game's (blurred) shadow map of riders and objects replaced by the
+//   unblurred one filtered with penumbras that widen away from the caster
+//   (Shadow softness).
 void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
-  std::vector<CasterDraw> env, height, ground;
+  std::vector<CasterDraw> env, height;
   env.swap(env_draws_);
   height.swap(height_draws_);
-  ground.swap(ground_draws_);
   std::vector<std::array<double, 16>> candidates;
   candidates.swap(light_candidates_);
   baked_ok_ = false;
   sun_frame_ok_ = false;
+  sun_depth_per_m_ = 0.0;
   if (!SunShadowsOn()) return;
   // The lighting's lookup into the shadow map: u = c6.p / c9.p,
   // v = c7.p / c9.p (v remapped with the shadow distance).
@@ -5788,19 +5923,17 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     sun_rec_counts_.clear();
   }
   if (Diag("sun")) {
-    std::fprintf(stderr,
-                 "sun: inputs %d light %d (of %zu) depth %d world %zu heights %zu ground %zu\n",
-                 int(sun_inputs_ok_), int(sun_light_ok_), candidates.size(), int(sun_depth_ok_),
-                 env.size(), height.size(), ground.size());
+    std::fprintf(stderr, "sun: phase %d inputs %d light %d (of %zu) depth %d world %zu heights %zu\n",
+                 sun_phase_, int(sun_inputs_ok_), int(sun_light_ok_), candidates.size(),
+                 int(sun_depth_ok_), env.size(), height.size());
   }
   EndRendering();
   ++stats_.tree_shadow_draws;
-  // The sun maps: centred near the camera, as wide as the shadows reach,
-  // the Shadow resolution setting's texels (2048 at 2x).
+  // The sun maps: the Shadow resolution setting's texels (2048 at 2x),
+  // wide (100 m and more), centred ahead of the camera: trees are drawn only
+  // while in view, and their crowns leave the top of the view well before
+  // the camera reaches them.
   const double reach = shadow_distance_ > 0.0f ? double(shadow_distance_) : 45.0;
-  // Wide (100 m and more), centred ahead of the camera: trees are drawn
-  // only while in view, and their crowns leave the top of the view well
-  // before the camera reaches them.
   const double R = std::clamp(std::max(reach * 1.15, 100.0), 100.0, 180.0);
   const float res = shadow_res_ > 0.0f ? shadow_res_ : 2.0f;
   const uint32_t n_texels =
@@ -5808,8 +5941,9 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   const double N = double(n_texels);
   const double texel = 2.0 * R / N;
   const double cam[3] = {cam_pos_[0], cam_pos_[1], cam_pos_[2]};
-  // Where the camera looks (on the level): the screen's centre, far.
+  // Where the camera looks: the screen's centre, far.
   double ahead[3] = {cam[0], cam[1], cam[2]};
+  double look[3] = {0.0, 0.0, 1.0};
   {
     double wp[4];
     const double ndc[4] = {0.0, 0.0, 0.5, 1.0};
@@ -5818,92 +5952,107 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
       for (int c = 0; c < 4; ++c) wp[r] += inv_vp_[r * 4 + c] * ndc[c];
     }
     if (std::fabs(wp[3]) > 1e-12) {
-      double dx = wp[0] / wp[3] - cam[0], dz = wp[2] / wp[3] - cam[2];
-      const double n = std::sqrt(dx * dx + dz * dz);
-      if (n > 1e-6) {
-        ahead[0] += 0.35 * R * dx / n;
-        ahead[2] += 0.35 * R * dz / n;
+      double v[3] = {wp[0] / wp[3] - cam[0], wp[1] / wp[3] - cam[1], wp[2] / wp[3] - cam[2]};
+      const double nl = std::sqrt(dot3(v, v));
+      if (nl > 1e-6) {
+        for (int i = 0; i < 3; ++i) look[i] = v[i] / nl;
+      }
+      const double nh = std::sqrt(v[0] * v[0] + v[2] * v[2]);
+      if (nh > 1e-6) {
+        ahead[0] += 0.35 * R * v[0] / nh;
+        ahead[2] += 0.35 * R * v[2] / nh;
       }
     }
   }
   const bool world = world_detail_ > 0;
-  for (Image* im : {&sun_env_, &sun_ground_, &sun_height_, &sun_scratch_, &sun_seen_,
-                    &sun_seen_scratch_}) {
-    const bool color = im == &sun_seen_ || im == &sun_seen_scratch_;
-    if (!world && im != &sun_ground_ && im != &sun_scratch_) continue;
-    if (!im->image || im->width != n_texels) {
-      if (im->image) Retire(*im);
-      *im = gpu_.CreateImage(n_texels, n_texels,
-                             color ? VK_FORMAT_R8_UNORM : VK_FORMAT_D32_SFLOAT_S8_UINT, !color,
-                             im == &sun_env_      ? "sun_world"
-                             : im == &sun_ground_ ? "sun_ground"
-                             : im == &sun_height_ ? "sun_heights"
-                             : im == &sun_seen_   ? "sun_seen"
-                                                  : "sun_scratch");
-      ToGeneral(cb_, *im);
-      sun_map_ok_ = false;
+  if (world) {
+    for (Image* im : {&sun_env_, &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_}) {
+      const bool color = im == &sun_seen_ || im == &sun_seen_scratch_;
+      if (!im->image || im->width != n_texels) {
+        if (im->image) Retire(*im);
+        *im = gpu_.CreateImage(n_texels, n_texels,
+                               color ? VK_FORMAT_R8_UNORM : VK_FORMAT_D32_SFLOAT_S8_UINT, !color,
+                               im == &sun_env_      ? "sun_world"
+                               : im == &sun_height_ ? "sun_heights"
+                               : im == &sun_seen_   ? "sun_seen"
+                                                    : "sun_scratch");
+        ToGeneral(cb_, *im);
+        sun_map_ok_ = false;
+      }
     }
-  }
-  const double moved = std::sqrt((cam[0] - sun_last_cam_[0]) * (cam[0] - sun_last_cam_[0]) +
-                                 (cam[1] - sun_last_cam_[1]) * (cam[1] - sun_last_cam_[1]) +
-                                 (cam[2] - sun_last_cam_[2]) * (cam[2] - sun_last_cam_[2]));
-  // Started over when the sun moves (another mountain: its direction is
-  // fixed per mountain), the camera jumps (a restart, another run) or the
-  // maps' size changes.
-  const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < 0.9997 || R != sun_r_ || moved > 0.5 * R ||
-                     std::fabs(dot3(cam, sun_f_) - sun_ref_) > 0.3 * kSunDepth ||
-                     std::fabs(cam[1] - sun_href_) > 0.3 * kSunDepth;
-  const float far_depth[4] = {0, 0, 0, 0};
-  if (reset) {
-    const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
-    double e1[3], e2[3];
-    cross(std::fabs(f[1]) < 0.9 ? up : side, f, e1);
-    const double n1 = std::sqrt(dot3(e1, e1));
-    for (double& v : e1) v /= n1;
-    cross(f, e1, e2);
-    std::memcpy(sun_f_, f, sizeof(f));
-    std::memcpy(sun_e1_, e1, sizeof(e1));
-    std::memcpy(sun_e2_, e2, sizeof(e2));
-    std::memcpy(sun_c0_, ahead, sizeof(ahead));
-    sun_ci_ = sun_cj_ = sun_hi_ = sun_hj_ = 0;
-    sun_r_ = R;
-    sun_ref_ = dot3(cam, f);
-    sun_href_ = cam[1];
-    for (Image* im : {&sun_env_, &sun_ground_, &sun_height_}) {
-      if (im->image) ClearImage(im, far_depth, 1.0f, 0, false, true, true);
+    const double moved = std::sqrt((cam[0] - sun_last_cam_[0]) * (cam[0] - sun_last_cam_[0]) +
+                                   (cam[1] - sun_last_cam_[1]) * (cam[1] - sun_last_cam_[1]) +
+                                   (cam[2] - sun_last_cam_[2]) * (cam[2] - sun_last_cam_[2]));
+    // Started over when the sun moves (another mountain: its direction is
+    // fixed per mountain), the camera jumps (a restart, another run) or the
+    // maps' size changes.
+    const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < 0.9997 || R != sun_r_ ||
+                       moved > 0.5 * R ||
+                       std::fabs(dot3(cam, sun_f_) - sun_ref_) > 0.3 * kSunDepth ||
+                       std::fabs(cam[1] - sun_href_) > 0.3 * kSunDepth;
+    const float far_depth[4] = {0, 0, 0, 0};
+    if (reset) {
+      const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
+      double e1[3], e2[3];
+      cross(std::fabs(f[1]) < 0.9 ? up : side, f, e1);
+      const double n1 = std::sqrt(dot3(e1, e1));
+      for (double& v : e1) v /= n1;
+      cross(f, e1, e2);
+      std::memcpy(sun_f_, f, sizeof(f));
+      std::memcpy(sun_e1_, e1, sizeof(e1));
+      std::memcpy(sun_e2_, e2, sizeof(e2));
+      std::memcpy(sun_c0_, ahead, sizeof(ahead));
+      sun_ci_ = sun_cj_ = sun_hi_ = sun_hj_ = 0;
+      sun_r_ = R;
+      sun_ref_ = dot3(cam, f);
+      sun_href_ = cam[1];
+      for (Image* im : {&sun_env_, &sun_height_}) ClearImage(im, far_depth, 1.0f, 0, false, true, true);
+      ClearImage(&sun_seen_, far_depth, 0.0f, 0, true, false, false);
+      FlushPendingClears();
+      sun_map_ok_ = true;
+      ++stats_.sun_map_resets;
+      // What's recorded this frame was meant for the old maps' frame: drawn
+      // all the same (reprojected: it lands right), the update starts now.
+      if (Diag("sun")) std::fprintf(stderr, "sun: maps started over (%u texels)\n", n_texels);
     }
-    if (sun_seen_.image) ClearImage(&sun_seen_, far_depth, 0.0f, 0, true, false, false);
-    FlushPendingClears();
-    sun_map_ok_ = true;
-    ++stats_.sun_map_resets;
-    if (Diag("sun")) std::fprintf(stderr, "sun: maps started over (%u texels)\n", n_texels);
-  }
-  std::memcpy(f, sun_f_, sizeof(f));
-  std::memcpy(sun_last_cam_, cam, sizeof(cam));
-  // Moved along when the camera is an eighth of the maps from their centre
-  // (the contents shifted a whole number of texels).
-  {
+    std::memcpy(sun_last_cam_, cam, sizeof(cam));
+    // Moved along when the camera is an eighth of the maps from their centre
+    // (the contents shifted a whole number of texels).
     const int64_t limit = int64_t(n_texels) / 8;
     const double rel[3] = {ahead[0] - sun_c0_[0], ahead[1] - sun_c0_[1], ahead[2] - sun_c0_[2]};
     const int64_t ai = std::llround(dot3(rel, sun_e1_) / texel);
     const int64_t aj = std::llround(dot3(rel, sun_e2_) / texel);
     if (std::llabs(ai - sun_ci_) > limit || std::llabs(aj - sun_cj_) > limit) {
-      for (Image* map : {&sun_env_, &sun_ground_}) {
-        if (map->image) ShiftMap(map, &sun_scratch_, ai - sun_ci_, aj - sun_cj_);
-      }
-      if (sun_seen_.image) ShiftMap(&sun_seen_, &sun_seen_scratch_, ai - sun_ci_, aj - sun_cj_);
+      ShiftMap(&sun_env_, &sun_scratch_, ai - sun_ci_, aj - sun_cj_);
+      ShiftMap(&sun_seen_, &sun_seen_scratch_, ai - sun_ci_, aj - sun_cj_);
       sun_ci_ = ai;
       sun_cj_ = aj;
     }
     const int64_t hi = std::llround(rel[0] / texel), hj = std::llround(rel[2] / texel);
     if (std::llabs(hi - sun_hi_) > limit || std::llabs(hj - sun_hj_) > limit) {
-      if (sun_height_.image) ShiftMap(&sun_height_, &sun_scratch_, hi - sun_hi_, hj - sun_hj_);
+      ShiftMap(&sun_height_, &sun_scratch_, hi - sun_hi_, hj - sun_hj_);
       sun_hi_ = hi;
       sun_hj_ = hj;
     }
   }
+  std::memcpy(f, world ? sun_f_ : f, sizeof(f));
   // The sun maps' rows (world -> their ndc x, y and depth along the sun),
   // and the height map's (world -> x, z from above; depth from the top).
+  // (Without World shadows: the same frame around the camera, to measure.)
+  if (!world) {
+    const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
+    cross(std::fabs(f[1]) < 0.9 ? up : side, f, sun_e1_);
+    const double n1 = std::sqrt(dot3(sun_e1_, sun_e1_));
+    for (double& v : sun_e1_) v /= n1;
+    cross(f, sun_e1_, sun_e2_);
+    std::memcpy(sun_f_, f, sizeof(f));
+    std::memcpy(sun_c0_, cam, sizeof(cam));
+    sun_ci_ = sun_cj_ = sun_hi_ = sun_hj_ = 0;
+    sun_r_ = R;
+    sun_ref_ = dot3(cam, f);
+    sun_href_ = cam[1];
+    sun_map_ok_ = false;
+  }
   double C[3];
   for (int i = 0; i < 3; ++i) {
     C[i] = sun_c0_[i] + double(sun_ci_) * texel * sun_e1_[i] + double(sun_cj_) * texel * sun_e2_[i];
@@ -5920,59 +6069,63 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   O[2 * 4 + 3] = 0.5 - sun_ref_ / kSunDepth;
   O[15] = 1.0;
   const double hx = sun_c0_[0] + double(sun_hi_) * texel, hz = sun_c0_[2] + double(sun_hj_) * texel;
-  double H[16] = {1.0 / R, 0, 0, -hx / R,
-                  0, 0, 1.0 / R, -hz / R,
-                  0, -1.0 / kSunDepth, 0, 0.5 + sun_href_ / kSunDepth,
-                  0, 0, 0, 1};
+  const double H[16] = {1.0 / R, 0, 0, -hx / R,
+                        0, 0, 1.0 / R, -hz / R,
+                        0, -1.0 / kSunDepth, 0, 0.5 + sun_href_ / kSunDepth,
+                        0, 0, 0, 1};
   if (world) {
     DrawIntoSunMap(env, &sun_env_, O);
     DrawIntoSunMap(height, &sun_height_, H);
     stats_.tree_casters += uint32_t(env.size());
+    stats_.sun_receivers += uint32_t(height.size());
     if (!env.empty()) ++sun_world_drawn_;
-  }
-  DrawIntoSunMap(ground, &sun_ground_, O);
-  stats_.sun_receivers += uint32_t(ground.size());
-  // The rays whose sunward side is in view this frame (with the world drawn
-  // into the maps): what casts on them has been drawn.
-  if (world && !env.empty() && sun_seen_.image) {
-    double Oinv[16], vp[16];
-    if (Invert4(O, Oinv) && Invert4(inv_vp_, vp)) {
-      float spc[32];
-      for (int r = 0; r < 4; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          spc[c * 4 + r] = float(Oinv[r * 4 + c]);  // column-major
-          spc[16 + c * 4 + r] = float(vp[r * 4 + c]);
+    // The rays whose sunward side is in view at the end of an update (with
+    // the world drawn into the maps): what casts on them has been drawn.
+    const bool update_done = sun_phase_ == 2 || sun_phase_ == 3;
+    if (update_done) {
+      double Oinv[16], vp[16];
+      if (Invert4(O, Oinv) && Invert4(inv_vp_, vp)) {
+        float spc[32];
+        for (int r = 0; r < 4; ++r) {
+          for (int c = 0; c < 4; ++c) {
+            spc[c * 4 + r] = float(Oinv[r * 4 + c]);  // column-major
+            spc[16 + c * 4 + r] = float(vp[r * 4 + c]);
+          }
         }
+        const VkRect2D all{{0, 0}, {n_texels, n_texels}};
+        FullscreenPass(CopyKind::kSunSeen, &sun_seen_, &sun_env_, nullptr, nullptr, false, spc, 32,
+                       &all);
       }
-      const VkRect2D all{{0, 0}, {n_texels, n_texels}};
-      FullscreenPass(CopyKind::kSunSeen, &sun_seen_, &sun_ground_, nullptr, nullptr, false, spc, 32,
-                     &all);
     }
+    sun_frame_ok_ = true;
+    // The world's shadows, baked into the slopes' shadow map around the
+    // camera at the end of an update.
+    BakeWorldShadows(d, st, H, update_done);
+    SunCycle(cam, look);
   }
-  sun_frame_ok_ = true;
-  // The world's shadows, baked into the slopes' shadow map around the camera.
-  if (world) BakeWorldShadows(d, st, H, !env.empty() || Diag("sunevery"));
   if (!sun_inputs_ok_) return;
   std::string note;
   Image* shadow = TextureFor(d, 0, st, &note);
   if (!shadow || shadow->depth) return;
   const uint32_t w = shadow->width, h = shadow->height;
   if (w != sun_raw_.width || h != sun_raw_.height || shadow->format != sun_raw_.format) return;
-  // Pass 1: per texel of the shadow map, where its ray is in the sun maps
-  // (the lighting's rows inverted on the maps' plane: map (u, v) -> their
-  // ndc), the ground it lands on, and the caster's height when the light's
-  // view-projection is known.
-  auto ensure = [&](Image& im, VkFormat fmt, const char* name) {
-    if (im.image && im.width == w && im.height == h && im.format == fmt) return;
+  // Pass 1: per texel of the shadow map, the ground its ray lands on and the
+  // caster's height when the light's view-projection is known.
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat fmt, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == fmt) return;
     if (im.image) Retire(im);
-    im = gpu_.CreateImage(w, h, fmt, false, name);
+    im = gpu_.CreateImage(iw, ih, fmt, false, name);
     ToGeneral(cb_, im);
   };
-  ensure(sun_prep_, VK_FORMAT_R32G32B32A32_SFLOAT, "sun_prep");
-  ensure(sun_out_, shadow->format, "sun_shadows");
+  ensure(sun_prep_, w, h, VK_FORMAT_R32G32_SFLOAT, "sun_prep");
+  ensure(sun_out_, w, h, shadow->format, "sun_shadows");
+  ensure(sun_tiles_, (w + 7) / 8, (h + 7) / 8, VK_FORMAT_R8_UNORM, "sun_tiles");
+  ensure(sun_tiles2_, (w + 7) / 8, (h + 7) / 8, VK_FORMAT_R8_UNORM, "sun_tiles_spread");
   float prep_pc[32] = {};
+  float hrows[12] = {};
   {
-    // Plane points P(a, b) = C + a R e1 + b R e2 (a, b: the maps' ndc).
+    // Plane points P(a, b) = C + a R e1 + b R e2 (a, b: the maps' ndc); the
+    // lighting's rows on it, inverted: map (u, v) -> (a, b).
     const double E1[4] = {R * sun_e1_[0], R * sun_e1_[1], R * sun_e1_[2], 0.0};
     const double E2[4] = {R * sun_e2_[0], R * sun_e2_[1], R * sun_e2_[2], 0.0};
     const double Ch[4] = {C[0], C[1], C[2], 1.0};
@@ -5990,10 +6143,11 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     double Hm[16];
     if (!Invert4(M, Hm)) return;
     for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) prep_pc[r * 4 + c] = float(Hm[r * 4 + c]);
+      for (int c = 0; c < 3; ++c) prep_pc[r * 4 + c] = hrows[r * 4 + c] = float(Hm[r * 4 + c]);
     }
     prep_pc[3] = float(sun_ref_);
     prep_pc[7] = float(kSunDepth);
+    prep_pc[11] = world && sun_map_ok_ ? 1.0f : 0.0f;
   }
   // The casters' height: map texel (u, v, depth) -> the light's ndc (its
   // viewport undone) -> world through the light's inverse view-projection.
@@ -6005,30 +6159,55 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
                           0, 2.0 / ls.ndc_scale[1], 0, (-1.0 - ls.ndc_offset[1]) / ls.ndc_scale[1],
                           0, 0, 1.0 / ls.ndc_scale[2], -ls.ndc_offset[2] / ls.ndc_scale[2],
                           0, 0, 0, 1};
+    double A[16];
     for (int r = 0; r < 4; ++r) {
       for (int c = 0; c < 4; ++c) {
         double v = 0;
         for (int k = 0; k < 4; ++k) v += Vinv[r * 4 + k] * D[k * 4 + c];
+        A[r * 4 + c] = v;
         prep_pc[12 + c * 4 + r] = float(v);  // column-major
       }
     }
     heights = true;
+    // For the riders' own shadows: world -> the map's texel and depth, and
+    // its depth per metre towards the sun (at the camera: near enough).
+    if (Invert4(A, sun_tex_from_world_)) {
+      auto depth_at = [&](const double* p) {
+        double z = 0, ww = 0;
+        for (int k = 0; k < 3; ++k) {
+          z += sun_tex_from_world_[2 * 4 + k] * p[k];
+          ww += sun_tex_from_world_[3 * 4 + k] * p[k];
+        }
+        z += sun_tex_from_world_[2 * 4 + 3];
+        ww += sun_tex_from_world_[3 * 4 + 3];
+        return z / ww;
+      };
+      const double p1[3] = {cam[0] - f[0], cam[1] - f[1], cam[2] - f[2]};
+      sun_depth_per_m_ = depth_at(p1) - depth_at(cam);
+      if (!(sun_depth_per_m_ > 0.0)) sun_depth_per_m_ = 0.0;
+    }
   }
   for (int i = 0; i < 3; ++i) prep_pc[28 + i] = float(f[i]);
   prep_pc[31] = heights ? 1.0f : 0.0f;
-  FullscreenPass(CopyKind::kSunPrep, &sun_prep_, heights ? &sun_zo_ : nullptr, &sun_ground_,
-                 &sun_raw_, false, prep_pc, 32);
+  FullscreenPass(CopyKind::kSunPrep, &sun_prep_, heights ? &sun_zo_ : nullptr,
+                 world ? &sun_env_ : nullptr, &sun_raw_, false, prep_pc, 32);
+  // Where the casters are (coarse), spread over the filter's reach.
+  const float eight[4] = {8.0f, 0, 0, 0}, one[4] = {1.0f, 0, 0, 0};
+  FullscreenPass(CopyKind::kSunTiles, &sun_tiles_, &sun_raw_, nullptr, nullptr, false, eight, 4);
+  FullscreenPass(CopyKind::kSunTiles, &sun_tiles2_, &sun_tiles_, nullptr, nullptr, false, one, 4);
   // Pass 2: the filter. Penumbra radius = k * (caster to ground) + the
-  // smallest (about the game's blur, a texel or two of its map). Without
-  // the casters' heights this frame: the penumbra of the last frame that
-  // had them (no popping between frames).
+  // smallest (about the game's blur, a texel or two of its map).
   const float k = 0.04f * shadow_softness_;
   const float search = std::max(k * 40.0f, 0.25f);
   const float min_texels = std::clamp(1.5f * float(w) / 1280.0f, 1.0f, 3.0f) * 0.75f;
-  float pc[12] = {k, search, min_texels, 32.0f,
-                  float(R), float(N), float(sun_ref_), float(kSunDepth),
-                  0.0f, 0.15f, heights ? 0.0f : 1.0f, 0.0f};
-  FullscreenPass(CopyKind::kSunPcss, &sun_out_, &sun_raw_, &sun_prep_, nullptr, true, pc, 12);
+  float pc[16] = {k, search, min_texels, 32.0f};
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) pc[4 + r * 4 + c] = hrows[r * 4 + c];
+  }
+  pc[7] = float(R);
+  pc[11] = 0.15f;
+  pc[15] = heights ? 0.0f : 1.0f;
+  FullscreenPass(CopyKind::kSunPcss, &sun_out_, &sun_raw_, &sun_prep_, &sun_tiles2_, true, pc, 16);
   VkImageCopy region{};
   region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -6039,13 +6218,120 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   dyn_ = DynState{};
 }
 
+std::string Renderer::Impl::BakePath(uint32_t w, uint32_t h) const {
+  if (bake_dir_.empty() || !bake_key_) return {};
+  char name[64];
+  std::snprintf(name, sizeof(name), "%016llX_%ux%u.a3ws", (unsigned long long)bake_key_, w, h);
+  return bake_dir_ + "/" + name;
+}
+
+// World shadows on disk: a saved bake read in the background when the
+// mountain's painted map first shows (copied in when ready), and the bake
+// written back now and then (read back from the GPU a few frames after the
+// copy is recorded, compressed and written in the background).
+// File: "A3WS", version, width, height, then the texels deflated.
+void Renderer::Impl::BakeIoTick(Image* src) {
+  for (size_t i = 0; i < bake_retired_.size();) {
+    if (frame_number_ >= bake_retired_[i].first + 4) {
+      gpu_.DestroyBuffer(bake_retired_[i].second);
+      bake_retired_[i] = bake_retired_.back();
+      bake_retired_.pop_back();
+    } else {
+      ++i;
+    }
+  }
+  BakeIo& io = bake_io_;
+  const int state = io.state.load();
+  if (state == 1 && frame_number_ >= io.frame + 4) {
+    // The GPU's copy is done (frames in flight have come round): write it.
+    io.state = 2;
+    io.thread = std::thread([&io] {
+      const size_t n = size_t(io.w) * io.h;
+      mz_ulong packed = mz_compressBound(mz_ulong(n));
+      std::vector<uint8_t> out(16 + packed);
+      std::memcpy(out.data(), "A3WS", 4);
+      const uint32_t head[3] = {1u, io.w, io.h};
+      std::memcpy(out.data() + 4, head, 12);
+      io.ok = mz_compress2(out.data() + 16, &packed, io.buffer.mapped, mz_ulong(n), 1) == MZ_OK;
+      if (io.ok) {
+        const std::string tmp = io.path + ".tmp";
+        if (FILE* fp = std::fopen(tmp.c_str(), "wb")) {
+          io.ok = std::fwrite(out.data(), 1, 16 + packed, fp) == 16 + packed;
+          io.ok = (std::fclose(fp) == 0) && io.ok;
+          std::error_code ec;
+          if (io.ok) std::filesystem::rename(tmp, io.path, ec);
+          io.ok = io.ok && !ec;
+        } else {
+          io.ok = false;
+        }
+      }
+      io.state = 3;
+    });
+    return;
+  }
+  if (state != 3) return;
+  if (io.thread.joinable()) io.thread.join();
+  io.state = 0;
+  if (io.upload) {
+    // A saved bake read: copied in (if it's still this mountain's).
+    if (io.ok && baked_.image && baked_src_ == src && baked_.width == io.w &&
+        baked_.height == io.h) {
+      EndRendering();
+      VkBufferImageCopy r{};
+      r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      r.imageExtent = {io.w, io.h, 1};
+      Barrier();
+      vk::vkCmdCopyBufferToImage(cb_, io.buffer.buffer, baked_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                                 &r);
+      Barrier();
+      bake_loaded_ = true;
+      pending_notices_.push_back("world shadows: loaded what's baked (" + io.path + ")");
+      // (The buffer is in use by this frame: destroyed a few frames on.)
+      bake_retired_.push_back({frame_number_, io.buffer});
+    } else {
+      gpu_.DestroyBuffer(io.buffer);
+    }
+  } else {
+    if (!io.ok) pending_notices_.push_back("world shadows: couldn't save " + io.path);
+    gpu_.DestroyBuffer(io.buffer);
+  }
+  io.buffer = Buffer{};
+}
+
+void Renderer::Impl::BakeSave() {
+  BakeIo& io = bake_io_;
+  if (io.state.load() != 0 || !baked_.image || !bake_dirty_) return;
+  const std::string path = BakePath(baked_.width, baked_.height);
+  if (path.empty()) return;
+  std::error_code ec;
+  std::filesystem::create_directories(bake_dir_, ec);
+  EndRendering();
+  io.buffer = gpu_.CreateBuffer(VkDeviceSize(baked_.width) * baked_.height,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  VkBufferImageCopy r{};
+  r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.imageExtent = {baked_.width, baked_.height, 1};
+  Barrier();
+  vk::vkCmdCopyImageToBuffer(cb_, baked_.image, VK_IMAGE_LAYOUT_GENERAL, io.buffer.buffer, 1, &r);
+  Barrier();
+  io.upload = false;
+  io.ok = false;
+  io.w = baked_.width;
+  io.h = baked_.height;
+  io.path = path;
+  io.frame = frame_number_;
+  io.state = 1;
+  bake_dirty_ = false;
+  bake_last_save_ = frame_number_;
+}
+
 // World shadows: the slopes' painted shadow map (the lighting's tf2, over
 // the whole mountain: u, v = world x, z times c5.xy plus c5.zw) replaced
-// for the lighting by a copy World shadows times larger, first the painted
-// one magnified, then baked again around the camera as the camera goes:
-// each texel's surface (the height map, from above) looked at from the sun
-// through the world map, with penumbras that widen away from the caster.
-// What's baked stays (until another mountain).
+// for the lighting by a copy World shadows times larger: what was saved for
+// this mountain, else the painted one magnified; then baked again around
+// the camera as the camera goes: each texel's surface (the height map, from
+// above) looked at from the sun through the world map, with penumbras that
+// widen away from the caster. What's baked stays, and is saved.
 void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16],
                                       bool bake) {
   std::string note;
@@ -6054,9 +6340,13 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
   float c5[4];
   std::memcpy(c5, &st.ps_consts[5 * 4], 16);
   if (!(std::fabs(c5[0]) > 1e-9f) || !(std::fabs(c5[1]) > 1e-9f)) return;
+  std::memcpy(bake_c5_, c5, sizeof(c5));
+  BakeIoTick(src);
   const uint32_t mult = uint32_t(world_detail_);
   const uint32_t w = std::min(src->width * mult, 16384u), h = std::min(src->height * mult, 16384u);
   if (!baked_.image || baked_.width != w || baked_.height != h || baked_src_ != src) {
+    // Another mountain (or size): what's baked for the last one saved first.
+    if (baked_.image && bake_dirty_ && bake_io_.state.load() == 0) BakeSave();
     if (baked_.image) Retire(baked_);
     baked_ = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, "world_shadows");
     // Read as all four channels (whichever the lighting's fetch picks).
@@ -6071,12 +6361,55 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
               "world shadows view");
     ToGeneral(cb_, baked_);
     baked_src_ = src;
-    // The painted map, magnified.
+    bake_dirty_ = false;
+    bake_loaded_ = false;
+    bake_key_ = 0;
+    for (const auto& [name, t] : textures_) {
+      if (&t.image == src) bake_key_ = t.hash;
+    }
+    // The painted map, magnified (until a saved one is in).
     const float inv[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
     FullscreenPass(CopyKind::kBakeInit, &baked_, src, nullptr, nullptr, true, inv, 4);
     if (Diag("sun")) std::fprintf(stderr, "sun: world shadows %ux%u\n", w, h);
+    // A saved one: read in the background.
+    const std::string path = BakePath(w, h);
+    std::error_code ec;
+    if (!path.empty() && bake_io_.state.load() == 0 && std::filesystem::exists(path, ec)) {
+      BakeIo& io = bake_io_;
+      io.buffer = gpu_.CreateBuffer(VkDeviceSize(w) * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+      io.upload = true;
+      io.ok = false;
+      io.w = w;
+      io.h = h;
+      io.path = path;
+      io.state = 2;
+      io.thread = std::thread([&io] {
+        std::vector<uint8_t> data;
+        if (FILE* fp = std::fopen(io.path.c_str(), "rb")) {
+          std::fseek(fp, 0, SEEK_END);
+          const long size = std::ftell(fp);
+          std::fseek(fp, 0, SEEK_SET);
+          if (size > 16) {
+            data.resize(size_t(size));
+            if (std::fread(data.data(), 1, data.size(), fp) != data.size()) data.clear();
+          }
+          std::fclose(fp);
+        }
+        uint32_t head[3] = {};
+        if (data.size() > 16) std::memcpy(head, data.data() + 4, 12);
+        if (data.size() > 16 && !std::memcmp(data.data(), "A3WS", 4) && head[0] == 1 &&
+            head[1] == io.w && head[2] == io.h) {
+          mz_ulong n = mz_ulong(io.w) * io.h;
+          io.ok = mz_uncompress(io.buffer.mapped, &n, data.data() + 16, mz_ulong(data.size() - 16)) ==
+                      MZ_OK &&
+                  n == mz_ulong(io.w) * io.h;
+        }
+        io.state = 3;
+      });
+    }
   }
-  // Baked again: the texels within 80% of the sun maps' reach of the camera.
+  // Baked again (at the end of an update): the texels within 80% of the sun
+  // maps' reach of the camera.
   const double reach = 0.8 * sun_r_;
   const double cu = cam_pos_[0] * c5[0] + c5[2], cv = cam_pos_[2] * c5[1] + c5[3];
   const double du = reach * std::fabs(c5[0]) * w + 2.0, dv = reach * std::fabs(c5[1]) * h + 2.0;
@@ -6084,7 +6417,9 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
   const int32_t x0 = clampi(cu * w - du, w), x1 = clampi(cu * w + du + 1.0, w);
   const int32_t y0 = clampi(cv * h - dv, h), y1 = clampi(cv * h + dv + 1.0, h);
   const VkRect2D rect{{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
-  if (bake && rect.extent.width && rect.extent.height && !Diag("nobake")) {
+  // (Not while a saved one is being read: it would be copied over this.)
+  const bool reading = bake_io_.upload && bake_io_.state.load() != 0;
+  if (bake && !reading && rect.extent.width && rect.extent.height && !Diag("nobake")) {
     // c5; the height map's rows x, z and its depth -> height; the world
     // map's rows; penumbra radius per metre, smallest radius (m), reach (m),
     // the bake's texel (m).
@@ -6109,19 +6444,23 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     pc[28] = float(w);
     pc[29] = float(h);
     pc[27] = 0.0f;
-    FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_ground_, false, pc,
-                   32, &rect, &sun_seen_);
+    FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
+                   &rect);
     pc[27] = 1.0f;
-    FullscreenPass(CopyKind::kBakeMin, &baked_, &sun_height_, &sun_env_, &sun_ground_, false, pc,
-                   32, &rect, &sun_seen_);
+    FullscreenPass(CopyKind::kBakeMin, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
+                   &rect);
+    bake_dirty_ = true;
   }
+  // Saved every half a minute or so while there's something new.
+  if (bake_dirty_ && (frame_number_ >= bake_last_save_ + 1800 || Diag("bakesave"))) BakeSave();
   dyn_ = DynState{};
   baked_ok_ = true;
 }
 
 // Riders and whatever else is drawn after the lighting pass (it doesn't
 // light them: they're shaded by themselves) darkened where the world shades
-// them: each such pixel looked at from the sun through the world map.
+// them, and where they shade themselves (the game's own shadow map: an arm
+// on the body), on the surfaces facing the sun. Worked out at half size.
 Image* Renderer::Impl::ShadedMovers(Image* scene) {
   if (movers_done_) return movers_result_;
   movers_done_ = true;
@@ -6144,16 +6483,17 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
   const bool hidden = fits(ao_hidden_ok_, ao_after_hidden_);
   Image* after_hidden = hidden ? &ao_after_hidden_ : &ao_depth_;
   const uint32_t w = scene->width, h = scene->height;
+  const uint32_t hw = (w + 1) / 2, hh = (h + 1) / 2;
   EndRendering();
-  auto ensure = [&](Image& im, VkFormat f, const char* name) {
-    if (im.image && im.width == w && im.height == h && im.format == f) return;
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
     if (im.image) Retire(im);
-    im = gpu_.CreateImage(w, h, f, false, name);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
     ToGeneral(cb_, im);
   };
-  ensure(movers_pos_, VK_FORMAT_R32G32B32A32_SFLOAT, "movers_position");
-  ensure(movers_shade_, VK_FORMAT_R8_UNORM, "movers_shade");
-  ensure(movers_out_, scene->format, "movers_shaded");
+  ensure(movers_pos_, hw, hh, VK_FORMAT_R32G32B32A32_SFLOAT, "movers_position");
+  ensure(movers_shade_, hw, hh, VK_FORMAT_R8_UNORM, "movers_shade");
+  ensure(movers_out_, w, h, scene->format, "movers_shaded");
   movers_out_.scaled = scene->scaled;
   movers_out_.scale = scene->scale;
   Barrier();
@@ -6162,18 +6502,28 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
     for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
   }
   FullscreenPass(CopyKind::kMoverPos, &movers_pos_, late, &ao_depth_, after_hidden, false, pc, 16);
-  float sp[16] = {};
+  float sp[32] = {};
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 4; ++c) sp[r * 4 + c] = float(sun_O_[r * 4 + c]);
   }
-  sp[12] = float(kSunDepth);
-  sp[13] = float(sun_r_);
-  sp[14] = 0.04f * std::max(shadow_softness_, 0.25f);
-  sp[15] = Diag("moverdbg") ? -1.0f : 0.5f;  // how much of their light the shade takes
-  FullscreenPass(CopyKind::kMoverShade, &movers_shade_, &movers_pos_, &sun_env_, &sun_ground_, false,
-                 sp, 16);
-  FullscreenPass(CopyKind::kMoverApply, &movers_out_, scene, &movers_shade_, nullptr, false,
-                 nullptr, 0);
+  // Only what's saved (no world map kept up): the baked shadows instead.
+  const bool from_baked = bake_saved_only_ && bake_loaded_ && baked_ok_;
+  if (from_baked) {
+    for (int i = 0; i < 4; ++i) sp[i] = bake_c5_[i];
+    for (int i = 0; i < 3; ++i) sp[4 + i] = float(sun_f_[i]);
+  }
+  const bool self = sun_depth_per_m_ > 0.0 && sun_depth_ok_ && !Diag("noselfshadow");
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) sp[12 + c * 4 + r] = float(self ? sun_tex_from_world_[r * 4 + c] : 0.0);
+  }
+  sp[28] = 0.04f * std::max(shadow_softness_, 0.25f);
+  sp[29] = self ? float(sun_depth_per_m_) : 0.0f;
+  sp[30] = 0.5f;  // how much of their light the shade takes
+  sp[31] = from_baked ? 2.0f : Diag("moverdbg") ? 1.0f : 0.0f;
+  FullscreenPass(CopyKind::kMoverShade, &movers_shade_, &movers_pos_, &sun_env_,
+                 self ? &sun_zo_ : nullptr, false, sp, 32, nullptr, from_baked ? &baked_ : nullptr);
+  FullscreenPass(CopyKind::kMoverApply, &movers_out_, &movers_shade_, scene, late, true, nullptr, 0,
+                 nullptr, &ao_depth_);
   dyn_ = DynState{};
   movers_result_ = &movers_out_;
   return movers_result_;
@@ -7679,16 +8029,19 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // into the sun maps. Into the world map: everything opaque that the
     // game doesn't already cast from (its shadow pass's casters: riders,
     // rails, objects), so trees, rocks, props and the terrain itself. Into
-    // the height map (from above) and the ground map (from the sun): the
-    // same without the trees (the surfaces shadows lie on).
+    // the height map (from above): the same without the trees (the surfaces
+    // shadows lie on). Only while an update goes (the camera has moved or
+    // turned enough since the last), a third of the draws each frame over
+    // three frames (SunCycle).
     // (Diagnostics, "sunkeep": the world drawn into the maps once only, to
     // check that its shadows stay.)
-    // (Every third frame: the world stays put, and the maps keep it.)
-    const bool scene_pass = !light_seen_ && tiling_.width && (st.reg(0x2200) & 6) == 6 &&
-                            sun_map_frame_ && !(Diag("sunkeep") && sun_world_drawn_ > 0);
+    bool scene_pass = !light_seen_ && tiling_.width && (st.reg(0x2200) & 6) == 6 &&
+                      sun_phase_ >= 0 && world_detail_ > 0 && sun_env_.image &&
+                      !(Diag("sunkeep") && sun_world_drawn_ > 0);
+    if (scene_pass) scene_pass = sun_phase_ == 3 || (sun_draw_seq_++ % 3) == uint32_t(sun_phase_);
     const uint64_t vh = vs->info.ucode_hash;
     static const std::vector<Image*> kNoColors;
-    if (scene_pass && world_detail_ > 0 && sun_env_.image && !shadow_caster_vs_.count(vh)) {
+    if (scene_pass && !shadow_caster_vs_.count(vh)) {
       const VkPipeline cp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_env_, 0, false, false,
                                         false, true);
       if (cp) keep(cp, env_draws_, true);
@@ -7698,11 +8051,6 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
                                           false, false, true);
         if (hp) keep(hp, height_draws_, true);
       }
-    }
-    if (scene_pass && !shadow_caster_vs_.count(vh) && !IsShadowCaster(vh) && sun_ground_.image) {
-      const VkPipeline gp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_ground_, 0, false, false,
-                                        false, true);
-      if (gp) keep(gp, ground_draws_, false);
     }
     if (!light_seen_ && (st.reg(0x2200) & 2) &&
         ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
@@ -8853,6 +9201,9 @@ Renderer::Impl::~Impl() {
   if (cache_save_.valid()) cache_save_.wait();
   if (pipelines_unsaved_) gpu_.SavePipelineCache(options_.pipeline_cache_path);
   vk::vkDeviceWaitIdle(gpu_.device);
+  if (bake_io_.thread.joinable()) bake_io_.thread.join();
+  gpu_.DestroyBuffer(bake_io_.buffer);
+  for (auto& r : bake_retired_) gpu_.DestroyBuffer(r.second);
   VkDevice dev = gpu_.device;
   upscaler_.reset();  // its context uses the device
   gpu_.DestroyImage(up_out_);
@@ -8891,9 +9242,9 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_out_img_);
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
-  for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_, &sun_ground_,
+  for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_,
                     &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &baked_,
-                    &movers_pos_, &movers_shade_,
+                    &sun_tiles_, &sun_tiles2_, &movers_pos_, &movers_shade_,
                     &movers_out_}) {
     gpu_.DestroyImage(*im);
   }
@@ -9002,13 +9353,14 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   ao_before_ok_ = ao_hidden_ok_ = false;
   env_draws_.clear();
   height_draws_.clear();
-  ground_draws_.clear();
   shadow_caster_vs_.clear();
   light_candidates_.clear();
   movers_done_ = false;
   movers_result_ = nullptr;
   sun_frame_ok_ = false;
-  sun_map_frame_ = frame_number_ % 3 == 0 || !sun_map_ok_ || Diag("sunevery");
+  sun_phase_ = Diag("sunevery") ? 3 : sun_next_phase_;
+  sun_next_phase_ = -1;
+  sun_draw_seq_ = 0;
   sun_depth_target_ = nullptr;
   sun_light_ok_ = sun_prepared_ = sun_inputs_ok_ = sun_depth_ok_ = false;
   baked_ok_ = false;
@@ -9305,7 +9657,12 @@ void Renderer::SetFoliageFade(bool on) {
 }
 void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(strength, 0.0f); }
 
-void Renderer::SetWorldShadows(int detail) { impl_->world_detail_ = std::clamp(detail, 0, 4); }
+void Renderer::SetWorldShadows(int detail, bool saved_only) {
+  impl_->world_detail_ = std::clamp(detail, 0, 4);
+  impl_->bake_saved_only_ = saved_only;
+}
+
+void Renderer::SetWorldShadowsFolder(const std::string& folder) { impl_->bake_dir_ = folder; }
 
 void Renderer::SetShadowSoftness(float softness) {
   impl_->shadow_softness_ = std::max(softness, 0.0f);
@@ -9450,8 +9807,7 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   if (impl_->sun_out_.image) out.push_back(Describe(&impl_->sun_out_));
   if (impl_->baked_.image && impl_->Diag("dumpbake")) out.push_back(Describe(&impl_->baked_));
   if (impl_->Diag("dumpbake")) {
-    for (auto* im : {&impl_->sun_height_, &impl_->sun_env_, &impl_->sun_ground_,
-                     &impl_->movers_shade_}) {
+    for (auto* im : {&impl_->sun_height_, &impl_->sun_env_, &impl_->movers_shade_}) {
       if (im->image) out.push_back(Describe(im));
     }
   }

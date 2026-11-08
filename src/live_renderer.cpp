@@ -200,6 +200,10 @@ REXCVAR_DEFINE_INT32(native_world_shadows, 2, "GPU",
                      "map's resolution as you ride (0: the game's painted shadows; 2 or 4), "
                      "riders shaded by them too")
     .range(0, 4);
+REXCVAR_DEFINE_BOOL(native_world_shadows_saved, false, "GPU",
+                    "Native renderer: World shadows from what's saved for the mountain only "
+                    "(logs/world_shadows), no baking as you ride: no cost once a mountain has "
+                    "been ridden; else baked as you ride and saved");
 REXCVAR_DEFINE_BOOL(native_ambient_occlusion, true, "GPU",
                     "Native renderer: ambient occlusion: creases, corners and the snow around "
                     "trees, rails and jumps shaded where the open sky's light can't reach");
@@ -1792,7 +1796,8 @@ void WorkerMain() {
         renderer->SetShadows(
             revamped ? float(REXCVAR_GET(native_shadow_resolution)) / 100.0f : 1.0f,
             revamped ? float(REXCVAR_GET(native_shadow_distance)) : 0.0f);
-        renderer->SetWorldShadows(revamped ? int(REXCVAR_GET(native_world_shadows)) : 0);
+        renderer->SetWorldShadows(revamped ? int(REXCVAR_GET(native_world_shadows)) : 0,
+                                  REXCVAR_GET(native_world_shadows_saved));
         renderer->SetShadowSoftness(
             revamped ? float(REXCVAR_GET(native_shadow_softness)) / 100.0f : 0.0f);
         renderer->SetAmbientOcclusion(

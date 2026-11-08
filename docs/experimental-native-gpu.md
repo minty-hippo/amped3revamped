@@ -572,22 +572,28 @@ world x, z x c5.xy + c5.zw, x = 1 lit). The light is directional, its
 direction fixed per mountain (the one the shadow map's rows u, v, w all take
 to zero).
 
-**Sun maps** (with Shadow softness or World shadows on): the scene pass's
-draws (before the lighting, depth-tested and written; every third frame)
-drawn again into maps that stay put in the world and are never cleared while
-the camera stays near (so what was drawn once stays, even when the game culls
-it later):
+**Sun maps** (with World shadows on): the scene pass's draws (before the
+lighting, depth-tested and written) drawn again into maps that stay put in
+the world and are never cleared while the camera stays near (so what was
+drawn once stays, even when the game culls it later):
 
 - the **world map**, depth along the sun: everything except what the game
   already casts (the shaders its shadow pass draws casters with, found each
-  frame): trees, rocks, props, terrain;
-- the **ground map**, the same without the trees (vertex shaders
+  frame): trees, rocks, props, terrain. It's also the ground for the game's
+  casters' penumbras (what each ray meets first);
+- the **height map**, the same without the trees (vertex shaders
   `5919B6B651142594`, `9BAF953BF548C874`, `BEF747C713765676`,
-  `8D6CC76801E89D1A`): the surfaces shadows lie on;
-- the **height map**, the same from above (x, z, height);
+  `8D6CC76801E89D1A`), from above (x, z, height): the surfaces shadows lie
+  on, and their slope;
 - the **seen map**: rays whose sunward side (the ground and 45 m towards the
-  sun) has been in view while the world was drawn: what casts on them has
-  been drawn.
+  sun) was in view at the end of an update: what casts on them has been
+  drawn.
+
+**Updates** go only when the camera has moved 2.5 m or turned 6 degrees
+since the last one: the world's draws are drawn into the maps over the next
+three frames, a third each (by their order in the frame), and the seen map
+and the bake are done on the third. Standing still (menus, replays of one
+spot) costs nothing; riding at speed, an update every few frames.
 
 They're reprojected in the vertex shader (`XE_FLAG_REPROJECT`: camera clip
 -> world through `inv_vp_` -> the map), 1024 texels a side at Shadow
@@ -598,29 +604,48 @@ moves (another mountain), the camera jumps or their size changes.
 
 - **World shadows** (`native_world_shadows`: 0 the painted map, 2 or 4): the
   painted map is replaced for the lighting by a copy that many times larger
-  (an R8 image read as RRRR), first the painted one magnified, then baked
-  again around the camera on the frames that draw the maps: each texel's
-  surface (the height map) looked at from the sun through the world map,
-  percentage-closer soft shadows with a receiver plane from the ground map
-  (so slopes don't shade themselves). Where the ray's sunward side has been
-  seen, the bake is written outright (lit where nothing casts within 4 m);
-  elsewhere only where it's darker than what's there (blended by min: a
-  tree's crown above the view may not have been drawn). What's baked stays
-  until another mountain.
+  (an R8 image read as RRRR): what's saved for the mountain, else the
+  painted one magnified; then baked again around the camera at the end of
+  each update: each texel's surface (the height map) looked at from the sun
+  through the world map, percentage-closer soft shadows with a receiver
+  plane from the height map's slope (so slopes don't shade themselves).
+  Where the ray's sunward side has been seen, the bake is written outright
+  (lit where nothing casts within 4 m); elsewhere only where it's darker
+  than what's there (blended by min: a tree's crown above the view may not
+  have been drawn).
+- **Saved bakes**: `logs/world_shadows/<the painted map's TextureHash>_<w>x<h>.a3ws`
+  ("A3WS", version 1, width, height, the texels deflated: 5-15 MB at 2x).
+  Read in the background when the mountain's painted map first shows,
+  written in the background every 30 s or so while there's something new,
+  and when the mountain changes (the GPU copies to a host buffer; the file is
+  written four frames later, when the copy is done). With
+  `native_world_shadows_saved` on, once a mountain's saved bake is in, no
+  more updates at all (no cost but the riders' shading, which then reads the
+  saved shadows where the sun's ray through a rider meets the ground).
+  There's no way to bake ahead of time outside the game: the shadows come
+  from the world as the game draws it.
 - **Riders shaded**: what's drawn after the lighting (riders, their boards:
   the late depth differs from the world's and from what the depth-only
-  passes left) is looked at from the sun through the world map the same way,
-  and darkened by half in its shade.
+  passes left), worked out at half size (the nearest mover of each 2 x 2):
+  looked at from the sun through the world map (the world's shade), and
+  through the game's own shadow map's depth (the riders' **self-shadows**:
+  an arm on the body, the hair on the jacket; the light's view-projection
+  inverted gives each pixel's texel and depth in it, its depth per metre
+  towards the sun measured at the camera), on the surfaces facing the sun
+  (their normal from the neighbours: those facing away are dark already),
+  darkened by half.
 - **Shadow softness** (`native_shadow_softness`, percent, default 100): the
   game's casters' shadows (its map) filtered again: per texel, the casters
   near it (stencil 0) give their height above the ground along the sun (the
   light's view-projection from a shadow pass draw whose c0-c3 rows match the
-  lighting's, and the ground map), and the stencil is averaged over a disc of
-  radius 0.04 x softness x that height: sharp at a rider's feet, soft at the
-  head. Without the light's view-projection that frame, a rider's height is
-  assumed.
-- The replayer: `--world-shadows 2 --shadow-softness 1` (with `--repeat 4`,
-  or `--diag sunevery` to draw the maps every frame), `--diag sun` (what was
+  lighting's), and the stencil is averaged over a disc of radius 0.04 x
+  softness x that height: sharp at a rider's feet, soft at the head. Only
+  near a caster: a 1/8-size map of where the casters are, spread over the
+  filter's reach, lets every other texel keep the stencil as it is.
+- The replayer: `--world-shadows 2 --shadow-softness 1` (with `--repeat 5`:
+  an update takes three frames; `--diag sunevery` draws all of the world
+  every frame), `--bake-dir <folder>` and `--world-saved-only` (saved bakes;
+  `--diag bakesave` saves after every update), `--diag noselfshadow`, `--diag sun` (what was
   found), `--diag sunkeep` (the world drawn into the maps once only: its
   shadows must stay), `--diag dumpbake` (with `--dump`: the maps and the
   baked map), `--diag nobake`, `--diag moverdbg`.

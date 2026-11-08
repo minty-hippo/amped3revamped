@@ -78,6 +78,7 @@ const std::vector<Tab>& Tabs() {
             {{"0", "Even"}, {"50", "Subtle"}, {"100", "Natural"}, {"200", "Soft"}}},
            {"native_world_shadows", "World Shadows", Kind::kStops, 0, 0, 0,
             {{"0", "Painted"}, {"2", "Baked 2x"}, {"4", "Baked 4x"}}},
+           {"native_world_shadows_saved", "Saved Shadows Only"},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
@@ -388,6 +389,10 @@ std::string GraphicsPanel::Hint(const Row& r) const {
     return native ? "Trees, rocks and slopes' shadows baked again in-game, sharper; riders shaded."
                   : "Native renderer only (Options F1 > Native renderer).";
   }
+  if (name == "native_world_shadows_saved") {
+    return native ? "Once a mountain's World Shadows are saved, use them and stop baking (no cost)."
+                  : "Native renderer only (Options F1 > Native renderer).";
+  }
   if (name == "native_upscaled_textures") {
     return native ? "Textures upscaled on this PC at install (textures\\upscaled)."
                   : "Native renderer only (Options F1 > Native renderer).";
@@ -505,7 +510,8 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     if (name == "native_upscaler_msaa") dim = !native || upscaler == "off";
     if (name == "native_sharp_fonts" || name == "native_upscaled_textures") dim = !native;
     if (name == "native_shadow_resolution" || name == "native_shadow_distance" ||
-        name == "native_world_shadows" || name == "native_shadow_softness") {
+        name == "native_world_shadows" || name == "native_shadow_softness" ||
+        name == "native_world_shadows_saved") {
       dim = !native || !revamped;
     }
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);
