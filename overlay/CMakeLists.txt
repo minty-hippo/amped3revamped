@@ -183,6 +183,54 @@ if(UNIX AND NOT APPLE)
     target_link_options(amped3-texture-upscale PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
+# Subtitles (installer\Make-Subtitles.ps1, linux/make-subtitles.sh): finds the
+# game's sounds, decodes their XMA with the SDK's FFmpeg (the decoder the game
+# plays them with) and transcribes the speech with whisper.cpp, writing
+# subtitles\amped3.subtitles. Built only when asked for (target
+# amped3-subtitles; not part of the normal build), and only when setup has
+# fetched whisper.cpp (AMPED3_WHISPER_DIR) and the SDK checkout has FFmpeg.
+set(AMPED3_WHISPER_DIR "" CACHE PATH "whisper.cpp source folder (setup fetches it)")
+set(_amped3_ffmpeg "${AMPED3_SDK_SOURCE_DIR}/thirdparty/FFmpeg")
+set(_amped3_avcodec "")
+foreach(_t rex::libavcodec libavcodec)
+    if(NOT _amped3_avcodec AND TARGET ${_t})
+        set(_amped3_avcodec ${_t})
+    endif()
+endforeach()
+if(AMPED3_WHISPER_DIR AND EXISTS "${AMPED3_WHISPER_DIR}/CMakeLists.txt" AND _amped3_avcodec
+   AND EXISTS "${_amped3_ffmpeg}/libavcodec/avcodec.h")
+    set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(WHISPER_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+    # ggml's own thread pool (no OpenMP runtime to ship next to the tool).
+    set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+    set(_amped3_shared "${BUILD_SHARED_LIBS}")
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory("${AMPED3_WHISPER_DIR}" "${CMAKE_BINARY_DIR}/whisper.cpp" EXCLUDE_FROM_ALL)
+    set(BUILD_SHARED_LIBS "${_amped3_shared}")
+    add_executable(amped3-subtitles EXCLUDE_FROM_ALL
+        tools/subtitles/main.cpp
+        src/gui_patch_core.cpp
+        third_party/miniz/miniz.c)
+    target_include_directories(amped3-subtitles PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${_amped3_ffmpeg})
+    target_link_libraries(amped3-subtitles PRIVATE whisper ${_amped3_avcodec})
+    if(TARGET rex::libavutil)
+        target_link_libraries(amped3-subtitles PRIVATE rex::libavutil)
+    elseif(TARGET libavutil)
+        target_link_libraries(amped3-subtitles PRIVATE libavutil)
+    endif()
+    if(UNIX AND NOT APPLE)
+        target_link_options(amped3-subtitles PRIVATE -static-libstdc++ -static-libgcc)
+        target_link_libraries(amped3-subtitles PRIVATE pthread m)
+    endif()
+    message(STATUS "amped3: subtitle maker (amped3-subtitles) with whisper.cpp from ${AMPED3_WHISPER_DIR}")
+else()
+    message(STATUS "amped3: whisper.cpp or the SDK's FFmpeg not found; no subtitle maker")
+endif()
+
 # Shortcut icon (installers): the game's Xbox 360 dashboard icon from the
 # user's default.xex (tools/xex-icon). Decrypts and decompresses the XEX with
 # the SDK checkout's tiny-AES-c and libmspack LZX decoder.

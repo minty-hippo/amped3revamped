@@ -2,6 +2,7 @@
 
 #include "amped3_app.h"
 #include "audio_trace.h"
+#include "subtitles.h"
 
 #include <cctype>
 #include <cerrno>
@@ -378,6 +379,12 @@ void Amped3App::OnPostSetup() {
 
   // Music / XMA stream diagnostics (setting trace_audio).
   amped3::audio_trace::Start(runtime());
+  // Subtitles (made at install: subtitles\amped3.subtitles next to the exe).
+  amped3::subtitles::Start(runtime(), imgui_drawer(),
+                           rex::filesystem::GetExecutableFolder() / "subtitles",
+                           [this](std::function<void()> fn) {
+                             app_context().CallInUIThread(std::move(fn));
+                           });
 
   // Native renderer: its render scale is a percentage of the window's size.
   amped3::live::SetWindowSize([this]() -> std::pair<uint32_t, uint32_t> {
@@ -438,6 +445,7 @@ void Amped3App::OnShutdown() {
   amped3::perf::Shutdown();
   amped3::live::Shutdown();
   amped3::audio_trace::Stop();
+  amped3::subtitles::Stop();
   StopControllerHotkeyWatcher();
   amped3::pad::Install(nullptr, nullptr, nullptr);
   rex::ui::UnregisterBind(kMenuBind);

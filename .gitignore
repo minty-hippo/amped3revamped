@@ -29,3 +29,6 @@
 # Python caches (tools)
 __pycache__/
 /.amped3-source
+
+# Subtitles made from the game (installer Subtitles step): never commit.
+*.subtitles

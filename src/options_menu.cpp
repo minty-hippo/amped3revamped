@@ -501,6 +501,19 @@ const std::vector<Tab>& Tabs() {
                         "Lower means less delay; raise it if you hear crackling.", 4, 64,
                         "%d frames"),
             }},
+           {"Subtitles",
+            {
+                Choices("subtitles", "Subtitles",
+                        "What's said, on screen. The subtitles are made on this PC from your own "
+                        "copy of the game by the installer's Subtitles step (or Make Subtitles.bat "
+                        "/ linux/make-subtitles.sh), which listens to the game's dialogue with "
+                        "offline speech recognition; until then there are none to show. "
+                        "Cutscenes and movies: the story cutscenes' dialogue and the movies. "
+                        "All speech: also riders, coaches and announcers while you ride.",
+                        {{"0", "Off"}, {"1", "Cutscenes and movies"}, {"2", "All speech"}}),
+                SliderI("subtitles_size", "Subtitle size", "How big the subtitle text is.", 50,
+                        200, "%d%%"),
+            }},
        }},
       {"Controls",
        {

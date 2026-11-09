@@ -392,6 +392,38 @@ if (Test-Path (Join-Path $GlslangDir 'CMakeLists.txt')) {
 } else {
   Write-Host "    glslang not found at $GlslangDir; the native renderer preview will be unavailable" -ForegroundColor Yellow
 }
+# Subtitles (installer\Make-Subtitles.ps1): the subtitle maker uses whisper.cpp
+# (speech recognition, MIT), fetched once at a pinned release. Optional: without
+# it everything else builds as before.
+$WhisperRepo = 'https://github.com/ggml-org/whisper.cpp.git'
+$WhisperTag = 'v1.8.2'
+$WhisperCommit = '4979e04f5dcaccb36057e059bbaed8a2f5288315'
+$WhisperDir = Join-Path $ProjectDir 'out\whisper.cpp'
+function Get-GitHead([string]$Dir) {
+  # git's complaints on stderr would stop the script under Windows PowerShell 5.1.
+  $ErrorActionPreference = 'Continue'
+  try { $h = (& git -C $Dir rev-parse HEAD 2>&1 | Select-Object -First 1) } catch { return '' }
+  if ($LASTEXITCODE -ne 0 -or -not $h) { return '' }
+  return "$h".Trim()
+}
+function Get-Whisper {
+  if (Test-Path (Join-Path $WhisperDir 'CMakeLists.txt')) {
+    if ((Get-GitHead $WhisperDir) -eq $WhisperCommit) { return $true }
+    Remove-Item -LiteralPath $WhisperDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  Step "Getting whisper.cpp $WhisperTag (speech recognition for subtitles)"
+  if (-not (Invoke-Logged 'whisper-clone' { git -c advice.detachedHead=false clone --depth 1 --branch $WhisperTag $WhisperRepo $WhisperDir } -AllowFail)) {
+    Write-Host '    Could not get whisper.cpp; the subtitle maker will be unavailable.' -ForegroundColor Yellow
+    return $false
+  }
+  if ((Get-GitHead $WhisperDir) -ne $WhisperCommit) {
+    Write-Host "    whisper.cpp $WhisperTag isn't the expected commit; not using it." -ForegroundColor Yellow
+    Remove-Item -LiteralPath $WhisperDir -Recurse -Force -ErrorAction SilentlyContinue
+    return $false
+  }
+  return $true
+}
+if (Get-Whisper) { $ConfigureArgs += "-DAMPED3_WHISPER_DIR=$WhisperDir" }
 $Exe = Join-Path $ProjectDir "out\build\$Preset\amped3.exe"
 $RunLogDir = Join-Path (Split-Path $Exe) 'logs'
 
@@ -552,6 +584,13 @@ function Build-Game([string]$Tag) {
   Invoke-Logged "$Tag-build" { cmake --build --preset $Preset }
   if (-not (Test-Path $Exe)) { Fail "Build finished but $Exe is missing." }
   Install-UpscalerRuntimes
+  # The subtitle maker (not part of the normal build; the game doesn't need it).
+  if (Test-Path (Join-Path $WhisperDir 'CMakeLists.txt')) {
+    Step 'Building the subtitle maker (amped3-subtitles)'
+    if (-not (Invoke-Logged "$Tag-subtitles" { cmake --build --preset $Preset --target amped3-subtitles } -AllowFail)) {
+      Write-Host "    The subtitle maker didn't build (see $($script:LastLog)); the game works without it." -ForegroundColor Yellow
+    }
+  }
 }
 
 # Launches the game and watches its log. Returns the guest address of a

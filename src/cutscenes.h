@@ -22,4 +22,8 @@ namespace amped3::cutscenes {
 // should close (a scene was started, so it isn't hidden behind the menu).
 bool DrawTab();
 
+// Any thread: a story cutscene is playing (between the game's
+// GroverPlayer::Play and Stop, or the end of the challenge intro state).
+bool SceneActive();
+
 }  // namespace amped3::cutscenes

@@ -256,6 +256,24 @@ if [ -f "$SDK_DIR/thirdparty/glslang/CMakeLists.txt" ]; then
 else
   warn "glslang not found in the SDK checkout; the native renderer will be unavailable"
 fi
+# Subtitles (linux/make-subtitles.sh): the subtitle maker uses whisper.cpp
+# (speech recognition, MIT), fetched once at a pinned release. Optional:
+# without it everything else builds as before.
+WHISPER_REPO='https://github.com/ggml-org/whisper.cpp.git'
+WHISPER_TAG='v1.8.2'
+WHISPER_COMMIT='4979e04f5dcaccb36057e059bbaed8a2f5288315'
+WHISPER_DIR="$PROJECT_DIR/out/whisper.cpp"
+if [ "$(git -C "$WHISPER_DIR" rev-parse HEAD 2>/dev/null || true)" != "$WHISPER_COMMIT" ]; then
+  rm -rf "$WHISPER_DIR"
+  step "Getting whisper.cpp $WHISPER_TAG (speech recognition for subtitles)"
+  if ! run_logged --allow-fail whisper-clone git -c advice.detachedHead=false clone --depth 1 \
+         --branch "$WHISPER_TAG" "$WHISPER_REPO" "$WHISPER_DIR" ||
+     [ "$(git -C "$WHISPER_DIR" rev-parse HEAD 2>/dev/null || true)" != "$WHISPER_COMMIT" ]; then
+    warn "Could not get whisper.cpp $WHISPER_TAG; the subtitle maker will be unavailable."
+    rm -rf "$WHISPER_DIR"
+  fi
+fi
+[ -f "$WHISPER_DIR/CMakeLists.txt" ] && CONFIGURE_ARGS+=(-DAMPED3_WHISPER_DIR="$WHISPER_DIR")
 BUILD_DIR="$PROJECT_DIR/out/build/$PRESET"
 EXE="$BUILD_DIR/amped3"
 
@@ -299,6 +317,13 @@ step "Building amped3 ($PRESET) - compiling the recompiled game takes a while"
 run_logged build-reconfigure cmake --preset "$PRESET" "${CONFIGURE_ARGS[@]}"
 run_logged build cmake --build --preset "$PRESET"
 [ -x "$EXE" ] || fail "Build finished but $EXE is missing."
+# The subtitle maker (not part of the normal build; the game doesn't need it).
+if [ -f "$WHISPER_DIR/CMakeLists.txt" ]; then
+  step 'Building the subtitle maker (amped3-subtitles)'
+  if ! run_logged --allow-fail build-subtitles cmake --build --preset "$PRESET" --target amped3-subtitles; then
+    warn "The subtitle maker didn't build (see $LAST_LOG); the game works without it."
+  fi
+fi
 
 # AMD FSR 3.1 (Upscaler option): AMD ships its runtime for Windows only, so
 # it's built here from the FidelityFX SDK's sources (linux/fidelityfx). Only

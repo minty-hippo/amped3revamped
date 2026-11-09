@@ -41,7 +41,7 @@ executable. On top of the plain recompile it adds:
     integer scaling, CAS/FSR upscaling and sharpening.
   - **Graphics:** anisotropic filtering (up to 16×), background shader
     compilation, GPU readback accuracy.
-  - **Audio:** mute, buffer size.
+  - **Audio:** mute, stereo mix, buffer size, subtitles (see *Subtitles*).
   - **Controls:** controller driver, Guide button passthrough, keyboard/mouse mode
     and sensitivity.
   - **Enhancements:** game patch toggles (see *Adding an enhancement*) and
@@ -174,8 +174,10 @@ sources from GitHub and builds the game on your computer from your own Amped 3
 4. Choose the **Graphics**: Revamped (the new effects and 60 fps; the
    default) or Original (as on the Xbox 360), and whether to **Upscale
    textures** (menus, HUD and loading screens 4x with Real-ESRGAN after the
-   build; Windows and Linux x86_64). Both can be changed later: Graphics
-   settings, and Upscale textures on the launcher's home page.
+   build; Windows and Linux x86_64), and whether to make **Subtitles** after
+   the build (see *Subtitles*). These can be changed later: Graphics
+   settings, and Upscale textures and Make subtitles on the launcher's home
+   page.
 5. Select **Build and install** (twice, to confirm). The build's output
    scrolls in the launcher and is saved to a log. The first build takes about
    an hour on a PC and several hours on a handheld.
@@ -203,6 +205,8 @@ Armada).
 - **Upscale textures:** runs the texture upscaler (Real-ESRGAN, 4x: menus,
   HUD and loading screens) and switches Upscaled textures on. Windows and
   Linux x86_64.
+- **Make subtitles:** runs the subtitle maker (see *Subtitles*); stopping it
+  is fine, running it again carries on.
 - **Start the game directly:** the launcher starts the game at once next
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.
@@ -398,6 +402,35 @@ The row is added in memory as the game loads its menus; the game's files are
 never changed. Set `patch_game_menus = false` in `amped3.toml` to leave the
 menus untouched.
 
+## Subtitles
+
+Amped 3 has no subtitles of its own, and none can ship with this project (the
+dialogue is the game's). So they're made on your PC, from your own copy:
+the installer offers a **Subtitles** step (and `Make Subtitles.bat`,
+`linux/make-subtitles.sh` or the launcher's **Make subtitles** run it any
+time). It finds the game's sounds in its files (XACT wave banks and XMA
+files, loose or inside the `.res` archives), decodes them with the SDK's XMA
+decoder and writes down what's said with offline speech recognition
+([whisper.cpp](https://github.com/ggml-org/whisper.cpp); its `base.en` model,
+142 MB, is downloaded once; `-Model small.en` is more accurate and about 3x
+slower). Nothing leaves the PC. It runs on the CPU and takes a while (short
+sounds are transcribed 20-odd seconds' worth at a time); it can be stopped and
+picks up where it was. Music is left out. The result is
+`subtitles\amped3.subtitles` in the install folder, and `subtitles\scan.txt`
+lists every sound and movie it found and what it did with each.
+
+In game, **Options > Audio > Subtitles**: *Cutscenes and movies* (default),
+*All speech* (riders, coaches and announcers while you ride too) or *Off*,
+and the text size (`subtitles`, `subtitles_size`). The game recognises a
+sound as it starts playing (from the start of its data, as the audio
+decoder reads it) and shows its lines at their times from there, so
+pausing pauses them too. `trace_subtitles` logs which sounds were recognised
+and which weren't.
+
+Speech recognition makes mistakes, mostly with names and shouted lines.
+Whatever plays through the game's XMA audio is covered; if a movie's sound
+track doesn't, `scan.txt` and a log with `trace_subtitles` show why.
+
 ## Hotkeys
 
 | Key / buttons | Action |
@@ -474,8 +507,10 @@ hook plus a setting that switches it on:
 | `amped3_functions_auto.toml` | Function entry points `setup.ps1` adds when codegen reports branches into unknown code |
 | `amped3.defaults.toml` | Starting `amped3.toml` (windowed, 16× AF) |
 | `patches/rexglue/` | SDK fixes, credit [3on3NHL-recomp](https://github.com/Wndwsqrrl/3on3NHL-recomp) (MIT) |
+| `src/subtitles.*`, `src/subtitle_file.h`, `tools/subtitles/`, `installer/Make-Subtitles.ps1`, `linux/make-subtitles.sh` | Subtitles: the overlay, the file format, and the subtitle maker the installer runs |
 
-Never share `generated\`, `out\`, the game folder or a built `amped3.exe`.
+Never share `generated\`, `out\`, the game folder, a built `amped3.exe` or
+the install's `subtitles\` folder (it's the game's dialogue written down).
 They contain or are built from the game's code. `.gitignore` keeps them, the
 XeSS headers and `assets/local` out of git.
 
@@ -511,6 +546,11 @@ respective owners; this project is not affiliated with or endorsed by them.
 - **[Intel XeSS](https://github.com/intel/xess)** © Intel Corporation (Intel
   Simplified Software License). Headers and runtime are downloaded at build
   time, not included here.
+- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** © The ggml
+  authors (MIT), with OpenAI's Whisper models (MIT), for the optional
+  subtitles. Fetched at build time and the model at install time, not included
+  here. The subtitle maker decodes XMA with the SDK's FFmpeg (LGPL 2.1+), as
+  the game does.
 - **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (ncnn-vulkan build)
   © Xintao Wang (BSD 3-Clause), for the optional texture upscaling. Downloaded
   at install time, not included here.

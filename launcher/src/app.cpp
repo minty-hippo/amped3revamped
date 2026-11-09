@@ -175,7 +175,8 @@ struct App::Shared {
 
   enum class Job { kIdle, kRunning, kDone, kFailed, kCancelled } job = Job::kIdle;
   bool job_install = false;
-  bool job_upscale = false;  // the texture upscaler on its own
+  bool job_upscale = false;    // the texture upscaler on its own
+  bool job_subtitles = false;  // the subtitle maker on its own
   std::string step, job_error;
   std::deque<std::string> log;
   fs::path log_path;
@@ -246,6 +247,7 @@ void App::LoadSettings() {
   direct_start_ = get("direct_start") == "1";
   original_look_ = get("look") == "original";
   upscale_on_install_ = get("upscale_on_install") == "1";
+  subtitles_on_install_ = get("subtitles_on_install") == "1";
   std::string branch = get("branch");
   if (branch.empty()) {
     const Version v = ReadVersion(install_dir_ / "amped3-version.txt");
@@ -267,6 +269,7 @@ void App::SaveSettings() {
   kv["direct_start"] = direct_start_ ? "1" : "0";
   kv["look"] = original_look_ ? "original" : "revamped";
   kv["upscale_on_install"] = upscale_on_install_ ? "1" : "0";
+  kv["subtitles_on_install"] = subtitles_on_install_ ? "1" : "0";
   {
     std::lock_guard lock(s_->m);
     kv["branch"] = s_->branches[size_t(s_->branch)];
@@ -388,7 +391,8 @@ void App::StartCheck() {
 // Downloads the branch into the sources folder (or updates a git checkout),
 // then runs the installer: an install from the disc image, or a rebuild of
 // the existing install.
-void App::StartJob(bool install, bool upscale) {
+void App::StartJob(bool install, Tool tool) {
+  const bool upscale = tool == Tool::kUpscale;
   std::string branch;
   {
     std::lock_guard lock(s_->m);
@@ -397,6 +401,7 @@ void App::StartJob(bool install, bool upscale) {
     s_->job = Shared::Job::kRunning;
     s_->job_install = install;
     s_->job_upscale = upscale;
+    s_->job_subtitles = tool == Tool::kSubtitles;
     s_->step = "Starting";
     s_->job_error.clear();
     s_->log.clear();
@@ -416,14 +421,18 @@ void App::StartJob(bool install, bool upscale) {
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
     s_->log_path =
-        logs / (std::string(upscale ? "upscale_" : install ? "install_" : "update_") + stamp + ".log");
+        logs / (std::string(upscale                  ? "upscale_"
+                            : tool == Tool::kSubtitles ? "subtitles_"
+                            : install                  ? "install_"
+                                                       : "update_") +
+                stamp + ".log");
     s_->log_file.close();
     s_->log_file.open(s_->log_path);
   }
   SaveSettings();
   const fs::path iso = install && !discs_.empty() ? discs_[size_t(disc_)] : fs::path();
-  if (upscale) {
-    std::thread([this] { UpscaleMain(); }).detach();
+  if (tool != Tool::kNone) {
+    std::thread([this, tool] { ToolMain(tool); }).detach();
     return;
   }
   std::thread([this, install, branch, iso] { JobMain(install, branch, iso); }).detach();
@@ -518,6 +527,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   else argv.insert(argv.end(), {"-GameDir", PathText(install_dir / "game")});
   argv.insert(argv.end(), {"-InstallDir", PathText(install_dir), "-Yes", "-UpscaleTextures",
                            install && upscale_on_install_ && kCanUpscale ? "yes" : "no"});
+  if (FileContains(build_src / "installer" / "Install-Amped3.ps1", "$Subtitles")) {
+    argv.insert(argv.end(), {"-Subtitles", install && subtitles_on_install_ ? "yes" : "no"});
+  }
   if (install && FileContains(build_src / "installer" / "Install-Amped3.ps1", "$Graphics")) {
     argv.insert(argv.end(), {"-Graphics", original_look_ ? "original" : "revamped"});
   }
@@ -529,6 +541,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   else argv.insert(argv.end(), {"--game-dir", PathText(install_dir / "game")});
   argv.insert(argv.end(), {"--install-dir", PathText(install_dir), "--yes", "--upscale-textures",
                            install && upscale_on_install_ && kCanUpscale ? "yes" : "no"});
+  if (FileContains(build_src / "install.sh", "--subtitles)")) {
+    argv.insert(argv.end(), {"--subtitles", install && subtitles_on_install_ ? "yes" : "no"});
+  }
   if (install && FileContains(build_src / "install.sh", "--graphics)")) {
     argv.insert(argv.end(), {"--graphics", original_look_ ? "original" : "revamped"});
   }
@@ -554,9 +569,10 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   finish(Shared::Job::kDone, "");
 }
 
-// Upscale textures: the install's texture upscaler (installer/Upscale-Textures.ps1,
-// linux/upscale-textures.sh from its sources), then the game uses them.
-void App::UpscaleMain() {
+// Upscale textures / Make subtitles: one of the install's tools on its own
+// (installer/Upscale-Textures.ps1 or Make-Subtitles.ps1, linux/upscale-textures.sh
+// or make-subtitles.sh from its sources), then the game uses what it made.
+void App::ToolMain(Tool tool) {
   auto s = s_;
   const fs::path install_dir = install_dir_;
   const fs::path source = source_dir_;
@@ -570,29 +586,31 @@ void App::UpscaleMain() {
       s->log_file.close();
     }
   };
+  const bool subs = tool == Tool::kSubtitles;
+  const char* what = subs ? "The subtitle maker" : "The texture upscaler";
   std::error_code ec;
-  s->Step("Upscaling textures (Real-ESRGAN): downloads 45 MB once, then a few minutes on the GPU");
+  s->Step(subs ? "Making subtitles (speech recognition): downloads 142 MB once, then a while on the CPU"
+               : "Upscaling textures (Real-ESRGAN): downloads 45 MB once, then a few minutes on the GPU");
   const fs::path src = NoSpacePath(source);
   std::vector<std::string> argv;
 #if defined(_WIN32)
-  const fs::path script = src / "installer" / "Upscale-Textures.ps1";
+  const fs::path script = src / "installer" / (subs ? "Make-Subtitles.ps1" : "Upscale-Textures.ps1");
   argv = {"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PathText(script),
           "-InstallDir", PathText(install_dir)};
   for (const auto& entry : fs::directory_iterator(src / "out" / "build", ec)) {
-    const fs::path tool = entry.path() / "amped3-texture-upscale.exe";
-    if (fs::exists(tool, ec)) {
-      argv.insert(argv.end(), {"-Tool", PathText(tool)});
+    const fs::path exe = entry.path() / (subs ? "amped3-subtitles.exe" : "amped3-texture-upscale.exe");
+    if (fs::exists(exe, ec)) {
+      argv.insert(argv.end(), {"-Tool", PathText(exe)});
       break;
     }
   }
 #else
-  const fs::path script = src / "linux" / "upscale-textures.sh";
+  const fs::path script = src / "linux" / (subs ? "make-subtitles.sh" : "upscale-textures.sh");
   argv = {"bash", PathText(script), "--install-dir", PathText(install_dir)};
 #endif
   if (!fs::exists(script, ec)) {
-    return finish(Shared::Job::kFailed,
-                  "The texture upscaler isn't in this install's sources (" + PathText(source) +
-                      "): Update first.");
+    return finish(Shared::Job::kFailed, std::string(what) + " isn't in this install's sources (" +
+                                            PathText(source) + "): Update first.");
   }
   std::string error;
   const int code = RunProcess(argv, src, [&](const std::string& line) {
@@ -601,13 +619,15 @@ void App::UpscaleMain() {
   }, &error);
   if (code < 0) s->Log(error);
   if (code != 0) {
-    return finish(Shared::Job::kFailed, "The texture upscaler failed (exit " + std::to_string(code) + ").");
+    return finish(Shared::Job::kFailed, std::string(what) + " failed (exit " + std::to_string(code) + ").");
   }
-  // Used from now on (Graphics settings: Upscaled textures).
-  GameConfig config;
-  config.Load(install_dir / "amped3.toml");
-  for (const auto& gs : DisplaySettings()) {
-    if (std::string(gs.key) == "native_upscaled_textures") config.Set(gs, "true");
+  if (!subs) {
+    // Used from now on (Graphics settings: Upscaled textures).
+    GameConfig config;
+    config.Load(install_dir / "amped3.toml");
+    for (const auto& gs : DisplaySettings()) {
+      if (std::string(gs.key) == "native_upscaled_textures") config.Set(gs, "true");
+    }
   }
   finish(Shared::Job::kDone, "");
 }
@@ -722,8 +742,11 @@ std::vector<App::Row> App::Rows() const {
   std::lock_guard lock(s_->m);
   if (s_->job == Shared::Job::kRunning) return {kRowCancel};
   if (!IsInstalled(install_dir_)) {
-    if (!kCanUpscale) return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowInstall, kRowQuit};
-    return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowUpscaleOnInstall, kRowInstall, kRowQuit};
+    if (!kCanUpscale) {
+      return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowSubtitlesOnInstall, kRowInstall, kRowQuit};
+    }
+    return {kRowDisc,    kRowBranch, kRowFolder, kRowLook, kRowUpscaleOnInstall, kRowSubtitlesOnInstall,
+            kRowInstall, kRowQuit};
   }
   if (page_ != Page::kHome) {
     std::vector<Row> rows;
@@ -734,6 +757,7 @@ std::vector<App::Row> App::Rows() const {
   }
   std::vector<Row> rows = {kRowPlay, kRowGraphics};
   if (kCanUpscale) rows.push_back(kRowUpscale);
+  rows.push_back(kRowSubtitles);
   for (Row r : {kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut, kRowQuit}) rows.push_back(r);
   return rows;
 }
@@ -765,7 +789,8 @@ void App::Change(Row row, int step) {
     if (IsInstalled(install_dir_)) check_at_ = ImGui::GetTime() + 0.6;
   } else if (row == kRowDisc && !discs_.empty()) {
     disc_ = (disc_ + step + int(discs_.size())) % int(discs_.size());
-  } else if (row == kRowDirect || row == kRowLook || row == kRowUpscaleOnInstall) {
+  } else if (row == kRowDirect || row == kRowLook || row == kRowUpscaleOnInstall ||
+             row == kRowSubtitlesOnInstall) {
     Activate(row);
   } else if (row >= kRowSetting && size_t(row - kRowSetting) < PageSettings().size()) {
     if (!config_.Step(PageSettings()[size_t(row - kRowSetting)], step)) {
@@ -838,7 +863,19 @@ void App::Activate(Row row) {
     case kRowUpscale:
       if (now < confirm_until_) {
         confirm_until_ = 0;
-        StartJob(false, true);
+        StartJob(false, Tool::kUpscale);
+      } else {
+        confirm_until_ = now + 6.0;
+      }
+      break;
+    case kRowSubtitlesOnInstall:
+      subtitles_on_install_ = !subtitles_on_install_;
+      SaveSettings();
+      break;
+    case kRowSubtitles:
+      if (now < confirm_until_) {
+        confirm_until_ = 0;
+        StartJob(false, Tool::kSubtitles);
       } else {
         confirm_until_ = now + 6.0;
       }
@@ -924,7 +961,7 @@ void App::Draw(ImFont* font) {
   Shared::Check check;
   CommitInfo remote;
   int behind, ahead;
-  bool job_install, job_upscale;
+  bool job_install, job_upscale, job_subtitles;
   std::chrono::steady_clock::duration elapsed{};
   {
     std::lock_guard lock(s_->m);
@@ -933,6 +970,7 @@ void App::Draw(ImFont* font) {
     job = s_->job;
     job_install = s_->job_install;
     job_upscale = s_->job_upscale;
+    job_subtitles = s_->job_subtitles;
     job_error = s_->job_error;
     check = s_->check;
     check_error = s_->check_error;
@@ -1032,7 +1070,8 @@ void App::Draw(ImFont* font) {
         const uint64_t free = FreeSpace(install_dir_);
         if (now < confirm_until_) {
           t.value = std::string("select again: ") + (original_look_ ? "Original" : "Revamped") +
-                    (upscale_on_install_ && kCanUpscale ? ", upscaled textures" : "");
+                    (upscale_on_install_ && kCanUpscale ? ", upscaled textures" : "") +
+                    (subtitles_on_install_ ? ", subtitles" : "");
           t.color = kGold;
         } else {
           t.value = "needs about 40 GB (" + GiB(free) + " free)";
@@ -1086,7 +1125,10 @@ void App::Draw(ImFont* font) {
         break;
       case kRowCancel:
         t.label = "Stop";
-        t.value = (job_upscale ? "upscaling " : job_install ? "installing " : "updating ") +
+        t.value = (job_upscale     ? "upscaling "
+                   : job_subtitles ? "making subtitles "
+                   : job_install   ? "installing "
+                                   : "updating ") +
                   Elapsed(elapsed);
         t.color = kGold;
         break;
@@ -1112,6 +1154,20 @@ void App::Draw(ImFont* font) {
           t.color = kGold;
         } else {
           t.value = "menus, HUD, loading screens (Real-ESRGAN, 4x)";
+          t.color = kDim;
+        }
+        break;
+      case kRowSubtitlesOnInstall:
+        t.label = "Subtitles";
+        t.value = subtitles_on_install_ ? "<  Yes, made after the build  >" : "<  No  >";
+        break;
+      case kRowSubtitles:
+        t.label = "Make subtitles";
+        if (now < confirm_until_) {
+          t.value = "select again to start";
+          t.color = kGold;
+        } else {
+          t.value = "cutscenes and movies (speech recognition, offline)";
           t.color = kDim;
         }
         break;

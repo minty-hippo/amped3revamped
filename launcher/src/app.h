@@ -65,6 +65,7 @@ class App {
     kRowCancel, kRowQuit,
     kRowGraphics, kRowEffects, kRowBack,                                 // settings pages
     kRowLook, kRowUpscaleOnInstall, kRowUpscale,                         // install choices
+    kRowSubtitlesOnInstall, kRowSubtitles,
     kRowSetting = 100  // + the setting's index on the page
   };
   enum class Page { kHome, kDisplay, kEffects };
@@ -80,9 +81,11 @@ class App {
   void SaveSettings();
   void StartBranchList();
   void StartCheck();
-  void StartJob(bool install, bool upscale = false);
+  enum class Tool { kNone, kUpscale, kSubtitles };
+  void StartJob(bool install, Tool tool = Tool::kNone);
   void JobMain(bool install, std::string branch, fs::path iso);
-  void UpscaleMain();  // the texture upscaler on its own (Upscale textures)
+  // One of the install's tools on its own (Upscale textures, Make subtitles).
+  void ToolMain(Tool tool);
   void BrowseDisc();
   void BrowseFolder();
   void MakeShortcut();
@@ -107,6 +110,7 @@ class App {
   // and whether to upscale the textures after the build.
   bool original_look_ = false;
   bool upscale_on_install_ = false;
+  bool subtitles_on_install_ = false;  // make subtitles after the build
   std::vector<fs::path> discs_;
   int disc_ = 0;
 };

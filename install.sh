@@ -6,7 +6,7 @@
 #
 #   ./install.sh [--iso <image.iso>] [--game-dir <extracted game>]
 #                [--install-dir <folder>] [--config Release|RelWithDebInfo]
-#                [--container | --native] [--upscale-textures yes|no]
+#                [--container | --native] [--upscale-textures yes|no] [--subtitles yes|no]
 #                [--graphics revamped|original] [--yes]
 #                [--update]
 #
@@ -15,14 +15,15 @@
 #     otherwise inside a podman / docker container (SteamOS, Armada).
 #  3. Puts the game together in the install folder (portable: move it
 #     anywhere), with a launcher and a desktop entry to add to Steam.
-#  4. Optionally upscales the game's textures (x86_64).
+#  4. Optionally upscales the game's textures (x86_64) and makes subtitles
+#     (offline speech recognition over the game's own dialogue).
 # --update (the launcher, and update.sh): installs or rebuilds without asking
 # anything, and leaves the menu entry and Steam to the launcher.
 # The build takes a long time the first time (hours on a handheld) and needs
 # about 40 GB free. Logs go to ./logs/.
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; YES=0; UPDATE=0
+ISO=''; GAME_SRC=''; INSTALL_DIR=''; CONFIG=Release; MODE=auto; UPSCALE=ask; SUBTITLES=ask; YES=0; UPDATE=0
 GRAPHICS=ask
 
 while [ $# -gt 0 ]; do
@@ -34,6 +35,7 @@ while [ $# -gt 0 ]; do
     --container) MODE=container; shift ;;
     --native) MODE=native; shift ;;
     --upscale-textures) UPSCALE="$2"; shift 2 ;;
+    --subtitles) SUBTITLES="$2"; shift 2 ;;
     --graphics) GRAPHICS="$2"; shift 2 ;;
     --yes|-y) YES=1; shift ;;
     --update) UPDATE=1; YES=1; shift ;;
@@ -127,7 +129,7 @@ BUILD_DIR="$PROJECT_DIR/out/build/linux-$ARCH-$CFG"
 # ---------------------------------------------------------------------------
 step 'Putting the game together'
 copied=0
-for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.* \
+for f in "$BUILD_DIR"/amped3 "$BUILD_DIR"/amped3-texture-upscale "$BUILD_DIR"/amped3-subtitles "$BUILD_DIR"/*.so "$BUILD_DIR"/*.so.* \
          "$BUILD_DIR"/*-LICENSE.txt; do
   [ -e "$f" ] || continue
   # A running game (the launcher's Update) has these mapped: replace the file
@@ -232,6 +234,22 @@ if [ "$UPSCALE" = yes ]; then
     set_game_setting native_upscaled_textures true  # used from now on
   else
     warn "Texture upscaling didn't finish (the game runs without it; run linux/upscale-textures.sh to retry)"
+  fi
+fi
+
+# Optional, not part of --yes: downloads a 142 MB model, keeps the CPU busy.
+if [ "$SUBTITLES" = ask ]; then
+  if [ "$YES" -eq 0 ] && [ -x "$INSTALL_DIR/amped3-subtitles" ] && [ ! -f "$INSTALL_DIR/subtitles/amped3.subtitles" ] &&
+     ask "Make subtitles for the cutscenes and movies? Listens to the game's dialogue here (offline speech recognition): 142 MB download, takes a while on the CPU (can be stopped and run again later)" n; then
+    SUBTITLES=yes
+  else
+    SUBTITLES=no
+  fi
+fi
+if [ "$SUBTITLES" = yes ]; then
+  step 'Making subtitles (speech recognition)'
+  if ! bash "$PROJECT_DIR/linux/make-subtitles.sh" --install-dir "$INSTALL_DIR"; then
+    warn "Making subtitles didn't finish (the game runs without them; run linux/make-subtitles.sh to carry on)"
   fi
 fi
 

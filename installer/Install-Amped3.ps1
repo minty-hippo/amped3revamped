@@ -51,6 +51,10 @@ param(
   [string]$UpscaleTextures = 'ask',
   [ValidateSet('ui', 'world', 'all')]
   [string]$UpscaleSet = 'ui',
+  # Make subtitles for the game's dialogue on this PC (offline speech
+  # recognition over your own copy's sounds; optional, asked unless given).
+  [ValidateSet('ask', 'yes', 'no')]
+  [string]$Subtitles = 'ask',
   # Revamped Graphics (the native renderer's effects and 60 fps; default) or
   # the original look. Asked unless given (-Yes: revamped).
   [ValidateSet('ask', 'revamped', 'original')]
@@ -554,6 +558,32 @@ if ($upscale) {
     Set-GameSetting $gameSettings 'native_upscaled_textures' 'true'
   } catch {
     Warn "Texture upscaling didn't finish: $_ (the game runs without it; run 'Upscale Textures.bat' to retry)"
+  }
+}
+
+# Optional: subtitles made on this PC (installer\Make-Subtitles.ps1; also
+# "Make Subtitles.bat" to run it later). Not part of -Yes: it downloads a
+# 142 MB model and keeps the CPU busy for a while.
+$subtitleTool = Join-Path $buildDir 'amped3-subtitles.exe'
+$makeSubtitles = switch ($Subtitles) {
+  'yes' { $true }
+  'no' { $false }
+  default {
+    if ($Yes -or -not (Test-Path $subtitleTool) -or
+        (Test-Path (Join-Path $InstallDir 'subtitles\amped3.subtitles'))) { $false } else {
+      $answer = Read-Host ("    Make subtitles for the cutscenes and movies? Listens to the game's dialogue on " +
+                           "this PC (offline speech recognition): downloads 142 MB and takes a while on the " +
+                           "CPU (it can be stopped and run again later). [y/N]")
+      $answer -match '^[Yy]'
+    }
+  }
+}
+if ($makeSubtitles) {
+  Step 'Making subtitles (speech recognition)'
+  try {
+    & (Join-Path $InstallerDir 'Make-Subtitles.ps1') -InstallDir $InstallDir -Tool $subtitleTool
+  } catch {
+    Warn "Making subtitles didn't finish: $_ (the game runs without them; run 'Make Subtitles.bat' to carry on)"
   }
 }
 
