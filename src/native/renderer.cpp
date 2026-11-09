@@ -1451,7 +1451,7 @@ struct Renderer::Impl {
   void BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16], bool bake);
   void ShiftMap(Image* map, Image* scratch, int64_t dx, int64_t dy);
   // Riders (drawn after the lighting) shaded by the world (ShadedMovers).
-  Image movers_pos_, movers_shade_, movers_out_;
+  Image movers_pos_, movers_shade_, movers_blur_, movers_out_;
   bool movers_done_ = false;
   Image* movers_result_ = nullptr;
   Image* ShadedMovers(Image* scene);
@@ -1723,7 +1723,8 @@ struct Renderer::Impl {
     kRadialBlur = 11, kFogColor = 12, kFog = 13, kRayMask = 14, kRayBlur = 15, kRayAdd = 16,
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
-    kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32
+    kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
+    kMoverBlur = 33
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1764,7 +1765,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[33] = {};  // by CopyKind
+  VkShaderModule copy_fs_[34] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -4525,6 +4526,36 @@ void main() {
   // Sun shadows, 1b: where the game's casters are, coarsely (1/8 size: the
   // least stencil of each 8 x 8 block), then that spread over 4 blocks each
   // way: the filter skips everywhere else (most of the map).
+  // Shaded riders, 2b: the shade blurred one way (a.xy: the step), only
+  // across points on the same surface (within a few cm of each other): what
+  // was left of the depth's own grain up close (a face, a hand) evened out.
+  copy_fs_[33] = CompileBuiltin("builtin_movers_blur", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D shade;
+layout(set = 0, binding = 1) uniform sampler2D pos;
+layout(push_constant) uniform Blur { vec4 a; } pc;  // step (texels), -
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 size = textureSize(shade, 0);
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec4 q = texelFetch(pos, c, 0);
+  float here = texelFetch(shade, c, 0).r;
+  if (q.w < 0.5) {
+    o = vec4(here);
+    return;
+  }
+  float sum = 0.0, wsum = 0.0;
+  for (int i = -4; i <= 4; ++i) {
+    ivec2 t = clamp(c + ivec2(pc.a.xy) * i, ivec2(0), size - 1);
+    vec4 qi = texelFetch(pos, t, 0);
+    if (qi.w < 0.5) continue;
+    vec3 d = qi.xyz - q.xyz;
+    float w = exp(-float(i * i) / 8.0) * exp(-dot(d, d) / 0.0016);
+    sum += texelFetch(shade, t, 0).r * w;
+    wsum += w;
+  }
+  o = vec4(wsum > 0.0 ? sum / wsum : here);
+}
+)", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(push_constant) uniform Tiles { vec4 a; } pc;  // a.x: block size (8: from the map; 1: spread)
@@ -4705,26 +4736,38 @@ void main() {
   vec3 fd = normalize(pc.p.w > 1.5 ? pc.o1.xyz : pc.o2.xyz);  // the sun's direction (travelling)
   float D = 1.0 / length(pc.o2.xyz), R = 1.0 / length(pc.o0.xyz);
   // The surface's normal (from its neighbours) and how much it faces the sun.
+  // The neighbours a few pixels off, not the next ones: up close (a face in a
+  // cutscene) the next pixel is a millimetre or two away, and the depth's
+  // own steps tilted a normal from it this way and that from pixel to pixel,
+  // which flipped the facing and showed as dark speckle in vertical runs.
   ivec2 ps = textureSize(pos, 0);
-  vec4 qx = texelFetch(pos, min(c + ivec2(1, 0), ps - 1), 0);
-  vec4 qy = texelFetch(pos, min(c + ivec2(0, 1), ps - 1), 0);
-  vec4 qx0 = texelFetch(pos, max(c - ivec2(1, 0), ivec2(0)), 0);
-  vec4 qy0 = texelFetch(pos, max(c - ivec2(0, 1), ivec2(0)), 0);
-  // Each side's neighbour, the nearer one in depth: across an edge (an arm
-  // in front of the body) the other side's is a different surface, and a
-  // normal from it is noise (it made the shading flicker and dither).
-  vec3 ex1 = qx.w > 0.5 ? qx.xyz - q.xyz : vec3(1e9), ex0 = qx0.w > 0.5 ? q.xyz - qx0.xyz : vec3(1e9);
-  vec3 ey1 = qy.w > 0.5 ? qy.xyz - q.xyz : vec3(1e9), ey0 = qy0.w > 0.5 ? q.xyz - qy0.xyz : vec3(1e9);
-  vec3 dx = dot(ex1, ex1) < dot(ex0, ex0) ? ex1 : ex0;
-  vec3 dy = dot(ey1, ey1) < dot(ey0, ey0) ? ey1 : ey0;
-  // (Screen right x screen down points away from the camera: the other way.)
-  vec3 n = cross(dy, dx);
-  // No neighbour on a side, or one more than 15 cm away (an edge either
-  // way): no normal, so half facing.
-  bool normal_ok = dot(dx, dx) < 0.0225 && dot(dy, dy) < 0.0225 && dot(n, n) > 1e-12;
-  n = normal_ok ? normalize(n) : vec3(0.0);
+  float nd = 0.0;
+  vec3 n = vec3(0.0);
+  for (int k = 3; k >= 1; --k) {  // the widest that stays on the surface
+    vec4 qx = texelFetch(pos, min(c + ivec2(k, 0), ps - 1), 0);
+    vec4 qy = texelFetch(pos, min(c + ivec2(0, k), ps - 1), 0);
+    vec4 qx0 = texelFetch(pos, max(c - ivec2(k, 0), ivec2(0)), 0);
+    vec4 qy0 = texelFetch(pos, max(c - ivec2(0, k), ivec2(0)), 0);
+    // Each side's neighbour, the nearer one in depth: across an edge (an
+    // arm in front of the body) the other side's is a different surface.
+    vec3 ex1 = qx.w > 0.5 ? qx.xyz - q.xyz : vec3(1e9), ex0 = qx0.w > 0.5 ? q.xyz - qx0.xyz : vec3(1e9);
+    vec3 ey1 = qy.w > 0.5 ? qy.xyz - q.xyz : vec3(1e9), ey0 = qy0.w > 0.5 ? q.xyz - qy0.xyz : vec3(1e9);
+    vec3 dx = dot(ex1, ex1) < dot(ex0, ex0) ? ex1 : ex0;
+    vec3 dy = dot(ey1, ey1) < dot(ey0, ey0) ? ey1 : ey0;
+    // (Screen right x screen down points away from the camera: the other way.)
+    vec3 nk = cross(dy, dx);
+    // A neighbour more than 15 cm a step away: an edge, try nearer.
+    float lim = 0.0225 * float(k * k);
+    if (dot(dx, dx) < lim && dot(dy, dy) < lim && dot(nk, nk) > 1e-14) {
+      n = normalize(nk);
+      nd = 1.0;
+      break;
+    }
+  }
+  // No normal (an edge, a thin part): half facing.
+  bool normal_ok = nd > 0.5;
   float ndl = normal_ok ? dot(n, -fd) : 0.5;
-  float facing = smoothstep(0.05, 0.45, ndl);
+  float facing = smoothstep(0.0, 0.5, ndl);
   // The world (trees, slopes): the world map; or, with only what's saved
   // (p.w = 2: o0 is c5, o1 the sun's direction), the baked shadows where the
   // sun's ray through it meets the ground.
@@ -6609,6 +6652,7 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
   };
   ensure(movers_pos_, hw, hh, VK_FORMAT_R32G32B32A32_SFLOAT, "movers_position");
   ensure(movers_shade_, hw, hh, VK_FORMAT_R8_UNORM, "movers_shade");
+  ensure(movers_blur_, hw, hh, VK_FORMAT_R8_UNORM, "movers_shade_blur");
   ensure(movers_out_, w, h, scene->format, "movers_shaded");
   movers_out_.scaled = scene->scaled;
   movers_out_.scale = scene->scale;
@@ -6638,6 +6682,10 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
   sp[31] = from_baked ? 2.0f : Diag("moverdbg") ? 1.0f : 0.0f;
   FullscreenPass(CopyKind::kMoverShade, &movers_shade_, &movers_pos_, &sun_env_,
                  self ? &sun_zo_ : nullptr, false, sp, 32, nullptr, from_baked ? &baked_ : nullptr);
+  // Evened out across each surface (both ways), then applied.
+  const float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
+  FullscreenPass(CopyKind::kMoverBlur, &movers_blur_, &movers_shade_, &movers_pos_, nullptr, false, bx, 4);
+  FullscreenPass(CopyKind::kMoverBlur, &movers_shade_, &movers_blur_, &movers_pos_, nullptr, false, by, 4);
   FullscreenPass(CopyKind::kMoverApply, &movers_out_, &movers_shade_, scene, late, true, nullptr, 0,
                  nullptr, &ao_depth_);
   dyn_ = DynState{};
@@ -9360,7 +9408,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_late_depth_);
   for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_,
                     &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &baked_,
-                    &sun_tiles_, &sun_tiles2_, &movers_pos_, &movers_shade_,
+                    &sun_tiles_, &sun_tiles2_, &movers_pos_, &movers_shade_, &movers_blur_,
                     &movers_out_}) {
     gpu_.DestroyImage(*im);
   }
