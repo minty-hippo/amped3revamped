@@ -142,12 +142,41 @@ if (-not $clangBin) {
 $env:PATH = "$clangBin;$env:PATH"
 Write-Host "    using clang from $clangBin"
 
+# Visual Studio's CMake and Ninja first, and Git for Windows' git. An MSYS2 /
+# Cygwin folder on PATH (devkitPro, for one) brings its own cmake and git:
+# that cmake reports the host as MSYS, which turns off the SDK's Windows
+# presets ("Could not use disabled preset win-amd64").
+$preferred = @(
+  (Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin'),
+  (Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'),
+  (Join-Path $env:ProgramFiles 'Git\cmd')
+) | Where-Object { Test-Path $_ }
+if ($preferred) { $env:PATH = (($preferred -join ';') + ';' + $env:PATH) }
+function Test-PosixTool([string]$Path) { return $Path -match '(?i)\\(msys[^\\]*|cygwin[^\\]*|devkitpro)\\' }
+foreach ($tool in 'cmake', 'ninja') {
+  $found = Get-Command $tool -ErrorAction SilentlyContinue
+  if ($found -and (Test-PosixTool $found.Source)) {
+    # Still one from MSYS2/Cygwin: those folders go to the end of PATH (for
+    # this build only), so the Windows one is found first.
+    $dirs = $env:PATH -split ';' | Where-Object { $_ }
+    $posix = @($dirs | Where-Object { Test-PosixTool "$_\" })
+    $env:PATH = ((@($dirs | Where-Object { -not (Test-PosixTool "$_\") }) + $posix) -join ';')
+    Write-Host "    ($tool from $($found.Source) passed over: an MSYS2/Cygwin build)" -ForegroundColor Yellow
+  }
+}
+$cmakeFound = Get-Command cmake -ErrorAction SilentlyContinue
+if ($cmakeFound -and (Test-PosixTool $cmakeFound.Source)) {
+  Fail ('Only an MSYS2/Cygwin cmake was found; the build needs a Windows one (Visual Studio''s ' +
+        '"C++ CMake tools for Windows" component, or: winget install Kitware.CMake).')
+}
 foreach ($tool in 'git', 'cmake', 'ninja') {
   if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
     if ($tool -eq 'git') { Fail 'Git not found. Install it from https://git-scm.com or: winget install Git.Git' }
     Fail "$tool not found (it normally comes with Visual Studio's C++ workload)."
   }
 }
+Write-Host "    cmake: $((Get-Command cmake).Source)"
+Write-Host "    git: $((Get-Command git).Source)"
 
 # ---------------------------------------------------------------------------
 $SdkDir = [IO.Path]::GetFullPath($SdkDir)
