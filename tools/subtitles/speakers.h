@@ -30,6 +30,7 @@ namespace amped3::speakers {
 // pretrained.pt at Resemblyzer commit 15d828edebe06bc72b9cabc8ef8ca5ab2cb457ce.
 inline constexpr const char* kModelSha256 = "39373b86598fa3da9fcddee6142382efe09777e8d37dc9c0561f41f0070f134e";
 inline constexpr size_t kModelSize = 17090379;
+inline constexpr double kPi = 3.14159265358979323846;  // (M_PI isn't standard: not on Windows)
 
 class VoiceEncoder {
  public:
@@ -153,11 +154,11 @@ class VoiceEncoder {
         fb_[m * 201 + k] = float(std::max(0.0, std::min(lower, upper)) * enorm);
       }
     }
-    for (int n = 0; n < 400; ++n) window_[n] = float(0.5 - 0.5 * std::cos(2 * M_PI * n / 400.0));
+    for (int n = 0; n < 400; ++n) window_[n] = float(0.5 - 0.5 * std::cos(2 * kPi * n / 400.0));
     for (int k = 0; k < 201; ++k) {
       for (int n = 0; n < 400; ++n) {
-        cos_[k * 400 + n] = float(std::cos(2 * M_PI * k * n / 400.0));
-        sin_[k * 400 + n] = float(std::sin(2 * M_PI * k * n / 400.0));
+        cos_[k * 400 + n] = float(std::cos(2 * kPi * k * n / 400.0));
+        sin_[k * 400 + n] = float(std::sin(2 * kPi * k * n / 400.0));
       }
     }
   }

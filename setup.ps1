@@ -625,6 +625,8 @@ function Build-Game([string]$Tag) {
     Step 'Building the subtitle maker (amped3-subtitles)'
     if (-not (Invoke-Logged "$Tag-subtitles" { cmake --build --preset $Preset --target amped3-subtitles } -AllowFail)) {
       Write-Host "    The subtitle maker didn't build (see $($script:LastLog)); the game works without it." -ForegroundColor Yellow
+      # An older one would be run with options it doesn't know.
+      Remove-Item -LiteralPath (Join-Path $ProjectDir "out\build\$Preset\amped3-subtitles.exe") -Force -ErrorAction SilentlyContinue
     }
   }
 }

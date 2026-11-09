@@ -322,6 +322,7 @@ if [ -f "$WHISPER_DIR/CMakeLists.txt" ]; then
   step 'Building the subtitle maker (amped3-subtitles)'
   if ! run_logged --allow-fail build-subtitles cmake --build --preset "$PRESET" --target amped3-subtitles; then
     warn "The subtitle maker didn't build (see $LAST_LOG); the game works without it."
+    rm -f "$BUILD_DIR/amped3-subtitles"  # an older one would be run with options it doesn't know
   fi
 fi
 
