@@ -748,21 +748,27 @@ std::vector<App::Row> App::Rows() const {
     return {kRowDisc,    kRowBranch, kRowFolder, kRowLook, kRowUpscaleOnInstall, kRowSubtitlesOnInstall,
             kRowInstall, kRowQuit};
   }
+  if (page_ == Page::kSubtitleEditor) return {};
   if (page_ != Page::kHome) {
     std::vector<Row> rows;
     for (size_t i = 0; i < PageSettings().size(); ++i) rows.push_back(Row(kRowSetting + int(i)));
     if (page_ == Page::kDisplay) rows.push_back(kRowEffects);
+    if (page_ == Page::kSubtitles) {
+      rows.push_back(kRowSubtitles);
+      rows.push_back(kRowSubtitlesEdit);
+    }
     rows.push_back(kRowBack);
     return rows;
   }
   std::vector<Row> rows = {kRowPlay, kRowGraphics};
   if (kCanUpscale) rows.push_back(kRowUpscale);
-  rows.push_back(kRowSubtitles);
+  rows.push_back(kRowSubtitlesPage);
   for (Row r : {kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut, kRowQuit}) rows.push_back(r);
   return rows;
 }
 
 const std::vector<GameSetting>& App::PageSettings() const {
+  if (page_ == Page::kSubtitles) return SubtitleSettings();
   return page_ == Page::kEffects ? EffectSettings() : DisplaySettings();
 }
 
@@ -773,6 +779,28 @@ void App::OpenPage(Page page) {
   cursor_ = 0;
   confirm_until_ = 0;
   if (page != Page::kHome) config_.Load(install_dir_ / "amped3.toml");
+}
+
+std::string App::SubtitleStatus() const {
+  const fs::path file = install_dir_ / "subtitles" / amped3::subtitle_file::kFileName;
+  std::ifstream f(file, std::ios::binary);
+  if (!f) return "";
+  std::stringstream ss;
+  ss << f.rdbuf();
+  std::vector<amped3::subtitle_file::Clip> clips;
+  if (!amped3::subtitle_file::Parse(ss.str(), &clips, nullptr)) return "";
+  size_t lines = 0, edited = 0, movies = 0;
+  for (const auto& c : clips) {
+    lines += c.lines.size();
+    edited += c.edited ? 1 : 0;
+    movies += c.kind == amped3::subtitle_file::Kind::kVideo ? 1 : 0;
+  }
+  auto count = [](size_t n, const char* one, const char* many) {
+    return std::to_string(n) + " " + (n == 1 ? one : many);
+  };
+  return count(lines, "line", "lines") + " in " + count(clips.size() - movies, "sound", "sounds") + " and " +
+         count(movies, "movie", "movies") +
+         (edited ? ", " + std::to_string(edited) + " corrected by hand" : std::string());
 }
 
 void App::Change(Row row, int step) {
@@ -883,6 +911,19 @@ void App::Activate(Row row) {
     case kRowEffects:
       OpenPage(Page::kEffects);
       break;
+    case kRowSubtitlesPage:
+      OpenPage(Page::kSubtitles);
+      break;
+    case kRowSubtitlesEdit: {
+      std::string error;
+      if (editor_.Open(install_dir_, source_dir_, &error)) {
+        page_ = Page::kSubtitleEditor;
+        notice_.clear();
+      } else {
+        notice_ = error;
+      }
+      break;
+    }
     case kRowBack:
       OpenPage(page_ == Page::kEffects ? Page::kDisplay : Page::kHome);
       break;
@@ -893,6 +934,10 @@ void App::Activate(Row row) {
 }
 
 void App::OnAction(Action action) {
+  if (page_ == Page::kSubtitleEditor) {
+    if (action == Action::kBack && editor_.Back()) OpenPage(Page::kSubtitles);
+    return;
+  }
   const auto rows = Rows();
   if (rows.empty()) return;
   cursor_ = std::clamp(cursor_, 0, int(rows.size()) - 1);
@@ -928,6 +973,11 @@ void App::SetRenderer(SDL_Renderer* renderer) {
 }
 
 void App::Draw(ImFont* font) {
+  if (page_ == Page::kSubtitleEditor) {
+    const float unit = std::max(ImGui::GetIO().DisplaySize.y / 720.0f, 0.6f);
+    if (editor_.Draw(font, unit)) OpenPage(Page::kSubtitles);
+    return;
+  }
   // What the dialogs and threads reported.
   {
     std::lock_guard lock(s_->m);
@@ -991,6 +1041,7 @@ void App::Draw(ImFont* font) {
   const bool same_branch = version.branch.empty() || version.branch == branch;
   const auto rows = Rows();
   cursor_ = std::clamp(cursor_, 0, int(rows.size()) - 1);
+  const std::string subtitle_status = page_ == Page::kSubtitles ? SubtitleStatus() : std::string();
 
   ImGuiIO& io = ImGui::GetIO();
   const ImVec2 display = io.DisplaySize;
@@ -1031,6 +1082,7 @@ void App::Draw(ImFont* font) {
       !installed                  ? "Build the game from your own Amped 3 (Xbox 360) disc image"
       : page_ == Page::kDisplay   ? "Graphics settings: display"
       : page_ == Page::kEffects   ? "Graphics settings: effects"
+      : page_ == Page::kSubtitles ? "Subtitles"
                                   : "Installed version  " + VersionText();
   dl->AddText(font, small_px, ImVec2(x0, y), kDim, sub.c_str());
   y += small_px * 2.0f;
@@ -1162,14 +1214,24 @@ void App::Draw(ImFont* font) {
         t.value = subtitles_on_install_ ? "<  Yes, made after the build  >" : "<  No  >";
         break;
       case kRowSubtitles:
-        t.label = "Make subtitles";
+        t.label = subtitle_status.empty() ? "Make subtitles" : "Make again";
         if (now < confirm_until_) {
           t.value = "select again to start";
           t.color = kGold;
         } else {
-          t.value = "cutscenes and movies (speech recognition, offline)";
+          t.value = subtitle_status.empty() ? "speech recognition on this PC, offline"
+                                            : "keeps what's corrected by hand";
           t.color = kDim;
         }
+        break;
+      case kRowSubtitlesPage:
+        t.label = "Subtitles";
+        t.value = ">";
+        break;
+      case kRowSubtitlesEdit:
+        t.label = "Edit subtitles";
+        t.value = subtitle_status.empty() ? "none made yet" : ">";
+        t.color = subtitle_status.empty() ? kDim : kWhite;
         break;
       case kRowEffects:
         t.label = "Effects";
@@ -1259,10 +1321,11 @@ void App::Draw(ImFont* font) {
     if (job == Shared::Job::kRunning) {
       para(step, kGold);
     } else if (job == Shared::Job::kDone) {
-      para(job_upscale    ? "Textures upscaled and switched on (Graphics settings: Upscaled "
-                            "textures). Select Play."
-           : job_install ? "Installed. Select Play."
-                         : "Updated. Select Play.",
+      para(job_upscale      ? "Textures upscaled and switched on (Graphics settings: Upscaled "
+                              "textures). Select Play."
+           : job_subtitles ? "Subtitles made. Edit subtitles corrects the words and who says them."
+           : job_install   ? "Installed. Select Play."
+                           : "Updated. Select Play.",
            kGreen);
     } else {
       para(job_error.empty() ? std::string("Failed.") : job_error, kRed);
@@ -1272,6 +1335,16 @@ void App::Draw(ImFont* font) {
     const int fit = std::max(0, int((bottom - y) / line_h));
     const size_t from = log_tail.size() > size_t(fit) ? log_tail.size() - size_t(fit) : 0;
     for (size_t i = from; i < log_tail.size(); ++i) line(log_tail[i], kDim);
+  } else if (installed && page_ == Page::kSubtitles) {
+    para(subtitle_status.empty() ? std::string("No subtitles made yet.") : "Made: " + subtitle_status + ".",
+         subtitle_status.empty() ? kGold : kWhite);
+    para("Amped 3 has no subtitles of its own: Make subtitles writes them on this PC from your copy "
+         "of the game, listening to its dialogue with offline speech recognition (a 142 MB model, "
+         "downloaded once; it takes a while on the CPU, and can be stopped and run again). Each "
+         "speaker of a scene gets their own colour: white, yellow, pink, green. Edit subtitles "
+         "fixes the words, the times and who says them, with the sound to listen to.",
+         kDim);
+    para("The settings are saved to amped3.toml at once (also in the game: Options > Audio).", kDim);
   } else if (installed && page_ != Page::kHome) {
     para("Saved to amped3.toml in the install folder at once; the game uses them the next "
          "time it starts. The same settings are in the game's own Graphics panel.",

@@ -21,12 +21,12 @@ include(FetchContent)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # SDL3, static, only what the launcher uses (window, renderer, controllers,
-# file dialogs).
+# file dialogs, sound for the subtitle editor's Play).
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(SDL_AUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_AUDIO ON CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -67,6 +67,7 @@ add_executable(amped3-launcher WIN32
     src/app.cpp
     src/title_logo.cpp
     src/game_settings.cpp
+    src/subtitle_editor.cpp
     ${TITLE_GIF_C}
     src/platform.cpp
     src/process.cpp

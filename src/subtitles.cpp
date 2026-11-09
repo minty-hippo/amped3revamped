@@ -46,6 +46,9 @@ REXCVAR_DEFINE_INT32(subtitles, 1, "Amped 3/Subtitles",
 REXCVAR_DEFINE_INT32(subtitles_size, 100, "Amped 3/Subtitles",
                      "Subtitle text size, in percent of the standard size")
     .range(50, 200);
+REXCVAR_DEFINE_BOOL(subtitles_speaker_colors, true, "Amped 3/Subtitles",
+                    "Each speaker of a scene in their own colour (first white, then yellow, pink "
+                    "and green, the game's colours); off: all white");
 REXCVAR_DEFINE_BOOL(trace_subtitles, false, "Amped 3/Diagnostics",
                     "Log which sounds the subtitles recognise as they start, and the ones "
                     "they don't (to the log file).");
@@ -108,7 +111,20 @@ int Find(uint32_t length, uint64_t hash) {
 // ---- shown lines (monitor thread -> UI thread) ---------------------------------
 
 std::mutex g_shown_mutex;
-std::vector<std::string> g_shown;
+struct Shown {
+  std::string text;
+  int speaker = 0;
+};
+std::vector<Shown> g_shown;
+
+// The speakers' colours: white, then the yellow, pink and green of the
+// game's menus and HUD (sampled from its UI textures).
+ImU32 SpeakerColor(int speaker) {
+  static const ImU32 kColors[4] = {IM_COL32(255, 255, 255, 255), IM_COL32(250, 232, 74, 255),
+                                   IM_COL32(246, 96, 240, 255), IM_COL32(128, 224, 40, 255)};
+  if (!REXCVAR_GET(subtitles_speaker_colors)) return kColors[0];
+  return kColors[std::clamp(speaker, 0, 3)];
+}
 
 // ---- the overlay ---------------------------------------------------------------
 
@@ -118,7 +134,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
-    std::vector<std::string> lines;
+    std::vector<Shown> lines;
     {
       std::lock_guard lock(g_shown_mutex);
       lines = g_shown;
@@ -134,8 +150,9 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const float max_w = pic_w * 0.78f;
 
     // Wrapped rows, the newest line at the bottom.
-    std::vector<std::string> rows;
-    for (const std::string& line : lines) {
+    std::vector<Shown> rows;
+    for (const Shown& shown : lines) {
+      const std::string& line = shown.text;
       std::string row;
       size_t pos = 0;
       while (pos < line.size()) {
@@ -144,28 +161,29 @@ class Overlay final : public rex::ui::ImGuiDialog {
         const std::string word = line.substr(pos, sp - pos);
         const std::string attempt = row.empty() ? word : row + " " + word;
         if (!row.empty() && font->CalcTextSizeA(px, FLT_MAX, 0, attempt.c_str()).x > max_w) {
-          rows.push_back(row);
+          rows.push_back({row, shown.speaker});
           row = word;
         } else {
           row = attempt;
         }
         pos = sp + 1;
       }
-      if (!row.empty()) rows.push_back(row);
+      if (!row.empty()) rows.push_back({row, shown.speaker});
     }
     if (rows.empty()) return;
     const float line_h = px * 1.22f;
     const float pad_x = px * 0.45f, pad_y = px * 0.18f;
     float y = (h + pic_h) * 0.5f - pic_h * 0.075f - line_h * float(rows.size());
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    for (const std::string& row : rows) {
+    for (const Shown& r : rows) {
+      const std::string& row = r.text;
       const ImVec2 size = font->CalcTextSizeA(px, FLT_MAX, 0, row.c_str());
       const float x = (w - size.x) * 0.5f;
       dl->AddRectFilled(ImVec2(x - pad_x, y - pad_y), ImVec2(x + size.x + pad_x, y + line_h - pad_y),
                         IM_COL32(0, 0, 0, 150), px * 0.2f);
       const float o = std::max(1.0f, px / 22.0f);
       dl->AddText(font, px, ImVec2(x + o, y + o), IM_COL32(0, 0, 0, 200), row.c_str());
-      dl->AddText(font, px, ImVec2(x, y), IM_COL32(255, 255, 255, 255), row.c_str());
+      dl->AddText(font, px, ImVec2(x, y), SpeakerColor(r.speaker), row.c_str());
       y += line_h;
     }
   }
@@ -192,6 +210,7 @@ struct Ctx {
 };
 
 std::thread g_thread;
+std::filesystem::path g_file;
 std::atomic<bool> g_running{false};
 
 const uint8_t* Readable(const uint8_t* host, size_t size) {
@@ -230,13 +249,28 @@ void Monitor(rex::Runtime* runtime) {
   double last_shown = -10;
   double movie_poll = -1, movie_start = 0;
   int movie_clip = -1;
+  double file_check = 0;
+  std::error_code ec;
+  auto file_time = std::filesystem::last_write_time(g_file, ec);
   while (g_running.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const double now = std::chrono::duration<double>(Clock::now() - t0).count();
     const double dt = std::min(0.1, now - prev);
     prev = now;
+    // Corrected in the subtitle editor while the game runs: read again.
+    if (now - file_check > 2.0) {
+      file_check = now;
+      const auto t = std::filesystem::last_write_time(g_file, ec);
+      if (!ec && t != file_time) {
+        file_time = t;
+        if (Load(g_file)) {
+          for (Ctx& c : ctxs) c.track = Track{};
+          movie_clip = -1;
+        }
+      }
+    }
     const int mode = REXCVAR_GET(subtitles);
-    std::vector<std::string> shown;
+    std::vector<Shown> shown;
     auto* audio = static_cast<rex::audio::AudioSystem*>(runtime->audio_system());
     auto* decoder = audio ? audio->xma_decoder() : nullptr;
     auto* memory = runtime->memory();
@@ -309,7 +343,7 @@ void Monitor(rex::Runtime* runtime) {
         if (mode == 1 && cl.kind == sf::Kind::kSpeech) continue;
         const uint32_t ms = uint32_t(t.elapsed * 1000.0);
         for (const sf::Line& l : cl.lines) {
-          if (ms >= l.start_ms && ms < l.end_ms) shown.push_back(l.text);
+          if (ms >= l.start_ms && ms < l.end_ms) shown.push_back({l.text, l.speaker});
         }
       }
     }
@@ -337,7 +371,7 @@ void Monitor(rex::Runtime* runtime) {
     if (mode > 0 && movie_clip >= 0) {
       const uint32_t ms = uint32_t((now - movie_start) * 1000.0);
       for (const sf::Line& l : g_clips[size_t(movie_clip)].lines) {
-        if (ms >= l.start_ms && ms < l.end_ms) shown.push_back(l.text);
+        if (ms >= l.start_ms && ms < l.end_ms) shown.push_back({l.text, l.speaker});
       }
     }
     if (shown.size() > 3) shown.erase(shown.begin(), shown.end() - 3);
@@ -374,6 +408,7 @@ void Start(rex::Runtime* runtime, rex::ui::ImGuiDrawer* drawer, std::filesystem:
     return;
   }
   if (!Load(file) || g_clips.empty()) return;
+  g_file = file;
   g_drawer = drawer;
   g_post_ui = std::move(post_ui);
   g_running = true;

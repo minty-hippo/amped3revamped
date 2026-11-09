@@ -50,9 +50,26 @@ if [ ! -f "$MODEL_FILE" ] || [ "$(sha1sum "$MODEL_FILE" | cut -c1-40)" != "$SHA1
   mv -f "$MODEL_FILE.part" "$MODEL_FILE"
 fi
 
+# Who says what (speaker colours): Resemblyzer's voice encoder (Apache 2.0),
+# 17 MB, at a pinned commit, checked against its hash. Optional.
+SPK="$DIR/resemblyzer-pretrained.pt"
+SPK_SHA=39373b86598fa3da9fcddee6142382efe09777e8d37dc9c0561f41f0070f134e
+if [ ! -f "$SPK" ] || [ "$(sha256sum "$SPK" | cut -c1-64)" != "$SPK_SHA" ]; then
+  echo '    Downloading the voice model for speaker colours (Resemblyzer, 17 MB)'
+  if curl -fL --retry 3 -o "$SPK.part" \
+       "https://raw.githubusercontent.com/resemble-ai/Resemblyzer/15d828edebe06bc72b9cabc8ef8ca5ab2cb457ce/resemblyzer/pretrained.pt" &&
+     [ "$(sha256sum "$SPK.part" | cut -c1-64)" = "$SPK_SHA" ]; then
+    mv -f "$SPK.part" "$SPK"
+  else
+    rm -f "$SPK.part"
+    echo "    Couldn't get it; subtitles without speaker colours."
+  fi
+fi
+
 OUT="$INSTALL_DIR/subtitles"
 mkdir -p "$OUT"
 args=(--game "$GAME" --out "$OUT" --model "$MODEL_FILE" --language "$LANGUAGE")
+[ -f "$SPK" ] && args+=(--speaker-model "$SPK")
 [ "$THREADS" -gt 0 ] && args+=(--threads "$THREADS")
 [ "$FORCE" -eq 1 ] && args+=(--force)
 "$TOOL" "${args[@]}" || { echo "ERROR: making subtitles failed. What was found: $OUT/scan.txt"; exit 1; }

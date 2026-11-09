@@ -205,8 +205,9 @@ Armada).
 - **Upscale textures:** runs the texture upscaler (Real-ESRGAN, 4x: menus,
   HUD and loading screens) and switches Upscaled textures on. Windows and
   Linux x86_64.
-- **Make subtitles:** runs the subtitle maker (see *Subtitles*); stopping it
-  is fine, running it again carries on.
+- **Subtitles:** the subtitle settings (show them, speaker colours, text
+  size), **Make subtitles** (see *Subtitles*; stopping it is fine, running it
+  again carries on) and **Edit subtitles**, the subtitle editor.
 - **Start the game directly:** the launcher starts the game at once next
   time. Hold LB / View on a controller, or Shift, while it starts to see the
   launcher.
@@ -433,7 +434,27 @@ it at its times from there, so pausing pauses them too; a movie by its file
 being open, timed from when it opens. `trace_subtitles` logs which sounds and
 movies were recognised and which weren't.
 
-Speech recognition makes mistakes, mostly with names and shouted lines.
+**Speaker colours.** Each line of a scene or movie is coloured by who says
+it, in the order they first speak: white, yellow, pink, green (the yellow,
+pink and green of the game's menus). Who's who is worked out from the voices
+with [Resemblyzer](https://github.com/resemble-ai/Resemblyzer)'s voice
+encoder (its 17 MB model is downloaded once): each line's voice is compared
+with the others in the same clip and alike voices grouped. On the game's own
+riders (29 voices, labelled in its sound project) lines of a few seconds are
+grouped right about 85% of the time; short shouts are harder. Riders' and
+announcers' lines are one voice each. `subtitles_speaker_colors` off: all
+white.
+
+**Corrections.** Speech recognition makes mistakes, mostly with names and
+shouted lines, and the speakers can be wrong. The launcher's **Subtitles >
+Edit subtitles** lists every clip (search the words or the sound; filter
+story, movies, riding, corrected) and edits its lines: the words, the start
+and end times, and the speaker (click the coloured number). **Play** plays
+the sound itself (written out from your game files), or from a line with `>`.
+Save (Ctrl+S) and the game picks it up within a couple of seconds, even while
+it runs. A corrected clip is marked so, and Make subtitles again keeps it as
+it is. The file is plain text too (`subtitles\amped3.subtitles`, described in
+`src/subtitle_file.h`).
 
 ## Hotkeys
 
@@ -556,6 +577,10 @@ respective owners; this project is not affiliated with or endorsed by them.
   here. The subtitle maker decodes XMA with the SDK's FFmpeg (LGPL 2.1+), as
   the game does, and the movies' Bink Audio with a decoder written after
   FFmpeg's (LGPL 2.1+).
+- **[Resemblyzer](https://github.com/resemble-ai/Resemblyzer)** © Resemble AI
+  (Apache 2.0): its voice encoder's model, downloaded at install, tells the
+  subtitles' speakers apart (the network is run by the subtitle maker's own
+  code).
 - **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (ncnn-vulkan build)
   © Xintao Wang (BSD 3-Clause), for the optional texture upscaling. Downloaded
   at install time, not included here.

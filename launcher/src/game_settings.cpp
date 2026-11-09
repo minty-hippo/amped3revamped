@@ -70,9 +70,18 @@ const std::vector<GameSetting>& DisplaySettings() {
       {"native_upscaler_msaa", "MSAA with the upscaler", Kind::kToggle, "false"},
       {"native_sharp_fonts", "Sharp fonts", Kind::kToggle, "false"},
       {"native_upscaled_textures", "Upscaled textures", Kind::kToggle, "false"},
-      // Made at install on this PC (the Subtitles step); none to show until then.
+  };
+  return settings;
+}
+
+// The Subtitles page (the subtitles are made on this PC: the page's Make
+// subtitles; none to show until then).
+const std::vector<GameSetting>& SubtitleSettings() {
+  static const std::vector<GameSetting> settings = {
       {"subtitles", "Subtitles", Kind::kChoice, "1",
        {{"0", "Off"}, {"1", "Cutscenes and movies"}, {"2", "All speech"}}},
+      {"subtitles_speaker_colors", "Speaker colours", Kind::kToggle, "true"},
+      {"subtitles_size", "Text size", Kind::kSlider, "100", {}, 50, 200, 10, true},
   };
   return settings;
 }

@@ -114,6 +114,8 @@ int main(int, char**) {
           break;
         case SDL_EVENT_KEY_DOWN:
           if (e.key.repeat) break;
+          // Typing in a text field (the subtitle editor): the keys are the text's.
+          if (ImGui::GetIO().WantTextInput) break;
           switch (e.key.key) {
             case SDLK_UP: press(launcher::Action::kUp, true); break;
             case SDLK_DOWN: press(launcher::Action::kDown, true); break;

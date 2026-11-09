@@ -25,6 +25,7 @@
 
 #include "platform.h"
 #include "game_settings.h"
+#include "subtitle_editor.h"
 #include "title_logo.h"
 
 struct ImFont;
@@ -65,10 +66,11 @@ class App {
     kRowCancel, kRowQuit,
     kRowGraphics, kRowEffects, kRowBack,                                 // settings pages
     kRowLook, kRowUpscaleOnInstall, kRowUpscale,                         // install choices
-    kRowSubtitlesOnInstall, kRowSubtitles,
+    kRowSubtitlesOnInstall, kRowSubtitles,                               // Make subtitles
+    kRowSubtitlesPage, kRowSubtitlesEdit,
     kRowSetting = 100  // + the setting's index on the page
   };
-  enum class Page { kHome, kDisplay, kEffects };
+  enum class Page { kHome, kDisplay, kEffects, kSubtitles, kSubtitleEditor };
   Page page_ = Page::kHome;
   GameConfig config_;
   const std::vector<GameSetting>& PageSettings() const;
@@ -91,6 +93,8 @@ class App {
   void MakeShortcut();
   void EnsureIcon();
   std::string VersionText() const;
+  std::string SubtitleStatus() const;  // what's made (the Subtitles page)
+  SubtitleEditor editor_;
 
   std::shared_ptr<Shared> s_;
   SDL_Window* window_ = nullptr;

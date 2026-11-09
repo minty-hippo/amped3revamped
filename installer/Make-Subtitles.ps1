@@ -82,9 +82,28 @@ if (-not (Test-Path $modelFile) -or ((Get-FileHash $modelFile -Algorithm SHA1).H
   Move-Item -LiteralPath $partial -Destination $modelFile -Force
 }
 
+# Who says what (speaker colours): Resemblyzer's voice encoder (Apache 2.0),
+# 17 MB, at a pinned commit, checked against its hash. Optional.
+$speakerFile = Join-Path $modelDir 'resemblyzer-pretrained.pt'
+$speakerSha = '39373B86598FA3DA9FCDDEE6142382EFE09777E8D37DC9C0561F41F0070F134E'
+$speakerUrl = 'https://raw.githubusercontent.com/resemble-ai/Resemblyzer/15d828edebe06bc72b9cabc8ef8ca5ab2cb457ce/resemblyzer/pretrained.pt'
+if (-not (Test-Path $speakerFile) -or ((Get-FileHash $speakerFile -Algorithm SHA256).Hash -ne $speakerSha)) {
+  Write-Host '    Downloading the voice model for speaker colours (Resemblyzer, 17 MB)'
+  try {
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -Uri $speakerUrl -OutFile "$speakerFile.part" -UseBasicParsing
+    if ((Get-FileHash "$speakerFile.part" -Algorithm SHA256).Hash -ne $speakerSha) { throw 'hash mismatch' }
+    Move-Item -LiteralPath "$speakerFile.part" -Destination $speakerFile -Force
+  } catch {
+    Remove-Item "$speakerFile.part" -Force -ErrorAction SilentlyContinue
+    Write-Host "    Couldn't get it ($_); subtitles without speaker colours." -ForegroundColor Yellow
+  }
+}
+
 $out = Join-Path $InstallDir 'subtitles'
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 $toolArgs = @('--game', $game, '--out', $out, '--model', $modelFile, '--language', $Language)
+if (Test-Path $speakerFile) { $toolArgs += @('--speaker-model', $speakerFile) }
 if ($Threads -gt 0) { $toolArgs += @('--threads', "$Threads") }
 if ($Force) { $toolArgs += '--force' }
 & $Tool @toolArgs

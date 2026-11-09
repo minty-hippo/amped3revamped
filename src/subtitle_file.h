@@ -8,11 +8,13 @@
 //
 // Lines of text (UTF-8):
 //
-//   amped3-subtitles 1
+//   amped3-subtitles 2
 //   # comments
-//   clip <kind> <duration ms> <bytes> <keys> <source>
-//   <start ms> <end ms> <text>
+//   clip <kind>[+edited] <duration ms> <bytes> <keys> <source>
+//   <start ms> <end ms> s<speaker> <text>
 //   ...
+//
+// (Version 1 had no +edited and no speaker; it's still read.)
 //
 // A clip is one sound the game plays (a wave in a wave bank) or a movie's
 // dialogue track:
@@ -26,7 +28,10 @@
 //             file:<name>, its file name without the extension, lower case
 //   source    where it came from (the rest of the line; for the log only)
 // and the lines after it, until the next clip, are its subtitles: times from
-// the start of the sound.
+// the start of the sound, and who says it (s1 to s4: the clip's first,
+// second, third and fourth voice, shown white, yellow, pink and green).
+// +edited: corrected by hand (the subtitle editor); making the subtitles
+// again keeps it as it is.
 //
 // The game sees which XMA data each of the audio hardware's decoder contexts
 // is reading (guest memory), hashes the start of it and so knows which clip
@@ -34,6 +39,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -44,7 +50,9 @@
 namespace amped3::subtitle_file {
 
 inline constexpr const char* kFileName = "amped3.subtitles";
-inline constexpr const char* kMagic = "amped3-subtitles 1";
+inline constexpr const char* kMagic = "amped3-subtitles 2";
+inline constexpr const char* kMagicV1 = "amped3-subtitles 1";
+inline constexpr int kSpeakers = 4;
 inline constexpr uint32_t kKeyLengths[] = {2048, 4096, 8192, 16384};
 inline constexpr uint32_t kMaxKeyLength = 16384;
 
@@ -80,6 +88,7 @@ struct Line {
   uint32_t start_ms = 0;
   uint32_t end_ms = 0;
   std::string text;
+  int speaker = 0;  // 0..3
 };
 
 enum class Kind { kSpeech, kStory, kVideo };
@@ -95,6 +104,7 @@ struct Clip {
   uint32_t bytes = 0;
   std::vector<Key> keys;
   std::string source;
+  bool edited = false;  // corrected by hand: kept as it is
   std::vector<Line> lines;
 };
 
@@ -122,7 +132,7 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (first) {
       first = false;
-      if (line != kMagic) {
+      if (line != kMagic && line != kMagicV1) {
         if (error) *error = "not a subtitle file (or another version)";
         return false;
       }
@@ -137,7 +147,12 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
       if (std::sscanf(line.c_str() + 5, "%15s %u %u %n", kind, &duration, &bytes, &used) < 3) {
         continue;
       }
-      const std::string kind_name = kind;
+      std::string kind_name = kind;
+      const size_t plus = kind_name.find('+');
+      if (plus != std::string::npos) {
+        c.edited = kind_name.find("edited", plus) != std::string::npos;
+        kind_name.resize(plus);
+      }
       c.kind = kind_name == "video"   ? Kind::kVideo
                : kind_name == "story" ? Kind::kStory
                                       : Kind::kSpeech;
@@ -174,6 +189,10 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
       l.start_ms = a;
       l.end_ms = b;
       l.text = line.substr(used);
+      if (l.text.size() >= 3 && l.text[0] == 's' && l.text[1] >= '1' && l.text[1] <= '4' && l.text[2] == ' ') {
+        l.speaker = l.text[1] - '1';
+        l.text.erase(0, 3);
+      }
       if (!l.text.empty()) clips->back().lines.push_back(std::move(l));
     }
   }
@@ -182,6 +201,32 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
     return false;
   }
   return true;
+}
+
+// Text on one line (no line breaks or tabs).
+inline std::string OneLine(std::string s) {
+  for (char& c : s) {
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+  }
+  return s;
+}
+
+// The file's text for `clips` (header comment lines after the magic).
+inline std::string Format(const std::vector<Clip>& clips, const std::string& comment = "") {
+  std::string out = std::string(kMagic) + "\n";
+  if (!comment.empty()) out += comment;
+  out += "# Lines: clip <kind>[+edited] <ms> <bytes> <keys> <source> / <start ms> <end ms> s<speaker> <text>\n";
+  char buf[64];
+  for (const Clip& c : clips) {
+    std::snprintf(buf, sizeof(buf), " %u %u ", c.duration_ms, c.bytes);
+    out += std::string("clip ") + KindName(c.kind) + (c.edited ? "+edited" : "") + buf +
+           FormatKeys(c.keys, c.file) + " " + OneLine(c.source) + "\n";
+    for (const Line& l : c.lines) {
+      std::snprintf(buf, sizeof(buf), "%u %u s%d ", l.start_ms, l.end_ms, std::clamp(l.speaker, 0, 3) + 1);
+      out += buf + OneLine(l.text) + "\n";
+    }
+  }
+  return out;
 }
 
 }  // namespace amped3::subtitle_file

@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "gui_patch_core.h"
+#include "speakers.h"
 #include "subtitle_file.h"
 
 extern "C" {
@@ -883,6 +884,7 @@ struct Word {
   int64_t t0 = 0, t1 = 0;  // ms, within the clip
   std::string text;
   float p = 0;
+  int seg = 0;  // whisper's segment (a new one is often a new speaker)
 };
 
 // Strips what isn't a spoken word: "[Music]", "(laughs)", "*sighs*", notes.
@@ -912,9 +914,13 @@ std::vector<sf::Line> MakeLines(const std::vector<Word>& words, int64_t clip_ms)
     }
     cur = sf::Line{};
   };
+  int last_seg = -1;
   for (const Word& w : words) {
     const bool first = cur.text.empty();
-    if (!first && (w.t0 - last_end > 700 || cur.text.size() + w.text.size() > 84)) flush();
+    if (!first && (w.t0 - last_end > 700 || w.seg != last_seg || cur.text.size() + w.text.size() > 84)) {
+      flush();
+    }
+    last_seg = w.seg;
     if (cur.text.empty()) cur.start_ms = uint32_t(std::max<int64_t>(0, w.t0));
     cur.text += w.text;
     cur.end_ms = uint32_t(std::max<int64_t>(w.t1, cur.start_ms));
@@ -1004,7 +1010,7 @@ struct Transcriber {
         if (!text || !*text) continue;
         const std::string tt = text;
         if (words.empty() || tt[0] == ' ') {
-          words.push_back(Word{td.t0 * 10, td.t1 * 10, tt, td.p});
+          words.push_back(Word{td.t0 * 10, td.t1 * 10, tt, td.p, s});
         } else {
           words.back().text += tt;
           words.back().t1 = std::max<int64_t>(words.back().t1, td.t1 * 10);
@@ -1053,6 +1059,9 @@ struct Options {
   fs::path dump_wav;
   fs::path test_wav;
   std::string only;   // --only <text>: just the sounds whose source has it (checking)
+  fs::path speaker_model;  // --speaker-model: Resemblyzer's pretrained.pt (who says what)
+  std::string extract;     // --extract <source> --wav <file>: one sound as a WAV (the editor's Play)
+  fs::path extract_wav;
   fs::path bink_dump;  // --bink-tracks <movie>: each audio track as a WAV in --out (checking)  // --transcribe-wav: one 16 kHz mono 16-bit WAV, lines printed (checking)
   size_t limit = 0;
 };
@@ -1089,6 +1098,9 @@ int main(int argc, char** argv) {
     else if (a == "--transcribe-wav") o.test_wav = next();
     else if (a == "--bink-tracks") o.bink_dump = next();
     else if (a == "--only") o.only = next();
+    else if (a == "--speaker-model") o.speaker_model = next();
+    else if (a == "--extract") o.extract = next();
+    else if (a == "--wav") o.extract_wav = next();
     else {
       Usage();
       return 2;
@@ -1144,7 +1156,13 @@ int main(int argc, char** argv) {
     whisper_free(tr.ctx);
     return 0;
   }
-  if (o.game.empty() || o.out.empty() || (o.model.empty() && !o.scan_only)) {
+  if (!o.extract.empty()) {
+    // Only the files the source names are read (it starts with the file's path).
+    o.scan_only = false;
+    if (o.out.empty()) o.out = o.extract_wav.parent_path();
+  }
+  if (o.game.empty() || o.out.empty() ||
+      (o.model.empty() && !o.scan_only && o.dump_wav.empty() && o.extract.empty())) {
     Usage();
     return 2;
   }
@@ -1190,6 +1208,7 @@ int main(int argc, char** argv) {
   for (const fs::path& f : files) {
     const std::string rel = fs::relative(f, o.game, ec).generic_string();
     const std::string lrel = Lower(rel);
+    if (!o.extract.empty() && o.extract.compare(0, rel.size(), rel) != 0) continue;
     const std::string ext = Lower(f.extension().string());
     if (ext == ".xex") continue;
     if (ext == ".bik") {
@@ -1303,7 +1322,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  {
+  if (o.extract.empty()) {
     std::ofstream rep(o.out / "scan.txt");
     rep << "amped3-subtitles: what was found in " << o.game.string() << "\n\n";
     for (const auto& l : scan.report) rep << l << "\n";
@@ -1328,16 +1347,122 @@ int main(int argc, char** argv) {
   }
   if (o.limit && picks.size() > o.limit) picks.resize(o.limit);
 
+  // A sound as 16 kHz mono (its XMA, or a movie's dialogue track).
+  auto decode16k = [&](const Sound& snd, std::vector<float>* pcm) {
+    std::vector<float> native;
+    int rate = snd.rate;
+    if (snd.kind == sf::Kind::kVideo) {
+      Bytes d;
+      BinkFile b;
+      if (!ReadFile(snd.movie, &d) || !ParseBink(d, &b) || snd.track >= b.tracks.size() ||
+          !DecodeBinkTrack(d, b, snd.track, &native)) {
+        return false;
+      }
+      rate = b.tracks[snd.track].rate;
+    } else if (!DecodeXma(snd, &native)) {
+      return false;
+    }
+    *pcm = To16k(native, rate);
+    return true;
+  };
+
+  if (!o.extract.empty()) {
+    // The editor's Play: one sound, by its source, as a WAV.
+    for (const Sound& snd : scan.sounds) {
+      if (snd.source != o.extract) continue;
+      std::vector<float> pcm;
+      if (!decode16k(snd, &pcm)) break;
+      float peak = 0;
+      for (float v : pcm) peak = std::max(peak, std::fabs(v));
+      if (peak > 0) {
+        for (float& v : pcm) v *= std::min(0.9f / peak, 8.0f);
+      }
+      WriteWav(o.extract_wav, pcm);
+      return 0;
+    }
+    std::fprintf(stderr, "No sound %s\n", o.extract.c_str());
+    return 1;
+  }
+
+  if (o.model.empty()) {
+    // --dump-wav without a model: only decode (checking what's heard).
+    size_t n = 0;
+    for (const Pick& p : picks) {
+      const Sound& snd = scan.sounds[p.index];
+      std::vector<float> pcm;
+      if (!decode16k(snd, &pcm)) continue;
+      std::string name;
+      for (char c : snd.source) name += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+      WriteWav(o.dump_wav / (name + ".wav"), pcm);
+      ++n;
+    }
+    std::printf("Decoded %zu to %s\n", n, o.dump_wav.string().c_str());
+    return 0;
+  }
+
+  // ---- what was corrected by hand (kept as it is)
+  const fs::path out_file = o.out / sf::kFileName;
+  std::map<std::string, sf::Clip> edited;  // source -> clip
+  {
+    std::ifstream f(out_file, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::vector<sf::Clip> old;
+    std::string error;
+    if (f && sf::Parse(ss.str(), &old, &error)) {
+      for (auto& c : old) {
+        if (c.edited) edited[c.source] = c;
+      }
+    }
+    if (!edited.empty()) std::printf("Keeping %zu clips corrected by hand.\n", edited.size());
+  }
+
+  // ---- who says what (the story's and the movies' dialogue)
+  amped3::speakers::VoiceEncoder voices;
+  if (!o.speaker_model.empty()) {
+    std::string error;
+    if (!voices.Load(o.speaker_model.string(), &error)) {
+      std::fprintf(stderr, "Speaker colours off: %s\n", error.c_str());
+    }
+  }
+  auto multi_voice = [](const Sound& snd) { return snd.kind != sf::Kind::kSpeech; };
+  // Each line's voice, then the clip's lines grouped by it.
+  auto assign_speakers = [&](const std::vector<float>& pcm, std::vector<sf::Line>* lines) {
+    std::vector<std::vector<float>> emb(lines->size());
+    std::atomic<size_t> next{0};
+    auto work = [&]() {
+      for (size_t i; (i = next++) < lines->size();) {
+        const sf::Line& l = (*lines)[i];
+        uint32_t end = l.end_ms;
+        if (i + 1 < lines->size()) end = std::min(end, (*lines)[i + 1].start_ms);
+        const size_t a = size_t(l.start_ms) * 16, b = std::min(pcm.size(), size_t(end) * 16);
+        if (b <= a || b - a < 16000 * 4 / 10) continue;  // under 0.4 s: too little to tell
+        emb[i] = voices.Embed(std::vector<float>(pcm.begin() + std::ptrdiff_t(a), pcm.begin() + std::ptrdiff_t(b)));
+      }
+    };
+    std::vector<std::thread> pool;
+    const int n = std::max(1, std::min<int>(o.threads, int(lines->size())));
+    for (int t = 1; t < n; ++t) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    const auto who = amped3::speakers::Group(emb);
+    for (size_t i = 0; i < lines->size(); ++i) (*lines)[i].speaker = who[i];
+  };
+
   // ---- earlier progress
   const fs::path cache_path = o.out / "work" / "transcripts.cache";
   const std::string model_tag = Lower(o.model.filename().string());
-  std::unordered_map<uint64_t, std::pair<uint32_t, std::vector<sf::Line>>> cache;  // id -> (ms, lines)
+  struct Cached {
+    uint32_t ms = 0;
+    bool speakers = false;
+    std::vector<sf::Line> lines;
+  };
+  std::unordered_map<uint64_t, Cached> cache;
   if (!o.force) {
     std::ifstream f(cache_path);
     std::string line;
-    uint64_t id = 0;
     bool ok = false;
-    std::pair<uint32_t, std::vector<sf::Line>>* cur = nullptr;
+    Cached* cur = nullptr;
     while (std::getline(f, line)) {
       if (!line.empty() && line.back() == '\r') line.pop_back();
       if (line.compare(0, 6, "model ") == 0) {
@@ -1348,22 +1473,27 @@ int main(int argc, char** argv) {
       unsigned long long h = 0;
       unsigned ms = 0;
       if (line.compare(0, 6, "sound ") == 0 && std::sscanf(line.c_str() + 6, "%llx %u", &h, &ms) == 2) {
-        id = h;
-        cur = &cache[id];
-        cur->first = ms;
-        cur->second.clear();
+        cur = &cache[h];
+        *cur = Cached{ms, line.find(" spk") != std::string::npos, {}};
         continue;
       }
       if (!cur) continue;
-      unsigned a = 0, b = 0;
-      int used = 0;
-      if (std::sscanf(line.c_str(), "%u %u %n", &a, &b, &used) >= 2 && used > 0) {
-        cur->second.push_back(sf::Line{a, b, line.substr(used)});
+      std::vector<sf::Clip> one;
+      if (sf::Parse(std::string(sf::kMagic) + "\nclip speech 0 0 x\n" + line + "\n", &one, nullptr) && !one.empty() &&
+          !one[0].lines.empty()) {
+        cur->lines.push_back(one[0].lines[0]);
       }
     }
   }
   std::ofstream cache_out(cache_path, std::ios::app);
   cache_out << "model " << model_tag << "\n";
+  auto cache_write = [&](uint64_t id, uint32_t ms, bool spk, const std::vector<sf::Line>& lines) {
+    cache_out << "sound " << std::hex << id << std::dec << " " << ms << (spk ? " spk" : "") << "\n";
+    for (const auto& l : lines) {
+      cache_out << l.start_ms << " " << l.end_ms << " s" << (l.speaker + 1) << " " << Clean(l.text) << "\n";
+    }
+    cache_out.flush();
+  };
 
   // ---- the model
   whisper_context_params cp = whisper_context_default_params();
@@ -1381,7 +1511,7 @@ int main(int argc, char** argv) {
   std::vector<sf::Clip> clips(picks.size());
   std::vector<bool> have(picks.size(), false);
   const double t_start = Now();
-  size_t done = 0, from_cache = 0, failed = 0;
+  size_t done = 0, from_cache = 0, failed = 0, kept = 0;
   double audio_secs = 0;
   std::vector<size_t> pending;  // indices into picks, decoded, waiting for a batch
   std::vector<std::vector<float>> pending_pcm;
@@ -1410,11 +1540,11 @@ int main(int argc, char** argv) {
       const size_t k = pending[b];
       const uint32_t ms = uint32_t(pending_pcm[b].size() / 16);
       auto lines = MakeLines(words[b], ms);
-      cache_out << "sound " << std::hex << ids[k] << std::dec << " " << ms << "\n";
-      for (const auto& l : lines) cache_out << l.start_ms << " " << l.end_ms << " " << Clean(l.text) << "\n";
+      const bool spk = voices.loaded() && multi_voice(scan.sounds[picks[k].index]);
+      if (spk && lines.size() > 1) assign_speakers(pending_pcm[b], &lines);
+      cache_write(ids[k], ms, spk, lines);
       finish(k, ms, std::move(lines));
     }
-    cache_out.flush();
     pending.clear();
     pending_pcm.clear();
     pending_samples = 0;
@@ -1423,6 +1553,10 @@ int main(int argc, char** argv) {
   double last_print = 0;
   for (size_t k = 0; k < picks.size(); ++k) {
     const Sound& s = scan.sounds[picks[k].index];
+    if (edited.count(s.source)) {
+      ++kept;
+      continue;  // written as corrected
+    }
     if (s.kind == sf::Kind::kVideo) {
       const std::string key = s.movie_name + "#" + std::to_string(s.track) + "#" +
                               std::to_string(fs::file_size(s.movie, ec));
@@ -1430,27 +1564,27 @@ int main(int argc, char** argv) {
     } else {
       ids[k] = sf::Fnv1a64(s.data.data(), s.data.size()) ^ (uint64_t(s.channels) << 56) ^ uint64_t(s.rate);
     }
+    const bool want_spk = voices.loaded() && multi_voice(s);
     if (auto it = cache.find(ids[k]); it != cache.end()) {
-      finish(k, it->second.first, it->second.second);
+      Cached& c = it->second;
+      if (want_spk && !c.speakers && c.lines.size() > 1) {
+        // Transcribed before speakers were told apart: only that now.
+        std::vector<float> pcm;
+        if (decode16k(s, &pcm)) {
+          assign_speakers(pcm, &c.lines);
+          c.speakers = true;
+          cache_write(ids[k], c.ms, true, c.lines);
+        }
+      }
+      finish(k, c.ms, c.lines);
       ++from_cache;
       continue;
     }
-    std::vector<float> native;
-    int rate = s.rate;
-    if (s.kind == sf::Kind::kVideo) {
-      Bytes d;
-      BinkFile b;
-      if (!ReadFile(s.movie, &d) || !ParseBink(d, &b) || s.track >= b.tracks.size() ||
-          !DecodeBinkTrack(d, b, s.track, &native)) {
-        ++failed;
-        continue;
-      }
-      rate = b.tracks[s.track].rate;
-    } else if (!DecodeXma(s, &native)) {
+    std::vector<float> pcm;
+    if (!decode16k(s, &pcm)) {
       ++failed;
       continue;
     }
-    std::vector<float> pcm = To16k(native, rate);
     float peak = 0;
     for (float v : pcm) peak = std::max(peak, std::fabs(v));
     audio_secs += double(pcm.size()) / 16000.0;
@@ -1462,7 +1596,7 @@ int main(int argc, char** argv) {
     if (peak < 0.003f || pcm.size() < 16000 / 4) {
       // Silent, or too short for a word.
       const uint32_t ms = uint32_t(pcm.size() / 16);
-      cache_out << "sound " << std::hex << ids[k] << std::dec << " " << ms << "\n";
+      cache_write(ids[k], ms, false, {});
       finish(k, ms, {});
       continue;
     }
@@ -1493,7 +1627,8 @@ int main(int argc, char** argv) {
 
   // ---- the file
   // Keys shared by clips that say different things can't tell them apart:
-  // dropped (a longer key of theirs still can).
+  // dropped (a longer key of theirs still can). The same scene line in the
+  // four player voices says the same: fine.
   std::map<std::pair<uint32_t, uint64_t>, std::set<std::string>> seen;
   auto said = [](const sf::Clip& c) {
     std::string s;
@@ -1504,31 +1639,28 @@ int main(int argc, char** argv) {
     if (!have[k]) continue;
     for (const auto& key : clips[k].keys) seen[{key.length, key.hash}].insert(said(clips[k]));
   }
-  // The same scene line in the four player voices says the same: fine.
-  std::ostringstream text;
-  text << sf::kMagic << "\n";
-  text << "# Made on this PC by amped3-subtitles from this copy of the game (model " << model_tag << ").\n";
-  text << "# Lines: clip <kind> <ms> <bytes> <keys> <source> / <start ms> <end ms> <text>\n";
+  std::vector<sf::Clip> out;
   size_t with_text = 0, lines_total = 0;
   for (size_t k = 0; k < clips.size(); ++k) {
     if (!have[k] || clips[k].lines.empty()) continue;
+    sf::Clip c = clips[k];
     std::vector<sf::Key> keys;
-    for (const auto& key : clips[k].keys) {
+    for (const auto& key : c.keys) {
       if (seen[{key.length, key.hash}].size() == 1) keys.push_back(key);
     }
-    const sf::Clip& c = clips[k];
     if (keys.empty() && c.file.empty()) continue;
-    text << "clip " << sf::KindName(c.kind) << " " << c.duration_ms << " " << c.bytes << " "
-         << sf::FormatKeys(keys, c.file) << " " << Clean(c.source) << "\n";
-    for (const auto& l : c.lines) text << l.start_ms << " " << l.end_ms << " " << Clean(l.text) << "\n";
+    c.keys = keys;
     ++with_text;
     lines_total += c.lines.size();
+    out.push_back(std::move(c));
   }
-  const fs::path out_file = o.out / sf::kFileName;
+  for (auto& [source, c] : edited) out.push_back(c);  // as corrected
+  const std::string comment = "# Made on this PC by amped3-subtitles from this copy of the game (model " + model_tag +
+                              (voices.loaded() ? ", speakers by Resemblyzer's voice encoder" : "") + ").\n";
   const fs::path tmp = o.out / (std::string(sf::kFileName) + ".new");
   {
     std::ofstream f(tmp, std::ios::binary);
-    f << text.str();
+    f << sf::Format(out, comment);
     if (!f) {
       std::fprintf(stderr, "Couldn't write %s\n", tmp.string().c_str());
       return 1;
@@ -1540,7 +1672,7 @@ int main(int argc, char** argv) {
     fs::remove(tmp, ec);
   }
   std::printf("Done: %zu sounds with speech (%zu subtitle lines) of %zu transcribed (%zu from earlier runs, "
-              "%zu couldn't be decoded), in %.0f s.\nWrote %s\n",
-              with_text, lines_total, done, from_cache, failed, Now() - t_start, out_file.string().c_str());
+              "%zu corrected by hand kept, %zu couldn't be decoded), in %.0f s.\nWrote %s\n",
+              with_text, lines_total, done, from_cache, kept, failed, Now() - t_start, out_file.string().c_str());
   return 0;
 }
