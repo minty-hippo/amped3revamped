@@ -9376,17 +9376,26 @@ bool Renderer::Impl::DrawOutput(Image* src, const uint8_t* lut, bool share, uint
 }
 
 Renderer::Impl::~Impl() {
+  // (Each step named for the stall watch: a renderer that never finished
+  // closing froze the picture when the upscaler was switched.)
+  PhaseScope phase("closing the old renderer: its command stream");
   if (stream_.active()) stream_.End();  // a frame left unfinished (an error)
   if (!gpu_.device) return;
+  g_phase = "closing the old renderer: stopping the pipeline builders";
   StopPipelineBuilders();
+  g_phase = "closing the old renderer: saving the pipeline cache";
   if (cache_save_.valid()) cache_save_.wait();
   if (pipelines_unsaved_) gpu_.SavePipelineCache(options_.pipeline_cache_path);
+  g_phase = "closing the old renderer: waiting for the GPU (vkDeviceWaitIdle)";
   vk::vkDeviceWaitIdle(gpu_.device);
+  g_phase = "closing the old renderer: the world shadows' file thread";
   if (bake_io_.thread.joinable()) bake_io_.thread.join();
   gpu_.DestroyBuffer(bake_io_.buffer);
   for (auto& r : bake_retired_) gpu_.DestroyBuffer(r.second);
   VkDevice dev = gpu_.device;
+  g_phase = "closing the old renderer: the upscaler's context";
   upscaler_.reset();  // its context uses the device
+  g_phase = "closing the old renderer: freeing its images and buffers";
   gpu_.DestroyImage(up_out_);
   gpu_.DestroyImage(mv_img_);
   for (auto& fs : slots_) {
@@ -9484,6 +9493,7 @@ Renderer::Impl::~Impl() {
   }
   if (copy_set_layout_) vk::vkDestroyDescriptorSetLayout(dev, copy_set_layout_, nullptr);
   if (ts_pool_) vk::vkDestroyQueryPool(dev, ts_pool_, nullptr);
+  g_phase = "closing the old renderer: its Vulkan device";
   gpu_.Shutdown();
 }
 

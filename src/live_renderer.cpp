@@ -1638,7 +1638,10 @@ void WorkerMain() {
         }
         continue;
       }
-      g_work_cv.wait(lock, ready);
+      {
+        native::PhaseScope phase("waiting for the game's next frame (from the prep thread)");
+        g_work_cv.wait(lock, ready);
+      }
       if (g_stop) break;
       f = std::move(g_work);
     }
@@ -1692,7 +1695,11 @@ void WorkerMain() {
                        texture_pack != renderer_pack ||
                        upscaled_textures != renderer_upscaled)) {
         pending.valid = false;
+        native::PhaseScope phase("closing the old renderer (settings changed)");
+        const auto t_close = Clock::now();
         renderer.reset();
+        REXLOG_INFO("Native renderer: settings changed; the old one closed in {:.0f} ms",
+                    since(t_close));
       }
       if (!renderer) {
         pending.valid = false;
