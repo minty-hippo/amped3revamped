@@ -1,7 +1,9 @@
 # Builds the launcher (launcher/) for Windows, Linux x86_64 and Linux arm64.
 # Every run keeps the three files as artifacts. On main they are also
 # published as the release launcher-v<launcher/VERSION> (made, or its files
-# replaced, by this workflow): raise VERSION for a new release. The launcher holds nothing from the game: it
+# replaced, by this workflow): raise VERSION for a new release. On
+# experimental they're published as the pre-release launcher-experimental,
+# made again on every run (its tag moves to the newest commit). The launcher holds nothing from the game: it
 # downloads these sources and builds the game from the player's own disc image.
 name: Launcher
 
@@ -117,6 +119,39 @@ jobs:
             Amped 3 (Xbox 360) disc image and select Build and install. It downloads this
             project's sources and builds the game on your computer; nothing from the game is
             included or downloaded.
+
+            - Windows: amped3-launcher-windows-x64.exe
+            - Linux / SteamOS (x86_64): amped3-launcher-linux-x86_64
+            - Linux ARM handhelds such as Armada (arm64): amped3-launcher-linux-arm64
+
+  prerelease:
+    if: github.ref == 'refs/heads/experimental'
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Linux files are executable
+        run: chmod +x dist/amped3-launcher-linux-*
+      # The tag moves to this commit: the old pre-release and its tag go first.
+      - name: Remove the previous experimental launcher
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete launcher-experimental --cleanup-tag --yes --repo "${{ github.repository }}" || true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: launcher-experimental
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          prerelease: true
+          make_latest: false
+          name: Launcher (experimental)
+          body: |
+            The launcher from the experimental branch (commit ${{ github.sha }}), made again on
+            every change to it: newer than the release, less tested. Choose the experimental
+            branch in it (Update branch) to build the matching game.
 
             - Windows: amped3-launcher-windows-x64.exe
             - Linux / SteamOS (x86_64): amped3-launcher-linux-x86_64
