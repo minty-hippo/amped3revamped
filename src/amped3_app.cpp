@@ -2,6 +2,7 @@
 
 #include "amped3_app.h"
 #include "audio_trace.h"
+#include "notice.h"
 #include "subtitles.h"
 
 #include <cctype>
@@ -131,6 +132,7 @@ namespace {
 constexpr const char* kMenuBind = "bind_options_menu";
 constexpr const char* kHangBind = "bind_hang_report";
 constexpr const char* kCaptureBind = "bind_frame_capture";
+constexpr const char* kRevampedBind = "bind_revamped_graphics";
 }  // namespace
 
 Amped3App::~Amped3App() {
@@ -333,6 +335,17 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // Records the next whole frame's draws and device state (docs/frame-capture.md).
   rex::ui::RegisterBind(kCaptureBind, "F10", "Capture one frame of Direct3D calls to logs",
                         [] { amped3::capture::RequestFrame(); });
+  // Every enhancement at once, on or off (to compare with the original look).
+  rex::ui::RegisterBind(kRevampedBind, "F2", "Turn Revamped Graphics on or off",
+                        [this] { ToggleRevampedGraphics(); });
+}
+
+void Amped3App::ToggleRevampedGraphics() {
+  const bool on = rex::cvar::GetFlagByName("revamped_graphics") != "true";
+  if (!rex::cvar::SetFlagByName("revamped_graphics", on ? "true" : "false")) return;
+  if (!config_path_.empty()) rex::cvar::SaveConfig(config_path_);
+  REXLOG_INFO("Revamped Graphics {} (F2)", on ? "on" : "off");
+  amped3::notice::Show(on ? "Revamped Graphics: on" : "Revamped Graphics: off");
 }
 
 void Amped3App::OnConfigureFonts(ImFontAtlas* atlas) {
@@ -379,6 +392,10 @@ void Amped3App::OnPostSetup() {
 
   // Music / XMA stream diagnostics (setting trace_audio).
   amped3::audio_trace::Start(runtime());
+  // Short notices (keyboard shortcuts that change a setting).
+  amped3::notice::Install(imgui_drawer(), [this](std::function<void()> fn) {
+    app_context().CallInUIThread(std::move(fn));
+  });
   // Subtitles (made at install: subtitles\amped3.subtitles next to the exe).
   amped3::subtitles::Start(runtime(), imgui_drawer(),
                            rex::filesystem::GetExecutableFolder() / "subtitles",

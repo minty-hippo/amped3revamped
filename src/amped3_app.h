@@ -48,6 +48,7 @@ class Amped3App : public rex::ReXApp {
  private:
   // Opens the menu if closed, closes it if open. UI thread only.
   void ToggleOptionsMenu();
+  void ToggleRevampedGraphics();
   // The Graphics panel (Pause > Options > Graphics in the game's menu). UI
   // thread only.
   void OpenGraphicsPanel();

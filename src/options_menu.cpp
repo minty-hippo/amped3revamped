@@ -1080,7 +1080,7 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
     Close();
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("   F4: every setting (advanced)");
+  ImGui::TextDisabled("   F2: Revamped Graphics on/off   F4: every setting (advanced)");
 
   ImGui::End();
 
