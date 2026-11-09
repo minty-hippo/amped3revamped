@@ -358,4 +358,20 @@ class Renderer {
   std::unique_ptr<Impl> impl_;
 };
 
+// What the renderer's thread is doing (a fixed string; "" between frames):
+// the stall watch names it when a frame never finishes.
+const char* RendererPhase();
+
+// Sets the phase for a scope (the previous one back after).
+class PhaseScope {
+ public:
+  explicit PhaseScope(const char* phase);
+  ~PhaseScope();
+  PhaseScope(const PhaseScope&) = delete;
+  PhaseScope& operator=(const PhaseScope&) = delete;
+
+ private:
+  const char* previous_;
+};
+
 }  // namespace amped3::native

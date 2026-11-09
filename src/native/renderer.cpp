@@ -56,6 +56,15 @@
 #include "../../third_party/miniz/miniz.h"
 
 namespace amped3::native {
+
+namespace {
+std::atomic<const char*> g_phase{""};
+}  // namespace
+const char* RendererPhase() { return g_phase.load(std::memory_order_relaxed); }
+PhaseScope::PhaseScope(const char* phase)
+    : previous_(g_phase.exchange(phase, std::memory_order_relaxed)) {}
+PhaseScope::~PhaseScope() { g_phase.store(previous_, std::memory_order_relaxed); }
+
 namespace {
 
 // --- Small helpers ----------------------------------------------------------------
@@ -815,11 +824,13 @@ class Gpu {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = first ? 2 : 1;
     si.pCommandBuffers = first ? cbs : &cbs[1];
+    PhaseScope phase("submitting the frame (vkQueueSubmit)");
     vk::Check(vk::vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
   }
 
   void Submit(VkCommandBuffer cb, VkCommandBuffer first = VK_NULL_HANDLE,
               VkCommandPool cb_pool = VK_NULL_HANDLE) {
+    PhaseScope phase("a one-off GPU job (submit and wait)");
     if (first) {
       VkSubmitInfo fi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
       fi.commandBufferCount = 1;
@@ -1197,6 +1208,7 @@ struct Renderer::Impl {
   double FinishSlot(FrameSlot& fs) {
     if (!fs.pending) return 0;
     const auto t0 = std::chrono::steady_clock::now();
+    PhaseScope phase("waiting for an earlier frame's GPU work (its fence)");
     vk::Check(vk::vkWaitForFences(gpu_.device, 1, &fs.fence, VK_TRUE, UINT64_MAX), "fence");
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
@@ -7020,6 +7032,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   const uint32_t oh = std::max(uint32_t(std::lround(gh * out_scale_)), 1u);
   std::string error;
   if (!up_inited_ || rw > up_in_w_ || rh > up_in_h_ || ow != up_out_w_ || oh != up_out_h_) {
+    PhaseScope phase("starting the upscaler");
     if (up_inited_) {
       // A new size: a new context (none of the old one's work in flight).
       vk::vkDeviceWaitIdle(gpu_.device);
@@ -7144,8 +7157,12 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
   if (reactive) Transition(*reactive, gen, ro);
   // The upscaler records into the command buffer itself: everything before
   // it first.
-  if (stream_.active()) stream_.Drain();
-  const bool ok = upscaler_->Dispatch(cb_, in, &error);
+  bool ok;
+  {
+    PhaseScope phase("the upscaler (recording its work)");
+    if (stream_.active()) stream_.Drain();
+    ok = upscaler_->Dispatch(cb_, in, &error);
+  }
   Transition(*src, ro, gen);
   Transition(*depth, ro, gen);
   Transition(mv_img_, ro, gen);
@@ -9473,6 +9490,7 @@ Renderer::Impl::~Impl() {
 RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources,
                                    uint32_t max_draws, const Renderer::OutputRequest* output,
                                    OutputInfo* info) {
+  PhaseScope phase("recording the frame");
   FrameSlot* fs = nullptr;
   if (options_.async) {
     // The slot two frames back: wait for it (normally long done), then this
@@ -9884,6 +9902,7 @@ double Renderer::WaitFrame(uint64_t ticket) {
   for (auto& fs : impl_->slots_) {
     if (fs.pending && fs.ticket == ticket) {
       const auto t0 = std::chrono::steady_clock::now();
+      PhaseScope phase("waiting for the frame's GPU work (its fence)");
       vk::Check(vk::vkWaitForFences(impl_->gpu_.device, 1, &fs.fence, VK_TRUE, UINT64_MAX),
                 "fence");
       return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)

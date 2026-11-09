@@ -224,6 +224,20 @@ REXCVAR_DEFINE_BOOL(native_motion_blur_debug, false, "GPU",
 
 namespace amped3::live {
 namespace {
+// The stall watch's clocks (see WatchdogMain): the game's last swap and the
+// native renderer's last finished frame.
+std::atomic<int64_t> g_last_swap_ns{0};
+std::atomic<int64_t> g_render_done_ns{0};
+std::once_flag g_watchdog_once;
+
+int64_t SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+namespace {
 
 using native::Draw;
 using native::Frame;
@@ -1565,6 +1579,7 @@ void WorkerMain() {
     bool ok;
     if (!IsGuestOutputExternal(presenter)) SetGuestOutputExternal(presenter, true);
     if (shared) {
+      native::PhaseScope phase("handing the picture to the window (shared image)");
       ok = PresentShared(presenter, pending.info, &error);
       if (!ok) {
         REXLOG_WARN("Native renderer: shared image failed ({}); presenting through the CPU from "
@@ -1723,6 +1738,7 @@ void WorkerMain() {
         rex::ui::Presenter* presenter = g_presenter ? g_presenter() : nullptr;
         options.match_device_uuid = presenter && PresenterDeviceUuid(presenter, options.device_uuid);
         renderer_msaa = msaa;
+        native::PhaseScope phase("starting the renderer");
         renderer = std::make_unique<native::Renderer>(options);
         shared = renderer->CanShareOutput() && presenter && CanPresentShared(presenter);
         {
@@ -1758,6 +1774,7 @@ void WorkerMain() {
       if (shared) {
         request.slot = shared_slot;
         shared_slot = (shared_slot + 1) % native::Renderer::kOutputSlots;
+        native::PhaseScope phase("waiting for the window to finish copying an earlier picture");
         WaitSharedSlot(request.slot);  // the presenter has finished copying from it
       }
       native::OutputInfo info;
@@ -1884,6 +1901,7 @@ void WorkerMain() {
         }
       }
       LogTimings(shared);
+      g_render_done_ns.store(SteadyNs());
       const double ms = since(t0);
       std::lock_guard lock(g_status_mutex);
       ++g_status.frames;
@@ -2528,14 +2546,7 @@ void OnEndTiling() {
 // (but under 5 s: loading), logs where every game thread is (link register
 // and r3 as of its last kernel call) once, then where the stall's CPU time
 // went, for the first 12 stalls. Quiet otherwise.
-std::atomic<int64_t> g_last_swap_ns{0};
-std::once_flag g_watchdog_once;
 
-int64_t SteadyNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
 
 // Per thread CPU time (Linux: /proc/self/task/*/stat), user and system
 // separately, in clock ticks: what a stall's time went to.
@@ -2597,10 +2608,29 @@ void WatchdogMain() {
                 ThreadTimeDeltas(baseline, ReadThreadTimes()), g_watch_calls.load() - base_calls,
                 g_watch_pages.load() - base_pages);
   };
-  while (stalls < 12) {
+  bool render_stuck = false;
+  for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     const int64_t last = g_last_swap_ns.load();
     if (!last) continue;
+    // The game going on (frames swapped) but the native renderer not
+    // finishing any for 3 s: the picture is frozen. Says what it's doing.
+    const int64_t done = g_render_done_ns.load();
+    if (done && Enabled()) {
+      const double stuck = double(SteadyNs() - done) * 1e-6;
+      const double since_swap = double(SteadyNs() - last) * 1e-6;
+      if (stuck > 3000.0 && since_swap < 1000.0 && !render_stuck) {
+        render_stuck = true;
+        const char* phase = native::RendererPhase();
+        REXLOG_WARN("Stall watch: the native renderer hasn't finished a frame for {:.1f} s "
+                    "(the game goes on); it is {}",
+                    stuck * 1e-3, phase && *phase ? phase : "between frames");
+      } else if (stuck < 1000.0 && render_stuck) {
+        render_stuck = false;
+        REXLOG_WARN("Stall watch: the native renderer is drawing again");
+      }
+    }
+    if (stalls >= 12) continue;
     const double ms = double(SteadyNs() - last) * 1e-6;
     if (ms < 250.0 || ms > 5000.0) {  // (longer: loading, a menu; not this)
       if (in_stall) {
