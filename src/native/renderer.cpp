@@ -4703,11 +4703,20 @@ void main() {
   vec4 qy = texelFetch(pos, min(c + ivec2(0, 1), ps - 1), 0);
   vec4 qx0 = texelFetch(pos, max(c - ivec2(1, 0), ivec2(0)), 0);
   vec4 qy0 = texelFetch(pos, max(c - ivec2(0, 1), ivec2(0)), 0);
-  vec3 dx = qx.w > 0.5 ? qx.xyz - q.xyz : (qx0.w > 0.5 ? q.xyz - qx0.xyz : vec3(0.0));
-  vec3 dy = qy.w > 0.5 ? qy.xyz - q.xyz : (qy0.w > 0.5 ? q.xyz - qy0.xyz : vec3(0.0));
+  // Each side's neighbour, the nearer one in depth: across an edge (an arm
+  // in front of the body) the other side's is a different surface, and a
+  // normal from it is noise (it made the shading flicker and dither).
+  vec3 ex1 = qx.w > 0.5 ? qx.xyz - q.xyz : vec3(1e9), ex0 = qx0.w > 0.5 ? q.xyz - qx0.xyz : vec3(1e9);
+  vec3 ey1 = qy.w > 0.5 ? qy.xyz - q.xyz : vec3(1e9), ey0 = qy0.w > 0.5 ? q.xyz - qy0.xyz : vec3(1e9);
+  vec3 dx = dot(ex1, ex1) < dot(ex0, ex0) ? ex1 : ex0;
+  vec3 dy = dot(ey1, ey1) < dot(ey0, ey0) ? ey1 : ey0;
   // (Screen right x screen down points away from the camera: the other way.)
   vec3 n = cross(dy, dx);
-  float ndl = dot(n, n) > 1e-10 ? dot(normalize(n), -fd) : 0.5;
+  // No neighbour on a side, or one more than 15 cm away (an edge either
+  // way): no normal, so half facing.
+  bool normal_ok = dot(dx, dx) < 0.0225 && dot(dy, dy) < 0.0225 && dot(n, n) > 1e-12;
+  n = normal_ok ? normalize(n) : vec3(0.0);
+  float ndl = normal_ok ? dot(n, -fd) : 0.5;
   float facing = smoothstep(0.05, 0.45, ndl);
   // The world (trees, slopes): the world map; or, with only what's saved
   // (p.w = 2: o0 is c5, o1 the sun's direction), the baked shadows where the
@@ -4717,9 +4726,18 @@ void main() {
   vec2 tc = (0.5 + 0.5 * vec2(dot(pc.o0, P), dot(pc.o1, P))) * vec2(wn);
   if (pc.p.w > 1.5) {
     fd = normalize(pc.o1.xyz);
-    float above = max(q.y - (q.w - 1e5), 0.0);
-    vec2 xz = q.xz + fd.xz * above / max(-fd.y, 0.1);
-    world_sh = 1.0 - textureLod(baked, xz * pc.o0.xy + pc.o0.zw, 0.0).r;
+    // How high it is over the ground (what's behind it can be far down the
+    // slope: at most 3 m, a rider's height and a jump's start), and the
+    // ground the sun's ray through it meets there. The bake is finer than a
+    // rider's shade needs (its thin tree shadows streaked them): a few taps
+    // over 40 cm.
+    float above = clamp(q.y - (q.w - 1e5), 0.0, 3.0);
+    vec2 xz = q.xz + fd.xz * above / max(-fd.y, 0.25);
+    vec2 uv = xz * pc.o0.xy + pc.o0.zw;
+    vec2 r = 0.4 * abs(pc.o0.xy);
+    float lit = 0.0;
+    for (int i = 0; i < 8; ++i) lit += textureLod(baked, uv + Disc(i, 8) * r, 0.0).r;
+    world_sh = 1.0 - lit / 8.0;
   } else if (all(greaterThanEqual(tc, vec2(1.0))) && all(lessThan(tc, vec2(wn) - 1.0))) {
     float zr = dot(pc.o2, P);
     float tm = 2.0 * R / float(wn.x);
@@ -4760,17 +4778,23 @@ void main() {
   // Themselves (and the riders, rails, objects the game casts): its map.
   float self_sh = 0.0;
   if (pc.p.y > 0.0) {
-    vec4 m = pc.l * P;
-    vec3 s = m.xyz / m.w;  // texel u, v (0..1) and depth
+    // Looked up a little off the surface, along its normal (and towards
+    // the sun): a surface steep to the sun crosses several of the map's
+    // depths within a texel, and compared at the surface itself it shades
+    // itself in stripes (shadow acne) that crawl as the rider moves.
     ivec2 zn = textureSize(zo, 0);
+    vec4 m0 = pc.l * P;
+    vec4 m1 = pc.l * vec4(P.xyz + vec3(1.0, 0.0, 0.0), 1.0);
+    float texel_m = 1.0 / max(length((m1.xy / m1.w - m0.xy / m0.w) * vec2(zn)), 1e-3);  // metres per texel
+    vec3 off = (n * 0.75 - fd * 0.25) * texel_m;
+    vec4 m = pc.l * vec4(P.xyz + off, 1.0);
+    vec3 s = m.xyz / m.w;  // texel u, v (0..1) and depth
     if (all(greaterThan(s.xy, vec2(0.0))) && all(lessThan(s.xy, vec2(1.0)))) {
-      // (More where the surface is steep to the sun: its own depth varies
-      // over a texel.)
-      float bias = (0.12 + 0.2 * (1.0 - clamp(ndl, 0.0, 1.0))) * pc.p.y;
-      for (int i = 0; i < 12; ++i) {
-        vec2 uv = s.xy + Disc(i, 12) * 2.5 / vec2(zn);
+      float bias = (0.08 + 0.25 * (1.0 - clamp(ndl, 0.0, 1.0))) * pc.p.y;
+      for (int i = 0; i < 16; ++i) {
+        vec2 uv = s.xy + Disc(i, 16) * 3.0 / vec2(zn);
         float z = texelFetch(zo, ivec2(uv * vec2(zn)), 0).r;
-        self_sh += z > s.z + bias ? 1.0 / 12.0 : 0.0;
+        self_sh += z > s.z + bias ? 1.0 / 16.0 : 0.0;
       }
     }
   }
