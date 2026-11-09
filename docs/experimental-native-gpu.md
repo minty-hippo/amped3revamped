@@ -614,7 +614,14 @@ moves (another mountain), the camera jumps or their size changes.
   than what's there (blended by min: a tree's crown above the view may not
   have been drawn).
 - **Saved bakes**: `logs/world_shadows/<the painted map's TextureHash>_<w>x<h>.a3ws`
-  ("A3WS", version 1, width, height, the texels deflated: 5-15 MB at 2x).
+  ("A3WS", version 2, width, height, the settings it was made with, the
+  texels deflated: 5-15 MB at 2x). The settings a bake depends on (World
+  shadows, Shadow softness, Shadow resolution) are kept beside them in
+  `bake_settings.txt`: when they change (in game, or between runs) the saved
+  bakes are deleted, the one in memory starts over from the painted map, and
+  what's baked from then on is saved as the current bake (with saved-only on,
+  a mountain is baked live until its new bake is saved). A file made with
+  other settings is never loaded, even if it couldn't be deleted.
   Read in the background when the mountain's painted map first shows,
   written in the background every 30 s or so while there's something new,
   and when the mountain changes (the GPU copies to a host buffer; the file is

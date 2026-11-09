@@ -214,7 +214,6 @@ Shared& S() {
   return s;
 }
 std::atomic<int> g_state{-1};
-std::atomic<bool> g_scene_playing{false};  // SceneActive()
 
 // ---- game thread only -------------------------------------------------------
 
@@ -332,8 +331,6 @@ const char* StateName(int state) {
 }
 
 }  // namespace
-
-bool SceneActive() { return g_scene_playing.load(); }
 
 bool DrawTab() {
   bool close = false;
@@ -505,7 +502,6 @@ extern "C" REX_FUNC(sub_824B9AB8) {
   }
   __imp__sub_824B9AB8(ctx, base);
   const bool loaded = (ctx.r3.u32 & 0xFF) != 0;
-  if (loaded) g_scene_playing = true;
   {
     std::lock_guard lock(S().mutex);
     S().playing = loaded ? name : std::string{};
@@ -533,7 +529,6 @@ extern "C" REX_FUNC(sub_824B9C10) {
                 uint32_t(ctx.lr));
   }
   __imp__sub_824B9C10(ctx, base);
-  g_scene_playing = false;
   std::lock_guard lock(S().mutex);
   S().playing.clear();
   S().playing_from_menu = false;
@@ -600,7 +595,6 @@ extern "C" REX_FUNC(sub_8215D420) {
 extern "C" REX_FUNC(sub_8215D1D8) {
   if (Tracing()) REXLOG_INFO("cutscene trace: challenge intro ends");
   __imp__sub_8215D1D8(ctx, base);
-  g_scene_playing = false;
   std::lock_guard lock(g_mutex);
   if (g.active) {
     const uint32_t challenge = Load32(base, kChallengePtr);

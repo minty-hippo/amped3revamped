@@ -1,35 +1,33 @@
 // amped3-subtitles: makes subtitles for the game's dialogue on the player's PC.
 //
-// Finds the game's sounds in its own files (XACT wave banks, .xwb, and RIFF
-// XMA files, loose or inside the .res archives), decodes their XMA audio
-// (the ReXGlue SDK's FFmpeg, the same XMA decoder the game plays them with),
-// and writes down what's said in them with offline speech recognition
-// (whisper.cpp; the model is downloaded by the installer). The result is
+// Listens only to the dialogue, which Amped 3 keeps apart from its music and
+// effects: the voice wave banks (XACT 2, Xbox 360) in audiobin/<language>/
+// and each movie's dialogue track for that language (Bink 1, GameInfo/
+// AmpedWorldMovies). Decodes them (XMA with the ReXGlue SDK's FFmpeg, the
+// decoder the game plays them with; Bink Audio with the decoder below), and
+// writes down what's said with offline speech recognition (whisper.cpp; the
+// model is downloaded by the installer). The result is
 // <out>/amped3.subtitles (src/subtitle_file.h), which the game reads to show
-// subtitles while a recognised sound plays (src/subtitles.cpp).
+// subtitles while a recognised line or movie plays (src/subtitles.cpp).
+// --all-sounds goes through every file instead (other games' layouts).
 //
 // Nothing of the game leaves the PC and nothing of it ships with the project:
 // the file is made from the player's own copy.
 //
-// Which sounds: music is left out (long stereo sounds and banks of them, and
-// anything named like music), so are sounds too short to hold a word. What
-// isn't speech comes out empty (whisper's no-speech estimate, and sounds it
-// only hears as noises are dropped).
-//
-// Speed: short sounds are put together, a couple of seconds of silence
+// Speed: short lines are put together, a couple of seconds of silence
 // between them, into windows of up to ~25 s (whisper always listens in 30 s
-// windows), and each word is given back to the sound it falls in. Progress is
+// windows), and each word is given back to the line it falls in. Progress is
 // kept in <out>/work/transcripts.cache, so a run that's stopped carries on
 // where it left off.
 //
 //   amped3-subtitles --game "<install>\game" --out "<install>\subtitles"
-//       --model "<folder>\ggml-base.en.bin" [--threads N] [--force]
-//       [--scan] [--dump-wav <folder>] [--include-music] [--limit N]
+//       --model "<folder>\ggml-base.en.bin" [--language English|French|German]
+//       [--threads N] [--force] [--scan] [--dump-wav <folder>] [--limit N]
 //
 //   --scan          only list what's found (<out>/scan.txt), no transcribing
 //   --dump-wav      also write each decoded sound as a 16 kHz WAV (checking)
-//   --include-music transcribe long stereo sounds too
-//   --limit N       stop after N sounds (testing)
+//   --only <text>   just the sounds whose source has <text> (checking)
+//   --bink-tracks <movie>  each of a movie's audio tracks as a WAV (checking)
 
 #include <algorithm>
 #include <atomic>
@@ -133,6 +131,12 @@ struct Sound {
   Bytes data;             // XMA packets
   bool in_bank = false;
   std::string bank;       // wave bank name (when in_bank)
+  std::string wave;       // the wave's name in the bank (when it has names)
+  sf::Kind kind = sf::Kind::kSpeech;
+  // A movie's dialogue track (data empty: decoded when its turn comes).
+  fs::path movie;
+  size_t track = 0;
+  std::string movie_name;  // file name without extension, lower case
 };
 
 struct Scan {
@@ -206,32 +210,37 @@ void FromWaveBank(const std::string& name, const Bytes& d, Scan* scan) {
   scan->report.push_back(line);
   if (count == 0 || count > 200000 || wave_data >= d.size() + 1) return;
 
-  // MINIWAVEFORMAT: tag 2 bits (1 = XMA), channels 3, rate 18 (26 in older
-  // banks), block align 8, bits 1. Xbox 360 banks may store the fields in
-  // the other bit order; both are tried.
+  // MINIWAVEFORMAT. XACT 2's first banks (version 23 here, Amped 3's):
+  // XMA 1 bit, channels 3, rate 18, block align 9, 16-bit 1. Later ones: tag
+  // 2 bits (1 = XMA), channels 3, rate 18 (26 in some), block align 8, bits
+  // 1. Both are tried, the bank's version's first.
   struct Format {
     int tag, channels;
     uint32_t rate;
   };
-  auto decode_format = [](uint32_t f, Format* out) {
-    Format a{int(f & 3), int((f >> 2) & 7), (f >> 5) & 0x3FFFF};
-    Format a26{int(f & 3), int((f >> 2) & 7), (f >> 5) & 0x3FFFFFF};
-    Format b{int((f >> 30) & 3), int((f >> 27) & 7), (f >> 9) & 0x3FFFF};
-    for (const Format& x : {a, b, a26}) {
-      if (x.channels >= 1 && x.channels <= 6 && x.rate >= 8000 && x.rate <= 48000 &&
-          (IsStandardRate(x.rate) || &x == &a26)) {
-        *out = x;
-        return true;
-      }
-    }
-    for (const Format& x : {a, b, a26}) {
-      if (x.channels >= 1 && x.channels <= 6 && x.rate >= 8000 && x.rate <= 48000) {
+  const bool early = version < 32;
+  auto decode_format = [early](uint32_t f, Format* out) {
+    const Format v1{int(f & 1), int((f >> 1) & 7), (f >> 4) & 0x3FFFF};
+    const Format a{int(f & 3), int((f >> 2) & 7), (f >> 5) & 0x3FFFF};
+    const Format b{int((f >> 30) & 3), int((f >> 27) & 7), (f >> 9) & 0x3FFFF};
+    const Format order[3] = {early ? v1 : a, early ? a : b, early ? b : v1};
+    for (const Format& x : order) {
+      if (x.channels >= 1 && x.channels <= 6 && IsStandardRate(x.rate)) {
         *out = x;
         return true;
       }
     }
     return false;
   };
+  // Entry names (64 characters each), when the bank has them: the segment
+  // that's exactly that long.
+  const uint32_t name_elem = u32(bank + 8 + name_len + 4);
+  size_t names = 0;
+  if ((flags & 0x00010000) && name_elem >= 16 && name_elem <= 256) {
+    for (int k = 2; k < segs; ++k) {
+      if (k != data_seg && seg_len(k) == count * name_elem) names = seg_off(k);
+    }
+  }
 
   int xma = 0, other = 0, bad = 0;
   for (uint32_t i = 0; i < count; ++i) {
@@ -265,6 +274,11 @@ void FromWaveBank(const std::string& name, const Bytes& d, Scan* scan) {
     }
     Sound s;
     s.source = name + " #" + std::to_string(i);
+    if (names) {
+      const size_t at = names + size_t(i) * name_elem;
+      for (size_t k = 0; k < name_elem && at + k < d.size() && d[at + k]; ++k) s.wave += char(d[at + k]);
+      if (!s.wave.empty()) s.source += " " + s.wave;
+    }
     s.container = name;
     s.channels = f.channels;
     s.rate = int(f.rate);
@@ -595,6 +609,258 @@ void WriteWav(const fs::path& path, const std::vector<float>& pcm) {
   for (float v : pcm) w16(uint16_t(int16_t(std::clamp(v, -1.0f, 1.0f) * 32767.0f)));
 }
 
+// ---- Bink movies -----------------------------------------------------------------
+//
+// The movies (GameInfo/AmpedWorldMovies/*.bik, Bink 1 'i') carry their sound
+// as several Bink Audio tracks (DCT variant); the dialogue is on a track of
+// its own. Decoding follows FFmpeg's binkaudio.c (LGPL; the method, written
+// out again here): per block, two float coefficients, band quantisers, run-
+// length coded coefficients, an inverse DCT (DCT-III) and a short crossfade
+// with the block before.
+
+struct BinkTrack {
+  int rate = 0;
+  int channels = 1;
+  bool dct = false;
+  uint32_t id = 0;
+};
+
+struct BinkFile {
+  uint32_t frames = 0;
+  double fps = 0;
+  std::vector<BinkTrack> tracks;
+  std::vector<std::pair<uint32_t, uint32_t>> frame;  // offset, size
+};
+
+bool ParseBink(const Bytes& d, BinkFile* b) {
+  if (d.size() < 48 || std::memcmp(d.data(), "BIK", 3) != 0) return false;
+  b->frames = Le32(&d[8]);
+  const uint32_t num = Le32(&d[28]), den = Le32(&d[32]);
+  if (!b->frames || b->frames > 1000000 || !num || !den) return false;
+  b->fps = double(num) / double(den);
+  const uint32_t tracks = Le32(&d[40]);
+  if (tracks > 256) return false;
+  size_t o = 44 + size_t(tracks) * 4;  // max decoded sizes
+  if (d.size() < o + size_t(tracks) * 8 + size_t(b->frames + 1) * 4) return false;
+  for (uint32_t i = 0; i < tracks; ++i) {
+    BinkTrack t;
+    t.rate = Le16(&d[o + i * 4]);
+    const uint16_t flags = Le16(&d[o + i * 4 + 2]);
+    t.channels = (flags & 0x2000) ? 2 : 1;
+    t.dct = (flags & 0x1000) != 0;
+    b->tracks.push_back(t);
+  }
+  o += size_t(tracks) * 4;
+  for (uint32_t i = 0; i < tracks; ++i) b->tracks[i].id = Le32(&d[o + i * 4]);
+  o += size_t(tracks) * 4;
+  const uint32_t file_size = Le32(&d[4]) + 8;
+  for (uint32_t i = 0; i < b->frames; ++i) {
+    const uint32_t pos = Le32(&d[o + i * 4]) & ~1u;
+    const uint32_t next = i + 1 < b->frames ? Le32(&d[o + (i + 1) * 4]) & ~1u : file_size;
+    if (next <= pos || next > d.size()) return false;
+    b->frame.push_back({pos, next - pos});
+  }
+  return true;
+}
+
+// Bits, least significant first (Bink's bit order).
+struct LeBits {
+  const uint8_t* p;
+  size_t bits, pos = 0;
+  LeBits(const uint8_t* data, size_t bytes) : p(data), bits(bytes * 8) {}
+  size_t left() const { return pos < bits ? bits - pos : 0; }
+  uint32_t get(int n) {
+    uint32_t v = 0;
+    for (int i = 0; i < n; ++i, ++pos) {
+      if (pos < bits && ((p[pos >> 3] >> (pos & 7)) & 1)) v |= 1u << i;
+    }
+    return v;
+  }
+  void align32() { pos = (pos + 31) & ~size_t(31); }
+};
+
+// In-place complex FFT (radix 2), sign +1 (inverse, unscaled).
+void Fft(std::vector<double>& re, std::vector<double>& im) {
+  const size_t n = re.size();
+  for (size_t i = 1, j = 0; i < n; ++i) {
+    size_t bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      std::swap(re[i], re[j]);
+      std::swap(im[i], im[j]);
+    }
+  }
+  for (size_t len = 2; len <= n; len <<= 1) {
+    const double a = 2 * 3.14159265358979323846 / double(len);
+    const double wr = std::cos(a), wi = std::sin(a);
+    for (size_t i = 0; i < n; i += len) {
+      double cr = 1, ci = 0;
+      for (size_t k = 0; k < len / 2; ++k) {
+        const size_t u = i + k, v = i + k + len / 2;
+        const double tr = re[v] * cr - im[v] * ci, ti = re[v] * ci + im[v] * cr;
+        re[v] = re[u] - tr;
+        im[v] = im[u] - ti;
+        re[u] += tr;
+        im[u] += ti;
+        const double nr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = nr;
+      }
+    }
+  }
+}
+
+class BinkAudio {
+ public:
+  BinkAudio(int rate, int channels) : channels_(channels) {
+    const int bits = rate < 22050 ? 9 : rate < 44100 ? 10 : 11;
+    len_ = 1 << bits;
+    overlap_ = len_ / 16;
+    const double root = len_ / (std::sqrt(double(len_)) * 32768.0);
+    root_ = float(root);
+    for (int i = 0; i < 96; ++i) quant_[i] = float(std::exp(i * 0.15289164787221953823) * root);
+    static const int kCritical[25] = {100,  200,  300,  400,  510,  630,  770,  920,  1080,
+                                      1270, 1480, 1720, 2000, 2320, 2700, 3150, 3700, 4400,
+                                      5300, 6400, 7700, 9500, 12000, 15500, 24500};
+    const int half = (rate + 1) / 2;
+    for (bands_n_ = 1; bands_n_ < 25; ++bands_n_) {
+      if (half <= kCritical[bands_n_ - 1]) break;
+    }
+    bands_[0] = 2;
+    for (int i = 1; i < bands_n_; ++i) bands_[i] = (kCritical[i - 1] * len_ / half) & ~1;
+    bands_[bands_n_] = len_;
+    prev_.assign(size_t(channels), std::vector<float>(size_t(overlap_), 0.0f));
+    // The DCT-III by an FFT of twice the size.
+    fre_.resize(size_t(len_) * 2);
+    fim_.resize(size_t(len_) * 2);
+    for (int n = 0; n < len_; ++n) {
+      const double a = 3.14159265358979323846 * n / (2.0 * len_);
+      tw_re_.push_back(std::cos(a));
+      tw_im_.push_back(std::sin(a));
+    }
+  }
+
+  // One packet (one movie frame's audio for this track): appends mono samples.
+  void Decode(const uint8_t* data, size_t size, std::vector<float>* out) {
+    if (size < 4) return;
+    LeBits gb(data, size);
+    gb.get(32);  // the decoded size
+    std::vector<std::vector<float>> c(static_cast<size_t>(channels_), std::vector<float>(static_cast<size_t>(len_)));
+    while (gb.left() >= 64) {
+      if (!Block(gb, c)) break;
+      const int n = len_ - overlap_;
+      const size_t at = out->size();
+      out->resize(at + size_t(n), 0.0f);
+      for (int ch = 0; ch < channels_; ++ch) {
+        for (int i = 0; i < n; ++i) (*out)[at + size_t(i)] += c[size_t(ch)][size_t(i)] / float(channels_);
+      }
+      gb.align32();
+      if (gb.left() == 0) break;
+    }
+  }
+
+ private:
+  static float Float(LeBits& gb) {
+    const int power = int(gb.get(5));
+    float f = std::ldexp(float(gb.get(23)), power - 23);
+    if (gb.get(1)) f = -f;
+    return f;
+  }
+
+  bool Block(LeBits& gb, std::vector<std::vector<float>>& out) {
+    static const uint8_t kRle[16] = {2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64};
+    gb.get(2);
+    for (int ch = 0; ch < channels_; ++ch) {
+      std::vector<float>& x = out[size_t(ch)];
+      if (gb.left() < 58) return false;
+      x[0] = Float(gb) * root_;
+      x[1] = Float(gb) * root_;
+      if (gb.left() < size_t(bands_n_) * 8) return false;
+      float quant[25];
+      for (int i = 0; i < bands_n_; ++i) quant[i] = quant_[std::min<uint32_t>(gb.get(8), 95)];
+      int k = 0;
+      float q = quant[0];
+      int i = 2;
+      while (i < len_) {
+        int j;
+        if (gb.get(1)) j = i + kRle[gb.get(4)] * 8;
+        else j = i + 8;
+        j = std::min(j, len_);
+        const int width = int(gb.get(4));
+        if (width == 0) {
+          std::fill(x.begin() + i, x.begin() + j, 0.0f);
+          i = j;
+          while (bands_[k] < i) q = quant[k++];
+        } else {
+          while (i < j) {
+            if (bands_[k] == i) q = quant[k++];
+            const uint32_t coeff = gb.get(width);
+            if (coeff) x[size_t(i)] = gb.get(1) ? -q * float(coeff) : q * float(coeff);
+            else x[size_t(i)] = 0.0f;
+            ++i;
+          }
+        }
+        if (gb.left() == 0 && i < len_) return false;
+      }
+      x[0] /= 0.5f;
+      Dct3(x);
+    }
+    const int count = overlap_ * channels_;
+    for (int ch = 0; ch < channels_; ++ch) {
+      std::vector<float>& x = out[size_t(ch)];
+      if (!first_) {
+        int j = ch;
+        for (int i = 0; i < overlap_; ++i, j += channels_) {
+          x[size_t(i)] = (prev_[size_t(ch)][size_t(i)] * float(count - j) + x[size_t(i)] * float(j)) / float(count);
+        }
+      }
+      std::copy(x.end() - overlap_, x.end(), prev_[size_t(ch)].begin());
+    }
+    first_ = false;
+    return true;
+  }
+
+  // X_k = x_0 / 2 + sum x_n cos(pi n (2k + 1) / 2N).
+  void Dct3(std::vector<float>& x) {
+    const size_t n2 = size_t(len_) * 2;
+    for (size_t i = 0; i < n2; ++i) fre_[i] = fim_[i] = 0;
+    for (int n = 0; n < len_; ++n) {
+      const double w = n == 0 ? 0.5 : 1.0;
+      fre_[size_t(n)] = w * x[size_t(n)] * tw_re_[size_t(n)];
+      fim_[size_t(n)] = w * x[size_t(n)] * tw_im_[size_t(n)];
+    }
+    Fft(fre_, fim_);
+    for (int k = 0; k < len_; ++k) x[size_t(k)] = float(fre_[size_t(k)] * (2.0 / len_));
+  }
+
+  int channels_, len_ = 2048, overlap_ = 128, bands_n_ = 25;
+  float root_ = 1;
+  float quant_[96];
+  int bands_[26];
+  bool first_ = true;
+  std::vector<std::vector<float>> prev_;
+  std::vector<double> fre_, fim_, tw_re_, tw_im_;
+};
+
+// One track of a movie as mono floats at the track's rate.
+bool DecodeBinkTrack(const Bytes& d, const BinkFile& b, size_t track, std::vector<float>* out) {
+  if (track >= b.tracks.size() || !b.tracks[track].dct) return false;
+  BinkAudio dec(b.tracks[track].rate, b.tracks[track].channels);
+  out->clear();
+  for (const auto& [pos, size] : b.frame) {
+    size_t o = pos, end = size_t(pos) + size;
+    for (size_t t = 0; t < b.tracks.size() && o + 4 <= end; ++t) {
+      const uint32_t n = Le32(&d[o]);
+      o += 4;
+      if (o + n > end) return !out->empty();
+      if (t == track && n >= 4) dec.Decode(&d[o], n, out);
+      o += n;
+    }
+  }
+  return !out->empty();
+}
+
 // ---- which sounds ------------------------------------------------------------------
 
 bool NamedLike(const std::string& lower, std::initializer_list<const char*> words) {
@@ -688,6 +954,7 @@ std::string Clean(std::string s) {
 struct Transcriber {
   whisper_context* ctx = nullptr;
   int threads = 4;
+  std::string language = "en";
 
   // Transcribes `batch` (each ~short) as one window, words given back to
   // the clip they fall in. Returns per-clip words.
@@ -707,7 +974,7 @@ struct Transcriber {
 
     whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
     p.n_threads = threads;
-    p.language = "en";
+    p.language = language.c_str();
     p.translate = false;
     p.no_context = true;
     p.single_segment = false;
@@ -781,15 +1048,20 @@ struct Options {
   fs::path game, out, model;
   int threads = 0;
   bool force = false, scan_only = false, include_music = false;
+  bool all_sounds = false;          // --all-sounds: every file, not just the dialogue
+  std::string language = "English";  // --language: English, French or German
   fs::path dump_wav;
-  fs::path test_wav;  // --transcribe-wav: one 16 kHz mono 16-bit WAV, lines printed (checking)
+  fs::path test_wav;
+  std::string only;   // --only <text>: just the sounds whose source has it (checking)
+  fs::path bink_dump;  // --bink-tracks <movie>: each audio track as a WAV in --out (checking)  // --transcribe-wav: one 16 kHz mono 16-bit WAV, lines printed (checking)
   size_t limit = 0;
 };
 
 void Usage() {
   std::printf(
       "amped3-subtitles --game <game folder> --out <subtitles folder> --model <ggml model>\n"
-      "    [--threads N] [--force] [--scan] [--dump-wav <folder>] [--include-music] [--limit N]\n");
+      "    [--language English|French|German] [--threads N] [--force] [--scan]\n"
+      "    [--dump-wav <folder>] [--all-sounds [--include-music]] [--limit N] [--only <text>]\n");
 }
 
 }  // namespace
@@ -811,12 +1083,42 @@ int main(int argc, char** argv) {
     else if (a == "--scan") o.scan_only = true;
     else if (a == "--dump-wav") o.dump_wav = next();
     else if (a == "--include-music") o.include_music = true;
+    else if (a == "--all-sounds") o.all_sounds = true;
+    else if (a == "--language") o.language = next();
     else if (a == "--limit") o.limit = size_t(std::stoul(next()));
     else if (a == "--transcribe-wav") o.test_wav = next();
+    else if (a == "--bink-tracks") o.bink_dump = next();
+    else if (a == "--only") o.only = next();
     else {
       Usage();
       return 2;
     }
+  }
+  if (!o.bink_dump.empty()) {
+    Bytes d;
+    BinkFile b;
+    if (!ReadFile(o.bink_dump, &d) || !ParseBink(d, &b)) return 1;
+    std::error_code e2;
+    fs::create_directories(o.out, e2);
+    std::printf("%u frames at %.3f fps, %zu audio tracks\n", b.frames, b.fps, b.tracks.size());
+    for (size_t t = 0; t < b.tracks.size(); ++t) {
+      std::vector<float> pcm;
+      const bool ok = DecodeBinkTrack(d, b, t, &pcm);
+      float peak = 0;
+      double sum = 0;
+      for (float v : pcm) {
+        peak = std::max(peak, std::fabs(v));
+        sum += double(v) * v;
+      }
+      std::printf("  track %zu (id %u): %d Hz %dch %s: %.1f s, peak %.3f, rms %.4f\n", t, b.tracks[t].id,
+                  b.tracks[t].rate, b.tracks[t].channels, b.tracks[t].dct ? "DCT" : "RDFT",
+                  pcm.size() / double(std::max(1, b.tracks[t].rate)), peak,
+                  pcm.empty() ? 0.0 : std::sqrt(sum / double(pcm.size())));
+      if (!ok) continue;
+      if (peak > 0) for (float& v : pcm) v *= 0.9f / peak;
+      WriteWav(o.out / ("track" + std::to_string(t) + ".wav"), To16k(pcm, b.tracks[t].rate));
+    }
+    return 0;
   }
   if (!o.test_wav.empty() && !o.model.empty()) {
     // Checking the speech recognition on its own: a 16 kHz mono WAV, split
@@ -852,7 +1154,25 @@ int main(int argc, char** argv) {
   if (o.threads <= 0) o.threads = int(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
 
   // ---- find the sounds
-  std::printf("Looking for the game's sounds in %s\n", o.game.string().c_str());
+  //
+  // The dialogue is kept apart from the music and effects in Amped 3: its
+  // wave banks are in audiobin/<language>/ (Grover: the story cutscenes, a
+  // line per scene part and player voice; Act.*.Story.VO: story missions;
+  // Voice, Voice Strm: riders, coaches and announcers while riding), and the
+  // movies have a dialogue track per language (English, French, German; the
+  // other tracks are music and effects). So only those are listened to.
+  // --all-sounds goes through every file instead.
+  std::printf("Looking for the game's dialogue in %s\n", o.game.string().c_str());
+  int lang_track = 0;
+  {
+    const std::string l = Lower(o.language);
+    if (l == "french") lang_track = 1;
+    else if (l == "german") lang_track = 2;
+    else if (l != "english") {
+      std::fprintf(stderr, "Unknown language %s (English, French or German)\n", o.language.c_str());
+      return 2;
+    }
+  }
   Scan scan;
   std::vector<fs::path> files;
   for (auto it = fs::recursive_directory_iterator(o.game, ec); !ec && it != fs::recursive_directory_iterator();
@@ -860,74 +1180,127 @@ int main(int argc, char** argv) {
     if (it->is_regular_file(ec)) files.push_back(it->path());
   }
   std::sort(files.begin(), files.end());
-  for (const fs::path& f : files) {
-    const std::string rel = fs::relative(f, o.game, ec).generic_string();
-    const std::string ext = Lower(f.extension().string());
-    if (ext == ".xex") continue;
-    const auto size = fs::file_size(f, ec);
-    if (ec || size > (uint64_t(3) << 30)) continue;
-    Bytes d;
-    if (!ReadFile(f, &d)) continue;
-    FromData(rel, ext, d, &scan);
-  }
-
-  // ---- decide which to transcribe
-  // Banks that are mostly long stereo sounds hold the music.
-  std::map<std::string, std::pair<int, int>> bank_stats;  // container -> (long stereo, all)
   struct Pick {
     size_t index;
-    bool video;
     std::string why;
   };
   std::vector<Pick> picks;
   std::vector<std::string> decisions;
-  // Rough length from the data size (XMA runs ~ 8:1 to 16:1 against 16-bit
-  // PCM); the real length comes from decoding.
-  auto rough_seconds = [](const Sound& s) {
-    return double(s.data.size()) * 10.0 / (2.0 * std::max(1, s.rate) * std::max(1, s.channels));
-  };
-  for (const Sound& s : scan.sounds) {
-    if (!s.in_bank) continue;
-    auto& st = bank_stats[s.container];
-    st.second++;
-    if (s.channels >= 2 && rough_seconds(s) > 60) st.first++;
-  }
-  for (size_t i = 0; i < scan.sounds.size(); ++i) {
-    const Sound& s = scan.sounds[i];
-    const std::string lower = Lower(s.source + " " + s.bank);
-    std::string leaf = s.container.substr(s.container.find_last_of("/\\:") + 1);
-    const std::string stem = Lower(fs::path(leaf).stem().string());
-    const bool video = scan.video_stems.count(stem) != 0 ||
-                       NamedLike(lower, {"movie", "video", "fmv", "bink", "intro", "credits", "trailer"});
-    const bool speechy = video || NamedLike(lower, {"scene", "cinem", "cine", "dialog", "voice", "vo_",
-                                                     "/vo", "speech", "story", "talk", "chatter"});
-    const double secs = rough_seconds(s);
-    std::string why;
-    bool take = true;
-    if (s.data.size() < 4096) {
-      take = false;
-      why = "too short";
-    } else if (!o.include_music && !speechy) {
-      const auto it = bank_stats.find(s.container);
-      const bool music_bank = it != bank_stats.end() && it->second.second >= 4 &&
-                              it->second.first * 2 >= it->second.second;
-      if (NamedLike(lower, {"music", "song", "soundtrack", "radio"})) {
-        take = false;
-        why = "named like music";
-      } else if (music_bank) {
-        take = false;
-        why = "in a bank of long stereo sounds (music)";
-      } else if (s.channels >= 2 && secs > 150) {
-        take = false;
-        why = "long stereo sound (music)";
+  const std::string lang_dir = Lower("audiobin/" + o.language + "/");
+  for (const fs::path& f : files) {
+    const std::string rel = fs::relative(f, o.game, ec).generic_string();
+    const std::string lrel = Lower(rel);
+    const std::string ext = Lower(f.extension().string());
+    if (ext == ".xex") continue;
+    if (ext == ".bik") {
+      // A movie: its dialogue track.
+      const std::string stem = Lower(f.stem().string());
+      scan.video_stems.insert(stem);
+      bool other_language = false;
+      for (const char* l : {"_english", "_french", "_german", "_italian", "_spanish"}) {
+        const std::string suffix = l;
+        if (stem.size() > suffix.size() && stem.compare(stem.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+            suffix != "_" + Lower(o.language)) {
+          other_language = true;
+        }
       }
+      Bytes head(4096);
+      {
+        std::ifstream in(f, std::ios::binary);
+        in.read(reinterpret_cast<char*>(head.data()), std::streamsize(head.size()));
+        head.resize(size_t(in.gcount()));
+      }
+      // The header (without the frame table, which ParseBink also wants).
+      uint32_t tracks = head.size() >= 44 ? Le32(&head[40]) : 0;
+      char line[512];
+      if (other_language) {
+        std::snprintf(line, sizeof(line), "  no    video   %s  -- another language's", rel.c_str());
+        decisions.push_back(line);
+        continue;
+      }
+      if (head.size() < 44 || std::memcmp(head.data(), "BIK", 3) != 0 || tracks == 0 || tracks > 16) {
+        std::snprintf(line, sizeof(line), "  no    video   %s  -- no sound (or not a Bink 1 movie)", rel.c_str());
+        decisions.push_back(line);
+        continue;
+      }
+      Sound s;
+      s.source = rel;
+      s.container = rel;
+      s.kind = sf::Kind::kVideo;
+      s.movie = f;
+      s.movie_name = stem;
+      // Dialogue, music and effects (6 tracks): the language's dialogue track;
+      // otherwise the one track there is (dialogue and music together).
+      s.track = tracks >= 6 ? size_t(lang_track) : 0;
+      std::snprintf(line, sizeof(line), "  yes   video   %u tracks, track %zu  %s", tracks, s.track, rel.c_str());
+      decisions.push_back(line);
+      picks.push_back({scan.sounds.size(), ""});
+      scan.sounds.push_back(std::move(s));
+      continue;
     }
-    char line[512];
-    std::snprintf(line, sizeof(line), "  %-5s %-7s %dch %5d Hz ~%6.1f s  %s%s%s", take ? "yes" : "no",
-                  video ? "video" : "speech", s.channels, s.rate, secs, s.source.c_str(),
-                  why.empty() ? "" : "  -- ", why.c_str());
-    decisions.push_back(line);
-    if (take) picks.push_back({i, video, why});
+    if (!o.all_sounds && !(ext == ".xwb" && lrel.rfind(lang_dir, 0) == 0)) continue;
+    const auto size = fs::file_size(f, ec);
+    if (ec || size > (uint64_t(3) << 30)) continue;
+    Bytes d;
+    if (!ReadFile(f, &d)) continue;
+    const size_t before = scan.sounds.size();
+    FromData(rel, ext, d, &scan);
+    if (o.all_sounds) continue;
+    for (size_t i = before; i < scan.sounds.size(); ++i) {
+      Sound& s = scan.sounds[i];
+      const std::string w = Lower(s.wave);
+      const std::string b = Lower(s.bank);
+      // The Grover bank also holds the scenes' music and effects.
+      std::string why;
+      if (w.find("music") != std::string::npos) why = "music";
+      else if (w.find("fx") != std::string::npos) why = "effects";
+      else if (s.data.size() < 4096) why = "too short";
+      s.kind = (b.find("grover") != std::string::npos || b.find("story") != std::string::npos)
+                   ? sf::Kind::kStory
+                   : sf::Kind::kSpeech;
+      char line[512];
+      std::snprintf(line, sizeof(line), "  %-5s %-7s %dch %5d Hz  %s%s%s", why.empty() ? "yes" : "no",
+                    sf::KindName(s.kind), s.channels, s.rate, s.source.c_str(), why.empty() ? "" : "  -- ",
+                    why.c_str());
+      decisions.push_back(line);
+      if (why.empty()) picks.push_back({i, ""});
+    }
+  }
+  if (o.all_sounds) {
+    // Everything found: music left out by its look (long stereo sounds, banks
+    // of them, names).
+    std::map<std::string, std::pair<int, int>> bank_stats;  // container -> (long stereo, all)
+    auto rough_seconds = [](const Sound& s) {
+      return double(s.data.size()) * 10.0 / (2.0 * std::max(1, s.rate) * std::max(1, s.channels));
+    };
+    for (const Sound& s : scan.sounds) {
+      if (!s.in_bank) continue;
+      auto& st = bank_stats[s.container];
+      st.second++;
+      if (s.channels >= 2 && rough_seconds(s) > 60) st.first++;
+    }
+    for (size_t i = 0; i < scan.sounds.size(); ++i) {
+      const Sound& s = scan.sounds[i];
+      if (s.kind == sf::Kind::kVideo) continue;
+      const std::string lower = Lower(s.source + " " + s.bank);
+      std::string why;
+      if (s.data.size() < 4096) {
+        why = "too short";
+      } else if (!o.include_music) {
+        const auto it = bank_stats.find(s.container);
+        const bool music_bank = it != bank_stats.end() && it->second.second >= 4 &&
+                                it->second.first * 2 >= it->second.second;
+        if (NamedLike(lower, {"music", "song", "soundtrack", "radio"})) why = "named like music";
+        else if (music_bank) why = "in a bank of long stereo sounds (music)";
+        else if (s.channels >= 2 && rough_seconds(s) > 150) why = "long stereo sound (music)";
+      }
+      char line[512];
+      std::snprintf(line, sizeof(line), "  %-5s %-7s %dch %5d Hz  %s%s%s", why.empty() ? "yes" : "no",
+                    sf::KindName(s.kind), s.channels, s.rate, s.source.c_str(), why.empty() ? "" : "  -- ",
+                    why.c_str());
+      decisions.push_back(line);
+      if (why.empty()) picks.push_back({i, ""});
+    }
   }
 
   {
@@ -936,15 +1309,22 @@ int main(int argc, char** argv) {
     for (const auto& l : scan.report) rep << l << "\n";
     rep << "\nOther files (by extension: count, first bytes of one):\n";
     for (const auto& [k, n] : scan.other_kinds) rep << "  " << k << ": " << n << "  " << scan.other_magic[k] << "\n";
-    rep << "\nSounds (" << scan.sounds.size() << "; transcribed: yes/no):\n";
+    rep << "\nSounds and movies (" << scan.sounds.size() << "; transcribed: yes/no):\n";
     for (const auto& l : decisions) rep << l << "\n";
   }
-  std::printf("Found %zu XMA sounds (%zu to transcribe) and %zu movies; list in %s\n", scan.sounds.size(),
-              picks.size(), scan.video_stems.size(), (o.out / "scan.txt").string().c_str());
+  std::printf("Found %zu sounds and movies (%zu to transcribe); list in %s\n", scan.sounds.size(), picks.size(),
+              (o.out / "scan.txt").string().c_str());
   if (o.scan_only) return 0;
   if (picks.empty()) {
     std::printf("Nothing to transcribe.\n");
     return 1;
+  }
+  if (!o.only.empty()) {
+    std::vector<Pick> kept;
+    for (const Pick& p : picks) {
+      if (scan.sounds[p.index].source.find(o.only) != std::string::npos) kept.push_back(p);
+    }
+    picks = kept;
   }
   if (o.limit && picks.size() > o.limit) picks.resize(o.limit);
 
@@ -990,6 +1370,7 @@ int main(int argc, char** argv) {
   cp.use_gpu = false;
   Transcriber tr;
   tr.threads = o.threads;
+  tr.language = lang_track == 1 ? "fr" : lang_track == 2 ? "de" : "en";
   tr.ctx = whisper_init_from_file_with_params(o.model.string().c_str(), cp);
   if (!tr.ctx) {
     std::fprintf(stderr, "Couldn't load the speech recognition model %s\n", o.model.string().c_str());
@@ -1010,10 +1391,11 @@ int main(int argc, char** argv) {
   auto finish = [&](size_t k, uint32_t ms, std::vector<sf::Line> lines) {
     sf::Clip& c = clips[k];
     const Sound& s = scan.sounds[picks[k].index];
-    c.video = picks[k].video;
+    c.kind = s.kind;
     c.duration_ms = ms;
     c.bytes = uint32_t(s.data.size());
-    c.keys = sf::KeysOf(s.data.data(), s.data.size());
+    if (s.kind == sf::Kind::kVideo) c.file = s.movie_name;
+    else c.keys = sf::KeysOf(s.data.data(), s.data.size());
     c.source = s.source;
     c.lines = std::move(lines);
     have[k] = true;
@@ -1041,18 +1423,34 @@ int main(int argc, char** argv) {
   double last_print = 0;
   for (size_t k = 0; k < picks.size(); ++k) {
     const Sound& s = scan.sounds[picks[k].index];
-    ids[k] = sf::Fnv1a64(s.data.data(), s.data.size()) ^ (uint64_t(s.channels) << 56) ^ uint64_t(s.rate);
+    if (s.kind == sf::Kind::kVideo) {
+      const std::string key = s.movie_name + "#" + std::to_string(s.track) + "#" +
+                              std::to_string(fs::file_size(s.movie, ec));
+      ids[k] = sf::Fnv1a64(reinterpret_cast<const uint8_t*>(key.data()), key.size());
+    } else {
+      ids[k] = sf::Fnv1a64(s.data.data(), s.data.size()) ^ (uint64_t(s.channels) << 56) ^ uint64_t(s.rate);
+    }
     if (auto it = cache.find(ids[k]); it != cache.end()) {
       finish(k, it->second.first, it->second.second);
       ++from_cache;
       continue;
     }
     std::vector<float> native;
-    if (!DecodeXma(s, &native)) {
+    int rate = s.rate;
+    if (s.kind == sf::Kind::kVideo) {
+      Bytes d;
+      BinkFile b;
+      if (!ReadFile(s.movie, &d) || !ParseBink(d, &b) || s.track >= b.tracks.size() ||
+          !DecodeBinkTrack(d, b, s.track, &native)) {
+        ++failed;
+        continue;
+      }
+      rate = b.tracks[s.track].rate;
+    } else if (!DecodeXma(s, &native)) {
       ++failed;
       continue;
     }
-    std::vector<float> pcm = To16k(native, s.rate);
+    std::vector<float> pcm = To16k(native, rate);
     float peak = 0;
     for (float v : pcm) peak = std::max(peak, std::fabs(v));
     audio_secs += double(pcm.size()) / 16000.0;
@@ -1106,6 +1504,7 @@ int main(int argc, char** argv) {
     if (!have[k]) continue;
     for (const auto& key : clips[k].keys) seen[{key.length, key.hash}].insert(said(clips[k]));
   }
+  // The same scene line in the four player voices says the same: fine.
   std::ostringstream text;
   text << sf::kMagic << "\n";
   text << "# Made on this PC by amped3-subtitles from this copy of the game (model " << model_tag << ").\n";
@@ -1117,10 +1516,10 @@ int main(int argc, char** argv) {
     for (const auto& key : clips[k].keys) {
       if (seen[{key.length, key.hash}].size() == 1) keys.push_back(key);
     }
-    if (keys.empty()) continue;
     const sf::Clip& c = clips[k];
-    text << "clip " << (c.video ? "video" : "speech") << " " << c.duration_ms << " " << c.bytes << " "
-         << sf::FormatKeys(keys) << " " << Clean(c.source) << "\n";
+    if (keys.empty() && c.file.empty()) continue;
+    text << "clip " << sf::KindName(c.kind) << " " << c.duration_ms << " " << c.bytes << " "
+         << sf::FormatKeys(keys, c.file) << " " << Clean(c.source) << "\n";
     for (const auto& l : c.lines) text << l.start_ms << " " << l.end_ms << " " << Clean(l.text) << "\n";
     ++with_text;
     lines_total += c.lines.size();

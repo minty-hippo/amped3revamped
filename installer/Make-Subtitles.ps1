@@ -5,21 +5,28 @@ Subtitles), from your own copy of the game.
 Downloads a speech recognition model once (whisper.cpp's base.en, 142 MB, from
 the whisper.cpp project's Hugging Face page, checked against its known hash)
 and runs amped3-subtitles, which finds the game's sounds in its own files,
-decodes them and writes down what's said, with times:
+decodes them and writes down what's said, with times. Only the dialogue is
+listened to: the game keeps it apart (its own wave banks per language, and a
+dialogue track per language in the movies), so music and effects are skipped
+entirely. The result is
 <install>\subtitles\amped3.subtitles. It all runs offline on the CPU; nothing
 of the game leaves the PC. Expect it to take a while (tens of minutes on a
 recent PC); stopping it is fine, running it again carries on where it was.
 What it found is listed in <install>\subtitles\scan.txt.
 
   -InstallDir   the portable install (holds amped3.exe and game\)
-  -Model        base.en (default) or small.en (466 MB, more accurate, ~3x slower)
+  -Language     English (default), French or German: which dialogue
+  -Model        base (default) or small (466 MB, more accurate, ~3x slower);
+                English uses the English-only models (base.en, small.en)
   -Threads      CPU threads to use (default: up to 8)
   -Force        transcribe everything again
 #>
 param(
   [string]$InstallDir = '',
-  [ValidateSet('base.en', 'small.en')]
-  [string]$Model = 'base.en',
+  [ValidateSet('English', 'French', 'German')]
+  [string]$Language = 'English',
+  [ValidateSet('base', 'small', 'base.en', 'small.en')]
+  [string]$Model = 'base',
   [int]$Threads = 0,
   [switch]$Force,
   [string]$Tool = ''
@@ -33,7 +40,11 @@ $ProjectDir = Split-Path -Parent $InstallerDir
 $Models = @{
   'base.en'  = @{ File = 'ggml-base.en.bin'; Size = '142 MB'; Sha1 = '137C40403D78FD54D454DA0F9BD998F78703390C' }
   'small.en' = @{ File = 'ggml-small.en.bin'; Size = '466 MB'; Sha1 = 'DB8A495A91D927739E50B3FC1CC4C6B8F6C2D022' }
+  'base'     = @{ File = 'ggml-base.bin'; Size = '142 MB'; Sha1 = '465707469FF3A37A2B9B8D8F89F2F99DE7299DAC' }
+  'small'    = @{ File = 'ggml-small.bin'; Size = '466 MB'; Sha1 = '55356645C2B361A969DFD0EF2C5A50D530AFD8D5' }
 }
+$size = $Model -replace '\.en$', ''
+$Model = if ($Language -eq 'English') { "$size.en" } else { $size }
 $ModelUrlBase = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/'
 
 if (-not $InstallDir) {
@@ -73,7 +84,7 @@ if (-not (Test-Path $modelFile) -or ((Get-FileHash $modelFile -Algorithm SHA1).H
 
 $out = Join-Path $InstallDir 'subtitles'
 New-Item -ItemType Directory -Force -Path $out | Out-Null
-$toolArgs = @('--game', $game, '--out', $out, '--model', $modelFile)
+$toolArgs = @('--game', $game, '--out', $out, '--model', $modelFile, '--language', $Language)
 if ($Threads -gt 0) { $toolArgs += @('--threads', "$Threads") }
 if ($Force) { $toolArgs += '--force' }
 & $Tool @toolArgs

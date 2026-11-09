@@ -1423,9 +1423,16 @@ struct Renderer::Impl {
     bool ok = false;
     uint64_t frame = 0;
     uint32_t w = 0, h = 0;
+    uint32_t sig = 0;              // the settings it was baked with (BakeSignature)
     std::string path;
   };
   BakeIo bake_io_;
+  // The settings a bake depends on (World shadows, Shadow softness, Shadow
+  // resolution): saved bakes made with others are deleted when they change,
+  // and what's baked from then on is saved as the current bake.
+  uint32_t BakeSignature() const;
+  void CheckBakeSettings();
+  uint32_t bake_sig_applied_ = 0;
   std::vector<std::pair<uint64_t, Buffer>> bake_retired_;  // (frame, buffer)
   bool bake_loaded_ = false;
   float bake_c5_[4] = {};  // the saved one is in (no updates needed in saved-only mode)
@@ -6218,6 +6225,69 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   dyn_ = DynState{};
 }
 
+uint32_t Renderer::Impl::BakeSignature() const {
+  const uint32_t parts[3] = {uint32_t(world_detail_), uint32_t(std::lround(shadow_softness_ * 100.0f)),
+                             uint32_t(std::lround(shadow_res_ * 100.0f))};
+  uint32_t h = 2166136261u;
+  for (uint32_t v : parts) {
+    for (int b = 0; b < 4; ++b) {
+      h ^= (v >> (8 * b)) & 0xFF;
+      h *= 16777619u;
+    }
+  }
+  return h ? h : 1;
+}
+
+// When the settings a bake depends on have changed (here, or since the saved
+// bakes were made: bake_settings.txt beside them): the saved bakes go (they'd
+// show shadows of another size and softness), the one in memory starts over
+// from the painted map, and what's baked from now on is saved as the current
+// bake. Files that couldn't be deleted are still never loaded (their header
+// carries the settings they were made with).
+void Renderer::Impl::CheckBakeSettings() {
+  const uint32_t sig = BakeSignature();
+  if (sig == bake_sig_applied_) return;
+  const bool first = bake_sig_applied_ == 0;
+  bake_sig_applied_ = sig;
+  char text[64];
+  std::snprintf(text, sizeof(text), "%08X detail %d softness %d resolution %d\n", sig, world_detail_,
+                int(std::lround(shadow_softness_ * 100.0f)), int(std::lround(shadow_res_ * 100.0f)));
+  if (!bake_dir_.empty()) {
+    const std::string marker = bake_dir_ + "/bake_settings.txt";
+    std::string old;
+    if (FILE* fp = std::fopen(marker.c_str(), "rb")) {
+      char buf[64] = {};
+      old.assign(buf, std::fread(buf, 1, sizeof(buf) - 1, fp));
+      std::fclose(fp);
+    }
+    if (old.compare(0, 8, std::string(text, 8)) != 0) {
+      std::error_code ec;
+      int removed = 0;
+      for (const auto& e : std::filesystem::directory_iterator(bake_dir_, ec)) {
+        const std::string ext = e.path().extension().string();
+        if (ext == ".a3ws" || ext == ".tmp") removed += std::filesystem::remove(e.path(), ec) ? 1 : 0;
+      }
+      std::filesystem::create_directories(bake_dir_, ec);
+      if (FILE* fp = std::fopen(marker.c_str(), "wb")) {
+        std::fputs(text, fp);
+        std::fclose(fp);
+      }
+      if (removed) {
+        pending_notices_.push_back("world shadows: settings changed, " + std::to_string(removed) +
+                                   " saved bake(s) cleared");
+      }
+    }
+  }
+  if (!first && baked_.image) {
+    // What's in memory was made with the old settings: started over.
+    Retire(baked_);
+    baked_src_ = nullptr;
+    bake_dirty_ = false;
+    bake_loaded_ = false;
+    baked_ok_ = false;
+  }
+}
+
 std::string Renderer::Impl::BakePath(uint32_t w, uint32_t h) const {
   if (bake_dir_.empty() || !bake_key_) return {};
   char name[64];
@@ -6229,7 +6299,8 @@ std::string Renderer::Impl::BakePath(uint32_t w, uint32_t h) const {
 // mountain's painted map first shows (copied in when ready), and the bake
 // written back now and then (read back from the GPU a few frames after the
 // copy is recorded, compressed and written in the background).
-// File: "A3WS", version, width, height, then the texels deflated.
+// File: "A3WS", version (2), width, height, the settings it was made with
+// (BakeSignature), then the texels deflated.
 void Renderer::Impl::BakeIoTick(Image* src) {
   for (size_t i = 0; i < bake_retired_.size();) {
     if (frame_number_ >= bake_retired_[i].first + 4) {
@@ -6248,15 +6319,15 @@ void Renderer::Impl::BakeIoTick(Image* src) {
     io.thread = std::thread([&io] {
       const size_t n = size_t(io.w) * io.h;
       mz_ulong packed = mz_compressBound(mz_ulong(n));
-      std::vector<uint8_t> out(16 + packed);
+      std::vector<uint8_t> out(20 + packed);
       std::memcpy(out.data(), "A3WS", 4);
-      const uint32_t head[3] = {1u, io.w, io.h};
-      std::memcpy(out.data() + 4, head, 12);
-      io.ok = mz_compress2(out.data() + 16, &packed, io.buffer.mapped, mz_ulong(n), 1) == MZ_OK;
+      const uint32_t head[4] = {2u, io.w, io.h, io.sig};
+      std::memcpy(out.data() + 4, head, 16);
+      io.ok = mz_compress2(out.data() + 20, &packed, io.buffer.mapped, mz_ulong(n), 1) == MZ_OK;
       if (io.ok) {
         const std::string tmp = io.path + ".tmp";
         if (FILE* fp = std::fopen(tmp.c_str(), "wb")) {
-          io.ok = std::fwrite(out.data(), 1, 16 + packed, fp) == 16 + packed;
+          io.ok = std::fwrite(out.data(), 1, 20 + packed, fp) == 20 + packed;
           io.ok = (std::fclose(fp) == 0) && io.ok;
           std::error_code ec;
           if (io.ok) std::filesystem::rename(tmp, io.path, ec);
@@ -6275,7 +6346,7 @@ void Renderer::Impl::BakeIoTick(Image* src) {
   if (io.upload) {
     // A saved bake read: copied in (if it's still this mountain's).
     if (io.ok && baked_.image && baked_src_ == src && baked_.width == io.w &&
-        baked_.height == io.h) {
+        baked_.height == io.h && io.sig == bake_sig_applied_) {
       EndRendering();
       VkBufferImageCopy r{};
       r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -6318,6 +6389,7 @@ void Renderer::Impl::BakeSave() {
   io.ok = false;
   io.w = baked_.width;
   io.h = baked_.height;
+  io.sig = bake_sig_applied_;
   io.path = path;
   io.frame = frame_number_;
   io.state = 1;
@@ -6341,6 +6413,7 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
   std::memcpy(c5, &st.ps_consts[5 * 4], 16);
   if (!(std::fabs(c5[0]) > 1e-9f) || !(std::fabs(c5[1]) > 1e-9f)) return;
   std::memcpy(bake_c5_, c5, sizeof(c5));
+  CheckBakeSettings();
   BakeIoTick(src);
   const uint32_t mult = uint32_t(world_detail_);
   const uint32_t w = std::min(src->width * mult, 16384u), h = std::min(src->height * mult, 16384u);
@@ -6381,6 +6454,7 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
       io.ok = false;
       io.w = w;
       io.h = h;
+      io.sig = bake_sig_applied_;
       io.path = path;
       io.state = 2;
       io.thread = std::thread([&io] {
@@ -6395,12 +6469,13 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
           }
           std::fclose(fp);
         }
-        uint32_t head[3] = {};
-        if (data.size() > 16) std::memcpy(head, data.data() + 4, 12);
-        if (data.size() > 16 && !std::memcmp(data.data(), "A3WS", 4) && head[0] == 1 &&
-            head[1] == io.w && head[2] == io.h) {
+        // Version 2: made with these settings (version 1 files never are).
+        uint32_t head[4] = {};
+        if (data.size() > 20) std::memcpy(head, data.data() + 4, 16);
+        if (data.size() > 20 && !std::memcmp(data.data(), "A3WS", 4) && head[0] == 2 &&
+            head[1] == io.w && head[2] == io.h && head[3] == io.sig) {
           mz_ulong n = mz_ulong(io.w) * io.h;
-          io.ok = mz_uncompress(io.buffer.mapped, &n, data.data() + 16, mz_ulong(data.size() - 16)) ==
+          io.ok = mz_uncompress(io.buffer.mapped, &n, data.data() + 20, mz_ulong(data.size() - 20)) ==
                       MZ_OK &&
                   n == mz_ulong(io.w) * io.h;
         }

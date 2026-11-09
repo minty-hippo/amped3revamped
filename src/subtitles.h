@@ -12,8 +12,10 @@
 // up: a sound in the file is playing, and its lines are shown at their times
 // from where it is (the decoder's read position for a sound held whole in
 // memory, else the time it has spent decoding, so pausing the game pauses its
-// subtitles too). Shown: story cutscene dialogue and movies' sound tracks
-// (subtitles = 1), or every line of speech the game plays (2).
+// subtitles too). A movie is known by its file (.bik) being open, its lines
+// timed from when it was opened. Shown: the story's dialogue (cutscenes,
+// story missions) and the movies (subtitles = 1), or every line of speech the
+// game plays, riders and announcers included (2).
 
 #pragma once
 

@@ -3,6 +3,7 @@
 #include "subtitles.h"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -29,10 +30,11 @@
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xfile.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 
-#include "cutscenes.h"
 #include "graphics_panel.h"
 #include "subtitle_file.h"
 
@@ -62,6 +64,7 @@ constexpr uint32_t kPacket = 2048;
 std::vector<sf::Clip> g_clips;
 // (length, hash) -> clip index.
 std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, int>>> g_index;
+std::unordered_map<std::string, int> g_movies;  // movie file name (lower case, no extension) -> clip
 std::atomic<int> g_clip_count{0};
 
 uint64_t IndexKey(uint32_t length, uint64_t hash) { return hash ^ (uint64_t(length) * 0x9E3779B97F4A7C15ull); }
@@ -79,9 +82,11 @@ bool Load(const std::filesystem::path& file) {
   }
   g_clips = std::move(clips);
   g_index.clear();
+  g_movies.clear();
   size_t lines = 0;
   for (size_t i = 0; i < g_clips.size(); ++i) {
     lines += g_clips[i].lines.size();
+    if (!g_clips[i].file.empty()) g_movies[g_clips[i].file] = int(i);
     for (const sf::Key& k : g_clips[i].keys) {
       g_index[IndexKey(k.length, k.hash)].push_back({k.length, int(i)});
     }
@@ -223,6 +228,8 @@ void Monitor(rex::Runtime* runtime) {
   double prev = 0;
   bool overlay_wanted = false;
   double last_shown = -10;
+  double movie_poll = -1, movie_start = 0;
+  int movie_clip = -1;
   while (g_running.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const double now = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -235,7 +242,6 @@ void Monitor(rex::Runtime* runtime) {
     auto* memory = runtime->memory();
     if (mode > 0 && decoder && memory && decoder->context_array_ptr()) {
       const uint8_t* base = memory->TranslatePhysical<uint8_t*>(decoder->context_array_ptr());
-      const bool scene = amped3::cutscenes::SceneActive();
       for (uint32_t i = 0; i < kContexts; ++i) {
         const uint8_t* raw = base + 64 * i;
         Ctx& c = ctxs[i];
@@ -300,11 +306,38 @@ void Monitor(rex::Runtime* runtime) {
           t = Track{};
           continue;
         }
-        if (mode == 1 && !cl.video && !scene) continue;
+        if (mode == 1 && cl.kind == sf::Kind::kSpeech) continue;
         const uint32_t ms = uint32_t(t.elapsed * 1000.0);
         for (const sf::Line& l : cl.lines) {
           if (ms >= l.start_ms && ms < l.end_ms) shown.push_back(l.text);
         }
+      }
+    }
+    // Movies: the one whose file is open, from when it was opened (Bink
+    // reads its movie as it plays and closes it at the end).
+    if (mode > 0 && !g_movies.empty() && runtime->kernel_state() && now - movie_poll >= 0.1) {
+      movie_poll = now;
+      int open_clip = -1;
+      for (auto& f : runtime->kernel_state()->object_table()->GetObjectsByType<rex::system::XFile>()) {
+        std::string name = f->name();
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+        if (name.size() < 5 || name.compare(name.size() - 4, 4, ".bik") != 0) continue;
+        auto it = g_movies.find(name.substr(0, name.size() - 4));
+        if (it != g_movies.end()) open_clip = it->second;
+      }
+      if (open_clip != movie_clip) {
+        movie_clip = open_clip;
+        movie_start = now;
+        if (open_clip >= 0 && REXCVAR_GET(trace_subtitles)) {
+          REXLOG_INFO("Subtitles: movie {} ({} lines)", g_clips[size_t(open_clip)].source,
+                      g_clips[size_t(open_clip)].lines.size());
+        }
+      }
+    }
+    if (mode > 0 && movie_clip >= 0) {
+      const uint32_t ms = uint32_t((now - movie_start) * 1000.0);
+      for (const sf::Line& l : g_clips[size_t(movie_clip)].lines) {
+        if (ms >= l.start_ms && ms < l.end_ms) shown.push_back(l.text);
       }
     }
     if (shown.size() > 3) shown.erase(shown.begin(), shown.end() - 3);

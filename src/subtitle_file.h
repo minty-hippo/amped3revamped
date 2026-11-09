@@ -14,20 +14,23 @@
 //   <start ms> <end ms> <text>
 //   ...
 //
-// A clip is one sound the game plays (a wave in a wave bank, an XMA file):
-//   kind      speech (dialogue anywhere) or video (a movie's sound track)
-//   bytes     the size of its XMA data
+// A clip is one sound the game plays (a wave in a wave bank) or a movie's
+// dialogue track:
+//   kind      story (story cutscene and story mission dialogue), speech
+//             (riders, coaches and announcers while riding) or video (a movie)
+//   bytes     the size of its XMA data (0 for a movie)
 //   keys      where it's recognised while it plays: comma-separated
 //             <length>:<hash>, the FNV-1a 64-bit hash (16 hex digits) of the
 //             first <length> bytes of its XMA data (2048, 4096, 8192 and
-//             16384, and the whole size when smaller)
+//             16384, and the whole size when smaller); for a movie
+//             file:<name>, its file name without the extension, lower case
 //   source    where it came from (the rest of the line; for the log only)
 // and the lines after it, until the next clip, are its subtitles: times from
 // the start of the sound.
 //
 // The game sees which XMA data each of the audio hardware's decoder contexts
 // is reading (guest memory), hashes the start of it and so knows which clip
-// is playing and how far into it.
+// is playing and how far into it; a movie by its file being open.
 
 #pragma once
 
@@ -79,8 +82,15 @@ struct Line {
   std::string text;
 };
 
+enum class Kind { kSpeech, kStory, kVideo };
+
+inline const char* KindName(Kind k) {
+  return k == Kind::kStory ? "story" : k == Kind::kVideo ? "video" : "speech";
+}
+
 struct Clip {
-  bool video = false;
+  Kind kind = Kind::kSpeech;
+  std::string file;  // a movie: its file name, no extension, lower case
   uint32_t duration_ms = 0;
   uint32_t bytes = 0;
   std::vector<Key> keys;
@@ -88,8 +98,8 @@ struct Clip {
   std::vector<Line> lines;
 };
 
-inline std::string FormatKeys(const std::vector<Key>& keys) {
-  std::string s;
+inline std::string FormatKeys(const std::vector<Key>& keys, const std::string& file = "") {
+  std::string s = file.empty() ? std::string() : "file:" + file;
   char buf[40];
   for (const Key& k : keys) {
     std::snprintf(buf, sizeof(buf), "%s%u:%016llx", s.empty() ? "" : ",", k.length,
@@ -127,7 +137,10 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
       if (std::sscanf(line.c_str() + 5, "%15s %u %u %n", kind, &duration, &bytes, &used) < 3) {
         continue;
       }
-      c.video = std::string(kind) == "video";
+      const std::string kind_name = kind;
+      c.kind = kind_name == "video"   ? Kind::kVideo
+               : kind_name == "story" ? Kind::kStory
+                                      : Kind::kSpeech;
       c.duration_ms = duration;
       c.bytes = bytes;
       std::string rest = line.substr(5 + used);
@@ -140,7 +153,9 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
         if (comma == std::string::npos) comma = keys.size();
         const std::string one = keys.substr(k, comma - k);
         const size_t colon = one.find(':');
-        if (colon != std::string::npos) {
+        if (one.compare(0, 5, "file:") == 0) {
+          c.file = one.substr(5);
+        } else if (colon != std::string::npos) {
           Key key;
           key.length = uint32_t(std::strtoul(one.substr(0, colon).c_str(), nullptr, 10));
           key.hash = std::strtoull(one.substr(colon + 1).c_str(), nullptr, 16);

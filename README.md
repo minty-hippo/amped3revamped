@@ -408,28 +408,32 @@ Amped 3 has no subtitles of its own, and none can ship with this project (the
 dialogue is the game's). So they're made on your PC, from your own copy:
 the installer offers a **Subtitles** step (and `Make Subtitles.bat`,
 `linux/make-subtitles.sh` or the launcher's **Make subtitles** run it any
-time). It finds the game's sounds in its files (XACT wave banks and XMA
-files, loose or inside the `.res` archives), decodes them with the SDK's XMA
-decoder and writes down what's said with offline speech recognition
-([whisper.cpp](https://github.com/ggml-org/whisper.cpp); its `base.en` model,
-142 MB, is downloaded once; `-Model small.en` is more accurate and about 3x
-slower). Nothing leaves the PC. It runs on the CPU and takes a while (short
-sounds are transcribed 20-odd seconds' worth at a time); it can be stopped and
-picks up where it was. Music is left out. The result is
-`subtitles\amped3.subtitles` in the install folder, and `subtitles\scan.txt`
-lists every sound and movie it found and what it did with each.
+time). It listens only to the dialogue, which the game keeps apart from the
+music and effects: the voice wave banks in `audiobin\English` (Grover: the
+story cutscenes, one line per scene part and player voice; Act I/II/IV Story
+VO: story missions; Voice and Voice Strm: riders, coaches and announcers) and
+each movie's English dialogue track (the story movies carry a dialogue track
+per language beside the music and effects). It decodes them (the SDK's XMA
+decoder; Bink Audio for the movies) and writes down what's said with offline
+speech recognition ([whisper.cpp](https://github.com/ggml-org/whisper.cpp);
+its `base.en` model, 142 MB, is downloaded once; `-Model small` is more
+accurate and about 3x slower; `-Language French` or `German` for the other
+dialogue). Nothing leaves the PC. It runs on the CPU and takes a while (short
+lines are transcribed 20-odd seconds' worth at a time); it can be stopped and
+picks up where it was. The result is `subtitles\amped3.subtitles` in the
+install folder, and `subtitles\scan.txt` lists every sound and movie it found
+and what it did with each.
 
-In game, **Options > Audio > Subtitles**: *Cutscenes and movies* (default),
-*All speech* (riders, coaches and announcers while you ride too) or *Off*,
-and the text size (`subtitles`, `subtitles_size`). The game recognises a
-sound as it starts playing (from the start of its data, as the audio
-decoder reads it) and shows its lines at their times from there, so
-pausing pauses them too. `trace_subtitles` logs which sounds were recognised
-and which weren't.
+In game, **Options > Audio > Subtitles**: *Cutscenes and movies* (default:
+the story's dialogue, cutscenes, story missions and movies), *All speech*
+(riders, coaches and announcers while you ride too) or *Off*, and the text
+size (`subtitles`, `subtitles_size`). The game recognises a line as it starts
+playing (from the start of its data, as the audio decoder reads it) and shows
+it at its times from there, so pausing pauses them too; a movie by its file
+being open, timed from when it opens. `trace_subtitles` logs which sounds and
+movies were recognised and which weren't.
 
 Speech recognition makes mistakes, mostly with names and shouted lines.
-Whatever plays through the game's XMA audio is covered; if a movie's sound
-track doesn't, `scan.txt` and a log with `trace_subtitles` show why.
 
 ## Hotkeys
 
@@ -550,7 +554,8 @@ respective owners; this project is not affiliated with or endorsed by them.
   authors (MIT), with OpenAI's Whisper models (MIT), for the optional
   subtitles. Fetched at build time and the model at install time, not included
   here. The subtitle maker decodes XMA with the SDK's FFmpeg (LGPL 2.1+), as
-  the game does.
+  the game does, and the movies' Bink Audio with a decoder written after
+  FFmpeg's (LGPL 2.1+).
 - **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (ncnn-vulkan build)
   © Xintao Wang (BSD 3-Clause), for the optional texture upscaling. Downloaded
   at install time, not included here.

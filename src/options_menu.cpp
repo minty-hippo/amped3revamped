@@ -439,7 +439,9 @@ const std::vector<Tab>& Tabs() {
                        "Each mountain's World shadows are saved as they're baked "
                        "(logs\\world_shadows) and read back next time. On: once a mountain "
                        "has been ridden, use what's saved and stop baking (no cost; riders are "
-                       "shaded from the saved shadows). Off: keep baking as you ride."),
+                       "shaded from the saved shadows). Off: keep baking as you ride. "
+                       "Changing World shadows, Shadow softness or Shadow resolution clears "
+                       "what's saved; the new bake is saved in its place."),
                 Toggle("native_ambient_occlusion", "Ambient occlusion",
                        "Shading where the open sky's light can't reach: the snow around tree "
                        "trunks, rails, jumps and buildings, creases and corners, worked out "
