@@ -429,11 +429,17 @@ $WhisperTag = 'v1.8.2'
 $WhisperCommit = '4979e04f5dcaccb36057e059bbaed8a2f5288315'
 $WhisperDir = Join-Path $ProjectDir 'out\whisper.cpp'
 function Get-GitHead([string]$Dir) {
-  # git's complaints on stderr would stop the script under Windows PowerShell 5.1.
+  # The checkout's commit. .git\HEAD holds it for a clone of a tag (detached);
+  # else git is asked (stdout only: a warning on stderr isn't the answer).
+  $headFile = Join-Path $Dir '.git\HEAD'
+  if (Test-Path $headFile) {
+    $line = (Get-Content -LiteralPath $headFile -TotalCount 1)
+    if ("$line".Trim() -match '^[0-9a-f]{40}$') { return "$line".Trim() }
+  }
   $ErrorActionPreference = 'Continue'
-  try { $h = (& git -C $Dir rev-parse HEAD 2>&1 | Select-Object -First 1) } catch { return '' }
-  if ($LASTEXITCODE -ne 0 -or -not $h) { return '' }
-  return "$h".Trim()
+  try { $out = @(& git -C $Dir rev-parse HEAD 2>$null) } catch { return '' }
+  foreach ($l in $out) { if ("$l".Trim() -match '^[0-9a-f]{40}$') { return "$l".Trim() } }
+  return ''
 }
 function Get-Whisper {
   if (Test-Path (Join-Path $WhisperDir 'CMakeLists.txt')) {
@@ -445,8 +451,9 @@ function Get-Whisper {
     Write-Host '    Could not get whisper.cpp; the subtitle maker will be unavailable.' -ForegroundColor Yellow
     return $false
   }
-  if ((Get-GitHead $WhisperDir) -ne $WhisperCommit) {
-    Write-Host "    whisper.cpp $WhisperTag isn't the expected commit; not using it." -ForegroundColor Yellow
+  $head = Get-GitHead $WhisperDir
+  if ($head -ne $WhisperCommit) {
+    Write-Host "    whisper.cpp $WhisperTag isn't the expected commit (got '$head'); not using it." -ForegroundColor Yellow
     Remove-Item -LiteralPath $WhisperDir -Recurse -Force -ErrorAction SilentlyContinue
     return $false
   }
