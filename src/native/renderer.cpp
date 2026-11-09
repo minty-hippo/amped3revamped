@@ -4334,12 +4334,14 @@ layout(location = 0) out vec4 o;
 // which one a sampler picks there differs between GPUs (and from row to
 // row), which put lines of wrong normals across the snow on Intel Arc.
 ivec2 kSize;
+bool kMover;  // set by World: the point is a rider (or what was drawn with one)
 vec3 World(ivec2 t, out bool sky) {
   t = clamp(t, ivec2(0), kSize - 1);
   // What was drawn after the depth-only passes (riders), else what was
   // there before them: what they wrote alone shows nowhere.
   float late_d = texelFetch(late, t, 0).r;
-  float d = late_d != texelFetch(hidden, t, 0).r ? late_d : texelFetch(depth, t, 0).r;
+  kMover = late_d != texelFetch(hidden, t, 0).r;
+  float d = kMover ? late_d : texelFetch(depth, t, 0).r;
   vec2 uv = (vec2(t) + 0.5) * pc.a.xy;
   vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
   sky = d <= 0.0 || abs(p.w) < 1e-7;
@@ -4351,6 +4353,7 @@ void main() {
   ivec2 c = ivec2(gl_FragCoord.xy) * 2;
   bool sky;
   vec3 p = World(c, sky);
+  bool here_mover = kMover;
   float dist = length(p - pc.cam.xyz);
   if (sky || dist > pc.a.w) {
     o = vec4(1.0, sky ? 60000.0 : dist, 0.0, 0.0);  // (16-bit float: < 65504)
@@ -4399,12 +4402,16 @@ void main() {
     vec3 v = World(c + off, sk) - p;
     if (sk) continue;
     float vv = dot(v, v);
-    float falloff = max(1.0 - vv / (r * r), 0.0);
+    // A rider darkens only what it touches (the snow right under the board
+    // and boots, a few tens of cm): over the full radius it laid a dark
+    // halo on the snow around it, on top of (and past) its sun shadow.
+    float rr = kMover && !here_mover ? min(r, 0.45) : r;
+    float falloff = max(1.0 - vv / (rr * rr), 0.0);
     // Above a ~20 degree horizon and proud of the surface by more than an
-    // eighth of the radius (30 cm at the full 2.5 m), and 20 cm: the folds between the
+    // eighth of the radius (30 cm at the full 2.5 m; 6 cm for a rider): the folds between the
     // terrain's flat triangles, the foot of a snow ramp and the board trails
     // laid on the snow don't count; walls, trunks, riders and corners do.
-    sum += max((dot(v, n) - 0.12 * r) * inversesqrt(vv + 1e-6) - 0.5, 0.0) * falloff;
+    sum += max((dot(v, n) - 0.12 * rr) * inversesqrt(vv + 1e-6) - 0.5, 0.0) * falloff;
   }
   float ao = clamp(1.0 - pc.b.z * sum * (2.0 / float(kTaps)), 0.0, 1.0);
   ao = mix(ao, 1.0, ragged);
@@ -4791,10 +4798,20 @@ void main() {
     vec3 s = m.xyz / m.w;  // texel u, v (0..1) and depth
     if (all(greaterThan(s.xy, vec2(0.0))) && all(lessThan(s.xy, vec2(1.0)))) {
       float bias = (0.08 + 0.25 * (1.0 - clamp(ndl, 0.0, 1.0))) * pc.p.y;
+      // Each tap the four texels around it, weighted by how near it is to
+      // each (as a comparison sampler filters): one texel's yes or no per tap
+      // flipped from pixel to pixel as the rider moved, and showed as
+      // speckle in runs down the clothes and faces up close.
       for (int i = 0; i < 16; ++i) {
-        vec2 uv = s.xy + Disc(i, 16) * 3.0 / vec2(zn);
-        float z = texelFetch(zo, ivec2(uv * vec2(zn)), 0).r;
-        self_sh += z > s.z + bias ? 1.0 / 16.0 : 0.0;
+        vec2 f = (s.xy + Disc(i, 16) * 3.0 / vec2(zn)) * vec2(zn) - 0.5;
+        ivec2 t = ivec2(floor(f));
+        vec2 fr = f - floor(f);
+        vec4 z4 = vec4(texelFetch(zo, clamp(t, ivec2(0), zn - 1), 0).r,
+                       texelFetch(zo, clamp(t + ivec2(1, 0), ivec2(0), zn - 1), 0).r,
+                       texelFetch(zo, clamp(t + ivec2(0, 1), ivec2(0), zn - 1), 0).r,
+                       texelFetch(zo, clamp(t + ivec2(1, 1), ivec2(0), zn - 1), 0).r);
+        vec4 hit = step(vec4(s.z + bias), z4);
+        self_sh += mix(mix(hit.x, hit.y, fr.x), mix(hit.z, hit.w, fr.x), fr.y) / 16.0;
       }
     }
   }
