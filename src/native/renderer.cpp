@@ -6419,7 +6419,10 @@ void Renderer::Impl::BakeIoTick(Image* src) {
       std::memcpy(out.data(), "A3WS", 4);
       const uint32_t head[4] = {2u, io.w, io.h, io.sig};
       std::memcpy(out.data() + 4, head, 16);
-      io.ok = mz_compress2(out.data() + 20, &packed, io.buffer.mapped, mz_ulong(n), 1) == MZ_OK;
+      // (From an ordinary copy: the compressor reads its input over and over,
+      // slow from GPU-visible memory where it isn't cached.)
+      std::vector<uint8_t> plain(io.buffer.mapped, io.buffer.mapped + n);
+      io.ok = mz_compress2(out.data() + 20, &packed, plain.data(), mz_ulong(n), 1) == MZ_OK;
       if (io.ok) {
         const std::string tmp = io.path + ".tmp";
         if (FILE* fp = std::fopen(tmp.c_str(), "wb")) {
@@ -6570,10 +6573,18 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
         if (data.size() > 20) std::memcpy(head, data.data() + 4, 16);
         if (data.size() > 20 && !std::memcmp(data.data(), "A3WS", 4) && head[0] == 2 &&
             head[1] == io.w && head[2] == io.h && head[3] == io.sig) {
-          mz_ulong n = mz_ulong(io.w) * io.h;
-          io.ok = mz_uncompress(io.buffer.mapped, &n, data.data() + 20, mz_ulong(data.size() - 20)) ==
+          // Unpacked in ordinary memory, then copied over in one go: unpacking
+          // reads back what it has written, and from the upload buffer
+          // (GPU-visible, uncached) that took a minute and a half for a
+          // 16384 x 16384 bake - and closing the renderer (an upscaler
+          // switched) waited for it, the picture frozen meanwhile.
+          const size_t total = size_t(io.w) * io.h;
+          std::vector<uint8_t> plain(total);
+          mz_ulong n = mz_ulong(total);
+          io.ok = mz_uncompress(plain.data(), &n, data.data() + 20, mz_ulong(data.size() - 20)) ==
                       MZ_OK &&
-                  n == mz_ulong(io.w) * io.h;
+                  n == mz_ulong(total);
+          if (io.ok) std::memcpy(io.buffer.mapped, plain.data(), total);
         }
         io.state = 3;
       });
