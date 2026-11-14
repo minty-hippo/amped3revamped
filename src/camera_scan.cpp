@@ -101,12 +101,14 @@ void Scan(const float cam[9]) {
     if (committed && size >= 12) {
       const uint8_t* p = memory->TranslateVirtual(start);
       scanned += size;
-      for (uint32_t off = 0; off + 12 <= size; off += 4) {
+      for (uint32_t off = 0; off + 12 <= size && hits.size() < 4000; off += 4) {
         const float x = F(p + off);
+        if (!std::isfinite(x)) continue;
         for (const Target& t : targets) {
-          if (std::fabs(x - t.v[0]) > t.tol) continue;
-          if (std::fabs(F(p + off + 4) - t.v[1]) > t.tol) continue;
-          if (std::fabs(F(p + off + 8) - t.v[2]) > t.tol) continue;
+          // (Written as "not within": a NaN is never within.)
+          if (!(std::fabs(x - t.v[0]) <= t.tol)) continue;
+          if (!(std::fabs(F(p + off + 4) - t.v[1]) <= t.tol)) continue;
+          if (!(std::fabs(F(p + off + 8) - t.v[2]) <= t.tol)) continue;
           hits.push_back({start + off, t.what, t.sign});
         }
       }
