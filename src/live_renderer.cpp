@@ -137,7 +137,7 @@ REXCVAR_DEFINE_DOUBLE(native_speed_blur_strength, 1.0, "GPU",
                       "Native renderer: speed blur strength (0..2)")
     .range(0.0, 2.0);
 REXCVAR_DEFINE_INT32(replay_seconds, 20, "GPU",
-                     "Instant replay (F7, or hold RB and press D-pad down): how many seconds of riding "
+                     "Instant replay (F7, or hold L3 + R3): how many seconds of riding "
                      "are kept to watch again (native renderer; 0: off, nothing kept)")
     .range(0, 60);
 REXCVAR_DEFINE_INT32(replay_memory_mb, 2048, "GPU",
@@ -650,6 +650,8 @@ std::atomic<bool> g_freecam_showing{false};
 std::mutex g_game_camera_mutex;
 float g_game_camera[9] = {};
 bool g_game_camera_valid = false;
+float g_freecam_pose[6] = {};  // the renderer's freecam, last frame (FreecamPose)
+bool g_freecam_pose_valid = false;
 
 std::mutex g_status_mutex;
 Status g_status;
@@ -2097,6 +2099,7 @@ void WorkerMain() {
           renderer->SetFreecam(g_freecam);
           // The steps are the renderer's now.
           g_freecam.reset = false;
+          g_freecam.set_pose = false;
           for (float& v : g_freecam.look_delta) v = 0.0f;
           for (float& v : g_freecam.move_delta) v = 0.0f;
         }
@@ -2201,6 +2204,13 @@ void WorkerMain() {
       }
       LogTimings(shared);
       ReplayKeep(*f, stats.camera_signature, stats.game_camera);
+      {
+        float pose[6];
+        const bool have = renderer->FreecamPose(pose);
+        std::lock_guard lock(g_game_camera_mutex);
+        g_freecam_pose_valid = have;
+        if (have) std::memcpy(g_freecam_pose, pose, sizeof(pose));
+      }
       if (stats.camera_signature && !f->replay) {
         std::lock_guard lock(g_game_camera_mutex);
         std::memcpy(g_game_camera, stats.game_camera, sizeof(g_game_camera));
@@ -2291,10 +2301,20 @@ void SetFreecam(const native::Renderer::FreecamInput& input) {
   const native::Renderer::FreecamInput old = g_freecam;
   g_freecam = input;
   g_freecam.reset = old.reset || input.reset;
+  if (!input.set_pose && old.set_pose) {
+    g_freecam.set_pose = true;
+    std::memcpy(g_freecam.pose, old.pose, sizeof(g_freecam.pose));
+  }
   for (int i = 0; i < 2; ++i) g_freecam.look_delta[i] += old.look_delta[i];
   for (int i = 0; i < 3; ++i) g_freecam.move_delta[i] += old.move_delta[i];
 }
 bool FreecamShowing() { return g_freecam_showing.load(); }
+bool FreecamPose(float out[6]) {
+  std::lock_guard lock(g_game_camera_mutex);
+  if (!g_freecam_pose_valid) return false;
+  std::memcpy(out, g_freecam_pose, sizeof(g_freecam_pose));
+  return true;
+}
 bool GameCamera(float out[9]) {
   std::lock_guard lock(g_game_camera_mutex);
   if (!g_game_camera_valid) return false;

@@ -62,6 +62,10 @@ struct Noclip {
   double right[3] = {}, up[3] = {}, back[3] = {};  // now
   Clock::time_point last{};
   bool posed = false;  // this frame's pose set (the second hook uses it)
+  // Where to start (position, forward) once the entry is taken: the view
+  // mode's pose, so switching doesn't jump back to the game's camera.
+  bool have_target = false;
+  double target[6] = {};
 } g_noclip;
 std::atomic<bool> g_noclip_on{false};
 // Noclip, the game paused: its camera setup doesn't run, so the freecam is
@@ -69,6 +73,7 @@ std::atomic<bool> g_noclip_on{false};
 // drew last). The camera setup's last run, for telling.
 std::atomic<int64_t> g_noclip_hook_ns{0};
 std::atomic<bool> g_paused_view{false};
+constexpr int kStatePaused = 15;  // the game state machine: its pause menu
 // L3: faster, until the left stick lets go.
 bool g_boost = false;
 
@@ -115,6 +120,9 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const bool noclip = g_mode.load() == Mode::kNoclip;
     const bool paused = noclip && g_paused_view.load();
     std::string title;
+    if (replay::Active()) {
+      title = "FREECAM: REPLAY (around what the replay drew)";
+    } else
     if (!noclip && !live::FreecamShowing()) {
       title = "FREECAM: waiting for a 3D scene";
     } else if (paused) {
@@ -133,7 +141,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     items.push_back("Y / R: back to the game's camera");
     items.push_back(noclip ? "D-pad down / N: view mode" : "D-pad down / N: noclip mode");
     items.push_back("View / H: hide controls");
-    items.push_back("B / L3+R3 / F6: leave");
+    items.push_back("B / tap L3+R3 / F6: leave");
     help_bar::Draw(io, title, items, replay::Active() ? replay::BarRows() : 0);
   }
 
@@ -169,6 +177,29 @@ class Overlay final : public rex::ui::ImGuiDialog {
 
 std::unique_ptr<Overlay> g_overlay;  // UI thread, while on
 
+// The renderer's freecam placed at the noclip camera's pose (no jump back to
+// the game's camera when the view mode takes over).
+void ViewFromNoclip(native::Renderer::FreecamInput& in) {
+  std::lock_guard lock(g_noclip.mutex);
+  if (!g_noclip.have_entry) return;
+  in.set_pose = true;
+  for (int i = 0; i < 3; ++i) {
+    in.pose[i] = float(g_noclip.p[i]);
+    in.pose[3 + i] = float(-g_noclip.back[i]);
+  }
+}
+
+// The noclip camera to start at the renderer freecam's pose.
+void NoclipFromView() {
+  float pose[6];
+  const bool have = live::FreecamPose(pose);
+  std::lock_guard lock(g_noclip.mutex);
+  g_noclip.have_entry = false;
+  g_noclip.posed = false;
+  g_noclip.have_target = have;
+  for (int i = 0; i < 6; ++i) g_noclip.target[i] = pose[i];
+}
+
 // What the renderer gets: in noclip only the HUD left out.
 void SendRenderer(native::Renderer::FreecamInput in) {
   if (g_mode.load() == Mode::kNoclip && !g_paused_view.load()) {
@@ -194,9 +225,12 @@ void SetOn(bool on) {
     std::lock_guard lock(g_noclip.mutex);
     g_noclip.have_entry = false;  // from the game's camera each time
     g_noclip.reset = false;
+    g_noclip.have_target = false;
+    g_noclip.posed = false;
   }
-  g_noclip_on = on && g_mode.load() == Mode::kNoclip;
-  g_paused_view = false;
+  // In a replay (the game paused), the view mode around the replay.
+  g_paused_view = on && g_mode.load() == Mode::kNoclip && replay::Active();
+  g_noclip_on = on && g_mode.load() == Mode::kNoclip && !g_paused_view.load();
   g_boost = false;
   g_noclip_hook_ns = NowNs();
   native::Renderer::FreecamInput in;
@@ -251,32 +285,53 @@ void OnPad(const pad::Snapshot& pad) {
   if (pressed & X_INPUT_GAMEPAD_BACK) help_bar::Toggle();
   // Noclip with the game paused (its camera setup idle for a while): the
   // view mode around the last spot, until it runs again.
+  // In a replay or the game's pause menu, too (the camera the game moves
+  // isn't the one drawn then).
   if (g_mode.load() == Mode::kNoclip) {
     const int64_t idle = NowNs() - g_noclip_hook_ns.load();
     const bool was = g_paused_view.load();
-    const bool now_paused = was ? idle > 60'000'000 : idle > 250'000'000;
+    const bool held = replay::Active() || live::GameState() == kStatePaused;
+    const bool now_paused = held || (was ? idle > 60'000'000 : idle > 250'000'000);
     if (now_paused != was) {
       g_paused_view = now_paused;
-      native::Renderer::FreecamInput fresh;
-      fresh.active = now_paused;
-      fresh.reset = true;  // from the last noclip view (what the game drew)
-      live::SetFreecam(native::Renderer::FreecamInput{});
-      if (now_paused) live::SetFreecam(fresh);
+      if (now_paused) {
+        native::Renderer::FreecamInput fresh;
+        fresh.active = true;
+        fresh.reset = true;
+        // At the noclip camera (not in a replay: there, around what it drew).
+        if (!replay::Active()) ViewFromNoclip(fresh);
+        live::SetFreecam(native::Renderer::FreecamInput{});
+        live::SetFreecam(fresh);
+      } else {
+        NoclipFromView();  // on from where the view mode got to
+        g_noclip_hook_ns = NowNs();
+        live::SetFreecam(native::Renderer::FreecamInput{});
+      }
+      g_noclip_on = !now_paused;
     }
   } else {
     g_paused_view = false;
   }
   if ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) || keys.switch_mode) {
     const Mode m = g_mode.load() == Mode::kNoclip ? Mode::kView : Mode::kNoclip;
-    g_mode = m;
-    {
-      std::lock_guard lock(g_noclip.mutex);
-      g_noclip.have_entry = false;
-    }
-    g_noclip_on = m == Mode::kNoclip;
+    const bool was_view = g_mode.load() == Mode::kView || g_paused_view.load();
     native::Renderer::FreecamInput fresh;
     fresh.active = true;
     fresh.reset = true;
+    // The pose carries over: no jump back to the game's camera.
+    if (m == Mode::kView && !was_view) ViewFromNoclip(fresh);
+    if (m == Mode::kView && was_view) {
+      float pose[6];
+      if (live::FreecamPose(pose)) {
+        fresh.set_pose = true;
+        std::memcpy(fresh.pose, pose, sizeof(pose));
+      }
+    }
+    if (m == Mode::kNoclip) NoclipFromView();
+    g_mode = m;
+    g_paused_view = false;
+    g_noclip_hook_ns = NowNs();
+    g_noclip_on = m == Mode::kNoclip;
     live::SetFreecam(native::Renderer::FreecamInput{});  // the renderer's starts over
     SendRenderer(fresh);
     notice::Show(m == Mode::kNoclip ? "Freecam: noclip (the game draws from it)"
@@ -374,11 +429,11 @@ void Rotate(const double axis[3], double a, const double v[3], double out[3]) {
 // After the view matrix is copied to r31+512.
 void Amped3_NoclipView(PPCRegister& r31) {
   using namespace amped3::freecam;
+  g_noclip_hook_ns = NowNs();  // (also while the view mode stands in: how it tells)
   if (!g_noclip_on.load(std::memory_order_relaxed)) {
     g_noclip.posed = false;
     return;
   }
-  g_noclip_hook_ns = NowNs();
   auto* memory = NoclipMemory();
   if (!memory) return;
   uint8_t* v = memory->TranslateVirtual(r31.u32 + 512);
@@ -410,6 +465,24 @@ void Amped3_NoclipView(PPCRegister& r31) {
     Rotate(n.right0, 0.1, fwd, t);
     n.pitch_sign = t[1] > fwd[1] ? 1.0 : -1.0;
     n.yaw = n.pitch = 0.0;
+    if (n.have_target && !n.reset) {
+      // Turned and tilted from the entry to the target's forward (no roll).
+      double f[3] = {n.target[3], n.target[4], n.target[5]};
+      const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+      if (fl > 1e-6) {
+        for (double& c : f) c /= fl;
+        const double he_l = std::hypot(fwd[0], fwd[2]), ht_l = std::hypot(f[0], f[2]);
+        if (he_l > 1e-6 && ht_l > 1e-6) {
+          const double hx = fwd[0] / he_l, hz = fwd[2] / he_l;
+          const double tx = f[0] / ht_l, tz = f[2] / ht_l;
+          n.yaw = std::atan2(hz * tx - hx * tz, hx * tx + hz * tz) * n.yaw_sign;
+        }
+        n.pitch = std::asin(std::clamp(f[1], -1.0, 1.0)) -
+                  std::asin(std::clamp(fwd[1], -1.0, 1.0));
+        for (int i = 0; i < 3; ++i) n.p[i] = n.target[i];
+      }
+    }
+    n.have_target = false;
     n.have_entry = true;
     n.reset = false;
   }

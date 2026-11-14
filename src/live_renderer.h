@@ -82,6 +82,8 @@ bool FreecamShowing();
 // The game's camera in the last frame drawn with a 3D scene: position, then
 // forward and right unit vectors (world). False before there was one.
 bool GameCamera(float out[9]);
+// The renderer's freecam (view mode) in the last frame: position, forward.
+bool FreecamPose(float out[6]);
 
 // Instant replay: the last seconds of riding kept (setting replay_seconds),
 // played again in place of the game's frames (pause the game first: the

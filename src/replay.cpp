@@ -102,9 +102,9 @@ class Overlay final : public rex::ui::ImGuiDialog {
         "LB RB / [ ]: slower, faster",
         "LT RT / Left Right: back, forward",
         "Y / Home: from the start",
-        "L3+R3 / F6: freecam",
+        "Tap L3+R3 / F6: freecam",
         "View / H: hide controls",
-        "B / Esc / F7: leave",
+        "B / hold L3+R3 / Esc / F7: leave",
     };
     if (freecam::Active()) {
       g_bar_rows = 0;  // the freecam's bar has the bottom

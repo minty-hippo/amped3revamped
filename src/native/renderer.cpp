@@ -1943,6 +1943,7 @@ struct Renderer::Impl {
   double fc_p_[3] = {}, fc_yaw_ = 0.0, fc_pitch_ = 0.0, fc_zoom_ = 1.0;
   double fc_vpf_[16] = {}, fc_ivpf_[16] = {};  // the freecam's, this frame
   double fc_ivpg_[16] = {};      // the game's inverse, this frame (from the frame's lighting pass)
+  float fc_pose_[6] = {};        // position, forward: this frame's (FreecamPose)
   TargetKey fc_depth_{};         // the scene's depth target (the lighting pass's)
   std::string lighting_ps_;      // the lighting pass's pixel shader resource name
   std::chrono::steady_clock::time_point fc_last_{};
@@ -5613,6 +5614,23 @@ void Renderer::Impl::FreecamFrame() {
     fc_have_entry_ = true;
     fc_in_.reset = false;
   }
+  if (fc_in_.set_pose) {
+    // Yaw and pitch from the entry that give this pose (both without roll:
+    // turned about the world's up, tilted about the right axis).
+    fc_in_.set_pose = false;
+    double f[3] = {fc_in_.pose[3], fc_in_.pose[4], fc_in_.pose[5]};
+    if (Normalize3(f)) {
+      double he[3] = {fc_fwd_[0], 0.0, fc_fwd_[2]}, ht[3] = {f[0], 0.0, f[2]};
+      if (Normalize3(he) && Normalize3(ht)) {
+        const double c = he[0] * ht[0] + he[2] * ht[2];
+        const double sn = he[2] * ht[0] - he[0] * ht[2];  // (he x ht) . up
+        fc_yaw_ = std::atan2(sn, c) * fc_yaw_sign_;
+      }
+      fc_pitch_ = std::asin(std::clamp(f[1], -1.0, 1.0)) -
+                  std::asin(std::clamp(fc_fwd_[1], -1.0, 1.0));
+      for (int i = 0; i < 3; ++i) fc_p_[i] = fc_in_.pose[i];
+    }
+  }
   // The pose, moved.
   const double kTurn = 1.8;  // radians per second at full deflection
   fc_yaw_ += fc_in_.look[0] * kTurn * dt / fc_zoom_ + fc_in_.look_delta[0];
@@ -5655,6 +5673,10 @@ void Renderer::Impl::FreecamFrame() {
   }
   if (!Invert4(vpf, fc_ivpf_)) return;
   std::memcpy(fc_vpf_, vpf, sizeof(vpf));
+  for (int i = 0; i < 3; ++i) {
+    fc_pose_[i] = float(fc_p_[i]);
+    fc_pose_[3 + i] = float(fwd[i]);
+  }
   fc_on_ = true;
 }
 
@@ -10142,10 +10164,19 @@ void Renderer::SetFreecam(const FreecamInput& input) {
   FreecamInput& in = impl_->fc_in_;
   in = input;
   in.reset = old.reset || input.reset;
+  if (!input.set_pose && old.set_pose) {
+    in.set_pose = true;
+    std::memcpy(in.pose, old.pose, sizeof(in.pose));
+  }
   for (int i = 0; i < 2; ++i) in.look_delta[i] += old.look_delta[i];
   for (int i = 0; i < 3; ++i) in.move_delta[i] += old.move_delta[i];
 }
 bool Renderer::FreecamActive() const { return impl_->fc_on_; }
+bool Renderer::FreecamPose(float out[6]) const {
+  if (!impl_->fc_on_) return false;
+  std::memcpy(out, impl_->fc_pose_, sizeof(impl_->fc_pose_));
+  return true;
+}
 void Renderer::SetGameState(int state) { impl_->game_state_ = state; }
 void Renderer::SetTrailMapOpen(bool open) {
   if (!impl_->map_known_ || open != impl_->map_open_) {

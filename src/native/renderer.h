@@ -325,10 +325,17 @@ class Renderer {
     float speed = 8.0f;  // metres per second at full deflection
     bool reset = false;  // back to the game's camera
     bool hide_hud = false;  // (inactive) only the HUD left out: the noclip freecam
+    // Placed at this pose (world position and forward unit vector, no roll)
+    // once the frame has the game's camera: switching from the noclip
+    // freecam without a jump.
+    bool set_pose = false;
+    float pose[6] = {};
   };
   void SetFreecam(const FreecamInput& input);
   // The freecam's state, for the overlay: active (a scene to see it in).
   bool FreecamActive() const;
+  // The freecam's pose in the last frame (position, forward): false if off.
+  bool FreecamPose(float out[6]) const;
   // The game state machine's state (0x828901E0 + 8), each frame: the map
   // clouds' reveal after a loading screen plays only on the trail map (7),
   // never over a video, a cutscene or a riding shot. -1: unknown (replayer).

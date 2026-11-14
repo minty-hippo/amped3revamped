@@ -28,14 +28,11 @@ int Draw(const ImGuiIO& io, const std::string& title, const std::vector<std::str
   const float px = std::max(12.0f, pic_h * 0.02f);
   ImFont* font = amped3::UiFont(px);
   const float gap = px * 1.4f, row_h = px * 1.5f, margin = pic_w * 0.03f;
-  // Rows: the title alone when hidden (with how to bring the rest back).
+  // Hidden: nothing at all (View / H brings it back).
+  if (!g_visible.load()) return 0;
   std::vector<std::string> shown;
   shown.push_back(title);
-  if (g_visible.load()) {
-    shown.insert(shown.end(), items.begin(), items.end());
-  } else {
-    shown.push_back("View / H: show controls");
-  }
+  shown.insert(shown.end(), items.begin(), items.end());
   std::vector<std::vector<std::string>> rows(1);
   float x = 0.0f;
   const float max_w = pic_w - 2.0f * margin;

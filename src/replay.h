@@ -1,8 +1,8 @@
 // amped3 - instant replay: watch the last seconds of riding again (native
 // renderer; live_renderer.cpp keeps the frames, setting replay_seconds).
 //
-// F7, or hold RB and press D-pad down (View pressed for a combo reached the
-// game first: in its pause menu it resumes). While riding, the game is paused for it
+// F7, or both sticks pressed in and held 0.6 s (a tap is the freecam; D-pad
+// down or View in a combo reached the game first: a snowball, a resume). While riding, the game is paused for it
 // (Start, pressed for it) and resumed after. Freecam (F6 / L3 + R3) works
 // in the replay too.
 //
