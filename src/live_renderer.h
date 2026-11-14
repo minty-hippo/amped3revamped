@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include "native/renderer.h"
 
 namespace rex::ui {
 class Presenter;
@@ -73,6 +74,11 @@ bool Enabled();
 // While the port's Graphics panel is open: the game's HUD and menus are left
 // out of the picture, so the scene behind can be seen as settings change.
 void SetHideInterface(bool hide);
+// The freecam (native renderer only): the input for the next frame (the
+// steps in it are added up until a frame uses them), and whether the last
+// frame was seen from it (a 3D scene to fly in).
+void SetFreecam(const native::Renderer::FreecamInput& input);
+bool FreecamShowing();
 // A frame is being recorded: the hooks below do work only then.
 bool Recording();
 

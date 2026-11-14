@@ -2,6 +2,7 @@
 
 #include "amped3_app.h"
 #include "audio_trace.h"
+#include "freecam.h"
 #include "notice.h"
 #include "subtitles.h"
 
@@ -133,6 +134,7 @@ constexpr const char* kMenuBind = "bind_options_menu";
 constexpr const char* kHangBind = "bind_hang_report";
 constexpr const char* kCaptureBind = "bind_frame_capture";
 constexpr const char* kRevampedBind = "bind_revamped_graphics";
+constexpr const char* kFreecamBind = "bind_freecam";
 }  // namespace
 
 Amped3App::~Amped3App() {
@@ -338,6 +340,8 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // Every enhancement at once, on or off (to compare with the original look).
   rex::ui::RegisterBind(kRevampedBind, "F2", "Turn Revamped Graphics on or off",
                         [this] { ToggleRevampedGraphics(); });
+  rex::ui::RegisterBind(kFreecamBind, "F6", "Freecam on or off (fly the camera; the HUD hidden)",
+                        [] { amped3::freecam::Toggle(); });
 }
 
 void Amped3App::ToggleRevampedGraphics() {
@@ -392,6 +396,21 @@ void Amped3App::OnPostSetup() {
 
   // Music / XMA stream diagnostics (setting trace_audio).
   amped3::audio_trace::Start(runtime());
+  // Freecam (F6, or L3 + R3): the controller flies the camera meanwhile.
+  {
+    amped3::freecam::Host host;
+    host.drawer = imgui_drawer();
+    host.post_ui = [this](std::function<void()> fn) { app_context().CallInUIThread(std::move(fn)); };
+    host.block_game_input = [this](bool block) {
+      if (block) {
+        unblock_when_released_ = false;
+        game_input_blocked_ = true;
+      } else {
+        unblock_when_released_ = true;  // the watcher, once every button is up
+      }
+    };
+    amped3::freecam::Install(std::move(host));
+  }
   // Short notices (keyboard shortcuts that change a setting).
   amped3::notice::Install(imgui_drawer(), [this](std::function<void()> fn) {
     app_context().CallInUIThread(std::move(fn));
@@ -517,15 +536,28 @@ void Amped3App::StartControllerHotkeyWatcher() {
     constexpr uint16_t kCombo = rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
     clock::time_point held_since{};
     bool latched = false;
+    bool stick_latched = false;
     while (!hotkey_thread_stop_.load()) {
       const auto pad = amped3::pad::Read();
       amped3::pad::Publish(pad);  // the port's menus read this on the UI thread
       // A menu just closed: give the game the controller back once every
       // button is up.
+      amped3::freecam::OnPad(pad);
       if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ &&
-          !graphics_panel_open_) {
+          !graphics_panel_open_ && !amped3::freecam::Active()) {
         unblock_when_released_ = false;
         game_input_blocked_ = false;
+      }
+      // Both sticks pressed in: the freecam on or off.
+      constexpr uint16_t kStickCombo =
+          rex::input::X_INPUT_GAMEPAD_LEFT_THUMB | rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB;
+      if ((pad.buttons & kStickCombo) == kStickCombo) {
+        if (!stick_latched) {
+          stick_latched = true;
+          amped3::freecam::Toggle();
+        }
+      } else {
+        stick_latched = false;
       }
       if ((pad.buttons & kCombo) == kCombo) {
         const auto now = clock::now();

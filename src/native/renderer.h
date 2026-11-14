@@ -304,6 +304,23 @@ class Renderer {
   // everything after the composite reads the finished scene, are left out.
   // For looking at the graphics while the port's Graphics panel is open.
   void SetHideInterface(bool hide);
+  // Freecam: the 3D scene seen from a camera of its own (every scene draw
+  // reprojected from the game's camera into it, the lighting pass given its
+  // inverse), the HUD left out. Where it starts: the game's camera when
+  // turned on. The game still only draws what its own camera sees.
+  struct FreecamInput {
+    bool active = false;
+    float move[3] = {};  // right, up, forward: -1..1 (times the speed)
+    float look[2] = {};  // turn right, look up: -1..1 (times the turn rate)
+    float look_delta[2] = {};  // the same, a step in radians (the mouse)
+    float move_delta[3] = {};  // a step in metres (right, up, forward)
+    float zoom = 0.0f;   // -1..1: wider / narrower
+    float speed = 8.0f;  // metres per second at full deflection
+    bool reset = false;  // back to the game's camera
+  };
+  void SetFreecam(const FreecamInput& input);
+  // The freecam's state, for the overlay: active (a scene to see it in).
+  bool FreecamActive() const;
   // The game state machine's state (0x828901E0 + 8), each frame: the map
   // clouds' reveal after a loading screen plays only on the trail map (7),
   // never over a video, a cutscene or a riding shot. -1: unknown (replayer).

@@ -457,6 +457,8 @@ int main(int argc, char** argv) {
   std::string bake_dir;                               // --bake-dir folder
   float shadow_softness = 0.0f;                       // --shadow-softness scale
   float ao = 0.0f;        // --ao strength [--ao-debug]: ambient occlusion
+  float freecam[5] = {};
+  bool use_freecam = false;
   bool ao_debug = false;
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
   fs::path rewrite;  // write the loaded frame back out in capture format (tests the writer)
@@ -515,6 +517,11 @@ int main(int argc, char** argv) {
       shadow_distance = std::stof(argv[++i]);
     } else if (a == "--ao" && i + 1 < argc) {
       ao = std::stof(argv[++i]);
+    } else if (a == "--freecam" && i + 1 < argc) {
+      // right, up, forward (metres), turn right, look up (degrees)
+      std::sscanf(argv[++i], "%f,%f,%f,%f,%f", &freecam[0], &freecam[1], &freecam[2], &freecam[3],
+                  &freecam[4]);
+      use_freecam = true;
     } else if (a == "--ao-debug") {
       ao_debug = true;
     } else if (a == "--fog" && i + 1 < argc) {
@@ -739,6 +746,17 @@ int main(int argc, char** argv) {
     renderer.SetSceneryObjectBlur(scenery_blur);
     renderer.SetMergeClears(merge_clears);
     renderer.SetParallelCommands(parallel_commands);
+    if (use_freecam) {
+      // Freecam test: on from the first frame, moved and turned once.
+      amped3::native::Renderer::FreecamInput fc;
+      fc.active = true;
+      fc.move_delta[0] = freecam[0];
+      fc.move_delta[1] = freecam[1];
+      fc.move_delta[2] = freecam[2];
+      fc.look_delta[0] = freecam[3] * 3.14159265f / 180.0f;
+      fc.look_delta[1] = freecam[4] * 3.14159265f / 180.0f;
+      renderer.SetFreecam(fc);
+    }
     if (motion_yaw != 0.0f) {
       // Test input: the same frame with the lighting pass's inverse
       // view-projection turned about the camera (c4) around world Y.

@@ -1927,7 +1927,26 @@ struct Renderer::Impl {
   };
   std::vector<VelDraw> vel_draws_;
   bool vel_post_light_ = false;  // a copy was recorded after the lighting pass
-  float cam_pos_[3] = {};        // this frame's camera (lighting pass c4)
+  float cam_pos_[3] = {};        // this frame's camera (lighting pass c4; the freecam's when on)
+  // The game's own camera, whatever is seen (the freecam): what follows the
+  // rider (speed, riding, the player) goes by it.
+  float game_cam_pos_[3] = {};
+  double game_inv_vp_[16] = {};  // the game's inverse view-projection (the lighting's c0..c3)
+  // Freecam (SetFreecam): the camera's pose, from the game's camera when it
+  // was turned on (entry: its view-projection, position and axes).
+  Renderer::FreecamInput fc_in_;
+  bool fc_on_ = false;           // this frame: a scene seen from the freecam
+  bool fc_have_entry_ = false;
+  double fc_vpe_[16] = {};       // entry view-projection (world -> x, y, 1 - depth, 1)
+  double fc_c0_[3] = {}, fc_fwd_[3] = {}, fc_right_[3] = {};
+  double fc_yaw_sign_ = 1.0, fc_pitch_sign_ = 1.0;
+  double fc_p_[3] = {}, fc_yaw_ = 0.0, fc_pitch_ = 0.0, fc_zoom_ = 1.0;
+  double fc_vpf_[16] = {}, fc_ivpf_[16] = {};  // the freecam's, this frame
+  double fc_ivpg_[16] = {};      // the game's inverse, this frame (from the frame's lighting pass)
+  TargetKey fc_depth_{};         // the scene's depth target (the lighting pass's)
+  std::string lighting_ps_;      // the lighting pass's pixel shader resource name
+  std::chrono::steady_clock::time_point fc_last_{};
+  void FreecamFrame();
   // Speed blur (SetSpeedBlur): the camera's speed (it follows the rider),
   // smoothed so the effect fades in and out, the direction of travel, and the
   // radial blur of this frame's scene.
@@ -5459,6 +5478,186 @@ bool Invert4(const double m[16], double out[16]) {
 
 }  // namespace
 
+namespace {
+
+void Mul4(const double a[16], const double b[16], double out[16]) {
+  double t[16];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      double v = 0;
+      for (int k = 0; k < 4; ++k) v += a[r * 4 + k] * b[k * 4 + c];
+      t[r * 4 + c] = v;
+    }
+  }
+  std::memcpy(out, t, sizeof(t));
+}
+
+// Rotation by `a` radians about the unit axis (x, y, z) (row-major 3 x 3).
+void AxisRotation(const double ax[3], double a, double m[9]) {
+  const double c = std::cos(a), s = std::sin(a), t = 1.0 - c;
+  const double x = ax[0], y = ax[1], z = ax[2];
+  const double r[9] = {t * x * x + c,     t * x * y - s * z, t * x * z + s * y,
+                       t * x * y + s * z, t * y * y + c,     t * y * z - s * x,
+                       t * x * z - s * y, t * y * z + s * x, t * z * z + c};
+  std::memcpy(m, r, sizeof(r));
+}
+
+void Apply3(const double m[9], const double v[3], double out[3]) {
+  double t[3];
+  for (int r = 0; r < 3; ++r) t[r] = m[r * 3] * v[0] + m[r * 3 + 1] * v[1] + m[r * 3 + 2] * v[2];
+  std::memcpy(out, t, sizeof(t));
+}
+
+bool Normalize3(double v[3]) {
+  const double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (!(n > 1e-9)) return false;
+  for (int i = 0; i < 3; ++i) v[i] /= n;
+  return true;
+}
+
+bool SameTarget(const TargetKey& a, const TargetKey& b) {
+  return a.depth == b.depth && a.base == b.base && a.format == b.format && a.pitch == b.pitch &&
+         a.samples == b.samples;
+}
+
+}  // namespace
+
+// The freecam for this frame (FreecamInput): the game's camera from the
+// frame's lighting pass (found before anything is drawn), the freecam's pose
+// moved by the input since the last frame, and its view-projection.
+void Renderer::Impl::FreecamFrame() {
+  fc_on_ = false;
+  const auto now = std::chrono::steady_clock::now();
+  double dt = fc_last_ == std::chrono::steady_clock::time_point{}
+                  ? 0.0
+                  : std::chrono::duration<double>(now - fc_last_).count();
+  fc_last_ = now;
+  dt = std::clamp(dt, 0.0, 0.1);
+  if (!fc_in_.active) {
+    fc_have_entry_ = false;
+    return;
+  }
+  // The lighting pass: its pixel shader by name once known (looked up by
+  // its microcode's hash until then).
+  const Draw* light = nullptr;
+  std::unordered_set<std::string> tried;
+  for (const Draw& d : frame_->draws) {
+    if (d.ps.empty()) continue;
+    if (!lighting_ps_.empty()) {
+      if (d.ps == lighting_ps_) {
+        light = &d;
+        break;
+      }
+      continue;
+    }
+    if (!tried.insert(d.ps).second) continue;
+    Shader* ps = GetShader(d.ps, ShaderStage::kPixel);
+    if (ps && ps->error.empty() && ps->info.ucode_hash == kLightingPixelShader) {
+      lighting_ps_ = d.ps;
+      light = &d;
+      break;
+    }
+  }
+  if (!light) return;  // no 3D scene this frame (menus, loading, videos)
+  const GpuState& st = *light->state;
+  double ivpg[16], vpg[16];
+  for (uint32_t i = 0; i < 16; ++i) {
+    float f;
+    const uint32_t bits = st.ps_consts[i];
+    std::memcpy(&f, &bits, 4);
+    ivpg[i] = f;
+  }
+  if (!Invert4(ivpg, vpg)) return;
+  double cam[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    float f;
+    const uint32_t bits = st.ps_consts[16 + i];
+    std::memcpy(&f, &bits, 4);
+    cam[i] = f;
+  }
+  std::memcpy(fc_ivpg_, ivpg, sizeof(ivpg));
+  fc_depth_ = DepthKey(st.reg(0x2000), st.reg(0x2002));
+  auto unproject = [&](double x, double y, double out[3]) {
+    const double n[4] = {x, y, 0.5, 1.0};
+    double w[4] = {};
+    for (int r = 0; r < 4; ++r) {
+      for (int k = 0; k < 4; ++k) w[r] += ivpg[r * 4 + k] * n[k];
+    }
+    for (int r = 0; r < 3; ++r) out[r] = w[r] / w[3];
+  };
+  if (!fc_have_entry_ || fc_in_.reset) {
+    // From the game's camera: its view-projection, position and axes (the
+    // screen's middle and a step right of it, unprojected).
+    double mid[3], side[3];
+    unproject(0.0, 0.0, mid);
+    unproject(0.5, 0.0, side);
+    double fwd[3] = {mid[0] - cam[0], mid[1] - cam[1], mid[2] - cam[2]};
+    double right[3] = {side[0] - mid[0], 0.0, side[2] - mid[2]};
+    if (!Normalize3(fwd) || !Normalize3(right)) return;
+    std::memcpy(fc_vpe_, vpg, sizeof(vpg));
+    std::memcpy(fc_c0_, cam, sizeof(cam));
+    std::memcpy(fc_p_, cam, sizeof(cam));
+    std::memcpy(fc_fwd_, fwd, sizeof(fwd));
+    std::memcpy(fc_right_, right, sizeof(right));
+    // Which way a positive angle turns (the world's handedness): right and up.
+    const double up[3] = {0, 1, 0};
+    double m[9], v[3];
+    AxisRotation(up, 0.1, m);
+    Apply3(m, fwd, v);
+    fc_yaw_sign_ = v[0] * right[0] + v[1] * right[1] + v[2] * right[2] > 0 ? 1.0 : -1.0;
+    AxisRotation(right, 0.1, m);
+    Apply3(m, fwd, v);
+    fc_pitch_sign_ = v[1] > fwd[1] ? 1.0 : -1.0;
+    fc_yaw_ = fc_pitch_ = 0.0;
+    fc_zoom_ = 1.0;
+    fc_have_entry_ = true;
+    fc_in_.reset = false;
+  }
+  // The pose, moved.
+  const double kTurn = 1.8;  // radians per second at full deflection
+  fc_yaw_ += fc_in_.look[0] * kTurn * dt / fc_zoom_ + fc_in_.look_delta[0];
+  fc_pitch_ += fc_in_.look[1] * kTurn * dt / fc_zoom_ + fc_in_.look_delta[1];
+  fc_in_.look_delta[0] = fc_in_.look_delta[1] = 0.0f;
+  const double e0 = std::asin(std::clamp(fc_fwd_[1], -1.0, 1.0));
+  fc_pitch_ = std::clamp(fc_pitch_, -1.45 - e0, 1.45 - e0);
+  fc_zoom_ = std::clamp(fc_zoom_ * std::exp(double(fc_in_.zoom) * 1.5 * dt), 1.0, 8.0);
+  const double up[3] = {0, 1, 0};
+  double ry[9], rp[9], R[9];
+  AxisRotation(up, fc_yaw_sign_ * fc_yaw_, ry);
+  AxisRotation(fc_right_, fc_pitch_sign_ * fc_pitch_, rp);
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      R[r * 3 + c] = ry[r * 3] * rp[c] + ry[r * 3 + 1] * rp[3 + c] + ry[r * 3 + 2] * rp[6 + c];
+    }
+  }
+  double fwd[3], right[3];
+  Apply3(R, fc_fwd_, fwd);
+  Apply3(R, fc_right_, right);
+  const double step = double(fc_in_.speed) * dt;
+  const float* md = fc_in_.move_delta;
+  for (int i = 0; i < 3; ++i) {
+    fc_p_[i] += (right[i] * fc_in_.move[0] + up[i] * fc_in_.move[1] + fwd[i] * fc_in_.move[2]) * step +
+                right[i] * md[0] + up[i] * md[1] + fwd[i] * md[2];
+  }
+  fc_in_.move_delta[0] = fc_in_.move_delta[1] = fc_in_.move_delta[2] = 0.0f;
+  // View-projection: a world point x is seen where the game's camera, at
+  // entry, saw c0 + R^T (x - p).
+  double T1[16] = {1, 0, 0, fc_c0_[0], 0, 1, 0, fc_c0_[1], 0, 0, 1, fc_c0_[2], 0, 0, 0, 1};
+  double RT[16] = {R[0], R[3], R[6], 0, R[1], R[4], R[7], 0, R[2], R[5], R[8], 0, 0, 0, 0, 1};
+  double T2[16] = {1, 0, 0, -fc_p_[0], 0, 1, 0, -fc_p_[1], 0, 0, 1, -fc_p_[2], 0, 0, 0, 1};
+  double vpf[16];
+  Mul4(fc_vpe_, T1, vpf);
+  Mul4(vpf, RT, vpf);
+  Mul4(vpf, T2, vpf);
+  for (int c = 0; c < 4; ++c) {
+    vpf[c] *= fc_zoom_;
+    vpf[4 + c] *= fc_zoom_;
+  }
+  if (!Invert4(vpf, fc_ivpf_)) return;
+  std::memcpy(fc_vpf_, vpf, sizeof(vpf));
+  fc_on_ = true;
+}
+
 void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   // Rows c0..c3: world (homogeneous) = rows * (ndc x, ndc y, 1 - depth, 1).
   for (uint32_t i = 0; i < 16; ++i) {
@@ -5511,6 +5710,14 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   if (speed_frame_ != frame_number_ && max_draws_ == UINT32_MAX) {
     speed_frame_ = frame_number_;
     UpdateSpeed();
+  }
+  // The game's camera kept; with the freecam on, what's drawn (the depth
+  // the effects read) is seen from the freecam.
+  std::memcpy(game_inv_vp_, inv_vp_, sizeof(inv_vp_));
+  std::memcpy(game_cam_pos_, cam_pos_, sizeof(cam_pos_));
+  if (fc_on_) {
+    std::memcpy(inv_vp_, fc_ivpf_, sizeof(inv_vp_));
+    for (int i = 0; i < 3; ++i) cam_pos_[i] = float(fc_p_[i]);
   }
   amped3::native::TextureFetch scene, depth;
   std::memcpy(scene.words, FetchWords(d, 3, st), sizeof(scene.words));
@@ -5820,7 +6027,7 @@ void Renderer::Impl::DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map,
   for (int r = 0; r < 4; ++r) {
     for (int c = 0; c < 4; ++c) {
       double v = 0;
-      for (int k = 0; k < 4; ++k) v += O[r * 4 + k] * inv_vp_[k * 4 + c];
+      for (int k = 0; k < 4; ++k) v += O[r * 4 + k] * game_inv_vp_[k * 4 + c];  // as the game drew them
       OI[r * 4 + c] = v;
     }
   }
@@ -7544,7 +7751,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     prof_t = t;
   };
   const GpuState& st = *d.state;
-  if (hide_interface_ && composite_seen_) return;  // the HUD / menus, left out
+  if ((hide_interface_ || fc_on_) && composite_seen_) return;  // the HUD / menus, left out
   if (d.vs.empty() || d.ps.empty()) {
     Skip(number, "no microcode recorded (capture from an older build)");
     return;
@@ -7788,6 +7995,29 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // One sample per pixel: the dither's per-frame phase (the shader).
     if (att0->samples == 1) sys.flags |= uint32_t(frame_number_ & 3) << 30;
   }
+  // Freecam: the scene's depth-tested geometry (on the scene's depth target:
+  // not the shadow maps, the lighting pass or other full-screen passes)
+  // reprojected, the game's clip position -> (x, y, 1 - depth, 1) -> world
+  // (the game's inverse) -> the freecam's -> back to a clip position with
+  // the draw's own depth scale.
+  if (fc_on_ && !composite_seen_ && (st.reg(0x2200) & 2) &&
+      ps->info.ucode_hash != kLightingPixelShader &&
+      SameTarget(DepthKey(surface, st.reg(0x2002)), fc_depth_)) {
+    const double dzs = st.reg(0x2206) & 16 ? st.regf(0x2113) : 1.0;
+    const double dzo = st.reg(0x2206) & 32 ? st.regf(0x2114) : 0.0;
+    if (std::fabs(dzs) > 1e-12) {
+      const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -dzs, 1.0 - dzo, 0, 0, 0, 1};
+      const double Ki[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1.0 / dzs, (1.0 - dzo) / dzs, 0, 0, 0, 1};
+      double m[16];
+      Mul4(fc_ivpg_, K, m);
+      Mul4(fc_vpf_, m, m);
+      Mul4(Ki, m, m);
+      for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) sys.reproject[c * 4 + r] = float(m[r * 4 + c]);  // column-major
+      }
+      sys.flags |= 16384u;  // XE_FLAG_REPROJECT
+    }
+  }
   sys.rt_inv_size[0] = 1.0f / float(rt_w);
   sys.rt_inv_size[1] = 1.0f / float(rt_h);
   sys.param_gen_register = (st.reg(0x2180) & (1u << 18)) ? ((st.reg(0x2181) >> 8) & 0xFF) : 255;
@@ -7882,6 +8112,26 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     std::memcpy(out + 10 * 16, c10, 16);
   }
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
+  // Freecam: the lighting pass works out each pixel's world position from
+  // the depth with its inverse view-projection (c0..c3) and the view from
+  // the camera's position (c4): the freecam's, the depth being seen from it.
+  const uint32_t* lit_src = st.ps_consts.data();
+  uint32_t fc_consts[1024];
+  if (fc_on_ && ps->info.ucode_hash == kLightingPixelShader) {
+    std::memcpy(fc_consts, st.ps_consts.data(), sizeof(fc_consts));
+    for (int i = 0; i < 16; ++i) {
+      const float f = float(fc_ivpf_[i]);
+      std::memcpy(&fc_consts[i], &f, 4);
+    }
+    for (int i = 0; i < 3; ++i) {
+      const float f = float(fc_p_[i]);
+      std::memcpy(&fc_consts[16 + i], &f, 4);
+    }
+    lit_src = fc_consts;
+    uint8_t* out;
+    offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
+    std::memcpy(out, fc_consts, ConstBytes(*ps));
+  }
   if (shadow_res_ > 1.0f && ps->info.ucode_hash == kShadowBlurPixelShader &&
       ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
     // The shadow map's blur (5 taps 1.25 texels apart, c255.xy = 1 / size):
@@ -7901,7 +8151,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // u, v), remapped the same way: v' = av (v - 1) + 1.
     uint8_t* out;
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
-    const uint32_t* src = st.ps_consts.data();
+    const uint32_t* src = lit_src;
     std::memcpy(out, src, ConstBytes(*ps));
     float c7[4], c9[4];
     std::memcpy(c7, src + 7 * 4, 16);
@@ -8272,7 +8522,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       max_draws_ == UINT32_MAX) {
     float a[3];
     if (CharacterAnchor(*vs, st.vs_consts.data(), a)) {
-      const float dx = a[0] - cam_pos_[0], dy = a[1] - cam_pos_[1], dz = a[2] - cam_pos_[2];
+      const float dx = a[0] - game_cam_pos_[0], dy = a[1] - game_cam_pos_[1],
+                  dz = a[2] - game_cam_pos_[2];
       const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
       if (dist < nearest_character_) {
         nearest_character_ = dist;
@@ -8719,7 +8970,7 @@ void Renderer::Impl::DrawVelocities() {
   float best = 1e30f;
   for (const VelDraw& v : vel_draws_) {
     if (!v.post_light || !v.has_anchor) continue;
-    const float dc = dist(v.anchor, cam_pos_);
+    const float dc = dist(v.anchor, game_cam_pos_);
     if (dc > 15.0f) continue;
     float score = dc;
     if (player_known_ && dist(v.anchor, player_pos_) < 4.0f) score -= 100.0f;
@@ -8732,7 +8983,8 @@ void Renderer::Impl::DrawVelocities() {
   if (player) std::memcpy(player_pos_, player->anchor, sizeof(player_pos_));
   player_draws_ = 0;
   for (VelDraw& v : vel_draws_) {
-    if (v.matched) v.sys.flags |= 1024u;  // XE_FLAG_VELOCITY: last frame's constants found
+    // (Freecam: the game's camera moves under the draws; camera motion only.)
+    if (v.matched && !fc_on_) v.sys.flags |= 1024u;  // XE_FLAG_VELOCITY: last frame's constants found
     if (v.post_light) v.sys.flags |= 4096u;  // XE_FLAG_VELOCITY_CHARACTER
     if (player && v.post_light && v.has_anchor && dist(v.anchor, player_pos_) < 2.5f) {
       v.sys.flags |= 2048u;  // XE_FLAG_VELOCITY_PLAYER
@@ -9082,8 +9334,8 @@ void Renderer::Impl::UpdateClouds() {
     cloud_dark_ = 0;
     bool riding_now = nearest_character_ <= kRidingCameraDistance;
     if (!riding_now && rider_known_) {
-      const float r[3] = {cam_pos_[0] - rider_pos_[0], cam_pos_[1] - rider_pos_[1],
-                          cam_pos_[2] - rider_pos_[2]};
+      const float r[3] = {game_cam_pos_[0] - rider_pos_[0], game_cam_pos_[1] - rider_pos_[1],
+                          game_cam_pos_[2] - rider_pos_[2]};
       riding_now = r[0] * r[0] + r[1] * r[1] + r[2] * r[2] < 60.0f * 60.0f;
     }
     if (in_scene_) {
@@ -9597,6 +9849,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   CollectPipelines();
   pipeline_sync_ms_ = 0;
   Prepass();
+  FreecamFrame();
   // The frame's commands: recorded on the command stream's thread (from a
   // pool of their own) while this one prepares the next draws.
   if (stream_.active()) stream_.End();  // the last frame stopped by an error
@@ -9735,17 +9988,18 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
         std::memcpy(rider_pos_, nearest_character_pos_, sizeof(rider_pos_));
         rider_known_ = true;
       } else if (rider_known_) {
-        const float d[3] = {cam_pos_[0] - riding_prev_cam_[0], cam_pos_[1] - riding_prev_cam_[1],
-                            cam_pos_[2] - riding_prev_cam_[2]};
+        const float d[3] = {game_cam_pos_[0] - riding_prev_cam_[0],
+                            game_cam_pos_[1] - riding_prev_cam_[1],
+                            game_cam_pos_[2] - riding_prev_cam_[2]};
         if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 3.0f * 3.0f) {
           for (int i = 0; i < 3; ++i) rider_pos_[i] += d[i];
         }
       }
-      const float r[3] = {cam_pos_[0] - rider_pos_[0], cam_pos_[1] - rider_pos_[1],
-                          cam_pos_[2] - rider_pos_[2]};
+      const float r[3] = {game_cam_pos_[0] - rider_pos_[0], game_cam_pos_[1] - rider_pos_[1],
+                          game_cam_pos_[2] - rider_pos_[2]};
       riding_ = nearest_character_ <= kRidingCameraDistance ||
                 (rider_known_ && r[0] * r[0] + r[1] * r[1] + r[2] * r[2] < 60.0f * 60.0f);
-      std::memcpy(riding_prev_cam_, cam_pos_, sizeof(riding_prev_cam_));
+      std::memcpy(riding_prev_cam_, game_cam_pos_, sizeof(riding_prev_cam_));
     }
     stats_.nearest_character = nearest_character_;
     if (!light_seen_) {
@@ -9846,6 +10100,16 @@ const std::string& Renderer::device_name() const { return impl_->gpu_.device_nam
 void Renderer::SetMapClouds(bool on) { impl_->map_clouds_ = on; }
 void Renderer::SetInCutscene(bool scene) { impl_->in_scene_ = scene; }
 void Renderer::SetHideInterface(bool hide) { impl_->hide_interface_ = hide; }
+void Renderer::SetFreecam(const FreecamInput& input) {
+  // Steps (the mouse, reset) not yet used by a frame are kept and added to.
+  const FreecamInput old = impl_->fc_in_;
+  FreecamInput& in = impl_->fc_in_;
+  in = input;
+  in.reset = old.reset || input.reset;
+  for (int i = 0; i < 2; ++i) in.look_delta[i] += old.look_delta[i];
+  for (int i = 0; i < 3; ++i) in.move_delta[i] += old.move_delta[i];
+}
+bool Renderer::FreecamActive() const { return impl_->fc_on_; }
 void Renderer::SetGameState(int state) { impl_->game_state_ = state; }
 void Renderer::SetTrailMapOpen(bool open) {
   if (!impl_->map_known_ || open != impl_->map_open_) {

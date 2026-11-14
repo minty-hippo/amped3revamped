@@ -632,6 +632,10 @@ std::unique_ptr<RecordedFrame> g_prep;  // waiting for the prep thread
 std::thread g_prep_thread;
 std::atomic<bool> g_failed{false};
 std::atomic<bool> g_hide_interface{false};  // SetHideInterface
+// SetFreecam: the input, its steps added up until the worker hands them on.
+std::mutex g_freecam_mutex;
+native::Renderer::FreecamInput g_freecam;
+std::atomic<bool> g_freecam_showing{false};
 
 std::mutex g_status_mutex;
 Status g_status;
@@ -1809,6 +1813,15 @@ void WorkerMain() {
         renderer->SetParallelCommands(REXCVAR_GET(native_parallel_commands));
         renderer->SetMapClouds(revamped && REXCVAR_GET(native_map_clouds));
         renderer->SetHideInterface(g_hide_interface.load());
+        {
+          std::lock_guard lock(g_freecam_mutex);
+          renderer->SetFreecam(g_freecam);
+          // The steps are the renderer's now.
+          g_freecam.reset = false;
+          for (float& v : g_freecam.look_delta) v = 0.0f;
+          for (float& v : g_freecam.move_delta) v = 0.0f;
+        }
+        g_freecam_showing = renderer->FreecamActive();
         // The game state machine (0x828901E0) + 8: 7 = the trail map.
         if (auto* memory = GuestMemory()) {
           const uint32_t game_state = U32(memory->virtual_membase() + 0x828901E8u);
@@ -1987,6 +2000,15 @@ void Shutdown() {
 bool Enabled() { return REXCVAR_GET(native_renderer) && !g_failed.load(); }
 
 void SetHideInterface(bool hide) { g_hide_interface = hide; }
+void SetFreecam(const native::Renderer::FreecamInput& input) {
+  std::lock_guard lock(g_freecam_mutex);
+  const native::Renderer::FreecamInput old = g_freecam;
+  g_freecam = input;
+  g_freecam.reset = old.reset || input.reset;
+  for (int i = 0; i < 2; ++i) g_freecam.look_delta[i] += old.look_delta[i];
+  for (int i = 0; i < 3; ++i) g_freecam.move_delta[i] += old.move_delta[i];
+}
+bool FreecamShowing() { return g_freecam_showing.load(); }
 
 bool Recording() { return g_recording.load(std::memory_order_relaxed); }
 

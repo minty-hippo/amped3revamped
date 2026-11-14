@@ -463,6 +463,7 @@ it is. The file is plain text too (`subtitles\amped3.subtitles`, described in
 | Back + Start (View + Menu), or F1 | Options menu |
 | In menu: D-pad or left stick / A / B / LB-RB | Move / change / close / switch tabs |
 | F2 | Revamped Graphics on or off (every enhancement at once, to compare with the original look; a notice shows which) |
+| F6, or both sticks pressed in (L3 + R3) | Freecam: fly the camera around the scene, HUD hidden (native renderer). Pause first (Start) for a photo mode; while riding the game goes on underneath. Left stick / W A S D move, right stick / arrows / right mouse look, LT RT / Q E down and up, LB RB / Z C zoom, A / Shift faster, X / Alt slower, Y / R back to the game's camera, View hides the help, B / F6 / Esc leave. The game only draws what its own camera sees, so flying far from it shows gaps |
 | F9 | Hang report: every thread's stack, written to `logs\amped3_hang_*.txt` (use when the game is stuck) |
 | F10 | Frame capture: the next frame's Direct3D calls and state, written to `logs\frame_*.txt` (see `docs/frame-capture.md`) |
 | F3 | Performance overlay: frame rate, CPU and GPU frame times with a live graph, CPU and GPU usage, clock speed and power draw |
