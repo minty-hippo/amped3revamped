@@ -5677,6 +5677,34 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
       h *= 1099511628211ull;
     }
     stats_.camera_signature = h | 1;
+    // Position and axes (the screen's middle and a step right, unprojected).
+    double ivp[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+      float f;
+      const uint32_t bits = st.ps_consts[i];
+      std::memcpy(&f, &bits, 4);
+      ivp[i] = f;
+    }
+    auto unproject = [&](double x, double y, double out[3]) {
+      const double n[4] = {x, y, 0.5, 1.0};
+      double w[4] = {};
+      for (int r = 0; r < 4; ++r) {
+        for (int k = 0; k < 4; ++k) w[r] += ivp[r * 4 + k] * n[k];
+      }
+      for (int r = 0; r < 3; ++r) out[r] = w[r] / w[3];
+    };
+    double mid[3], side[3];
+    unproject(0.0, 0.0, mid);
+    unproject(0.5, 0.0, side);
+    double fwd[3] = {mid[0] - cam_pos_[0], mid[1] - cam_pos_[1], mid[2] - cam_pos_[2]};
+    double right[3] = {side[0] - mid[0], side[1] - mid[1], side[2] - mid[2]};
+    if (Normalize3(fwd) && Normalize3(right)) {
+      for (int i = 0; i < 3; ++i) {
+        stats_.game_camera[i] = cam_pos_[i];
+        stats_.game_camera[3 + i] = float(fwd[i]);
+        stats_.game_camera[6 + i] = float(right[i]);
+      }
+    }
   }
   {
     // c14: the light's direction (a unit vector toward the sun).

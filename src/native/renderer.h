@@ -136,6 +136,9 @@ struct RenderStats {
   // view-projection and position; 0: no 3D scene). The same from frame to
   // frame: a still scene (the game paused).
   uint64_t camera_signature = 0;
+  // The game's camera this frame (with a 3D scene): position, and its
+  // forward and right unit vectors (world).
+  float game_camera[9] = {};
   // CPU time (ms): vertex data and per-frame setup, recording the draws, and
   // waiting for the GPU to finish (0 when async).
   double prepass_ms = 0, record_ms = 0, gpu_wait_ms = 0;

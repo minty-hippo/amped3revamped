@@ -79,6 +79,9 @@ void SetHideInterface(bool hide);
 // frame was seen from it (a 3D scene to fly in).
 void SetFreecam(const native::Renderer::FreecamInput& input);
 bool FreecamShowing();
+// The game's camera in the last frame drawn with a 3D scene: position, then
+// forward and right unit vectors (world). False before there was one.
+bool GameCamera(float out[9]);
 
 // Instant replay: the last seconds of riding kept (setting replay_seconds),
 // played again in place of the game's frames (pause the game first: the

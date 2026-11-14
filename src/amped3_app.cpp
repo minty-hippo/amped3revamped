@@ -2,6 +2,7 @@
 
 #include "amped3_app.h"
 #include "audio_trace.h"
+#include "camera_scan.h"
 #include "freecam.h"
 #include "notice.h"
 #include "replay.h"
@@ -137,6 +138,7 @@ constexpr const char* kCaptureBind = "bind_frame_capture";
 constexpr const char* kRevampedBind = "bind_revamped_graphics";
 constexpr const char* kFreecamBind = "bind_freecam";
 constexpr const char* kReplayBind = "bind_instant_replay";
+constexpr const char* kCameraScanBind = "bind_camera_scan";
 }  // namespace
 
 Amped3App::~Amped3App() {
@@ -295,6 +297,7 @@ void Amped3App::OnPostInitLogging() {
   // Same folder the SDK writes amped3_NNN.log to.
   amped3::crash::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::capture::Install(rex::filesystem::GetExecutableFolder() / "logs");
+  amped3::camera_scan::Install(rex::filesystem::GetExecutableFolder() / "logs");
 
   // Paths are resolved before the log file opens, so report them here.
   if (game_dir_.empty()) {
@@ -346,6 +349,9 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         [] { amped3::freecam::Toggle(); });
   rex::ui::RegisterBind(kReplayBind, "F7", "Instant replay: the last seconds of riding again",
                         [] { amped3::replay::Toggle(); });
+  // Diagnostics for the noclip freecam: where the game keeps its camera.
+  rex::ui::RegisterBind(kCameraScanBind, "F8", "Camera scan: where the game keeps its camera, to logs",
+                        [] { amped3::camera_scan::Run(); });
 }
 
 void Amped3App::ToggleRevampedGraphics() {

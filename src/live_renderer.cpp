@@ -646,6 +646,10 @@ std::atomic<bool> g_hide_interface{false};  // SetHideInterface
 std::mutex g_freecam_mutex;
 native::Renderer::FreecamInput g_freecam;
 std::atomic<bool> g_freecam_showing{false};
+// The game's camera, from the last frame with a 3D scene (GameCamera).
+std::mutex g_game_camera_mutex;
+float g_game_camera[9] = {};
+bool g_game_camera_valid = false;
 
 std::mutex g_status_mutex;
 Status g_status;
@@ -2186,6 +2190,11 @@ void WorkerMain() {
       }
       LogTimings(shared);
       ReplayKeep(*f, stats.camera_signature);
+      if (stats.camera_signature && !f->replay) {
+        std::lock_guard lock(g_game_camera_mutex);
+        std::memcpy(g_game_camera, stats.game_camera, sizeof(g_game_camera));
+        g_game_camera_valid = true;
+      }
       g_render_done_ns.store(SteadyNs());
       const double ms = since(t0);
       std::lock_guard lock(g_status_mutex);
@@ -2275,6 +2284,12 @@ void SetFreecam(const native::Renderer::FreecamInput& input) {
   for (int i = 0; i < 3; ++i) g_freecam.move_delta[i] += old.move_delta[i];
 }
 bool FreecamShowing() { return g_freecam_showing.load(); }
+bool GameCamera(float out[9]) {
+  std::lock_guard lock(g_game_camera_mutex);
+  if (!g_game_camera_valid) return false;
+  std::memcpy(out, g_game_camera, sizeof(g_game_camera));
+  return true;
+}
 
 bool Recording() { return g_recording.load(std::memory_order_relaxed); }
 
