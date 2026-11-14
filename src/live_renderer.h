@@ -79,6 +79,27 @@ void SetHideInterface(bool hide);
 // frame was seen from it (a 3D scene to fly in).
 void SetFreecam(const native::Renderer::FreecamInput& input);
 bool FreecamShowing();
+
+// Instant replay: the last seconds of riding kept (setting replay_seconds),
+// played again in place of the game's frames (pause the game first: the
+// frames it draws meanwhile are dropped).
+bool ReplayAvailable();
+bool ReplayStart();  // false: nothing kept
+void ReplayStop();
+bool ReplayPlaying();
+struct ReplayStatus {
+  double position = 0.0, length = 0.0;  // seconds
+  float speed = 1.0f;
+  bool paused = false;
+};
+ReplayStatus ReplayGetStatus();
+// speed > 0: set; pause 0 play, 1 pause, 2 toggle, -1 leave; seek >= 0: go to.
+void ReplayControl(float speed, int pause = -1, double seek = -1.0);
+// The game's camera unchanged over the last frames: a still scene (paused).
+bool SceneStill();
+// The game state machine's state (13 riding, 20 a story scene, 7 the trail
+// map; -1 unknown).
+int GameState();
 // A frame is being recorded: the hooks below do work only then.
 bool Recording();
 

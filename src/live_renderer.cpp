@@ -136,6 +136,15 @@ REXCVAR_DEFINE_BOOL(native_speed_blur, true, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_speed_blur_strength, 1.0, "GPU",
                       "Native renderer: speed blur strength (0..2)")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_INT32(replay_seconds, 20, "GPU",
+                     "Instant replay (F7, or hold View and press RB): how many seconds of riding "
+                     "are kept to watch again (native renderer; 0: off, nothing kept)")
+    .range(0, 60);
+REXCVAR_DEFINE_INT32(replay_memory_mb, 2048, "GPU",
+                     "Instant replay: at most this much memory (MB) for the kept frames (fewer "
+                     "seconds kept when it's reached)")
+    .range(256, 16384);
+
 REXCVAR_DEFINE_BOOL(native_fog, true, "GPU",
                     "Native renderer: distance fog: haze that builds with distance and is "
                     "thicker low down, lit by the sky and the sun (or moon) everywhere, "
@@ -429,6 +438,7 @@ struct RecordedFrame {
   bool states_built = false;                // BuildStates done (by the prep thread)
   double states_ms = 0;                     // its time
   std::chrono::steady_clock::time_point swap_time;  // when the game swapped it
+  bool replay = false;                      // fed again by the instant replay (not kept again)
   ~RecordedFrame();
 };
 
@@ -1229,6 +1239,260 @@ void PrepMain() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Instant replay. Each frame drawn while riding is kept (at most 60 a second,
+// the last `replay_seconds`): its draws and their state changes (compact:
+// the per-draw states are built again when it plays), its vertex data (the
+// same shared copies the vertex cache holds while unchanged) and texture
+// fetches (read from guest memory again when it plays). A still scene (the
+// game paused: its camera the same bit for bit) isn't kept. Playing, the
+// game paused, a thread feeds the kept frames to the prep thread at their
+// own pace (slower, paused, scrubbed), and frames the game draws meanwhile
+// are dropped.
+
+std::mutex g_replay_mutex;
+std::deque<std::unique_ptr<RecordedFrame>> g_replay_frames;  // oldest first
+std::deque<size_t> g_replay_sizes;
+size_t g_replay_bytes = 0;
+std::atomic<bool> g_replay_playing{false};
+std::atomic<bool> g_scene_still{false};  // the last frames' camera unchanged
+uint64_t g_last_camera = 0;
+std::chrono::steady_clock::time_point g_replay_last_kept{};
+// Playing: position (seconds from the first kept frame), speed, paused.
+std::thread g_replay_thread;
+std::atomic<bool> g_replay_stop{false};
+std::mutex g_replay_ctl_mutex;
+double g_replay_pos = 0.0, g_replay_len = 0.0;
+float g_replay_speed = 1.0f;
+bool g_replay_paused = false;
+double g_replay_seek = -1.0;
+
+// A frame's copy for keeping or feeding: no built states (rebuilt from the
+// deltas), no draw inputs (only for naming).
+std::unique_ptr<RecordedFrame> CopyForReplay(const RecordedFrame& src) {
+  auto r = std::make_unique<RecordedFrame>();
+  r->frame = src.frame;
+  for (auto& d : r->frame.draws) d.state.reset();
+  r->blobs = src.blobs;
+  r->versions = src.versions;
+  r->textures = src.textures;
+  r->deltas = src.deltas;
+  r->draw_delta_end = src.draw_delta_end;
+  r->swap_time = src.swap_time;
+  r->replay = true;
+  return r;
+}
+
+size_t ReplayBytes(const RecordedFrame& f) {
+  size_t n = f.deltas.size() + f.draw_delta_end.size() * 4 +
+             f.frame.events.size() * sizeof(native::Event) +
+             f.frame.draws.size() * (sizeof(native::Draw) + 64);
+  // Vertex data no one else holds (the vertex cache keeps unchanged buffers).
+  for (const auto& [name, blob] : f.blobs) {
+    if (blob && blob.use_count() <= 2) n += blob->size();
+  }
+  return n;
+}
+
+double ReplaySpan() {
+  if (g_replay_frames.size() < 2) return 0.0;
+  return std::chrono::duration<double>(g_replay_frames.back()->swap_time -
+                                       g_replay_frames.front()->swap_time)
+      .count();
+}
+
+// After a frame is drawn (worker): kept for the replay while riding.
+void ReplayKeep(const RecordedFrame& f, uint64_t camera) {
+  const bool still = camera != 0 && camera == g_last_camera;
+  g_last_camera = camera;
+  g_scene_still = still;
+  const int seconds = REXCVAR_GET(replay_seconds);
+  if (seconds <= 0 && !g_replay_playing.load()) {
+    // Off: nothing kept (memory back).
+    std::lock_guard lock(g_replay_mutex);
+    if (!g_replay_frames.empty()) {
+      g_replay_frames.clear();
+      g_replay_sizes.clear();
+      g_replay_bytes = 0;
+    }
+    return;
+  }
+  if (f.replay || g_replay_playing.load() || camera == 0 || still) return;
+  if (f.swap_time - g_replay_last_kept < std::chrono::milliseconds(15)) return;
+  g_replay_last_kept = f.swap_time;
+  const auto t0 = std::chrono::steady_clock::now();
+  auto r = CopyForReplay(f);
+  const size_t bytes = ReplayBytes(*r);
+  {
+    // What keeping costs, now and then in the log.
+    static double ms_sum = 0.0;
+    static size_t bytes_sum = 0, n = 0;
+    ms_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    bytes_sum += bytes;
+    if (++n == 600) {
+      REXLOG_INFO("Instant replay: keeping a frame takes {:.2f} ms, {:.1f} MB each; {} s kept "
+                  "({:.0f} MB)",
+                  ms_sum / double(n), double(bytes_sum) / double(n) / 1048576.0,
+                  [] {
+                    std::lock_guard lock(g_replay_mutex);
+                    return int(ReplaySpan());
+                  }(),
+                  [] {
+                    std::lock_guard lock(g_replay_mutex);
+                    return double(g_replay_bytes) / 1048576.0;
+                  }());
+      ms_sum = 0.0;
+      bytes_sum = n = 0;
+    }
+  }
+  const size_t cap = size_t(REXCVAR_GET(replay_memory_mb)) << 20;
+  std::lock_guard lock(g_replay_mutex);
+  // A gap (a pause, a loading screen): what came before isn't the same run.
+  if (!g_replay_frames.empty() &&
+      f.swap_time - g_replay_frames.back()->swap_time > std::chrono::milliseconds(500)) {
+    g_replay_frames.clear();
+    g_replay_sizes.clear();
+    g_replay_bytes = 0;
+  }
+  g_replay_frames.push_back(std::move(r));
+  g_replay_sizes.push_back(bytes);
+  g_replay_bytes += bytes;
+  while (g_replay_frames.size() > 1 &&
+         (g_replay_frames.back()->swap_time - g_replay_frames.front()->swap_time >
+              std::chrono::seconds(seconds) ||
+          g_replay_bytes > cap)) {
+    g_replay_bytes -= g_replay_sizes.front();
+    g_replay_frames.pop_front();
+    g_replay_sizes.pop_front();
+  }
+}
+
+void ReplayFeedMain() {
+  qos::PreferPerformanceThread(L"amped3 instant replay", false);
+  using Clock = std::chrono::steady_clock;
+  auto last = Clock::now();
+  size_t fed = SIZE_MAX;
+  auto fed_at = Clock::time_point{};
+  while (!g_replay_stop.load()) {
+    const auto now = Clock::now();
+    const double dt = std::chrono::duration<double>(now - last).count();
+    last = now;
+    double pos;
+    {
+      std::lock_guard lock(g_replay_ctl_mutex);
+      if (g_replay_seek >= 0.0) {
+        g_replay_pos = g_replay_seek;
+        g_replay_seek = -1.0;
+      } else if (!g_replay_paused) {
+        g_replay_pos += dt * g_replay_speed;
+      }
+      g_replay_pos = std::clamp(g_replay_pos, 0.0, g_replay_len);
+      if (g_replay_pos >= g_replay_len && !g_replay_paused) g_replay_paused = true;  // held at the end
+      pos = g_replay_pos;
+    }
+    std::unique_ptr<RecordedFrame> copy;
+    {
+      std::lock_guard lock(g_replay_mutex);
+      if (g_replay_frames.empty()) break;
+      const auto t0 = g_replay_frames.front()->swap_time;
+      const auto target = t0 + std::chrono::duration_cast<Clock::duration>(
+                                   std::chrono::duration<double>(pos));
+      // The last kept frame at or before the position.
+      size_t i = std::upper_bound(g_replay_frames.begin(), g_replay_frames.end(), target,
+                                  [](const Clock::time_point& t, const auto& f) {
+                                    return t < f->swap_time;
+                                  }) -
+                 g_replay_frames.begin();
+      i = i ? i - 1 : 0;
+      // A new frame, or the same again now and then (the freecam moves).
+      if (i != fed || now - fed_at > std::chrono::milliseconds(16)) {
+        copy = CopyForReplay(*g_replay_frames[i]);
+        copy->swap_time = now;
+        fed = i;
+        fed_at = now;
+      }
+    }
+    if (copy) HandOver(std::move(copy), g_prep_mutex, g_prep_cv, g_prep);
+    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+  }
+  // Ended on its own (nothing kept any more): the replay controls leave.
+  if (!g_replay_stop.load()) g_replay_playing = false;
+}
+
+}  // namespace
+
+bool ReplayAvailable() {
+  std::lock_guard lock(g_replay_mutex);
+  return ReplaySpan() > 0.5;
+}
+
+bool ReplayPlaying() { return g_replay_playing.load(); }
+
+bool SceneStill() { return g_scene_still.load(); }
+
+int GameState() {
+  auto* memory = GuestMemory();
+  if (!memory) return -1;
+  return int(U32(memory->virtual_membase() + 0x828901E8u));
+}
+
+bool ReplayStart() {
+  if (g_replay_playing.load()) return true;
+  double len;
+  {
+    std::lock_guard lock(g_replay_mutex);
+    len = ReplaySpan();
+  }
+  if (len <= 0.5) return false;
+  {
+    std::lock_guard lock(g_replay_ctl_mutex);
+    g_replay_len = len;
+    g_replay_pos = 0.0;
+    g_replay_speed = 1.0f;
+    g_replay_paused = false;
+    g_replay_seek = -1.0;
+  }
+  if (g_replay_thread.joinable()) g_replay_thread.join();
+  g_replay_playing = true;
+  g_replay_stop = false;
+  g_replay_thread = std::thread(ReplayFeedMain);
+  REXLOG_INFO("Instant replay: {:.1f} s", len);
+  return true;
+}
+
+void ReplayStop() {
+  if (!g_replay_playing.load()) return;
+  g_replay_stop = true;
+  if (g_replay_thread.joinable()) g_replay_thread.join();
+  g_replay_playing = false;
+  REXLOG_INFO("Instant replay: back to the game");
+}
+
+ReplayStatus ReplayGetStatus() {
+  std::lock_guard lock(g_replay_ctl_mutex);
+  ReplayStatus st;
+  st.position = g_replay_pos;
+  st.length = g_replay_len;
+  st.speed = g_replay_speed;
+  st.paused = g_replay_paused;
+  return st;
+}
+
+void ReplayControl(float speed, int pause, double seek) {
+  std::lock_guard lock(g_replay_ctl_mutex);
+  if (speed > 0.0f) g_replay_speed = speed;
+  if (pause == 0) g_replay_paused = false;
+  if (pause == 1) g_replay_paused = true;
+  if (pause == 2) {
+    // Toggled; at the end it starts over.
+    if (g_replay_paused && g_replay_pos >= g_replay_len - 1e-3) g_replay_pos = 0.0;
+    g_replay_paused = !g_replay_paused;
+  }
+  if (seek >= 0.0) g_replay_seek = std::min(seek, g_replay_len);
+}
+
+namespace {
+
 std::vector<uint32_t> ReadSpirv(const std::filesystem::path& p) {
   std::ifstream f(p, std::ios::binary);
   if (!f) return {};
@@ -1921,6 +2185,7 @@ void WorkerMain() {
         }
       }
       LogTimings(shared);
+      ReplayKeep(*f, stats.camera_signature);
       g_render_done_ns.store(SteadyNs());
       const double ms = since(t0);
       std::lock_guard lock(g_status_mutex);
@@ -1977,6 +2242,7 @@ void Install(const std::filesystem::path& log_dir, std::function<rex::ui::Presen
 }
 
 void Shutdown() {
+  ReplayStop();
   g_recording = false;
   {
     std::lock_guard lock(g_work_mutex);
@@ -2738,8 +3004,9 @@ void OnSwap(uint8_t* base, uint32_t front_buffer) {
     if (DeferredNaming()) {
       // The recorder thread names what is still queued, then hands the frame
       // on (or drops it).
-      EnqueueEndOfFrame(std::move(g_frame), enabled && !g_frame_overflow);
-    } else if (enabled && !g_frame_overflow) {
+      // (Dropped while the instant replay plays: the game is paused.)
+      EnqueueEndOfFrame(std::move(g_frame), enabled && !g_frame_overflow && !g_replay_playing);
+    } else if (enabled && !g_frame_overflow && !g_replay_playing) {
       // To the prep thread (per-draw states), then the worker.
       HandOver(std::move(g_frame), g_prep_mutex, g_prep_cv, g_prep);
     }

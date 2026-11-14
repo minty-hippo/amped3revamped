@@ -132,6 +132,10 @@ struct RenderStats {
   std::map<std::string, uint32_t> skipped;  // reason -> count
   std::string details;                      // first few occurrences per reason
   std::vector<std::string> notices;         // worth a line in the game's log
+  // A signature of the game's camera this frame (its lighting pass's inverse
+  // view-projection and position; 0: no 3D scene). The same from frame to
+  // frame: a still scene (the game paused).
+  uint64_t camera_signature = 0;
   // CPU time (ms): vertex data and per-frame setup, recording the draws, and
   // waiting for the GPU to finish (0 when async).
   double prepass_ms = 0, record_ms = 0, gpu_wait_ms = 0;

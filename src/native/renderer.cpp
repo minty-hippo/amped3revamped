@@ -5671,6 +5671,14 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
     std::memcpy(&cam_pos_[i], &bits, 4);
   }
   {
+    uint64_t h = 1469598103934665603ull;  // FNV-1a over c0..c4
+    for (uint32_t i = 0; i < 20; ++i) {
+      h ^= st.ps_consts[i];
+      h *= 1099511628211ull;
+    }
+    stats_.camera_signature = h | 1;
+  }
+  {
     // c14: the light's direction (a unit vector toward the sun).
     float l[3];
     for (uint32_t i = 0; i < 3; ++i) {

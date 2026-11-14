@@ -1080,7 +1080,7 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
     Close();
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("   F2: Revamped Graphics on/off   F6 or L3+R3: freecam   F4: every setting");
+  ImGui::TextDisabled("   F2: Revamped Graphics   F6 / L3+R3: freecam   F7 / View+RB: replay   F4: every setting");
 
   ImGui::End();
 

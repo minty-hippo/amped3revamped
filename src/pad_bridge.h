@@ -42,6 +42,11 @@ void Install(rex::input::InputSystem* input, const std::atomic<bool>* block_gues
 // middle of the ImGui frame.
 Snapshot Read();
 
+// Presses `buttons` for the game for `ms` milliseconds (a controller of the
+// port's own, merged with the real ones; the game sees it even while its
+// input is blocked). For the instant replay pausing the game (Start).
+void PressForGame(uint16_t buttons, int ms);
+
 // The app's watcher thread publishes each Read(); UI code uses Latest().
 void Publish(const Snapshot& snapshot);
 Snapshot Latest();
