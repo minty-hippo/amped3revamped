@@ -66,7 +66,16 @@ struct Noclip {
   // mode's pose, so switching doesn't jump back to the game's camera.
   bool have_target = false;
   double target[6] = {};
+  // The last poses set (newest at hist_at - 1): for telling when a frame the
+  // game drew from the noclip camera has reached the screen.
+  double hist[16][3] = {};
+  int hist_at = 0, hist_n = 0;
 } g_noclip;
+// To noclip: frames already on their way were drawn from the game's own
+// camera (the rider's), so the view mode stays on, at the noclip camera,
+// until the game's first noclip frame is drawn (no one-frame flash back).
+std::atomic<bool> g_handover{false};
+std::atomic<int64_t> g_handover_ns{0};
 std::atomic<bool> g_noclip_on{false};
 // Noclip, the game paused: its camera setup doesn't run, so the freecam is
 // the view mode's around where the noclip camera last was (what the game
@@ -200,9 +209,45 @@ void NoclipFromView() {
   for (int i = 0; i < 6; ++i) g_noclip.target[i] = pose[i];
 }
 
+// A frame drawn from the noclip camera has been shown (the renderer's last
+// frame's camera is one the noclip hook set).
+bool NoclipDrawn() {
+  float cam[9];
+  if (!live::GameCamera(cam)) return false;
+  std::lock_guard lock(g_noclip.mutex);
+  for (int k = 0; k < g_noclip.hist_n; ++k) {
+    const double* h = g_noclip.hist[k];
+    const double dx = cam[0] - h[0], dy = cam[1] - h[1], dz = cam[2] - h[2];
+    if (dx * dx + dy * dy + dz * dz < 0.02 * 0.02) return true;
+  }
+  return false;
+}
+
+void StartHandover() {
+  {
+    std::lock_guard lock(g_noclip.mutex);
+    g_noclip.hist_n = g_noclip.hist_at = 0;
+  }
+  g_handover_ns = NowNs();
+  g_handover = true;
+}
+
 // What the renderer gets: in noclip only the HUD left out.
 void SendRenderer(native::Renderer::FreecamInput in) {
   if (g_mode.load() == Mode::kNoclip && !g_paused_view.load()) {
+    if (g_handover.load()) {
+      if (NoclipDrawn() || NowNs() - g_handover_ns.load() > 1'000'000'000) {
+        g_handover = false;
+      } else {
+        // Held at the noclip camera (it moves there; the renderer doesn't).
+        native::Renderer::FreecamInput hold;
+        hold.active = true;
+        hold.speed = 0.0f;
+        ViewFromNoclip(hold);
+        live::SetFreecam(hold);
+        return;
+      }
+    }
     native::Renderer::FreecamInput hud;
     hud.hide_hud = true;
     live::SetFreecam(hud);
@@ -231,6 +276,7 @@ void SetOn(bool on) {
   // In a replay (the game paused), the view mode around the replay.
   g_paused_view = on && g_mode.load() == Mode::kNoclip && replay::Active();
   g_noclip_on = on && g_mode.load() == Mode::kNoclip && !g_paused_view.load();
+  g_handover = false;
   g_boost = false;
   g_noclip_hook_ns = NowNs();
   native::Renderer::FreecamInput in;
@@ -305,7 +351,7 @@ void OnPad(const pad::Snapshot& pad) {
       } else {
         NoclipFromView();  // on from where the view mode got to
         g_noclip_hook_ns = NowNs();
-        live::SetFreecam(native::Renderer::FreecamInput{});
+        StartHandover();  // the view mode until a noclip frame is shown
       }
       g_noclip_on = !now_paused;
     }
@@ -332,7 +378,12 @@ void OnPad(const pad::Snapshot& pad) {
     g_paused_view = false;
     g_noclip_hook_ns = NowNs();
     g_noclip_on = m == Mode::kNoclip;
-    live::SetFreecam(native::Renderer::FreecamInput{});  // the renderer's starts over
+    if (m == Mode::kNoclip) {
+      StartHandover();  // the view mode until a noclip frame is shown
+    } else {
+      g_handover = false;
+      live::SetFreecam(native::Renderer::FreecamInput{});  // the renderer's starts over
+    }
     SendRenderer(fresh);
     notice::Show(m == Mode::kNoclip ? "Freecam: noclip (the game draws from it)"
                                     : "Freecam: view (around what the game drew)");
@@ -518,6 +569,9 @@ void Amped3_NoclipView(PPCRegister& r31) {
   StoreF(v + 14 * 4, -dot(n.back));
   StoreF(v + 15 * 4, 1.0);
   n.posed = true;
+  for (int i = 0; i < 3; ++i) n.hist[n.hist_at][i] = n.p[i];
+  n.hist_at = (n.hist_at + 1) % 16;
+  n.hist_n = std::min(n.hist_n + 1, 16);
 }
 
 // After the forward vector's loads: the position (registers and r31+160) and

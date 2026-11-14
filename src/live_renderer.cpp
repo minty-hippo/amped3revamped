@@ -1258,6 +1258,7 @@ void PrepMain() {
 
 std::mutex g_replay_mutex;
 std::deque<std::unique_ptr<RecordedFrame>> g_replay_frames;  // oldest first
+std::unique_ptr<RecordedFrame> g_replay_spare;  // dropped out: the next copy goes in it
 std::deque<size_t> g_replay_sizes;
 // Each kept frame's time on the replay's own clock (seconds): the frames'
 // spacing, a gap (a hitch, a pause) shortened to a frame's worth.
@@ -1279,8 +1280,11 @@ double g_replay_seek = -1.0;
 
 // A frame's copy for keeping or feeding: no built states (rebuilt from the
 // deltas), no draw inputs (only for naming).
-std::unique_ptr<RecordedFrame> CopyForReplay(const RecordedFrame& src) {
-  auto r = std::make_unique<RecordedFrame>();
+// `into`: a kept frame that dropped out, written over (its buffers, and the
+// draws' strings, already the right size: no allocating, no page faults).
+std::unique_ptr<RecordedFrame> CopyForReplay(const RecordedFrame& src,
+                                             std::unique_ptr<RecordedFrame> into = nullptr) {
+  auto r = into ? std::move(into) : std::make_unique<RecordedFrame>();
   r->frame = src.frame;
   for (auto& d : r->frame.draws) d.state.reset();
   r->blobs = src.blobs;
@@ -1290,6 +1294,9 @@ std::unique_ptr<RecordedFrame> CopyForReplay(const RecordedFrame& src) {
   r->draw_delta_end = src.draw_delta_end;
   r->swap_time = src.swap_time;
   r->replay = true;
+  r->states_built = false;
+  r->states_ms = 0;
+  r->dump_name.clear();
   return r;
 }
 
@@ -1318,6 +1325,7 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
   if (seconds <= 0 && !g_replay_playing.load()) {
     // Off: nothing kept (memory back).
     std::lock_guard lock(g_replay_mutex);
+    g_replay_spare.reset();
     if (!g_replay_frames.empty()) {
       g_replay_frames.clear();
       g_replay_sizes.clear();
@@ -1330,7 +1338,12 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
   if (f.swap_time - g_replay_last_kept < std::chrono::milliseconds(15)) return;
   g_replay_last_kept = f.swap_time;
   const auto t0 = std::chrono::steady_clock::now();
-  auto r = CopyForReplay(f);
+  std::unique_ptr<RecordedFrame> spare;
+  {
+    std::lock_guard lock(g_replay_mutex);
+    spare = std::move(g_replay_spare);
+  }
+  auto r = CopyForReplay(f, std::move(spare));
   const size_t bytes = ReplayBytes(*r);
   {
     // What keeping costs, now and then in the log.
@@ -1355,6 +1368,9 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
     }
   }
   const size_t cap = size_t(REXCVAR_GET(replay_memory_mb)) << 20;
+  // Dropped frames: one kept for the next copy, the rest freed after the
+  // lock (thousands of small frees: not while the replay waits for it).
+  std::vector<std::unique_ptr<RecordedFrame>> dropped;
   std::lock_guard lock(g_replay_mutex);
   // A new run: a long gap (a loading screen, a long pause) or the camera far
   // from where it was (a lift, a restart). A hitch or a short pause is the
@@ -1366,6 +1382,7 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
     const float d[3] = {camera_pos[0] - g_replay_last_pos[0], camera_pos[1] - g_replay_last_pos[1],
                         camera_pos[2] - g_replay_last_pos[2]};
     if (gap > 5.0 || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 150.0f * 150.0f) {
+      for (auto& old : g_replay_frames) dropped.push_back(std::move(old));
       g_replay_frames.clear();
       g_replay_sizes.clear();
       g_replay_times.clear();
@@ -1383,9 +1400,14 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
          (g_replay_times.back() - g_replay_times.front() > double(seconds) ||
           g_replay_bytes > cap)) {
     g_replay_bytes -= g_replay_sizes.front();
+    dropped.push_back(std::move(g_replay_frames.front()));
     g_replay_frames.pop_front();
     g_replay_sizes.pop_front();
     g_replay_times.pop_front();
+  }
+  if (!dropped.empty() && !g_replay_spare) {
+    g_replay_spare = std::move(dropped.back());
+    dropped.pop_back();
   }
 }
 
@@ -1423,7 +1445,10 @@ void ReplayFeedMain() {
       i = i ? i - 1 : 0;
       // A new frame, or the same again now and then (the freecam moves).
       if (i != fed || now - fed_at > std::chrono::milliseconds(16)) {
-        copy = CopyForReplay(*g_replay_frames[i]);
+        // Into recycled frame buffers (the game is paused: it isn't using them).
+        auto into = std::make_unique<RecordedFrame>();
+        TakeFrameBuffers(*into);
+        copy = CopyForReplay(*g_replay_frames[i], std::move(into));
         copy->swap_time = now;
         fed = i;
         fed_at = now;
