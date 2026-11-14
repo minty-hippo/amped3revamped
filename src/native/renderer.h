@@ -324,6 +324,7 @@ class Renderer {
     float zoom = 0.0f;   // -1..1: wider / narrower
     float speed = 8.0f;  // metres per second at full deflection
     bool reset = false;  // back to the game's camera
+    bool hide_hud = false;  // (inactive) only the HUD left out: the noclip freecam
   };
   void SetFreecam(const FreecamInput& input);
   // The freecam's state, for the overlay: active (a scene to see it in).

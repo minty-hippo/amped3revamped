@@ -7787,7 +7787,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     prof_t = t;
   };
   const GpuState& st = *d.state;
-  if ((hide_interface_ || fc_on_) && composite_seen_) return;  // the HUD / menus, left out
+  if ((hide_interface_ || fc_on_ || fc_in_.hide_hud) && composite_seen_) return;  // the HUD / menus, left out
   if (d.vs.empty() || d.ps.empty()) {
     Skip(number, "no microcode recorded (capture from an older build)");
     return;

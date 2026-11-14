@@ -21,6 +21,20 @@ name = "Amped3_FixRenderShutdownRace"
 address = 0x821854F8
 registers = ["r11"]
 
+# --- Noclip freecam (src/freecam.cpp) ----------------------------------------
+# The game's camera setup (sub_824B4660, once a frame): the view matrix just
+# copied to r31+512, and the position (r29 r28 r26, r31+160) and forward
+# vector (r4 r25 r3) just loaded, set to the freecam's before they're used.
+[[midasm_hook]]
+name = "Amped3_NoclipView"
+address = 0x824B4740
+registers = ["r31"]
+
+[[midasm_hook]]
+name = "Amped3_NoclipPose"
+address = 0x824B47BC
+registers = ["r31", "r29", "r28", "r26", "r4", "r25", "r3"]
+
 # --- Diagnostics (src/audio_trace.cpp, setting trace_audio) -----------------
 # Each hook runs right after the function's opening "mflr r12", so r12 is the
 # caller's return address. They only log.
