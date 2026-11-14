@@ -24,6 +24,8 @@
 #include <rex/ui/imgui_drawer.h>
 
 #include "graphics_panel.h"
+#include "help_bar.h"
+#include "replay.h"
 #include "live_renderer.h"
 #include "notice.h"
 
@@ -62,6 +64,13 @@ struct Noclip {
   bool posed = false;  // this frame's pose set (the second hook uses it)
 } g_noclip;
 std::atomic<bool> g_noclip_on{false};
+// Noclip, the game paused: its camera setup doesn't run, so the freecam is
+// the view mode's around where the noclip camera last was (what the game
+// drew last). The camera setup's last run, for telling.
+std::atomic<int64_t> g_noclip_hook_ns{0};
+std::atomic<bool> g_paused_view{false};
+// L3: faster, until the left stick lets go.
+bool g_boost = false;
 
 // The keyboard and mouse, from the overlay (UI thread), for OnPad.
 std::mutex g_keys_mutex;
@@ -103,35 +112,29 @@ class Overlay final : public rex::ui::ImGuiDialog {
     ReadKeys(io);
     const float w = io.DisplaySize.x, h = io.DisplaySize.y;
     if (w < 64 || h < 64) return;
-    const float pic_h = std::min(h, w * 9.0f / 16.0f);
-    const float px = std::max(13.0f, pic_h * 0.022f);
-    ImFont* font = amped3::UiFont(px);
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    const float x0 = (w - std::min(w, h * 16.0f / 9.0f)) * 0.5f + px, y0 = (h - pic_h) * 0.5f + px;
     const bool noclip = g_mode.load() == Mode::kNoclip;
-    const bool showing = noclip || live::FreecamShowing();
-    const double age = double(NowNs() - g_started_ns.load()) * 1e-9;
-    std::string text;
-    if (!showing) {
-      text = "Freecam: waiting for a 3D scene";
-    } else if (g_show_help.load() || age < 6.0) {
-      text = std::string(noclip ? "FREECAM: NOCLIP (the game draws from it)\n"
-                                : "FREECAM: VIEW (around what the game drew)\n") +
-             "Left stick / W A S D: move     Right stick / arrows / right mouse: look\n"
-             "LT RT / Q E: down, up     " +
-             (noclip ? "" : "LB RB / Z C: zoom     ") +
-             "A / Shift: faster     X / Alt: slower\n"
-             "Y / R: back to the game's camera     D-pad down / N: " +
-             (noclip ? "view mode" : "noclip mode") +
-             "\nView: hide this     B / L3+R3 / F6: leave";
+    const bool paused = noclip && g_paused_view.load();
+    std::string title;
+    if (!noclip && !live::FreecamShowing()) {
+      title = "FREECAM: waiting for a 3D scene";
+    } else if (paused) {
+      title = "FREECAM: NOCLIP - game paused: looking around the last spot";
+    } else {
+      title = noclip ? "FREECAM: NOCLIP" : "FREECAM: VIEW (around what the game drew)";
     }
-    if (text.empty()) return;
-    const float alpha = showing && !g_show_help.load() ? float(std::clamp(6.0 - age, 0.0, 1.0)) : 1.0f;
-    const ImVec2 size = font->CalcTextSizeA(px, FLT_MAX, 0, text.c_str());
-    const float pad = px * 0.5f;
-    dl->AddRectFilled(ImVec2(x0 - pad, y0 - pad), ImVec2(x0 + size.x + pad, y0 + size.y + pad),
-                      IM_COL32(0, 0, 0, int(150 * alpha)), px * 0.3f);
-    dl->AddText(font, px, ImVec2(x0, y0), IM_COL32(255, 255, 255, int(235 * alpha)), text.c_str());
+    std::vector<std::string> items = {
+        "Left stick / W A S D: move",
+        "L3 / Shift: faster (until the stick lets go)",
+        "X / Alt: slower",
+        "Right stick / arrows / right mouse: look",
+        "LT RT / Q E: down, up",
+    };
+    if (!noclip || paused) items.push_back("LB RB / Z C: zoom");
+    items.push_back("Y / R: back to the game's camera");
+    items.push_back(noclip ? "D-pad down / N: view mode" : "D-pad down / N: noclip mode");
+    items.push_back("View / H: hide controls");
+    items.push_back("B / L3+R3 / F6: leave");
+    help_bar::Draw(io, title, items, replay::Active() ? replay::BarRows() : 0);
   }
 
  private:
@@ -149,6 +152,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const bool reset = g_keys.reset || ImGui::IsKeyPressed(ImGuiKey_R, false);
     const bool leave = g_keys.leave || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     const bool switch_mode = g_keys.switch_mode || ImGui::IsKeyPressed(ImGuiKey_N, false);
+    if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     float mouse[2] = {g_keys.mouse[0], g_keys.mouse[1]};
     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
       mouse[0] += io.MouseDelta.x * 0.003f;
@@ -167,7 +171,7 @@ std::unique_ptr<Overlay> g_overlay;  // UI thread, while on
 
 // What the renderer gets: in noclip only the HUD left out.
 void SendRenderer(native::Renderer::FreecamInput in) {
-  if (g_mode.load() == Mode::kNoclip) {
+  if (g_mode.load() == Mode::kNoclip && !g_paused_view.load()) {
     native::Renderer::FreecamInput hud;
     hud.hide_hud = true;
     live::SetFreecam(hud);
@@ -192,6 +196,9 @@ void SetOn(bool on) {
     g_noclip.reset = false;
   }
   g_noclip_on = on && g_mode.load() == Mode::kNoclip;
+  g_paused_view = false;
+  g_boost = false;
+  g_noclip_hook_ns = NowNs();
   native::Renderer::FreecamInput in;
   in.active = on;
   in.reset = on;  // from the game's camera each time
@@ -241,7 +248,24 @@ void OnPad(const pad::Snapshot& pad) {
     SetOn(false);
     return;
   }
-  if (pressed & X_INPUT_GAMEPAD_BACK) g_show_help = !g_show_help.load();
+  if (pressed & X_INPUT_GAMEPAD_BACK) help_bar::Toggle();
+  // Noclip with the game paused (its camera setup idle for a while): the
+  // view mode around the last spot, until it runs again.
+  if (g_mode.load() == Mode::kNoclip) {
+    const int64_t idle = NowNs() - g_noclip_hook_ns.load();
+    const bool was = g_paused_view.load();
+    const bool now_paused = was ? idle > 60'000'000 : idle > 250'000'000;
+    if (now_paused != was) {
+      g_paused_view = now_paused;
+      native::Renderer::FreecamInput fresh;
+      fresh.active = now_paused;
+      fresh.reset = true;  // from the last noclip view (what the game drew)
+      live::SetFreecam(native::Renderer::FreecamInput{});
+      if (now_paused) live::SetFreecam(fresh);
+    }
+  } else {
+    g_paused_view = false;
+  }
   if ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) || keys.switch_mode) {
     const Mode m = g_mode.load() == Mode::kNoclip ? Mode::kView : Mode::kNoclip;
     g_mode = m;
@@ -274,8 +298,14 @@ void OnPad(const pad::Snapshot& pad) {
   in.zoom = std::clamp(float(bool(pad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER)) -
                            float(bool(pad.buttons & X_INPUT_GAMEPAD_LEFT_SHOULDER)) + keys.zoom,
                        -1.0f, 1.0f);
+  // L3 (alone: with R3 it leaves): faster until the left stick lets go.
+  const bool stick_moving = Stick(pad.lx) != 0.0f || Stick(pad.ly) != 0.0f;
+  if ((pressed & X_INPUT_GAMEPAD_LEFT_THUMB) && !(pad.buttons & X_INPUT_GAMEPAD_RIGHT_THUMB)) {
+    g_boost = !g_boost;
+  }
+  if (!stick_moving && !(pressed & X_INPUT_GAMEPAD_LEFT_THUMB)) g_boost = false;
   float scale = keys.speed_scale;
-  if (pad.buttons & X_INPUT_GAMEPAD_A) scale *= 4.0f;
+  if (g_boost) scale *= 4.0f;
   if (pad.buttons & X_INPUT_GAMEPAD_X) scale *= 0.25f;
   in.speed = 8.0f * scale;
   if (g_mode.load() == Mode::kNoclip) {
@@ -348,6 +378,7 @@ void Amped3_NoclipView(PPCRegister& r31) {
     g_noclip.posed = false;
     return;
   }
+  g_noclip_hook_ns = NowNs();
   auto* memory = NoclipMemory();
   if (!memory) return;
   uint8_t* v = memory->TranslateVirtual(r31.u32 + 512);

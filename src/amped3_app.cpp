@@ -347,7 +347,7 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         [this] { ToggleRevampedGraphics(); });
   rex::ui::RegisterBind(kFreecamBind, "F6", "Freecam on or off (fly the camera; the HUD hidden)",
                         [] { amped3::freecam::Toggle(); });
-  rex::ui::RegisterBind(kReplayBind, "F7", "Instant replay: the last seconds of riding again",
+  rex::ui::RegisterBind(kReplayBind, "F7", "Instant replay: the last seconds of riding again (controller: RB + D-pad down)",
                         [] { amped3::replay::Toggle(); });
   // Diagnostics for the noclip freecam: where the game keeps its camera.
   rex::ui::RegisterBind(kCameraScanBind, "F8", "Camera scan: where the game keeps its camera, to logs",
@@ -421,7 +421,7 @@ void Amped3App::OnPostSetup() {
     };
     amped3::freecam::Install(std::move(host));
   }
-  // Instant replay (F7, or View + RB).
+  // Instant replay (F7, or RB + D-pad down).
   {
     amped3::replay::Host host;
     host.drawer = imgui_drawer();
@@ -578,9 +578,10 @@ void Amped3App::StartControllerHotkeyWatcher() {
       // Both sticks pressed in: the freecam on or off.
       constexpr uint16_t kStickCombo =
           rex::input::X_INPUT_GAMEPAD_LEFT_THUMB | rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB;
-      // View + RB: the instant replay.
+      // RB held + D-pad down: the instant replay. (Not View: it reached the
+      // game first, and in its pause menu View resumes.)
       constexpr uint16_t kReplayCombo =
-          rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+          rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER | rex::input::X_INPUT_GAMEPAD_DPAD_DOWN;
       if ((pad.buttons & kReplayCombo) == kReplayCombo) {
         if (!replay_latched) {
           replay_latched = true;

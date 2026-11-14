@@ -1,14 +1,16 @@
 // amped3 - instant replay: watch the last seconds of riding again (native
 // renderer; live_renderer.cpp keeps the frames, setting replay_seconds).
 //
-// F7, or hold View and press RB. While riding, the game is paused for it
+// F7, or hold RB and press D-pad down (View pressed for a combo reached the
+// game first: in its pause menu it resumes). While riding, the game is paused for it
 // (Start, pressed for it) and resumed after. Freecam (F6 / L3 + R3) works
 // in the replay too.
 //
 // Controller: A play / pause, LB / RB slower / faster, LT / RT (held) back /
 // forward, Y from the start, View show / hide the controls, B leave.
 // Keyboard: Space play / pause, [ ] slower / faster, Left / Right back /
-// forward, Home from the start, Esc or F7 leave.
+// forward, Home from the start, H show / hide the controls, Esc or F7 leave.
+// The controls are a bar along the bottom (help_bar.h).
 
 #pragma once
 
@@ -34,5 +36,7 @@ bool Active();
 // The controller, from the app's watcher thread (ignored while the freecam
 // has it).
 void OnPad(const pad::Snapshot& pad);
+// Rows the replay's bar takes at the bottom (UI thread; for a bar above it).
+int BarRows();
 
 }  // namespace amped3::replay

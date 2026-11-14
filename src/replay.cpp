@@ -21,6 +21,7 @@
 
 #include "freecam.h"
 #include "graphics_panel.h"
+#include "help_bar.h"
 #include "live_renderer.h"
 #include "notice.h"
 
@@ -36,6 +37,7 @@ Host g_host;
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_we_paused{false};  // Start pressed for the game: pressed again after
 std::atomic<bool> g_show_help{true};
+std::atomic<int> g_bar_rows{0};
 std::atomic<int64_t> g_started_ns{0};
 
 // From the overlay (UI thread): the keyboard, for OnPad.
@@ -82,7 +84,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const live::ReplayStatus st = live::ReplayGetStatus();
     // The bar: REPLAY, play / pause, time, speed, progress.
     const float x0 = (w - pic_w) * 0.5f + pic_w * 0.06f, x1 = (w + pic_w) * 0.5f - pic_w * 0.06f;
-    const float y = (h + pic_h) * 0.5f - pic_h * 0.07f;
+    const float y = (h - pic_h) * 0.5f + pic_h * 0.08f;  // the top (the controls go along the bottom)
     char speed[16];
     std::snprintf(speed, sizeof(speed), "x%g", double(st.speed));
     const std::string label = std::string("REPLAY   ") + (st.paused ? "||" : ">") + "   " +
@@ -94,21 +96,21 @@ class Overlay final : public rex::ui::ImGuiDialog {
     dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + px * 0.35f), IM_COL32(255, 255, 255, 60));
     dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + (x1 - x0) * frac, y + px * 0.35f),
                       IM_COL32(250, 210, 40, 230));
-    // The controls (hidden with View, or after a while).
-    const double age = double(NowNs() - g_started_ns.load()) * 1e-9;
-    if (freecam::Active() || (!g_show_help.load() && age > 6.0)) return;
-    const char* help =
-        "A / Space: play, pause     LB RB / [ ]: slower, faster     LT RT / Left Right: back, "
-        "forward\nY / Home: from the start     L3+R3 / F6: freecam     View: hide this     "
-        "B / Esc / F7: leave";
-    const float hp = px * 0.8f;
-    ImFont* hf = amped3::UiFont(hp);
-    const ImVec2 size = hf->CalcTextSizeA(hp, FLT_MAX, 0, help);
-    const float hx = (w - size.x) * 0.5f, hy = y - px * 2.3f - size.y;
-    dl->AddRectFilled(ImVec2(hx - hp * 0.5f, hy - hp * 0.4f),
-                      ImVec2(hx + size.x + hp * 0.5f, hy + size.y + hp * 0.4f),
-                      IM_COL32(0, 0, 0, 120), hp * 0.3f);
-    dl->AddText(hf, hp, ImVec2(hx, hy), IM_COL32(255, 255, 255, 220), help);
+    // The controls, along the bottom (above the progress bar).
+    const std::vector<std::string> items = {
+        "A / Space: play, pause",
+        "LB RB / [ ]: slower, faster",
+        "LT RT / Left Right: back, forward",
+        "Y / Home: from the start",
+        "L3+R3 / F6: freecam",
+        "View / H: hide controls",
+        "B / Esc / F7: leave",
+    };
+    if (freecam::Active()) {
+      g_bar_rows = 0;  // the freecam's bar has the bottom
+      return;
+    }
+    g_bar_rows = help_bar::Draw(io, "INSTANT REPLAY", items, 0);
   }
 
  private:
@@ -116,6 +118,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     std::lock_guard lock(g_keys_mutex);
     g_keys.toggle |= ImGui::IsKeyPressed(ImGuiKey_Space, false);
     g_keys.restart |= ImGui::IsKeyPressed(ImGuiKey_Home, false);
+    if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     g_keys.leave |= ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false)) --g_keys.speed_step;
     if (ImGui::IsKeyPressed(ImGuiKey_RightBracket, false)) ++g_keys.speed_step;
@@ -186,6 +189,8 @@ void Toggle() {
 
 bool Active() { return g_active.load(); }
 
+int BarRows() { return g_bar_rows.load(); }
+
 void OnPad(const pad::Snapshot& pad) {
   static uint16_t last_buttons = 0;
   static Clock::time_point last_time = Clock::now();
@@ -214,7 +219,7 @@ void OnPad(const pad::Snapshot& pad) {
     Leave();
     return;
   }
-  if (pressed & X_INPUT_GAMEPAD_BACK) g_show_help = !g_show_help.load();
+  if (pressed & X_INPUT_GAMEPAD_BACK) help_bar::Toggle();
   const live::ReplayStatus st = live::ReplayGetStatus();
   int step = keys.speed_step;
   if (pressed & X_INPUT_GAMEPAD_LEFT_SHOULDER) --step;

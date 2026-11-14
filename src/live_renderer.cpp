@@ -137,7 +137,7 @@ REXCVAR_DEFINE_DOUBLE(native_speed_blur_strength, 1.0, "GPU",
                       "Native renderer: speed blur strength (0..2)")
     .range(0.0, 2.0);
 REXCVAR_DEFINE_INT32(replay_seconds, 20, "GPU",
-                     "Instant replay (F7, or hold View and press RB): how many seconds of riding "
+                     "Instant replay (F7, or hold RB and press D-pad down): how many seconds of riding "
                      "are kept to watch again (native renderer; 0: off, nothing kept)")
     .range(0, 60);
 REXCVAR_DEFINE_INT32(replay_memory_mb, 2048, "GPU",
@@ -1257,6 +1257,10 @@ void PrepMain() {
 std::mutex g_replay_mutex;
 std::deque<std::unique_ptr<RecordedFrame>> g_replay_frames;  // oldest first
 std::deque<size_t> g_replay_sizes;
+// Each kept frame's time on the replay's own clock (seconds): the frames'
+// spacing, a gap (a hitch, a pause) shortened to a frame's worth.
+std::deque<double> g_replay_times;
+float g_replay_last_pos[3] = {};
 size_t g_replay_bytes = 0;
 std::atomic<bool> g_replay_playing{false};
 std::atomic<bool> g_scene_still{false};  // the last frames' camera unchanged
@@ -1299,14 +1303,12 @@ size_t ReplayBytes(const RecordedFrame& f) {
 }
 
 double ReplaySpan() {
-  if (g_replay_frames.size() < 2) return 0.0;
-  return std::chrono::duration<double>(g_replay_frames.back()->swap_time -
-                                       g_replay_frames.front()->swap_time)
-      .count();
+  if (g_replay_times.size() < 2) return 0.0;
+  return g_replay_times.back() - g_replay_times.front();
 }
 
 // After a frame is drawn (worker): kept for the replay while riding.
-void ReplayKeep(const RecordedFrame& f, uint64_t camera) {
+void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos) {
   const bool still = camera != 0 && camera == g_last_camera;
   g_last_camera = camera;
   g_scene_still = still;
@@ -1317,6 +1319,7 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera) {
     if (!g_replay_frames.empty()) {
       g_replay_frames.clear();
       g_replay_sizes.clear();
+      g_replay_times.clear();
       g_replay_bytes = 0;
     }
     return;
@@ -1351,23 +1354,36 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera) {
   }
   const size_t cap = size_t(REXCVAR_GET(replay_memory_mb)) << 20;
   std::lock_guard lock(g_replay_mutex);
-  // A gap (a pause, a loading screen): what came before isn't the same run.
-  if (!g_replay_frames.empty() &&
-      f.swap_time - g_replay_frames.back()->swap_time > std::chrono::milliseconds(500)) {
-    g_replay_frames.clear();
-    g_replay_sizes.clear();
-    g_replay_bytes = 0;
+  // A new run: a long gap (a loading screen, a long pause) or the camera far
+  // from where it was (a lift, a restart). A hitch or a short pause is the
+  // same run, played with the gap shortened.
+  double t = 0.0;
+  if (!g_replay_frames.empty()) {
+    const double gap =
+        std::chrono::duration<double>(f.swap_time - g_replay_frames.back()->swap_time).count();
+    const float d[3] = {camera_pos[0] - g_replay_last_pos[0], camera_pos[1] - g_replay_last_pos[1],
+                        camera_pos[2] - g_replay_last_pos[2]};
+    if (gap > 5.0 || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 150.0f * 150.0f) {
+      g_replay_frames.clear();
+      g_replay_sizes.clear();
+      g_replay_times.clear();
+      g_replay_bytes = 0;
+    } else {
+      t = g_replay_times.back() + std::min(gap, 0.05);
+    }
   }
+  std::memcpy(g_replay_last_pos, camera_pos, sizeof(g_replay_last_pos));
   g_replay_frames.push_back(std::move(r));
   g_replay_sizes.push_back(bytes);
+  g_replay_times.push_back(t);
   g_replay_bytes += bytes;
   while (g_replay_frames.size() > 1 &&
-         (g_replay_frames.back()->swap_time - g_replay_frames.front()->swap_time >
-              std::chrono::seconds(seconds) ||
+         (g_replay_times.back() - g_replay_times.front() > double(seconds) ||
           g_replay_bytes > cap)) {
     g_replay_bytes -= g_replay_sizes.front();
     g_replay_frames.pop_front();
     g_replay_sizes.pop_front();
+    g_replay_times.pop_front();
   }
 }
 
@@ -1398,15 +1414,10 @@ void ReplayFeedMain() {
     {
       std::lock_guard lock(g_replay_mutex);
       if (g_replay_frames.empty()) break;
-      const auto t0 = g_replay_frames.front()->swap_time;
-      const auto target = t0 + std::chrono::duration_cast<Clock::duration>(
-                                   std::chrono::duration<double>(pos));
-      // The last kept frame at or before the position.
-      size_t i = std::upper_bound(g_replay_frames.begin(), g_replay_frames.end(), target,
-                                  [](const Clock::time_point& t, const auto& f) {
-                                    return t < f->swap_time;
-                                  }) -
-                 g_replay_frames.begin();
+      // The last kept frame at or before the position (the replay's clock).
+      const double target = g_replay_times.front() + pos;
+      size_t i = std::upper_bound(g_replay_times.begin(), g_replay_times.end(), target) -
+                 g_replay_times.begin();
       i = i ? i - 1 : 0;
       // A new frame, or the same again now and then (the freecam moves).
       if (i != fed || now - fed_at > std::chrono::milliseconds(16)) {
@@ -2189,7 +2200,7 @@ void WorkerMain() {
         }
       }
       LogTimings(shared);
-      ReplayKeep(*f, stats.camera_signature);
+      ReplayKeep(*f, stats.camera_signature, stats.game_camera);
       if (stats.camera_signature && !f->replay) {
         std::lock_guard lock(g_game_camera_mutex);
         std::memcpy(g_game_camera, stats.game_camera, sizeof(g_game_camera));
