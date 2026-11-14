@@ -298,6 +298,19 @@ class Renderer {
   // Cartoon clouds that part when the view cuts to or from the trail map
   // (the fog fading with them).
   void SetMapClouds(bool on);
+  // Time of day (native/time_of_day.h): the mountain lit for another hour,
+  // its sky (sun, moon, stars, clouds) drawn for it. Off: as the game has it.
+  struct TimeOfDay {
+    bool on = false;
+    float hour = 12.0f;        // 0..24
+    float moon_phase = 0.5f;   // 0 new .. 0.5 full .. 1
+    float clouds = 0.35f;      // cover, 0..1
+    float night_light = 1.0f;  // how much light the night has (1: moonlit snow)
+    float seconds = 0.0f;      // a clock for the clouds' drift and the stars' twinkle
+  };
+  void SetTimeOfDay(const TimeOfDay& tod);
+  // The hour the mountain is made for (its own sun), -1 before a lit frame.
+  float MountainHour() const;
   // Whether the game has its trail map open (game state 7), each frame: the
   // map clouds play only for cuts to or from it (not, say, the camera cut of a
   // challenge restart). Never called (the replayer): any riding <-> overview

@@ -392,6 +392,27 @@ const std::vector<Tab>& Tabs() {
                         0.0, 3.0),
                 SliderF("native_fog_start", "Fog start distance",
                         "How far away the fog begins, in metres.", "%.0f m", 0.0, 1000.0),
+                Toggle("native_time_of_day", "Dynamic time of day (F5)",
+                       "The sun and moon move across the sky: the mountain's light, its "
+                       "colors, the sky, stars and drifting clouds follow the hour, from "
+                       "sunrise through dusk to a moonlit night. Each mountain starts at the "
+                       "hour it was made for and looks as the game has it then. The game's "
+                       "own fixed shadows fade out once the sun has moved well away from "
+                       "where they were made for. Native renderer only."),
+                SliderF("native_tod_start_hour", "Set the hour",
+                        "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
+                        -1.0, 24.0),
+                SliderF("native_tod_day_minutes", "Minutes per day",
+                        "How many real minutes a whole day takes (0: the clock stands still).",
+                        "%.0f min", 0.0, 240.0),
+                SliderF("native_tod_moon_phase", "Moon phase",
+                        "0 new, 0.25 first quarter, 0.5 full, 0.75 last quarter.", "%.2f", 0.0,
+                        1.0),
+                SliderF("native_tod_clouds", "Cloud cover",
+                        "How much of the sky the drifting clouds cover.", "%.2f", 0.0, 1.0),
+                SliderF("native_tod_night_light", "Night brightness",
+                        "How light the night is (1: moonlit snow you can ride by).", "%.1f",
+                        0.2, 3.0),
                 Choices("native_shadow_resolution", "Shadow resolution",
                         "The sun's shadow map (riders, rails, jumps and objects, and the trees "
                         "with Tree shadows; the mountains' shadows are painted into the slopes), "
@@ -1080,7 +1101,7 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
     Close();
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("   F2: Revamped Graphics   F6 / tap L3+R3: freecam   F7 / hold L3+R3: replay   F4: every setting");
+  ImGui::TextDisabled("   F2: Revamped Graphics   F5: time of day   F6 / tap L3+R3: freecam   F7 / hold L3+R3: replay   F4: every setting");
 
   ImGui::End();
 

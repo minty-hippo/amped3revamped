@@ -155,6 +155,27 @@ REXCVAR_DEFINE_DOUBLE(native_fog_density, 1.0, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_fog_start, 300.0, "GPU",
                       "Native renderer: distance fog starts this far from the camera (metres)")
     .range(0.0, 1000.0);
+REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
+                    "Native renderer: dynamic time of day (F5): the sun and moon move across "
+                    "the sky, the mountain's light, sky, stars and clouds follow the hour; "
+                    "off: each mountain at its own fixed hour, as the game has it");
+REXCVAR_DEFINE_DOUBLE(native_tod_day_minutes, 24.0, "GPU",
+                      "Time of day: minutes a whole day takes (0: the clock stands still)")
+    .range(0.0, 1440.0);
+REXCVAR_DEFINE_DOUBLE(native_tod_start_hour, -1.0, "GPU",
+                      "Time of day: the hour it starts at, and changing it sets the clock "
+                      "(-1: each mountain's own hour)")
+    .range(-1.0, 24.0);
+REXCVAR_DEFINE_DOUBLE(native_tod_moon_phase, 0.5, "GPU",
+                      "Time of day: the moon (0 new, 0.25 first quarter, 0.5 full, 0.75 last "
+                      "quarter)")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_DOUBLE(native_tod_clouds, 0.35, "GPU",
+                      "Time of day: how much of the sky drifting clouds cover (0: none)")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_DOUBLE(native_tod_night_light, 1.0, "GPU",
+                      "Time of day: how light the night is (1: moonlit snow you can ride by)")
+    .range(0.2, 3.0);
 REXCVAR_DEFINE_BOOL(native_smooth_foliage, true, "GPU",
                     "Native renderer, with multisampling: tree branches and other cut-out "
                     "textures get smooth anti-aliased edges, solid as on the console (the "
@@ -642,6 +663,7 @@ std::unique_ptr<RecordedFrame> g_prep;  // waiting for the prep thread
 std::thread g_prep_thread;
 std::atomic<bool> g_failed{false};
 std::atomic<bool> g_hide_interface{false};  // SetHideInterface
+std::atomic<float> g_tod_hour{-1.0f};        // TimeOfDayHour
 // SetFreecam: the input, its steps added up until the worker hands them on.
 std::mutex g_freecam_mutex;
 native::Renderer::FreecamInput g_freecam;
@@ -2118,6 +2140,35 @@ void WorkerMain() {
         renderer->SetMergeClears(REXCVAR_GET(native_merge_clears));
         renderer->SetParallelCommands(REXCVAR_GET(native_parallel_commands));
         renderer->SetMapClouds(revamped && REXCVAR_GET(native_map_clouds));
+        {
+          // Time of day: the clock runs while the game does (not paused, not
+          // in a replay); it starts at the setting's hour, or the mountain's.
+          static double tod_hour = -1.0, tod_seconds = 0.0, tod_start_seen = -2.0;
+          const double start = REXCVAR_GET(native_tod_start_hour);
+          if (start != tod_start_seen) {
+            tod_start_seen = start;
+            tod_hour = start >= 0.0 ? start : -1.0;
+          }
+          if (tod_hour < 0.0 && renderer->MountainHour() >= 0.0f) tod_hour = renderer->MountainHour();
+          const bool running = REXCVAR_GET(native_time_of_day) && !f->replay &&
+                               GameState() != 15 && dt > 0.0 && dt < 0.25;
+          const double minutes = REXCVAR_GET(native_tod_day_minutes);
+          if (running) {
+            tod_seconds += dt;
+            if (minutes > 0.0 && tod_hour >= 0.0) {
+              tod_hour = std::fmod(tod_hour + dt * 24.0 / (minutes * 60.0), 24.0);
+            }
+          }
+          native::Renderer::TimeOfDay tod;
+          tod.on = REXCVAR_GET(native_time_of_day) && tod_hour >= 0.0;
+          tod.hour = float(std::max(tod_hour, 0.0));
+          tod.moon_phase = float(REXCVAR_GET(native_tod_moon_phase));
+          tod.clouds = float(REXCVAR_GET(native_tod_clouds));
+          tod.night_light = float(REXCVAR_GET(native_tod_night_light));
+          tod.seconds = float(std::fmod(tod_seconds, 100000.0));
+          renderer->SetTimeOfDay(tod);
+          g_tod_hour = float(tod_hour);
+        }
         renderer->SetHideInterface(g_hide_interface.load());
         {
           std::lock_guard lock(g_freecam_mutex);
@@ -2321,6 +2372,7 @@ void Shutdown() {
 bool Enabled() { return REXCVAR_GET(native_renderer) && !g_failed.load(); }
 
 void SetHideInterface(bool hide) { g_hide_interface = hide; }
+float TimeOfDayHour() { return g_tod_hour.load(); }
 void SetFreecam(const native::Renderer::FreecamInput& input) {
   std::lock_guard lock(g_freecam_mutex);
   const native::Renderer::FreecamInput old = g_freecam;

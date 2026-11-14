@@ -136,6 +136,7 @@ constexpr const char* kMenuBind = "bind_options_menu";
 constexpr const char* kHangBind = "bind_hang_report";
 constexpr const char* kCaptureBind = "bind_frame_capture";
 constexpr const char* kRevampedBind = "bind_revamped_graphics";
+constexpr const char* kTimeOfDayBind = "bind_time_of_day";
 constexpr const char* kFreecamBind = "bind_freecam";
 constexpr const char* kReplayBind = "bind_instant_replay";
 constexpr const char* kCameraScanBind = "bind_camera_scan";
@@ -345,6 +346,21 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // Every enhancement at once, on or off (to compare with the original look).
   rex::ui::RegisterBind(kRevampedBind, "F2", "Turn Revamped Graphics on or off",
                         [this] { ToggleRevampedGraphics(); });
+  rex::ui::RegisterBind(kTimeOfDayBind, "F5", "Dynamic time of day on or off (native renderer)",
+                        [this] {
+                          const bool on = rex::cvar::GetFlagByName("native_time_of_day") != "true";
+                          if (!rex::cvar::SetFlagByName("native_time_of_day", on ? "true" : "false")) return;
+                          if (!config_path_.empty()) rex::cvar::SaveConfig(config_path_);
+                          REXLOG_INFO("Time of day {} (F5)", on ? "on" : "off");
+                          std::string text = on ? "Time of day: on" : "Time of day: off";
+                          const float h = amped3::live::TimeOfDayHour();
+                          if (on && h >= 0.0f) {
+                            char b[32];
+                            std::snprintf(b, sizeof(b), " (%02d:%02d)", int(h), int(std::fmod(h, 1.0f) * 60.0f));
+                            text += b;
+                          }
+                          amped3::notice::Show(text);
+                        });
   rex::ui::RegisterBind(kFreecamBind, "F6", "Freecam on or off (fly the camera; the HUD hidden)",
                         [] { amped3::freecam::Toggle(); });
   rex::ui::RegisterBind(kReplayBind, "F7", "Instant replay: the last seconds of riding again (controller: hold L3 + R3)",

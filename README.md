@@ -403,6 +403,31 @@ The row is added in memory as the game loads its menus; the game's files are
 never changed. Set `patch_game_menus = false` in `amped3.toml` to leave the
 menus untouched.
 
+### Dynamic time of day (experimental)
+
+Off by default; F5, or Graphics panel > Time of Day, or `native_time_of_day`
+turns it on. The sun and moon move across the sky, and the mountain's light
+follows the hour: low warm sun at dawn and dusk, blue twilight, a moonlit
+night with stars, and clouds drifting overhead. Each mountain starts at the
+hour it was made for, where it looks as the game has it; every other hour is
+worked out from that, so it fits each mountain's own look.
+
+- The terrain (the game's deferred lighting pass), and riders, characters
+  and props (their own lighting constants, found by their values) all take
+  the hour's sun or moon direction, its color and the sky's light.
+- The sky: the game's painted panorama recolored for the hour (its painted sun
+  dimmed once the real one has moved away), drifting clouds, the sun's disc,
+  the moon's disc lit from the sun's side (its phase), stars at night. The
+  distance fog and god rays take their colors from it.
+- The clock runs while the game does (it stops when paused and in a replay).
+  Settings: Minutes per Day (`native_tod_day_minutes`, 24; 0 stops it), Set the
+  Hour (`native_tod_start_hour`, -1 = the mountain's own), Moon Phase, Cloud
+  Cover, Night Brightness.
+- Shadows: the game's own shadows are made for each mountain's fixed sun, so
+  they fade out once the sun has moved well away from it. Shadows for the
+  moving sun and moon from the World Shadows maps, and lights that come on at
+  night (lift towers, buildings), are the next steps.
+
 ## Subtitles
 
 Amped 3 has no subtitles of its own, and none can ship with this project (the
@@ -463,6 +488,7 @@ it is. The file is plain text too (`subtitles\amped3.subtitles`, described in
 | Back + Start (View + Menu), or F1 | Options menu |
 | In menu: D-pad or left stick / A / B / LB-RB | Move / change / close / switch tabs |
 | F2 | Revamped Graphics on or off (every enhancement at once, to compare with the original look; a notice shows which) |
+| F5 | Dynamic time of day on or off (native renderer; a notice shows the hour) |
 | F6, or tap both sticks in (L3 + R3) | Freecam: fly the camera around the scene, HUD hidden (native renderer). Two modes, D-pad down / N to switch: **noclip** (the default) moves the game's own camera, so the game draws the whole world around it - explore anywhere; **view** moves only the renderer's view of what the game drew (zoom works there). Pause first (Start) for a photo mode; while riding the game goes on underneath. Left stick / W A S D move (L3 / Shift: faster until the stick returns to neutral), right stick / arrows / right mouse look, LT RT / Q E down and up, LB RB / Z C zoom (view mode), X / Alt slower, Y / R back to the game's camera, View / H hides the controls bar, B / F6 / Esc leave. With the game paused or in a replay, noclip can't move the game's camera, so it flies on as view mode from the same spot until the game runs again. Switching modes keeps the camera where it is (no jump back to the rider). Hiding the controls bar hides it completely. The game only draws what its own camera sees, so flying far from it shows gaps |
 | F7, or hold both sticks in (L3 + R3) for 0.6 s | Instant replay: the last 20 seconds of riding again (native renderer; setting `replay_seconds`, up to 60, and `replay_memory_mb`). While riding it pauses the game for you and resumes it after; from the pause menu it plays what came before the pause. A / Space play or pause, LB RB / [ ] slower or faster (1/8x to 2x), LT RT / Left Right scrub, Y / Home from the start, View / H hides the controls bar, B / Esc / F7 leave. The freecam works in the replay too (tap L3 + R3), flying around what the replay drew |
 | F8 | Camera scan (diagnostics, for the coming noclip freecam): where the game keeps its camera in memory, written to `logs\amped3_camera_scan_*.txt`. Best with the game paused |

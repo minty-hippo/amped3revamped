@@ -2,6 +2,7 @@
 // replayer (tools/replay), which is now a thin front end to this.
 
 #include "renderer.h"
+#include "time_of_day.h"
 
 #include <chrono>
 
@@ -1736,7 +1737,7 @@ struct Renderer::Impl {
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
-    kMoverBlur = 33
+    kMoverBlur = 33, kTodSky = 34, kTodTint = 35
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1777,7 +1778,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[34] = {};  // by CopyKind
+  VkShaderModule copy_fs_[36] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -1968,6 +1969,7 @@ struct Renderer::Impl {
   float fog_presence_ = 1.0f;  // 0..1: fades out without a rider close by
   float sun_dir_[3] = {};
   bool sun_valid_ = false;
+  float sun_dir_painted_[3] = {};  // where the panorama paints the sun (time of day)
   Image fog_color_img_[2];
   uint32_t fog_color_cur_ = 0;
   Image fog_img_;
@@ -2025,6 +2027,86 @@ struct Renderer::Impl {
   // cuts between riding and the trail map, then part over kCloudSeconds; the
   // fog fades out (or in) with them.
   bool map_clouds_ = true;
+  // Time of day (SetTimeOfDay, native/time_of_day.h).
+  Renderer::TimeOfDay tod_;
+  tod::Layout tod_layout_;
+  tod::State tod_state_;          // this frame's (valid: in use)
+  float tod_game_light_[3] = {};  // the mountain's own sun (c14), the layout's
+  float tod_mountain_hour_ = -1.0f;
+  // The lighting's sky-light table tinted (its tf1), and a plain white
+  // stand-in for the game's fixed shadows once the sun has moved away.
+  Image tod_lut_, tod_white_, tod_colors_, tod_sky_img_;
+  Image* tod_lut_src_ = nullptr;
+  bool tod_lut_ok_ = false;
+  bool tod_sky_done_ = false;
+  Image* tod_sky_result_ = nullptr;
+  bool TodOn() const { return tod_.on && tod_state_.valid; }
+  bool TodNoGameShadows() const { return TodOn() && tod_state_.away >= 0.5; }
+  void TodLightingInputs(const Draw& d, const GpuState& st);
+  // The game's lighting block in a copy of constants (time of day).
+  void TodLightingBlock(uint32_t* c, int dir_reg, int sh_base, int sun_base) const {
+    const tod::State& t = tod_state_;
+    float v[4];
+    std::memcpy(v, &c[dir_reg * 4], 16);
+    v[0] = float(t.light.x);
+    v[1] = float(t.light.y);
+    v[2] = float(t.light.z);
+    std::memcpy(&c[dir_reg * 4], v, 16);
+    const double amb[3] = {t.ambient_scale.x, t.ambient_scale.y, t.ambient_scale.z};
+    for (int r = 0; r < 24; ++r) {
+      const float k = float(amb[(r / 4) % 3]);
+      std::memcpy(v, &c[(sh_base + r) * 4], 16);
+      for (float& f : v) f *= k;
+      std::memcpy(&c[(sh_base + r) * 4], v, 16);
+    }
+    for (int r = 0; r < 4; ++r) {
+      std::memcpy(v, &c[(sun_base + r) * 4], 16);
+      v[0] *= float(t.light_scale.x);
+      v[1] *= float(t.light_scale.y);
+      v[2] *= float(t.light_scale.z);
+      std::memcpy(&c[(sun_base + r) * 4], v, 16);
+    }
+  }
+  // Other shaders lit by the same block (riders, characters, props: their
+  // vertex or pixel shaders): where each keeps it, found once by its values
+  // (the lighting pass's, the frame before) in the constants it's drawn
+  // with. -1: not lit by it (after a few looks).
+  struct TodBlock {
+    int dir = -1, sh = -1, sun = -1;
+    int looks = 0;
+  };
+  std::unordered_map<uint64_t, TodBlock> tod_blocks_[2];  // by stage, ucode hash
+  uint32_t tod_ref_[29 * 4] = {};  // the lighting pass's c14..c42 (bits)
+  bool tod_ref_ok_ = false;
+  const TodBlock* TodFind(int stage, const Shader& sh, const uint32_t* c) {
+    if (!tod_ref_ok_) return nullptr;
+    TodBlock& b = tod_blocks_[stage][sh.info.ucode_hash];
+    if (b.dir >= 0) return &b;
+    if (b.looks >= 6) return nullptr;
+    ++b.looks;
+    auto same = [&](int reg, int ref, int n, int comps) {
+      for (int r = 0; r < n; ++r) {
+        if (std::memcmp(&c[(reg + r) * 4], &tod_ref_[(ref + r) * 4], comps * 4) != 0) return false;
+      }
+      return true;
+    };
+    int dir = -1, shb = -1, sun = -1;
+    for (int r = 0; r < 256 && dir < 0; ++r) {
+      if (same(r, 0, 1, 3)) dir = r;
+    }
+    for (int r = 0; r + 24 <= 256 && shb < 0; ++r) {
+      if (same(r, 1, 24, 4)) shb = r;
+    }
+    for (int r = 0; r + 4 <= 256 && sun < 0; ++r) {
+      if (same(r, 25, 4, 4)) sun = r;
+    }
+    if (dir < 0 || shb < 0 || sun < 0) return nullptr;
+    b.dir = dir;
+    b.sh = shb;
+    b.sun = sun;
+    return &b;
+  }
+  Image* TodSky(Image* scene);
   bool cloud_known_ = false, cloud_riding_ = true, cloud_active_ = false;
   float cloud_p_ = 1.0f;  // 0 .. 1 through the parting
   std::chrono::steady_clock::time_point cloud_start_{};
@@ -2792,9 +2874,13 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   const bool radial = speed_strength_ > 0.0f && speed_amount_ > 0.002f;
   const bool fog = (fog_density_ > 0.0f || rays_strength_ > 0.0f) && fog_presence_ > 0.002f;
   const bool ao = ao_strength_ > 0.0f;
-  const bool movers = world_detail_ > 0;
+  // (Riders shaded from the mountain's own sun: not once the hour's has
+  // moved away from it.)
+  const bool movers = world_detail_ > 0 && !TodNoGameShadows();
+  const bool tod_sky = TodOn();
   if (light_seen_ && !tiling_.width && tex_base == scene_base_) composite_seen_ = true;
-  if ((blur || upscaler_ || radial || fog || ao || movers) && light_seen_ && !tiling_.width &&
+  if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky) && light_seen_ &&
+      !tiling_.width &&
       tex_base == scene_base_) {
     auto sit = resolved_.find(tex_base);
     if (sit != resolved_.end()) {
@@ -2803,6 +2889,11 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       // the composite's first draw).
       EndRendering();
       MarkPart("scene done (resolves)");
+      // The sky for the hour first (the fog takes its colors from it).
+      if (tod_sky) {
+        if (Image* sky = TodSky(scene)) scene = sky;
+        MarkPart("effect: time of day sky");
+      }
       // Riders in the world's shade first (they're lit by themselves).
       if (movers) {
         if (Image* shaded = ShadedMovers(scene)) scene = shaded;
@@ -4588,6 +4679,159 @@ void main() {
   o = vec4(wsum > 0.0 ? sum / wsum : here);
 }
 )", true);
+  // Time of day, 1: the lighting's sky-light table (its tf1: what the air
+  // adds, rgb, and lets through, a, by distance and angle to the sun) tinted
+  // for the hour.
+  copy_fs_[35] = CompileBuiltin("builtin_tod_tint", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(push_constant) uniform Tint { vec4 a; } pc;  // rgb: times, w: -
+layout(location = 0) out vec4 o;
+void main() {
+  vec4 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0);
+  o = vec4(c.rgb * pc.a.rgb, c.a);
+}
+)", true);
+  // Time of day, 2: the sky (where nothing was drawn: depth 0). The game's
+  // panorama recolored for the hour (its colors over the same sky's at the
+  // mountain's own hour), its painted sun dimmed once the sun has moved
+  // away; clouds drifting over it; the sun's disc, the moon's (lit from the
+  // sun's side) and the stars.
+  copy_fs_[34] = CompileBuiltin("builtin_tod_sky", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+// 4 x 1: the sky's colors now (top, horizon) and at the mountain's hour (top,
+// horizon).
+layout(set = 0, binding = 2) uniform sampler2D colors;
+layout(push_constant) uniform Sky {
+  vec4 c;       // the view ray through the screen's middle (xyz), seconds
+  vec4 r;       // its change across the screen (ndc x = 1), night (0..1)
+  vec4 u;       // (ndc y = 1), stars (0..1)
+  vec4 sun;     // toward the sun, its disc (0..1)
+  vec4 moon;    // toward the moon, its brightness (phase, 0..1)
+  vec4 painted; // toward the panorama's painted sun, how much to dim it
+  vec4 sun_col; // the sun's color, cloud cover (0..1)
+  vec4 sz;      // 1 / width, 1 / height, dusk (0..1), -
+} pc;
+layout(location = 0) out vec4 o;
+float hash(vec2 p) {
+  p = fract(p * vec2(443.897, 441.423));
+  p += dot(p, p.yx + 19.19);
+  return fract((p.x + p.y) * p.x);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), w.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), w.x), w.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; ++i) {
+    v += a * noise(p);
+    p = p * 2.03 + vec2(17.1, 9.7);
+    a *= 0.5;
+  }
+  return v;
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.sz.xy;
+  vec4 col = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+  float d = texelFetch(depth, ivec2(gl_FragCoord.xy), 0).r;
+  if (d > 0.0) {
+    o = col;
+    return;
+  }
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec3 dir = normalize(pc.c.xyz + ndc.x * pc.r.xyz + ndc.y * pc.u.xyz);
+  float up = clamp(dir.y, 0.0, 1.0);
+  float night = pc.r.w;
+  // The painted sun dimmed (its bright blob), as the sun moves away.
+  vec3 c = col.rgb;
+  float lum = dot(c, vec3(0.333));
+  float ps = smoothstep(0.9925, 0.9994, dot(dir, pc.painted.xyz)) * pc.painted.w;
+  c = mix(c, c / max(lum, 1e-3) * min(lum, 0.62), ps);
+  // Recolored: the hour's sky over the mountain's (per channel, top to
+  // horizon).
+  float hz = pow(up, 0.6);
+  vec3 now = mix(texelFetch(colors, ivec2(1, 0), 0).rgb, texelFetch(colors, ivec2(0, 0), 0).rgb, hz);
+  vec3 then = mix(texelFetch(colors, ivec2(3, 0), 0).rgb, texelFetch(colors, ivec2(2, 0), 0).rgb, hz);
+  vec3 scale = now / max(then, vec3(1e-3));
+  // How blue the panorama is here: open sky (stars show), not painted
+  // clouds or far mountains.
+  float open_sky = 1.0;
+  // Near the mountain's hour the panorama recolored; further away more the
+  // hour's own sky, keeping the panorama's light and shade.
+  vec3 detail = now * clamp(0.6 + 0.4 * dot(col.rgb, vec3(0.333)) / max(dot(then, vec3(0.333)), 0.05), 0.4, 1.5);
+  c = mix(c * scale, detail, pc.painted.w * 0.8);
+  // Sunward glow at dusk: the sky warm around the sun, low down.
+  float toward = max(dot(dir, pc.sun.xyz), 0.0);
+  c += pc.sun_col.rgb * pc.sz.z * (0.12 * pow(toward, 6.0) + 0.2 * pow(toward, 48.0)) *
+       (1.0 - 0.8 * up);
+  // Clouds: a layer overhead, drifting.
+  float cloud = 0.0;
+  if (pc.sun_col.w > 0.0 && dir.y > 0.0) {
+    vec2 p = dir.xz / (dir.y + 0.08) * 0.9 + vec2(pc.c.w * 0.006, pc.c.w * 0.0025);
+    float n = fbm(p);
+    float cover = pc.sun_col.w;
+    cloud = smoothstep(1.0 - cover - 0.12, 1.0 - cover + 0.25, n) * smoothstep(0.0, 0.12, dir.y);
+    // Lit: thin edges bright toward the sun, the bulk greyer; at night dark,
+    // a little moonlight.
+    float thick = smoothstep(1.0 - cover, 1.0 - cover + 0.45, n);
+    vec3 day_col = mix(vec3(0.92, 0.93, 0.96), pc.sun_col.rgb, pc.sz.z * 0.7) *
+                   (1.0 - 0.35 * thick) * (1.0 + 0.6 * pow(toward, 8.0) * (1.0 - thick));
+    vec3 night_col = vec3(0.035, 0.04, 0.055) + vec3(0.05, 0.055, 0.07) * pc.moon.w * max(pc.moon.y, 0.0);
+    vec3 cc = mix(day_col, night_col, night);
+    c = mix(c, cc, cloud * 0.9);
+  }
+  float clear = 1.0 - cloud;
+  // Stars: one cell in a few hundred, twinkling, fading toward the horizon.
+  if (pc.u.w > 0.0) {
+    vec3 a = abs(dir);
+    vec2 sp = a.y > max(a.x, a.z) ? dir.xz / a.y : (a.x > a.z ? dir.yz / a.x : dir.xy / a.z);
+    float face = a.y > max(a.x, a.z) ? (dir.y > 0.0 ? 0.0 : 1.0) : (a.x > a.z ? 2.0 : 3.0);
+    vec2 cell = floor(sp * 320.0) + face * 1000.0;
+    float h = hash(cell);
+    if (h > 0.9965) {
+      vec2 f = fract(sp * 320.0) - 0.5;
+      float b = pow(hash(cell + 7.0), 3.0) * 1.6 + 0.2;
+      float tw = 0.75 + 0.25 * sin(pc.c.w * (1.5 + 3.0 * hash(cell + 3.0)) + h * 60.0);
+      float star = exp(-dot(f, f) * 30.0) * b * tw;
+      c += vec3(0.9, 0.93, 1.0) * star * pc.u.w * clear * open_sky * smoothstep(0.02, 0.25, dir.y);
+    }
+  }
+  // The moon: its disc lit from the sun's side, a faint glow round it.
+  {
+    float m = dot(dir, pc.moon.xyz);
+    const float R = 0.0105;  // its radius (radians, a little big, as it looks)
+    float ang = acos(clamp(m, -1.0, 1.0));
+    if (pc.moon.y > -0.05) {
+      vec3 t1 = normalize(cross(abs(pc.moon.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0), pc.moon.xyz));
+      vec3 t2 = cross(pc.moon.xyz, t1);
+      vec2 q = vec2(dot(dir, t1), dot(dir, t2)) / R;
+      float r2 = dot(q, q);
+      float vis = smoothstep(-0.02, 0.03, pc.moon.y) * clear;
+      if (r2 < 1.0) {
+        vec3 nrm = q.x * t1 + q.y * t2 - sqrt(1.0 - r2) * pc.moon.xyz;
+        float lit = smoothstep(-0.05, 0.12, dot(nrm, pc.sun.xyz));
+        float maria = 0.85 + 0.15 * noise(q * 3.0 + 5.0);
+        float edge = smoothstep(1.0, 0.9, r2);
+        vec3 mc = vec3(0.86, 0.88, 0.92) * maria * (lit + 0.03);
+        c = mix(c, mc, edge * vis * (0.35 + 0.65 * night));
+      }
+      c += vec3(0.55, 0.6, 0.7) * 0.12 * pc.moon.w * night * exp(-ang * 18.0) * vis;
+    }
+  }
+  // The sun's disc and a glow, once it isn't where the panorama paints it.
+  if (pc.sun.w > 0.0) {
+    float s = dot(dir, pc.sun.xyz);
+    float ang = acos(clamp(s, -1.0, 1.0));
+    float disc = smoothstep(0.0105, 0.0085, ang);
+    float glow = exp(-ang * 14.0) * 0.5 + exp(-ang * 60.0) * 0.6;
+    c += pc.sun_col.rgb * (disc * 1.2 * (1.0 - 0.8 * cloud) + glow * (1.0 - 0.5 * cloud)) *
+         pc.sun.w * pc.painted.w;
+  }
+  o = vec4(c, col.a);
+}
+)", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(push_constant) uniform Tiles { vec4 a; } pc;  // a.x: block size (8: from the map; 1: spread)
@@ -5737,8 +5981,26 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
     }
     const float len = std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
     sun_valid_ = std::isfinite(len) && std::fabs(len - 1.0f) < 0.05f;
+    // Time of day: the day laid out around the mountain's own sun (again
+    // when it changes: another mountain).
+    tod_state_ = tod::State{};
+    std::memcpy(tod_ref_, st.ps_consts.data() + 14 * 4, sizeof(tod_ref_));
+    tod_ref_ok_ = sun_valid_;
     if (sun_valid_) {
-      for (int i = 0; i < 3; ++i) sun_dir_[i] = l[i] / len;
+      const float dot = (l[0] * tod_game_light_[0] + l[1] * tod_game_light_[1] +
+                         l[2] * tod_game_light_[2]) / len;
+      if (!tod_layout_.valid || dot < 0.99999f) {
+        for (int i = 0; i < 3; ++i) tod_game_light_[i] = l[i] / len;
+        tod_layout_ = tod::MakeLayout({tod_game_light_[0], tod_game_light_[1], tod_game_light_[2]});
+        tod_mountain_hour_ = float(tod_layout_.mountain_hour);
+      }
+      if (tod_.on) {
+        tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
+      }
+    }
+    if (sun_valid_) {
+      float painted[3];
+      for (int i = 0; i < 3; ++i) painted[i] = l[i] / len;
       // Mountains whose sky panorama paints the sun somewhere other than
       // where the light comes from: the god rays and the fog's sunward glow
       // come from the painted sun instead (the game's own lighting is left
@@ -5755,13 +6017,23 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
           {{0.7626f, 0.3727f, 0.5287f}, {0.6279f, 0.2120f, 0.7488f}},
       };
       for (const SkySun& k : kSkySuns) {
-        const float dot = sun_dir_[0] * k.light[0] + sun_dir_[1] * k.light[1] +
-                          sun_dir_[2] * k.light[2];
+        const float dot = painted[0] * k.light[0] + painted[1] * k.light[1] +
+                          painted[2] * k.light[2];
         if (dot > 0.9995f) {
           const float n = std::sqrt(k.sun[0] * k.sun[0] + k.sun[1] * k.sun[1] + k.sun[2] * k.sun[2]);
-          for (int i = 0; i < 3; ++i) sun_dir_[i] = k.sun[i] / n;
+          for (int i = 0; i < 3; ++i) painted[i] = k.sun[i] / n;
           break;
         }
+      }
+      std::memcpy(sun_dir_painted_, painted, sizeof(painted));
+      std::memcpy(sun_dir_, painted, sizeof(painted));
+      if (TodOn()) {
+        // The fog's glow and the god rays: from the sun, or the moon at night.
+        const tod::Vec3 v =
+            tod_state_.sun_elevation > -1.0 * tod::kDeg ? tod_state_.sun : tod_state_.moon;
+        sun_dir_[0] = float(v.x);
+        sun_dir_[1] = float(v.y);
+        sun_dir_[2] = float(v.z);
       }
     }
   }
@@ -5785,6 +6057,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   light_seen_ = true;
   UpdateShadowReach(st);
   DrawSunShadows(d, st);
+  TodLightingInputs(d, st);
   // Ambient occlusion: the world's depth, kept before it's resolved again.
   ao_depth_ok_ = false;
   if (ao_strength_ > 0.0f || world_detail_ > 0) {
@@ -7208,7 +7481,8 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
       pc[20] = sun_dir_[0];
       pc[21] = sun_dir_[1];
       pc[22] = sun_dir_[2];
-      pc[23] = 1.0f;
+      // (At night the moon's glow, faint.)
+      pc[23] = TodOn() ? float(1.0 - tod_state_.night) : 1.0f;
     }
     // Density 1: about half fogged 2 km away level with the camera; thinner
     // higher up (halving every ~230 m), up to twice as thick in the valleys.
@@ -7230,6 +7504,8 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
                  sun_valid_ ? 1 : 0, sun_dir_[0], sun_dir_[1], sun_dir_[2], sun_uv[0], sun_uv[1],
                  sun_visible, cam_pos_[0], cam_pos_[1], cam_pos_[2]);
   }
+  // (No god rays from the moon, nor a sun below the horizon.)
+  if (TodOn()) sun_visible *= float(tod_state_.sun_disc * (1.0 - tod_state_.night));
   if (rays_strength_ > 0.0f && sun_visible > 0.0f) {
     const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
     ensure(ray_mask_img_, hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, "ray_mask", false);
@@ -7256,6 +7532,135 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   dyn_ = DynState{};
   fog_result_ = out == scene ? nullptr : out;
   return fog_result_;
+}
+
+// Time of day, at the lighting pass: its sky-light table (tf1) tinted for
+// the hour; the white stand-in for the game's fixed shadows made.
+void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
+  tod_lut_ok_ = false;
+  if (!TodOn()) return;
+  auto ensure = [&](Image& im, uint32_t w, uint32_t h, VkFormat f, const char* name) {
+    if (im.image && im.width == w && im.height == h && im.format == f) return false;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(w, h, f, false, name);
+    ToGeneral(cb_, im);
+    return true;
+  };
+  EndRendering();
+  if (ensure(tod_white_, 4, 4, VK_FORMAT_R8G8B8A8_UNORM, "tod_white")) {
+    VkClearColorValue one{};
+    for (float& v : one.float32) v = 1.0f;
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk::vkCmdClearColorImage(cb_, tod_white_.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+  }
+  std::string note;
+  Image* src = TextureFor(d, 1, st, &note);
+  if (!src || src->depth || src->samples > 1 || src->width > 4096 || src->height > 4096) {
+    Barrier();
+    return;
+  }
+  ensure(tod_lut_, src->width, src->height, VK_FORMAT_R16G16B16A16_SFLOAT, "tod_sky_light");
+  Barrier();
+  // What the air adds: as bright and as blue as the sky's light.
+  const tod::Vec3& a = tod_state_.ambient_scale;
+  float pc[4] = {float(a.x), float(a.y), float(a.z), 0.0f};
+  FullscreenPass(CopyKind::kTodTint, &tod_lut_, src, nullptr, nullptr, false, pc, 4);
+  Barrier();
+  tod_lut_src_ = src;
+  tod_lut_ok_ = true;
+  dyn_ = DynState{};
+}
+
+// Time of day, after the scene: the sky drawn for the hour (builtin_tod_sky).
+Image* Renderer::Impl::TodSky(Image* scene) {
+  if (tod_sky_done_) return tod_sky_result_;
+  tod_sky_done_ = true;
+  tod_sky_result_ = nullptr;
+  if (!TodOn()) return nullptr;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
+      dit->second.width != scene->width || dit->second.height != scene->height ||
+      scene->samples > 1) {
+    return nullptr;
+  }
+  Image* depth = &dit->second;
+  const uint32_t w = scene->width, h = scene->height;
+  EndRendering();
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(tod_sky_img_, w, h, scene->format, "tod_sky");
+  tod_sky_img_.scaled = scene->scaled;
+  tod_sky_img_.scale = scene->scale;
+  ensure(tod_colors_, 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, "tod_sky_colors");
+  const tod::State& t = tod_state_;
+  {
+    Buffer staging = gpu_.CreateBuffer(64, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    float* f = reinterpret_cast<float*>(staging.mapped);
+    const tod::Vec3* cols[4] = {&t.zenith, &t.horizon, &t.mountain_zenith, &t.mountain_horizon};
+    for (int i = 0; i < 4; ++i) {
+      f[i * 4] = float(cols[i]->x);
+      f[i * 4 + 1] = float(cols[i]->y);
+      f[i * 4 + 2] = float(cols[i]->z);
+      f[i * 4 + 3] = 1.0f;
+    }
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {4, 1, 1};
+    Barrier();
+    vk::vkCmdCopyBufferToImage(cb_, staging.buffer, tod_colors_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                               &region);
+    staging_.push_back(staging);
+  }
+  Barrier();
+  // The view rays (linear in ndc for a perspective view): through the middle
+  // and their change across the screen, from the inverse view-projection.
+  auto unproject = [&](double x, double y, double out[3]) {
+    const double n[4] = {x, y, 0.5, 1.0};
+    double v[4] = {};
+    for (int r = 0; r < 4; ++r) {
+      for (int k = 0; k < 4; ++k) v[r] += inv_vp_[r * 4 + k] * n[k];
+    }
+    for (int r = 0; r < 3; ++r) out[r] = v[r] / v[3] - cam_pos_[r];
+  };
+  double c[3], rx[3], uy[3];
+  unproject(0, 0, c);
+  unproject(1, 0, rx);
+  unproject(0, 1, uy);
+  // Normalized so the middle ray is unit length (the others scale alike).
+  const double cl = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+  if (!(cl > 1e-9)) return nullptr;
+  float pc[32] = {};
+  for (int i = 0; i < 3; ++i) {
+    pc[0 + i] = float(c[i] / cl);
+    pc[4 + i] = float((rx[i] - c[i]) / cl);
+    pc[8 + i] = float((uy[i] - c[i]) / cl);
+    pc[12 + i] = float(t.sun.x * (i == 0) + t.sun.y * (i == 1) + t.sun.z * (i == 2));
+    pc[16 + i] = float(t.moon.x * (i == 0) + t.moon.y * (i == 1) + t.moon.z * (i == 2));
+    pc[20 + i] = sun_dir_painted_[i];
+  }
+  pc[3] = tod_.seconds;
+  pc[7] = float(t.night);
+  pc[11] = float(t.stars);
+  pc[15] = float(t.sun_disc);
+  pc[19] = float(t.moon_bright);
+  pc[23] = float(t.away);
+  pc[24] = float(t.sun_color.x);
+  pc[25] = float(t.sun_color.y);
+  pc[26] = float(t.sun_color.z);
+  pc[27] = std::clamp(tod_.clouds, 0.0f, 1.0f);
+  pc[28] = 1.0f / float(w);
+  pc[29] = 1.0f / float(h);
+  pc[30] = float(1.0 - tod::SmoothStep(2.0 * tod::kDeg, 20.0 * tod::kDeg, t.sun_elevation)) *
+           float(tod::SmoothStep(-8.0 * tod::kDeg, -1.0 * tod::kDeg, t.sun_elevation));
+  FullscreenPass(CopyKind::kTodSky, &tod_sky_img_, scene, depth, &tod_colors_, false, pc, 32);
+  Barrier();
+  dyn_ = DynState{};
+  tod_sky_result_ = &tod_sky_img_;
+  return tod_sky_result_;
 }
 
 Image* Renderer::Impl::RadialScene(Image* scene) {
@@ -7942,6 +8347,16 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
           ps->info.ucode_hash == kLightingPixelShader) {
         im = &baked_;
       }
+      // Time of day: the sky-light table tinted; the game's fixed shadows
+      // (the painted slopes, tf2; the shadow map, tf0) gone once the sun has
+      // moved well away from where they were made for.
+      if (stage == 1 && TodOn() && ps->info.ucode_hash == kLightingPixelShader) {
+        if (b.fetch_constant == 1 && tod_lut_ok_ && hit->second.image == tod_lut_src_) im = &tod_lut_;
+        if ((b.fetch_constant == 2 || b.fetch_constant == 0) && TodNoGameShadows() &&
+            tod_white_.image) {
+          im = &tod_white_;
+        }
+      }
       const std::string& note = hit->second.note;
       // Diagnostics: vertex textures replaced ("novtex") or sampled plainly
       // ("vtexplain") in the --diag-draws range.
@@ -8169,6 +8584,15 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     for (int i = 0; i < 4; ++i) c10[i] = shadow_av_ * (c10[i] - c12[i]) + c12[i];
     std::memcpy(out + 10 * 16, c10, 16);
   }
+  const TodBlock* tod_vs = TodOn() ? TodFind(0, *vs, st.vs_consts.data()) : nullptr;
+  if (tod_vs) {
+    uint32_t vc[1024];
+    std::memcpy(vc, st.vs_consts.data(), sizeof(vc));
+    TodLightingBlock(vc, tod_vs->dir, tod_vs->sh, tod_vs->sun);
+    uint8_t* out;
+    offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
+    std::memcpy(out, vc, ConstBytes(*vs));
+  }
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
   // Freecam: the lighting pass works out each pixel's world position from
   // the depth with its inverse view-projection (c0..c3) and the view from
@@ -8189,6 +8613,29 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     uint8_t* out;
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
     std::memcpy(out, fc_consts, ConstBytes(*ps));
+  }
+  // Time of day: the light from the hour's sun (or moon), its color and the
+  // sky's light scaled from the mountain's. The game's lighting block: toward
+  // the sun; the sky's light as spherical harmonics (24 registers: 4 sets of
+  // red, then green, then blue, the first band; then the second band the
+  // same); the sun's color (4 sets). The lighting pass has it at c14, c15,
+  // c39; vertex-lit things (riders, characters) at c238, c206, c230.
+  if (TodOn() && ps->info.ucode_hash == kLightingPixelShader) {
+    if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
+    TodLightingBlock(fc_consts, 14, 15, 39);
+    lit_src = fc_consts;
+    uint8_t* out;
+    offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
+    std::memcpy(out, fc_consts, ConstBytes(*ps));
+  } else if (TodOn()) {
+    if (const TodBlock* b = TodFind(1, *ps, lit_src)) {
+      if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
+      TodLightingBlock(fc_consts, b->dir, b->sh, b->sun);
+      lit_src = fc_consts;
+      uint8_t* out;
+      offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
+      std::memcpy(out, fc_consts, ConstBytes(*ps));
+    }
   }
   if (shadow_res_ > 1.0f && ps->info.ucode_hash == kShadowBlurPixelShader &&
       ShadowMapTarget(DepthKey(surface, st.reg(0x2002)))) {
@@ -9743,6 +10190,9 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(blur_img_);
   gpu_.DestroyImage(radial_img_);
   gpu_.DestroyImage(fog_img_);
+  for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_}) {
+    gpu_.DestroyImage(*im);
+  }
   gpu_.DestroyImage(fog_color_img_[0]);
   gpu_.DestroyImage(fog_color_img_[1]);
   gpu_.DestroyImage(ray_mask_img_);
@@ -9858,6 +10308,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   up_result_ = nullptr;
   radial_done_ = false;
   fog_done_ = false;
+  tod_sky_done_ = false;
   ao_done_ = false;
   ao_depth_ok_ = false;
   ao_late_ok_ = false;
@@ -10156,6 +10607,8 @@ Renderer::~Renderer() = default;
 const std::string& Renderer::device_name() const { return impl_->gpu_.device_name; }
 
 void Renderer::SetMapClouds(bool on) { impl_->map_clouds_ = on; }
+void Renderer::SetTimeOfDay(const TimeOfDay& tod) { impl_->tod_ = tod; }
+float Renderer::MountainHour() const { return impl_->tod_mountain_hour_; }
 void Renderer::SetInCutscene(bool scene) { impl_->in_scene_ = scene; }
 void Renderer::SetHideInterface(bool hide) { impl_->hide_interface_ = hide; }
 void Renderer::SetFreecam(const FreecamInput& input) {

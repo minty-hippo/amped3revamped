@@ -82,6 +82,18 @@ const std::vector<Tab>& Tabs() {
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
+      {"Time of Day",
+       {
+           {"native_time_of_day", "Dynamic Time of Day"},
+           {"native_tod_start_hour", "Set the Hour", Kind::kSlider, -1.0, 24.0, 0.25},
+           {"native_tod_day_minutes", "Minutes per Day", Kind::kStops, 0, 0, 0,
+            {{"0", "Stopped"}, {"12", "12 min"}, {"24", "24 min"}, {"48", "48 min"},
+             {"120", "2 hours"}, {"1440", "Real time"}}},
+           {"native_tod_moon_phase", "Moon Phase", Kind::kStops, 0, 0, 0,
+            {{"0", "New"}, {"0.25", "First quarter"}, {"0.5", "Full"}, {"0.75", "Last quarter"}}},
+           {"native_tod_clouds", "Cloud Cover", Kind::kSlider, 0.0, 1.0, 0.05},
+           {"native_tod_night_light", "Night Brightness", Kind::kSlider, 0.2, 3.0, 0.1},
+       }},
       {"Display",
        {
            {"fullscreen", "Fullscreen", Kind::kFullscreen},
