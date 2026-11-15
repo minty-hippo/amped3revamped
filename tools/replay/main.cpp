@@ -530,6 +530,8 @@ int main(int argc, char** argv) {
       tod.hour = std::stof(argv[++i]);
     } else if (a == "--tod-moon" && i + 1 < argc) {
       tod.moon_phase = std::stof(argv[++i]);
+    } else if (a == "--tod-night" && i + 1 < argc) {
+      tod.night_light = std::stof(argv[++i]);
     } else if (a == "--tod-clouds" && i + 1 < argc) {
       tod.clouds = std::stof(argv[++i]);
     } else if (a == "--fog" && i + 1 < argc) {

@@ -2068,43 +2068,54 @@ struct Renderer::Impl {
     }
   }
   // Other shaders lit by the same block (riders, characters, props: their
-  // vertex or pixel shaders): where each keeps it, found once by its values
-  // (the lighting pass's, the frame before) in the constants it's drawn
-  // with. -1: not lit by it (after a few looks).
+  // vertex or pixel shaders, each keeping it, or parts of it, at its own
+  // registers): every register holding one of the lighting pass's (the frame
+  // before), by value, gets that register's value for the hour. Where they
+  // are is looked up for each shader in its first few draws.
   struct TodBlock {
-    int dir = -1, sh = -1, sun = -1;
+    std::vector<std::pair<uint16_t, uint16_t>> regs;  // (register, lighting pass register - 14)
     int looks = 0;
   };
   std::unordered_map<uint64_t, TodBlock> tod_blocks_[2];  // by stage, ucode hash
   uint32_t tod_ref_[29 * 4] = {};  // the lighting pass's c14..c42 (bits)
+  uint32_t tod_new_[29 * 4] = {};  // the same for the hour
   bool tod_ref_ok_ = false;
-  const TodBlock* TodFind(int stage, const Shader& sh, const uint32_t* c) {
-    if (!tod_ref_ok_) return nullptr;
+  bool TodMatches(const uint32_t* v, int ref) const {
+    const uint32_t* r = &tod_ref_[ref * 4];
+    if ((r[0] | r[1] | r[2]) == 0) return false;  // (nothing to tell it by: zeros)
+    return std::memcmp(v, r, ref == 0 ? 12 : 16) == 0;
+  }
+  bool TodNeeds(int stage, const Shader& sh) {
+    if (!tod_ref_ok_) return false;
+    auto it = tod_blocks_[stage].find(sh.info.ucode_hash);
+    return it == tod_blocks_[stage].end() || it->second.looks < 4 || !it->second.regs.empty();
+  }
+  // The constants `c` (a copy) brought to the hour; false: nothing to change.
+  bool TodApply(int stage, const Shader& sh, uint32_t* c) {
+    if (!tod_ref_ok_) return false;
     TodBlock& b = tod_blocks_[stage][sh.info.ucode_hash];
-    if (b.dir >= 0) return &b;
-    if (b.looks >= 6) return nullptr;
-    ++b.looks;
-    auto same = [&](int reg, int ref, int n, int comps) {
-      for (int r = 0; r < n; ++r) {
-        if (std::memcmp(&c[(reg + r) * 4], &tod_ref_[(ref + r) * 4], comps * 4) != 0) return false;
+    if (b.looks < 4) {
+      ++b.looks;
+      for (int r = 0; r < 256; ++r) {
+        for (int k = 0; k < 29; ++k) {
+          if (!TodMatches(&c[r * 4], k)) continue;
+          const std::pair<uint16_t, uint16_t> e{uint16_t(r), uint16_t(k)};
+          if (std::find(b.regs.begin(), b.regs.end(), e) == b.regs.end()) b.regs.push_back(e);
+          break;
+        }
       }
-      return true;
-    };
-    int dir = -1, shb = -1, sun = -1;
-    for (int r = 0; r < 256 && dir < 0; ++r) {
-      if (same(r, 0, 1, 3)) dir = r;
+      if (Diag("tod") && b.looks == 1) {
+        std::fprintf(stderr, "tod: %s %016llx %zu registers\n", stage ? "ps" : "vs",
+                     (unsigned long long)sh.info.ucode_hash, b.regs.size());
+      }
     }
-    for (int r = 0; r + 24 <= 256 && shb < 0; ++r) {
-      if (same(r, 1, 24, 4)) shb = r;
+    bool changed = false;
+    for (const auto& [r, k] : b.regs) {
+      if (!TodMatches(&c[r * 4], k)) continue;  // (not set to it this time)
+      std::memcpy(&c[r * 4], &tod_new_[k * 4], k == 0 ? 12 : 16);
+      changed = true;
     }
-    for (int r = 0; r + 4 <= 256 && sun < 0; ++r) {
-      if (same(r, 25, 4, 4)) sun = r;
-    }
-    if (dir < 0 || shb < 0 || sun < 0) return nullptr;
-    b.dir = dir;
-    b.sh = shb;
-    b.sun = sun;
-    return &b;
+    return changed;
   }
   Image* TodSky(Image* scene);
   bool cloud_known_ = false, cloud_riding_ = true, cloud_active_ = false;
@@ -4732,36 +4743,72 @@ float fbm(vec2 p) {
   }
   return v;
 }
-void main() {
-  vec2 uv = gl_FragCoord.xy * pc.sz.xy;
-  vec4 col = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
-  float d = texelFetch(depth, ivec2(gl_FragCoord.xy), 0).r;
-  if (d > 0.0) {
-    o = col;
-    return;
-  }
-  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  vec3 dir = normalize(pc.c.xyz + ndc.x * pc.r.xyz + ndc.y * pc.u.xyz);
+// The panorama's color at `dir` for the hour: its painted sun dimmed (as
+// the sun moves away), recolored (the hour's sky over the mountain's, per
+// channel, top to horizon) and, further from the mountain's hour, more the
+// hour's own sky keeping the panorama's light and shade.
+vec3 recolor(vec3 col, vec3 dir) {
   float up = clamp(dir.y, 0.0, 1.0);
-  float night = pc.r.w;
-  // The painted sun dimmed (its bright blob), as the sun moves away.
-  vec3 c = col.rgb;
+  vec3 c = col;
   float lum = dot(c, vec3(0.333));
   float ps = smoothstep(0.9925, 0.9994, dot(dir, pc.painted.xyz)) * pc.painted.w;
   c = mix(c, c / max(lum, 1e-3) * min(lum, 0.62), ps);
-  // Recolored: the hour's sky over the mountain's (per channel, top to
-  // horizon).
   float hz = pow(up, 0.6);
   vec3 now = mix(texelFetch(colors, ivec2(1, 0), 0).rgb, texelFetch(colors, ivec2(0, 0), 0).rgb, hz);
   vec3 then = mix(texelFetch(colors, ivec2(3, 0), 0).rgb, texelFetch(colors, ivec2(2, 0), 0).rgb, hz);
   vec3 scale = now / max(then, vec3(1e-3));
-  // How blue the panorama is here: open sky (stars show), not painted
-  // clouds or far mountains.
+  vec3 detail = now * clamp(0.6 + 0.4 * dot(col, vec3(0.333)) / max(dot(then, vec3(0.333)), 0.05), 0.4, 1.5);
+  return mix(c * scale, detail, pc.painted.w * 0.8);
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.sz.xy;
+  vec4 col = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+  float d = texelFetch(depth, ivec2(gl_FragCoord.xy), 0).r;
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec3 dir = normalize(pc.c.xyz + ndc.x * pc.r.xyz + ndc.y * pc.u.xyz);
+  if (d > 0.0) {
+    // Edges against the sky (branches, a skyline): partly the panorama's
+    // color, smoothed in, so recolored by as much (else they glint with the
+    // day's sky at night). How much: where the color sits between the
+    // nearby sky's and the darkest nearby solid color.
+    ivec2 p = ivec2(gl_FragCoord.xy), sz = textureSize(depth, 0) - 1;
+    vec3 sky = vec3(0.0), solid = vec3(1e9);
+    float n = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+      for (int x = -1; x <= 1; ++x) {
+        if (x == 0 && y == 0) continue;
+        ivec2 q = clamp(p + ivec2(x, y), ivec2(0), sz);
+        vec3 qc = texelFetch(scene, q, 0).rgb;
+        if (texelFetch(depth, q, 0).r <= 0.0) {
+          sky += qc;
+          n += 1.0;
+        } else if (dot(qc, vec3(1.0)) < dot(solid, vec3(1.0))) {
+          solid = qc;
+        }
+      }
+    }
+    if (n < 0.5 || solid.x > 1e8) {
+      o = col;
+      return;
+    }
+    sky /= n;
+    vec3 span = sky - solid;
+    float f = clamp(dot(col.rgb - solid, span) / max(dot(span, span), 1e-5), 0.0, 1.0);
+    o = vec4(col.rgb + f * (recolor(sky, dir) - sky), col.a);
+    return;
+  }
+  float up = clamp(dir.y, 0.0, 1.0);
+  float night = pc.r.w;
+  vec3 c = recolor(col.rgb, dir);
+  // Open sky: not a gap between branches (no stars glittering in the trees).
   float open_sky = 1.0;
-  // Near the mountain's hour the panorama recolored; further away more the
-  // hour's own sky, keeping the panorama's light and shade.
-  vec3 detail = now * clamp(0.6 + 0.4 * dot(col.rgb, vec3(0.333)) / max(dot(then, vec3(0.333)), 0.05), 0.4, 1.5);
-  c = mix(c * scale, detail, pc.painted.w * 0.8);
+  {
+    ivec2 p = ivec2(gl_FragCoord.xy), sz = textureSize(depth, 0) - 1;
+    for (int i = 0; i < 4; ++i) {
+      ivec2 off = ivec2(i == 0 ? 3 : (i == 1 ? -3 : 0), i == 2 ? 3 : (i == 3 ? -3 : 0));
+      if (texelFetch(depth, clamp(p + off, ivec2(0), sz), 0).r > 0.0) open_sky = 0.0;
+    }
+  }
   // Sunward glow at dusk: the sky warm around the sun, low down.
   float toward = max(dot(dir, pc.sun.xyz), 0.0);
   c += pc.sun_col.rgb * pc.sz.z * (0.12 * pow(toward, 6.0) + 0.2 * pow(toward, 48.0)) *
@@ -5996,6 +6043,10 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
       }
       if (tod_.on) {
         tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
+        std::vector<uint32_t> c(1024, 0u);
+        std::memcpy(&c[14 * 4], tod_ref_, sizeof(tod_ref_));
+        TodLightingBlock(c.data(), 14, 15, 39);
+        std::memcpy(tod_new_, &c[14 * 4], sizeof(tod_new_));
       }
     }
     if (sun_valid_) {
@@ -8584,11 +8635,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     for (int i = 0; i < 4; ++i) c10[i] = shadow_av_ * (c10[i] - c12[i]) + c12[i];
     std::memcpy(out + 10 * 16, c10, 16);
   }
-  const TodBlock* tod_vs = TodOn() ? TodFind(0, *vs, st.vs_consts.data()) : nullptr;
-  if (tod_vs) {
-    uint32_t vc[1024];
-    std::memcpy(vc, st.vs_consts.data(), sizeof(vc));
-    TodLightingBlock(vc, tod_vs->dir, tod_vs->sh, tod_vs->sun);
+  uint32_t vc[1024];
+  if (TodOn() && TodNeeds(0, *vs) &&
+      (std::memcpy(vc, st.vs_consts.data(), sizeof(vc)), TodApply(0, *vs, vc))) {
     uint8_t* out;
     offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
     std::memcpy(out, vc, ConstBytes(*vs));
@@ -8627,10 +8676,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     uint8_t* out;
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
     std::memcpy(out, fc_consts, ConstBytes(*ps));
-  } else if (TodOn()) {
-    if (const TodBlock* b = TodFind(1, *ps, lit_src)) {
-      if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
-      TodLightingBlock(fc_consts, b->dir, b->sh, b->sun);
+  } else if (TodOn() && TodNeeds(1, *ps)) {
+    if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
+    if (TodApply(1, *ps, fc_consts)) {
       lit_src = fc_consts;
       uint8_t* out;
       offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
