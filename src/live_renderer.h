@@ -86,6 +86,13 @@ bool FreecamShowing();
 bool GameCamera(float out[9]);
 // The renderer's freecam (view mode) in the last frame: position, forward.
 bool FreecamPose(float out[6]);
+// Night lights (time of day): the lights to draw (the renderer's copy
+// updated on its next frame).
+void SetNightLights(const std::vector<native::Renderer::NightLight>& lights);
+// The mountain shown (0: not known yet): its night lights' file.
+uint64_t MountainKey();
+// The world point at the middle of the screen (false: sky, or not known).
+bool CenterPoint(float out[3]);
 
 // Instant replay: the last seconds of riding kept (setting replay_seconds),
 // played again in place of the game's frames (pause the game first: the

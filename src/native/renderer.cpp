@@ -1469,6 +1469,23 @@ struct Renderer::Impl {
   std::vector<CasterDraw> tod_movers_draws_;
   bool tod_mask_ok_ = false;
   Image* tod_game_map_ = nullptr;  // the game's shadow map (the lighting's tf0) this frame
+  // Night lights (SetNightLights): added after the scene from the lighting's
+  // own inputs (its albedo tf3 and normals tf4, kept at the lighting pass).
+  std::vector<Renderer::NightLight> lights_;
+  Image* tod_albedo_ = nullptr;
+  Image* tod_normal_ = nullptr;
+  Image lights_img_, lights_out_, lights_albedo_;
+  bool lights_done_ = false;
+  Image* lights_result_ = nullptr;
+  Image* NightLights(Image* scene, Image* depth);
+  // The middle of the screen's depth, read back 4 frames later (CenterPoint).
+  Buffer center_rb_;
+  uint64_t center_frame_[4] = {};
+  double center_inv_[4][16] = {};
+  float center_pt_[3] = {};
+  bool center_ok_ = false;
+  void CenterProbe(Image* depth);
+  void CenterRead();
   double tod_mask_rows_[12] = {};  // c6, c7, c9
   bool baked_ok_ = false;
   void BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16], bool bake);
@@ -1750,7 +1767,7 @@ struct Renderer::Impl {
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
-    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37
+    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1791,7 +1808,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[38] = {};  // by CopyKind
+  VkShaderModule copy_fs_[39] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -1849,7 +1866,8 @@ struct Renderer::Impl {
   Image player_rows_img_;  // 4 x 1: pixel offset from the player = rows * v / w
   void FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image* b1, Image* b2,
                       bool linear0, const float* pc, uint32_t floats,
-                      const VkRect2D* rect = nullptr, Image* b3 = nullptr);
+                      const VkRect2D* rect = nullptr, Image* b3 = nullptr,
+                      Image* b4 = nullptr, Image* b5 = nullptr);
   VkSampler linear_sampler_ = VK_NULL_HANDLE;
   void NoteLightingPass(const Draw& d, const GpuState& st);
   Image* BlurredScene(Image* scene);
@@ -2938,6 +2956,19 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
         if (Image* sky = TodSky(scene)) scene = sky;
         MarkPart("effect: time of day sky");
       }
+      // The night lights, and the screen's middle (placing them).
+      if (tod_sky) {
+        auto dit = resolved_.find(depth_base_);
+        Image* dimg = dit != resolved_.end() && dit->second.format == VK_FORMAT_R32_SFLOAT &&
+                              dit->second.samples == 1
+                          ? &dit->second
+                          : nullptr;
+        if (dimg) {
+          CenterProbe(dimg);
+          if (Image* lit = NightLights(scene, dimg)) scene = lit;
+          MarkPart("effect: night lights");
+        }
+      }
       // How bright the lit scene is (eye adaptation).
       if (eye) EyeMeasure(scene);
       // Riders in the world's shade first (they're lit by themselves).
@@ -3841,12 +3872,16 @@ void Renderer::Impl::CreateOnce() {
   vk::Check(vk::vkCreateSampler(dev, &si, nullptr, &linear_sampler_), "sampler");
 
   // Depth -> color copy (depth resolves).
-  VkDescriptorSetLayoutBinding cbnd[4] = {
+  VkDescriptorSetLayoutBinding cbnd[6] = {
       {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-      {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
-  lci.bindingCount = 4;  // binding 2: motion blur and a few more; 3: the world shadows' bake
+      {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+  // binding 2: motion blur and a few more; 3: the world shadows' bake; 4, 5:
+  // the night lights
+  lci.bindingCount = 6;
   lci.pBindings = cbnd;
   vk::Check(vk::vkCreateDescriptorSetLayout(dev, &lci, nullptr, &copy_set_layout_), "copy layout");
   VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};  // 128: motion blur
@@ -4975,6 +5010,83 @@ void main() {
     }
   }
   o = vec4(lit / 16.0);
+}
+)", true);
+  // Night lights: each lamp's light on the world (the lighting's albedo and
+  // normals: as the game lights it), a glow round each lamp in the air, the
+  // riders (drawn after the lighting) glowing only.
+  copy_fs_[38] = CompileBuiltin("builtin_night_lights", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D world_depth;  // at the lighting (0: nothing)
+layout(set = 0, binding = 2) uniform sampler2D lights;       // n x 2: pos, radius; color, intensity
+layout(set = 0, binding = 3) uniform sampler2D albedo;
+layout(set = 0, binding = 4) uniform sampler2D normals;      // xyz * 2 - 1
+layout(set = 0, binding = 5) uniform sampler2D depth;        // now (with the riders)
+layout(push_constant) uniform Lights {
+  mat4 m;    // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
+  vec4 cam;  // camera position, count
+  vec4 a;    // 1 / width, 1 / height, how dark it is (0..1), riders told apart (0/1)
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.a.xy;
+  vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+  float k = pc.a.z;
+  int count = int(pc.cam.w);
+  if (k <= 0.001 || count == 0) {
+    o = c;
+    return;
+  }
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  float dw = textureLod(world_depth, uv, 0.0).r;
+  float dn = textureLod(depth, uv, 0.0).r;
+  // (Inverted depth: what's drawn after the lighting in front is larger.)
+  bool rider = pc.a.w > 0.5 && dn > dw * 1.01 + 1e-7;  // (not the snow trails, just above)
+  float d = pc.a.w > 0.5 ? dn : dw;
+  vec4 mid = pc.m * vec4(ndc, 0.5, 1.0);
+  vec3 dir = normalize(mid.xyz / mid.w - pc.cam.xyz);
+  float pix_dist = 1e9;
+  vec3 P = vec3(0.0);
+  if (d > 0.0) {
+    vec4 wp = pc.m * vec4(ndc, 1.0 - d, 1.0);
+    P = wp.xyz / wp.w;
+    pix_dist = length(P - pc.cam.xyz);
+  }
+  vec3 N = normalize(textureLod(normals, uv, 0.0).xyz * 2.0 - 1.0);
+  vec3 alb = textureLod(albedo, uv, 0.0).rgb;
+  vec3 add = vec3(0.0);
+  for (int i = 0; i < count; ++i) {
+    vec4 lp = texelFetch(lights, ivec2(i, 0), 0);
+    vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
+    vec3 col = lc.rgb * lc.w;
+    // On the world.
+    if (d > 0.0 && !rider) {
+      vec3 dl = lp.xyz - P;
+      float dist = length(dl);
+      if (dist < lp.w) {
+        float x = dist / lp.w;
+        float fall = (1.0 - x * x) * (1.0 - x * x) / (1.0 + dist * dist * 0.06);
+        float ndl = max(dot(N, dl / max(dist, 1e-3)), 0.0) * 0.8 + 0.2;
+        add += alb * col * fall * ndl * 1.6;
+      }
+    }
+    // The glow in the air: nearest the view ray comes to the lamp (in front
+    // of what's drawn there).
+    vec3 to = lp.xyz - pc.cam.xyz;
+    float t = dot(to, dir);
+    if (t > 0.3 && t < pix_dist + 0.5) {
+      float perp = length(to - dir * t);
+      float size = 0.12 + 0.004 * t;  // a little bigger far away (still seen)
+      float g = size * size / (perp * perp + size * size);
+      add += col * (0.55 * g * g + 0.12 * g) * smoothstep(400.0, 150.0, t);
+    }
+  }
+  if (pc.a.w > 1.5) {  // (diagnostics: riders, depth, albedo, normal)
+    o = vec4(rider ? 1.0 : 0.0, d > 0.0 ? 0.5 : 0.0, dot(alb, vec3(0.333)), 1.0);
+    if (uv.x > 0.5) o = vec4(N * 0.5 + 0.5, 1.0);
+    return;
+  }
+  o = vec4(c.rgb + add * k, c.a);
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -6143,6 +6255,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
       }
       if (tod_.on) tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
       EyeUpdate();
+      CenterRead();
       lm_on_ = TodOn() || eye_strength_ > 0.0f;
       lm_set_dir_ = TodOn();
       const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
@@ -7762,6 +7875,28 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   {
     std::string n0;
     tod_game_map_ = TodOn() ? TextureFor(d, 0, st, &n0) : nullptr;
+    // (The albedo is the scene's own image, lit over by this pass: a copy.)
+    tod_albedo_ = nullptr;
+    Image* alb = TodOn() && !lights_.empty() && tod_state_.night > 0.25
+                     ? TextureFor(d, 3, st, &n0)
+                     : nullptr;
+    if (alb && !alb->depth && alb->samples == 1) {
+      EndRendering();
+      if (!lights_albedo_.image || lights_albedo_.width != alb->width ||
+          lights_albedo_.height != alb->height) {
+        if (lights_albedo_.image) Retire(lights_albedo_);
+        lights_albedo_ = gpu_.CreateImage(alb->width, alb->height, VK_FORMAT_R8G8B8A8_UNORM, false,
+                                          "night_lights_albedo");
+        ToGeneral(cb_, lights_albedo_);
+      }
+      Barrier();
+      const float one[4] = {1, 1, 1, 0};
+      FullscreenPass(CopyKind::kTodTint, &lights_albedo_, alb, nullptr, nullptr, false, one, 4);
+      Barrier();
+      tod_albedo_ = &lights_albedo_;
+      dyn_ = DynState{};
+    }
+    tod_normal_ = TodOn() ? TextureFor(d, 4, st, &n0) : nullptr;
   }
   if (!LightModOn()) return;
   auto ensure = [&](Image& im, uint32_t w, uint32_t h, VkFormat f, const char* name) {
@@ -7957,6 +8092,126 @@ void Renderer::Impl::TodShadows() {
   }
   tod_mask_ok_ = true;
   dyn_ = DynState{};
+}
+
+// The screen's middle: its depth copied to this frame's read-back slot (with
+// the view it goes with), read 4 frames later (CenterRead).
+void Renderer::Impl::CenterProbe(Image* depth) {
+  if (!center_rb_.buffer) center_rb_ = gpu_.CreateBuffer(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  EndRendering();
+  Barrier();
+  const int slot = int(frame_number_ % 4);
+  VkBufferImageCopy region{};
+  region.bufferOffset = VkDeviceSize(slot) * 16;
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageOffset = {int32_t(depth->width / 2), int32_t(depth->height / 2), 0};
+  region.imageExtent = {1, 1, 1};
+  vk::vkCmdCopyImageToBuffer(cb_, depth->image, VK_IMAGE_LAYOUT_GENERAL, center_rb_.buffer, 1, &region);
+  Barrier();
+  center_frame_[slot] = frame_number_;
+  std::memcpy(center_inv_[slot], inv_vp_, sizeof(inv_vp_));
+}
+
+void Renderer::Impl::CenterRead() {
+  const int slot = int(frame_number_ % 4);
+  if (!center_rb_.buffer || !center_frame_[slot] || frame_number_ < center_frame_[slot] + 4) return;
+  float d;
+  std::memcpy(&d, center_rb_.mapped + slot * 16, 4);
+  center_frame_[slot] = 0;
+  if (!(d > 0.0f) || !std::isfinite(d)) {
+    center_ok_ = false;
+    return;
+  }
+  const double n[4] = {0.0, 0.0, 1.0 - double(d), 1.0};
+  double w[4] = {};
+  for (int r = 0; r < 4; ++r) {
+    for (int k = 0; k < 4; ++k) w[r] += center_inv_[slot][r * 4 + k] * n[k];
+  }
+  if (std::fabs(w[3]) < 1e-12) return;
+  for (int i = 0; i < 3; ++i) center_pt_[i] = float(w[i] / w[3]);
+  center_ok_ = true;
+}
+
+// Night lights, after the scene (builtin_night_lights): on as it gets dark.
+Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
+  if (lights_done_) return lights_result_;
+  lights_done_ = true;
+  lights_result_ = nullptr;
+  const double dark = TodOn() ? tod::SmoothStep(0.25, 0.85, tod_state_.night) : 0.0;
+  if (lights_.empty() || dark <= 0.001 || !tod_albedo_ || !tod_normal_ ||
+      depth->width != scene->width || depth->height != scene->height || scene->samples > 1) {
+    return nullptr;
+  }
+  // The nearest 128 to the camera (within 400 m).
+  std::vector<std::pair<float, size_t>> near;
+  for (size_t i = 0; i < lights_.size(); ++i) {
+    const float* p = lights_[i].pos;
+    const float dx = p[0] - cam_pos_[0], dy = p[1] - cam_pos_[1], dz = p[2] - cam_pos_[2];
+    const float d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < 400.0f * 400.0f) near.push_back({d2, i});
+  }
+  if (near.empty()) return nullptr;
+  std::sort(near.begin(), near.end());
+  if (near.size() > 128) near.resize(128);
+  EndRendering();
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(lights_img_, 128, 2, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
+  ensure(lights_out_, scene->width, scene->height, scene->format, "night_lit");
+  lights_out_.scaled = scene->scaled;
+  lights_out_.scale = scene->scale;
+  {
+    Buffer staging = gpu_.CreateBuffer(128 * 2 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    float* f = reinterpret_cast<float*>(staging.mapped);
+    std::memset(f, 0, 128 * 2 * 16);
+    const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
+    for (size_t j = 0; j < near.size(); ++j) {
+      const Renderer::NightLight& l = lights_[near[j].second];
+      float* a = f + j * 4;
+      float* b = f + (128 + j) * 4;
+      a[0] = l.pos[0];
+      a[1] = l.pos[1];
+      a[2] = l.pos[2];
+      a[3] = std::max(l.radius, 0.5f);
+      b[0] = l.color[0];
+      b[1] = l.color[1];
+      b[2] = l.color[2];
+      b[3] = float(l.intensity * e);
+    }
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {128, 2, 1};
+    Barrier();
+    vk::vkCmdCopyBufferToImage(cb_, staging.buffer, lights_img_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                               &region);
+    staging_.push_back(staging);
+  }
+  Barrier();
+  // The world's depth as the lighting had it (riders told apart), when kept.
+  const bool have_world = ao_depth_ok_ && ao_depth_.width == depth->width &&
+                          ao_depth_.height == depth->height;
+  float pc[24] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
+  }
+  pc[16] = cam_pos_[0];
+  pc[17] = cam_pos_[1];
+  pc[18] = cam_pos_[2];
+  pc[19] = float(near.size());
+  pc[20] = 1.0f / float(scene->width);
+  pc[21] = 1.0f / float(scene->height);
+  pc[22] = float(dark);
+  pc[23] = Diag("lightsdbg") ? 2.0f : have_world ? 1.0f : 0.0f;
+  FullscreenPass(CopyKind::kTodLights, &lights_out_, scene, have_world ? &ao_depth_ : depth,
+                 &lights_img_, false, pc, 24, nullptr, tod_albedo_, tod_normal_, depth);
+  Barrier();
+  dyn_ = DynState{};
+  lights_result_ = &lights_out_;
+  return lights_result_;
 }
 
 // Time of day, after the scene: the sky drawn for the hour (builtin_tod_sky).
@@ -8261,7 +8516,7 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
 // missing ones the dummy image; binding 0 filtered when `linear0`).
 void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image* b1, Image* b2,
                                     bool linear0, const float* pc, uint32_t floats,
-                                    const VkRect2D* rect, Image* b3) {
+                                    const VkRect2D* rect, Image* b3, Image* b4, Image* b5) {
   FlushPendingClears();  // what it reads or writes may have a clear waiting
   VkPipeline p = CopyPipeline(kind, dst->format);
   VkDescriptorSet set;
@@ -8270,15 +8525,17 @@ void Renderer::Impl::FullscreenPass(CopyKind kind, Image* dst, Image* b0, Image*
   ai.descriptorSetCount = 1;
   ai.pSetLayouts = &copy_set_layout_;
   vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &set), "fullscreen pass set");
-  VkDescriptorImageInfo ii[4] = {
+  VkDescriptorImageInfo ii[6] = {
       {linear0 ? linear_sampler_ : point_sampler_, (b0 ? b0 : &dummy_)->sample_view,
        VK_IMAGE_LAYOUT_GENERAL},
       {point_sampler_, (b1 ? b1 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL},
       {point_sampler_, (b2 ? b2 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL},
-      {point_sampler_, (b3 ? b3 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL}};
+      {point_sampler_, (b3 ? b3 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL},
+      {point_sampler_, (b4 ? b4 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL},
+      {point_sampler_, (b5 ? b5 : &dummy_)->sample_view, VK_IMAGE_LAYOUT_GENERAL}};
   VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
   wr.dstSet = set;
-  wr.descriptorCount = 4;
+  wr.descriptorCount = 6;
   wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   wr.pImageInfo = ii;
   vk::vkUpdateDescriptorSets(gpu_.device, 1, &wr, 0, nullptr);
@@ -9984,7 +10241,7 @@ Image Renderer::Impl::Downsample(Image* im) {
                                false, im->name + "_downsampled");
   // Its own command buffer and descriptor pool: the frame's are finished.
   VkDescriptorPool frame_pool = pool_;
-  VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};  // copy_set_layout_
+  VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};  // copy_set_layout_
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpi.maxSets = 1;
   dpi.poolSizeCount = 1;
@@ -10616,8 +10873,10 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(radial_img_);
   gpu_.DestroyImage(fog_img_);
   if (eye_rb_.buffer) gpu_.DestroyBuffer(eye_rb_);
+  if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
-                    &tod_movers_map_, &tod_mask_}) {
+                    &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
+                    &lights_albedo_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -10737,6 +10996,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   fog_done_ = false;
   tod_sky_done_ = false;
   eye_done_ = false;
+  lights_done_ = false;
   ao_done_ = false;
   ao_depth_ok_ = false;
   ao_late_ok_ = false;
@@ -11036,6 +11296,22 @@ const std::string& Renderer::device_name() const { return impl_->gpu_.device_nam
 
 void Renderer::SetMapClouds(bool on) { impl_->map_clouds_ = on; }
 void Renderer::SetTimeOfDay(const TimeOfDay& tod) { impl_->tod_ = tod; }
+void Renderer::SetNightLights(const std::vector<NightLight>& lights) { impl_->lights_ = lights; }
+uint64_t Renderer::MountainKey() const {
+  if (!impl_->tod_layout_.valid) return 0;
+  uint64_t h = 1469598103934665603ull;
+  for (float f : impl_->tod_game_light_) {
+    // (Rounded: the same mountain gives the same key.)
+    const int32_t q = int32_t(std::lround(double(f) * 10000.0));
+    h = (h ^ uint32_t(q)) * 1099511628211ull;
+  }
+  return h;
+}
+bool Renderer::CenterPoint(float out[3]) const {
+  if (!impl_->center_ok_) return false;
+  std::memcpy(out, impl_->center_pt_, sizeof(impl_->center_pt_));
+  return true;
+}
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }
 float Renderer::Exposure() const { return float(impl_->eye_strength_ > 0.0f ? impl_->exposure_ : 1.0); }
 float Renderer::MountainHour() const { return impl_->tod_mountain_hour_; }

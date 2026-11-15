@@ -679,6 +679,12 @@ float g_game_camera[9] = {};
 bool g_game_camera_valid = false;
 float g_freecam_pose[6] = {};  // the renderer's freecam, last frame (FreecamPose)
 bool g_freecam_pose_valid = false;
+float g_center[3] = {};  // the screen's middle in the world (CenterPoint)
+bool g_center_valid = false;
+uint64_t g_mountain_key = 0;
+std::mutex g_lights_mutex;
+std::vector<native::Renderer::NightLight> g_lights;  // SetNightLights
+bool g_lights_changed = false;
 
 std::mutex g_status_mutex;
 Status g_status;
@@ -2172,8 +2178,15 @@ void WorkerMain() {
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
           tod.seconds = float(std::fmod(tod_seconds, 100000.0));
           renderer->SetTimeOfDay(tod);
+          {
+            std::lock_guard lock(g_lights_mutex);
+            if (g_lights_changed) {
+              renderer->SetNightLights(g_lights);
+              g_lights_changed = false;
+            }
+          }
           renderer->SetEyeAdaptation(revamped ? float(REXCVAR_GET(native_eye_adaptation)) : 0.0f);
-          g_tod_hour = float(tod_hour);
+          g_tod_hour = tod.on ? float(tod_hour) : -1.0f;
         }
         renderer->SetHideInterface(g_hide_interface.load());
         {
@@ -2292,6 +2305,8 @@ void WorkerMain() {
         std::lock_guard lock(g_game_camera_mutex);
         g_freecam_pose_valid = have;
         if (have) std::memcpy(g_freecam_pose, pose, sizeof(pose));
+        g_center_valid = renderer->CenterPoint(g_center);
+        g_mountain_key = renderer->MountainKey();
       }
       if (stats.camera_signature && !f->replay) {
         std::lock_guard lock(g_game_camera_mutex);
@@ -2392,6 +2407,21 @@ void SetFreecam(const native::Renderer::FreecamInput& input) {
   for (int i = 0; i < 3; ++i) g_freecam.move_delta[i] += old.move_delta[i];
 }
 bool FreecamShowing() { return g_freecam_showing.load(); }
+void SetNightLights(const std::vector<native::Renderer::NightLight>& lights) {
+  std::lock_guard lock(g_lights_mutex);
+  g_lights = lights;
+  g_lights_changed = true;
+}
+uint64_t MountainKey() {
+  std::lock_guard lock(g_game_camera_mutex);
+  return g_mountain_key;
+}
+bool CenterPoint(float out[3]) {
+  std::lock_guard lock(g_game_camera_mutex);
+  if (!g_center_valid) return false;
+  std::memcpy(out, g_center, sizeof(g_center));
+  return true;
+}
 bool FreecamPose(float out[6]) {
   std::lock_guard lock(g_game_camera_mutex);
   if (!g_freecam_pose_valid) return false;

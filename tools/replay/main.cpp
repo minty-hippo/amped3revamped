@@ -461,7 +461,8 @@ int main(int argc, char** argv) {
   bool use_freecam = false;
   bool ao_debug = false;
   amped3::native::Renderer::TimeOfDay tod;
-  float eye = 0.0f;  // --eye strength (eye adaptation)  // --tod hour [--tod-moon phase] [--tod-clouds cover]
+  float eye = 0.0f;  // --eye strength (eye adaptation)
+  bool test_lights = false;  // --test-lights: a few night lights ahead of the camera  // --tod hour [--tod-moon phase] [--tod-clouds cover]
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
   fs::path rewrite;  // write the loaded frame back out in capture format (tests the writer)
   // Draw counts to stop at, each drawn by a fresh renderer and dumped to
@@ -531,6 +532,8 @@ int main(int argc, char** argv) {
       tod.hour = std::stof(argv[++i]);
     } else if (a == "--tod-moon" && i + 1 < argc) {
       tod.moon_phase = std::stof(argv[++i]);
+    } else if (a == "--test-lights") {
+      test_lights = true;
     } else if (a == "--eye" && i + 1 < argc) {
       eye = std::stof(argv[++i]);
     } else if (a == "--tod-night" && i + 1 < argc) {
@@ -852,6 +855,24 @@ int main(int argc, char** argv) {
     if (shadow_softness > 0.0f) renderer.SetShadowSoftness(shadow_softness);
     auto stats = renderer.Render(cap, files, max_draws);
     first_use("first frame", stats);
+    if (test_lights) {
+      const float* g = stats.game_camera;  // position, forward, right
+      std::vector<amped3::native::Renderer::NightLight> lights;
+      for (int k = 0; k < 6; ++k) {
+        amped3::native::Renderer::NightLight l;
+        const float ahead = 8.0f + 9.0f * float(k / 2), side = (k % 2 ? 7.0f : -7.0f);
+        for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * ahead + g[6 + i] * side;
+        l.pos[1] = g[1] - 1.5f - 0.45f * ahead;  // (the slope falls away ahead)
+        if (k == 5) {
+          l.color[0] = 0.75f;
+          l.color[1] = 0.85f;
+          l.color[2] = 1.0f;
+        }
+        lights.push_back(l);
+      }
+      renderer.SetNightLights(lights);
+      std::cout << "Test lights around " << g[0] << " " << g[1] << " " << g[2] << "\n";
+    }
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";
     if (stats.fogged) std::cout << "Fog applied\n";
     if (stats.god_rays) std::cout << "God rays applied\n";

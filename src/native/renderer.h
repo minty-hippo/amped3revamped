@@ -311,6 +311,20 @@ class Renderer {
   void SetTimeOfDay(const TimeOfDay& tod);
   // The hour the mountain is made for (its own sun), -1 before a lit frame.
   float MountainHour() const;
+  // Night lights (time of day): lamps and lit windows, shining on the
+  // world and glowing, coming on as it gets dark. Positions in the world.
+  struct NightLight {
+    float pos[3] = {};
+    float color[3] = {1.0f, 0.8f, 0.55f};
+    float radius = 12.0f;     // metres it reaches
+    float intensity = 1.0f;
+  };
+  void SetNightLights(const std::vector<NightLight>& lights);
+  // The mountain (0 before a lit frame): an id for its lights' file.
+  uint64_t MountainKey() const;
+  // The world point at the middle of the screen, a few frames back (false:
+  // sky or not known yet): where a light is placed.
+  bool CenterPoint(float out[3]) const;
   // Eye adaptation (HDR-style): the lighting brightened in the dark and
   // toned down in glare, easing over a second or two like eyes adjusting,
   // from the scene's average brightness. strength 0 off .. 1 full.

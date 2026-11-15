@@ -443,7 +443,15 @@ worked out from that, so it fits each mountain's own look.
   Each mountain's shadows come from somewhat higher than its light (the
   game's choice): kept, easing to true long shadows toward sunrise and
   sunset, so at the mountain's own hour they match the game's.
-- Lights that come on at night (lift towers, buildings) are the next step.
+- Night lights: lamps, floodlights, lit windows and fires that come on as it
+  gets dark, lighting the snow and slopes around them (as the game's own
+  lighting does: its colors and surface directions) with a glow round each
+  in the air. Placed from the freecam with time of day on: aim the cross at
+  the middle of the screen, D-pad up / L places a light there, D-pad right /
+  J picks the kind, D-pad left / K removes the nearest one. Kept per mountain
+  in `lights\<id>.txt` next to the logs folder (one light a line:
+  x y z  r g b  radius intensity), so they can be shared. Lights found by
+  themselves on lifts and buildings are still to come.
 
 ## Subtitles
 

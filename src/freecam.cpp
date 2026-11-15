@@ -27,6 +27,7 @@
 #include "help_bar.h"
 #include "replay.h"
 #include "live_renderer.h"
+#include "night_lights.h"
 #include "notice.h"
 
 namespace amped3::freecam {
@@ -97,6 +98,8 @@ struct Keys {
   bool reset = false;
   bool leave = false;
   bool switch_mode = false;
+  // Night lights (time of day): place, remove, the kind to place.
+  bool light_place = false, light_remove = false, light_kind = false;
 } g_keys;
 
 std::atomic<bool> g_show_help{true};
@@ -149,9 +152,26 @@ class Overlay final : public rex::ui::ImGuiDialog {
     if (!noclip || paused) items.push_back("LB RB / Z C: zoom");
     items.push_back("Y / R: back to the game's camera");
     items.push_back(noclip ? "D-pad down / N: view mode" : "D-pad down / N: noclip mode");
+    if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
+      items.push_back("D-pad up / L: place a night light (" + night_lights::KindName() + ")");
+      items.push_back("D-pad right / J: light kind");
+      items.push_back("D-pad left / K: remove a light");
+    }
     items.push_back("View / H: hide controls");
     items.push_back("B / tap L3+R3 / F6: leave");
     help_bar::Draw(io, title, items, replay::Active() ? replay::BarRows() : 0);
+    // A small cross at the middle: where a light goes.
+    if (live::TimeOfDayHour() >= 0.0f && help_bar::Visible()) {
+      ImDrawList* dl = ImGui::GetForegroundDrawList();
+      const ImVec2 c(w * 0.5f, h * 0.5f);
+      const float r = std::max(6.0f, h * 0.008f);
+      for (int pass = 0; pass < 2; ++pass) {
+        const ImU32 col = pass ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160);
+        const float t = pass ? 1.5f : 3.5f;
+        dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), col, t);
+        dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r), col, t);
+      }
+    }
   }
 
  private:
@@ -169,6 +189,9 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const bool reset = g_keys.reset || ImGui::IsKeyPressed(ImGuiKey_R, false);
     const bool leave = g_keys.leave || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     const bool switch_mode = g_keys.switch_mode || ImGui::IsKeyPressed(ImGuiKey_N, false);
+    const bool light_place = g_keys.light_place || ImGui::IsKeyPressed(ImGuiKey_L, false);
+    const bool light_remove = g_keys.light_remove || ImGui::IsKeyPressed(ImGuiKey_K, false);
+    const bool light_kind = g_keys.light_kind || ImGui::IsKeyPressed(ImGuiKey_J, false);
     if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     float mouse[2] = {g_keys.mouse[0], g_keys.mouse[1]};
     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
@@ -179,6 +202,9 @@ class Overlay final : public rex::ui::ImGuiDialog {
     g_keys.reset = reset;
     g_keys.leave = leave;
     g_keys.switch_mode = switch_mode;
+    g_keys.light_place = light_place;
+    g_keys.light_remove = light_remove;
+    g_keys.light_kind = light_kind;
     g_keys.mouse[0] = mouse[0];
     g_keys.mouse[1] = mouse[1];
   }
@@ -323,6 +349,7 @@ void OnPad(const pad::Snapshot& pad) {
     keys = g_keys;
     g_keys.mouse[0] = g_keys.mouse[1] = 0.0f;
     g_keys.reset = g_keys.leave = g_keys.switch_mode = false;
+    g_keys.light_place = g_keys.light_remove = g_keys.light_kind = false;
   }
   if ((pressed & X_INPUT_GAMEPAD_B) || keys.leave) {
     SetOn(false);
@@ -357,6 +384,17 @@ void OnPad(const pad::Snapshot& pad) {
     }
   } else {
     g_paused_view = false;
+  }
+  // Night lights (time of day on; not in a replay: the replay's frames
+  // aren't where the camera is).
+  if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
+    if ((pressed & X_INPUT_GAMEPAD_DPAD_UP) || keys.light_place) notice::Show(night_lights::Place());
+    if ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) || keys.light_remove) {
+      notice::Show(night_lights::RemoveNearest());
+    }
+    if ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) || keys.light_kind) {
+      notice::Show(night_lights::NextKind());
+    }
   }
   if ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) || keys.switch_mode) {
     const Mode m = g_mode.load() == Mode::kNoclip ? Mode::kView : Mode::kNoclip;

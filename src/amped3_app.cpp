@@ -48,6 +48,7 @@
 #include "graphics_panel.h"
 #include "guest_waits.h"
 #include "live_renderer.h"
+#include "night_lights.h"
 #include "options_graphics.h"
 #include "options_menu.h"
 #include "pad_bridge.h"
@@ -299,6 +300,7 @@ void Amped3App::OnPostInitLogging() {
   amped3::crash::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::capture::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::camera_scan::Install(rex::filesystem::GetExecutableFolder() / "logs");
+  amped3::night_lights::Install(rex::filesystem::GetExecutableFolder() / "lights");
 
   // Paths are resolved before the log file opens, so report them here.
   if (game_dir_.empty()) {
@@ -586,6 +588,7 @@ void Amped3App::StartControllerHotkeyWatcher() {
       // button is up.
       amped3::freecam::OnPad(pad);
       amped3::replay::OnPad(pad);
+      amped3::night_lights::Tick();
       if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ &&
           !graphics_panel_open_ && !amped3::freecam::Active() && !amped3::replay::Active()) {
         unblock_when_released_ = false;
