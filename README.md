@@ -452,10 +452,13 @@ worked out from that, so it fits each mountain's own look.
   lighting does: its colors and surface directions) with a glow round each
   in the air. Placed from the freecam with time of day on: aim the cross at
   the middle of the screen, D-pad up / L places a light there, D-pad right /
-  J picks the kind, D-pad left / K removes the nearest one. Kept per mountain
-  in `lights\<id>.txt` next to the logs folder (one light a line:
-  x y z  r g b  radius intensity), so they can be shared. Lights found by
-  themselves on lifts and buildings are still to come.
+  J picks the kind, D-pad left / K removes the nearest one. A / O puts a
+  light on every copy of the object aimed at (each tower of a lift, each lamp
+  post: the object is told by its mesh, and copies light up as they come
+  into view); removing one of those removes them all. Kept per mountain in
+  `lights\<id>.txt` next to the logs folder (one light a line:
+  x y z  r g b  radius intensity; `T` lines the every-copy ones), so they can
+  be shared.
 
 ## Subtitles
 
