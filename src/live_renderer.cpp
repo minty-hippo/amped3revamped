@@ -44,6 +44,7 @@
 #include "live_present.h"
 #include "night_pass.h"
 #include "notice.h"
+#include "xm_radio.h"
 #include "perf_overlay.h"
 #include "perf_trace.h"
 #include "thread_qos.h"
@@ -767,9 +768,19 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
     REXLOG_INFO("Weather: {}", kWeather[next].name);
     if (next != prev_kind) {
       // (What's coming, as it starts to ease in.)
+      // In the game's own song popup when it's there (line 1, 2, and the
+      // short cyan line 3), else the port's notice.
       static constexpr const char* kComing[4] = {"The sky is clearing", "Clouds are rolling in",
                                                  "It's starting to snow", "A blizzard is blowing in"};
-      notice::Show(kComing[next]);
+      static constexpr const char* kPopup[4][3] = {{"Weather Report", "Skies clearing", "Clear"},
+                                                   {"Weather Report", "Clouds rolling in", "Overcast"},
+                                                   {"Weather Report", "Snow is falling", "Snowing"},
+                                                   {"Weather Alert", "Blizzard warning", "Whiteout"}};
+      if (xm_radio::Available()) {
+        xm_radio::Alert(kPopup[next][0], kPopup[next][1], kPopup[next][2]);
+      } else {
+        notice::Show(kComing[next]);
+      }
     }
   }
   // Easing toward it: the sky over a minute or so, snow and mist a little

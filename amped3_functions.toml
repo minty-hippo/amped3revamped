@@ -181,8 +181,13 @@ name = "Amped3_GuiLuaLoad"
 address = 0x821A0BF0
 registers = ["r4", "r5", "r6"]
 
-# The song popup (src/xm_radio.cpp): its show, sub_8253DE00, at its start
-# (r3 = the popup's object).
+# The song popup (src/xm_radio.cpp): its node lookup, sub_8253DC28, and its
+# show, sub_8253DE00, at their starts (r3 = the popup's object).
+[[midasm_hook]]
+name = "Amped3_XmRadioSetup"
+address = 0x8253DC28
+registers = ["r3"]
+
 [[midasm_hook]]
 name = "Amped3_XmRadioShow"
 address = 0x8253DE00

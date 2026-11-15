@@ -1,40 +1,55 @@
-// amped3 - the game's song popup (xm_radio.h).
+// amped3 - the game's song popup, for the port's alerts (xm_radio.h).
 
 #include "xm_radio.h"
 
-#include "challenges.h"
-
 #include <atomic>
-#include <chrono>
-#include <cstdint>
 #include <cstring>
-#include <string>
-#include <utility>
-#include <vector>
+#include <mutex>
 
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+REX_EXTERN(__imp__sub_8253DE00);  // the popup's show
+
 namespace amped3::xm_radio {
 namespace {
 
-bool g_scanned = false;
-bool g_scanned_refs = false;
-// The strings found (address, text): pointers to them searched for too.
-std::vector<std::pair<uint32_t, std::string>> g_found;
+constexpr uint32_t kVtable = 0x82083830u;
+constexpr uint32_t kNodes[3] = {152u, 160u, 156u};  // line 1 (band), 2 (song), 3 (label)
+constexpr uint32_t kText = 52u;                      // a node's shown string
+constexpr uint32_t kState = 140u;                    // 2: showing
+constexpr size_t kMax[3] = {18, 18, 13};             // characters before "..."
+constexpr uint32_t kSlot = 128u;                     // our strings: 3 slots
+
+std::atomic<uint32_t> g_object{0};  // the popup's object (from the hooks)
+std::mutex g_mutex;
+bool g_pending = false;
+std::string g_lines[3];
+uint32_t g_strings = 0;  // our strings' guest memory (3 slots)
 
 rex::memory::Memory* GuestMemory() {
   auto* kernel = rex::system::kernel_state();
   return kernel ? kernel->memory() : nullptr;
 }
 
+uint32_t Load32(const uint8_t* base, uint32_t a) {
+  const uint8_t* p = base + a;
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+void Store32(uint8_t* base, uint32_t a, uint32_t v) {
+  uint8_t* p = base + a;
+  p[0] = uint8_t(v >> 24);
+  p[1] = uint8_t(v >> 16);
+  p[2] = uint8_t(v >> 8);
+  p[3] = uint8_t(v);
+}
+
 bool Readable(rex::memory::Memory* memory, uint32_t address, uint32_t size) {
   auto* heap = memory->LookupHeap(address);
   if (!heap) return false;
   if (heap->QueryRangeAccess(address, address + size - 1) == rex::memory::PageAccess::kNoAccess) return false;
-  // Committed (reserved pages can carry a protection with nothing behind them).
   for (uint32_t a = address & ~0xFFFu; a < address + size; a += 0x1000u) {
     rex::memory::HeapAllocationInfo info{};
     if (!heap->QueryRegionInfo(a, &info) || !(info.state & rex::memory::kMemoryAllocationCommit)) return false;
@@ -42,254 +57,93 @@ bool Readable(rex::memory::Memory* memory, uint32_t address, uint32_t size) {
   return true;
 }
 
-// Printable ASCII text at p (up to its end), or "".
-std::string TextAt(const uint8_t* p, size_t max) {
-  std::string s;
-  for (size_t i = 0; i < max && p[i]; ++i) {
-    if (p[i] < 32 || p[i] > 126) return {};
-    s += char(p[i]);
+// The popup's object, if it's still one (on this mountain).
+uint32_t LiveObject(rex::memory::Memory* memory, uint8_t* base) {
+  const uint32_t o = g_object.load();
+  if (!o || !Readable(memory, o, 0xA4) || Load32(base, o) != kVtable) return 0;
+  for (uint32_t n : kNodes) {
+    const uint32_t node = Load32(base, o + n);
+    if (!node || !Readable(memory, node, 0x60)) return 0;
   }
-  return s;
+  return o;
 }
 
-// On a mountain (the HUD's scenes made): where the game keeps pointers to
-// the popup's field names and its scene (tables and objects), and what the
-// scene's holder points at.
-void ScanRefs(rex::memory::Memory* memory) {
-  uint8_t* base = memory->virtual_membase();
-  struct Want {
-    uint32_t value;
-    const char* what;
-  };
-  const Want wants[] = {
-      {0x82046974u, "XMRadioBandTitleText"}, {0x8204698Cu, "XMRadioMusicTypeText"},
-      {0x820469A4u, "XMRadioSongTitleText"}, {0x8205E514u, "\"XMRadio\""},
-      {0x8253D960u, "the XMRadio holder's getter (sub_8253D960)"},
-      {0x8286EAF8u, "the XMRadio holder (0x8286EAF8)"},
-  };
-  auto be32 = [&](uint32_t a) {
-    const uint8_t* p = base + a;
-    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
-  };
-  if (Readable(memory, 0x8286EAF8u, 16)) {
-    REXLOG_INFO("XM Radio popup: holder 0x8286EAF8 = {:08X} {:08X} {:08X} {:08X}", be32(0x8286EAF8u),
-                be32(0x8286EAFCu), be32(0x8286EB00u), be32(0x8286EB04u));
-    // What it points at, its first words.
-    const uint32_t obj = be32(0x8286EAF8u);
-    if (obj && Readable(memory, obj, 4) && Readable(memory, obj + 252, 4)) {
-      std::string line;
-      for (uint32_t i = 0; i < 64; ++i) line += fmt::format("{:08X}{}", be32(obj + i * 4), i % 8 == 7 ? " | " : " ");
-      REXLOG_INFO("XM Radio popup: object {:08X}: {}", obj, line);
-    }
+// Our string in slot i: header (the game's allocator, as its own strings
+// have; length; capacity; a reference count never run down), then the text.
+uint32_t PutString(uint8_t* base, int i, const std::string& text, uint32_t allocator) {
+  const uint32_t at = g_strings + uint32_t(i) * kSlot;
+  std::string t = text;
+  if (t.size() > kMax[i]) t = t.substr(0, kMax[i] - 3) + "...";
+  const uint32_t cap = (kSlot - 16) / 2 - 1;
+  if (t.size() > cap) t.resize(cap);
+  Store32(base, at + 0, allocator);
+  Store32(base, at + 4, uint32_t(t.size()));
+  Store32(base, at + 8, cap);
+  Store32(base, at + 12, 0x10000000u);
+  uint8_t* c = base + at + 16;
+  for (size_t k = 0; k < t.size(); ++k) {
+    c[k * 2] = 0;
+    c[k * 2 + 1] = uint8_t(t[k]);
   }
-  // (Page by page, 4 KB each, only those readable: a 64 KB range can have
-  // holes.) The image's data first: tables of names are kept there.
-  constexpr uint32_t kPage = 0x1000u;
-  int logged = 0;
-  const uint32_t ranges[][2] = {{0x82000000u, 0x83000000u}};
-  for (const auto& r : ranges) {
-    for (uint64_t page = r[0]; page < r[1] && logged < 80; page += kPage) {
-      if (!Readable(memory, uint32_t(page), kPage)) continue;
-      for (uint32_t i = 0; i < kPage; i += 4) {
-        const uint32_t v = be32(uint32_t(page) + i);
-        if ((v & 0xFF000000u) != 0x82000000u) continue;
-        for (const auto& w : wants) {
-          if (v != w.value) continue;
-          REXLOG_INFO("XM Radio popup: {} pointed to from {:08X}", w.what, uint32_t(page) + i);
-          ++logged;
-        }
-        for (const auto& [a, text] : g_found) {
-          if (v != a) continue;
-          REXLOG_INFO("XM Radio popup: '{}' pointed to from {:08X}", text, uint32_t(page) + i);
-          ++logged;
-        }
-      }
-    }
-  }
-  REXLOG_INFO("XM Radio popup: {} pointers found", logged);
-}
-
-// ---- the popup's object, at run time --------------------------------------
-// Its class (sub_8253D970 makes one): vtable 0x82883830; +136, +137 flags,
-// +140 state (2: showing), +144 timer, +148 its animations, +152 / +156 /
-// +160 its text nodes (band, genre, song: sub_8253DC28 looks them up by
-// name). Found by its vtable in the game's heap; its nodes' text found by
-// following their pointers to UTF-16 text.
-constexpr uint32_t kVtable = 0x82883830u;
-uint32_t g_object = 0;
-// Set by the hook on its show (sub_8253DE00): the object, and when (the
-// watcher logs it then and a second later, after its text's set).
-std::atomic<uint32_t> g_shown{0};
-std::atomic<int64_t> g_shown_ms{0};
-int g_logs_done = 0;
-double g_next_look = 0.0;
-bool g_text_logged = false;
-
-uint32_t Be32(uint8_t* base, uint32_t a) {
-  const uint8_t* p = base + a;
-  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
-}
-
-// UTF-16BE text at a (printable, 2..64 characters, shown with a "u:"), or
-// 8-bit text (3..64), or "".
-std::string Utf16At(rex::memory::Memory* memory, uint8_t* base, uint32_t a) {
-  if (!Readable(memory, a, 2)) return {};
-  {
-    std::string s;
-    bool ok = true;
-    for (int i = 0; i < 64; ++i) {
-      if (!Readable(memory, a + i, 1)) {
-        ok = false;
-        break;
-      }
-      const uint8_t c = base[a + i];
-      if (c == 0) break;
-      if (c < 32 || c > 126) {
-        ok = false;
-        break;
-      }
-      s += char(c);
-    }
-    if (ok && s.size() >= 3) return s;
-  }
-  std::string s;
-  for (int i = 0; i < 64; ++i) {
-    if (!Readable(memory, a + i * 2, 2)) return {};
-    const uint16_t c = uint16_t(base[a + i * 2] << 8 | base[a + i * 2 + 1]);
-    if (c == 0) break;
-    if (c < 32 || c > 126) return {};
-    s += char(c);
-  }
-  return s.size() >= 2 ? "u:" + s : std::string();
-}
-
-void LookAtObject(rex::memory::Memory* memory, double now) {
-  uint8_t* base = memory->virtual_membase();
-  (void)now;
-  if (!g_object || !Readable(memory, g_object, 0xA4)) return;
-  // Each text node: its words, and any that lead to UTF-16 text (directly,
-  // or one pointer further).
-  bool any = false;
-  std::string report;
-  for (uint32_t field : {152u, 156u, 160u}) {
-    const uint32_t node = Be32(base, g_object + field);
-    report += fmt::format(" | +{} node {:08X}:", field, node);
-    if (!node || !Readable(memory, node, 0x100)) continue;
-    for (uint32_t off = 0; off < 0x100; off += 4) {
-      const uint32_t v = Be32(base, node + off);
-      if (v < 0x40000000u || v >= 0xC0000000u) continue;
-      std::string t = Utf16At(memory, base, v);
-      if (!t.empty()) {
-        report += fmt::format(" [+{} -> '{}']", off, t);
-        any = true;
-        continue;
-      }
-      if (!Readable(memory, v, 0x40)) continue;
-      for (uint32_t o2 = 0; o2 < 0x40; o2 += 4) {
-        const uint32_t w = Be32(base, v + o2);
-        if (w < 0x40000000u || w >= 0xC0000000u) continue;
-        t = Utf16At(memory, base, w);
-        if (!t.empty()) {
-          report += fmt::format(" [+{} -> +{} -> '{}']", off, o2, t);
-          any = true;
-        }
-      }
-    }
-  }
-  const uint32_t state = Be32(base, g_object + 140);
-  {
-    std::string words;
-    for (uint32_t i = 0; i < 64; ++i) words += fmt::format("{:08X} ", Be32(base, g_object + i * 4));
-    REXLOG_INFO("XM Radio popup: object {:08X} (state {}): {}", g_object, state, words);
-    REXLOG_INFO("XM Radio popup: text{}", report);
-    // The nodes themselves.
-    for (uint32_t field : {152u, 156u, 160u}) {
-      const uint32_t node = Be32(base, g_object + field);
-      if (!node || !Readable(memory, node, 0x100)) continue;
-      std::string nw;
-      for (uint32_t i = 0; i < 64; ++i) nw += fmt::format("{:08X} ", Be32(base, node + i * 4));
-      REXLOG_INFO("XM Radio popup: node +{} {:08X}: {}", field, node, nw);
-      // What its pointers lead to (16 words each).
-      for (uint32_t i = 0; i < 64; ++i) {
-        const uint32_t v = Be32(base, node + i * 4);
-        if (v < 0x40000000u || v >= 0xC0000000u || !Readable(memory, v, 64)) continue;
-        std::string tw;
-        for (uint32_t k = 0; k < 16; ++k) tw += fmt::format("{:08X} ", Be32(base, v + k * 4));
-        REXLOG_INFO("XM Radio popup:   node +{} word +{} -> {:08X}: {}", field, i * 4, v, tw);
-      }
-    }
-  }
+  c[t.size() * 2] = 0;
+  c[t.size() * 2 + 1] = 0;
+  return at + 16;
 }
 
 }  // namespace
 
-void Tick() {
-  // The popup shown (the hook): its object and text, then and a second on
-  // (the first two shows).
-  if (const uint32_t shown = g_shown.load(); shown && g_logs_done < 4) {
-    if (auto* memory = GuestMemory()) {
-      const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
-      const int64_t since = ms - g_shown_ms.load();
-      if ((g_logs_done % 2 == 0) || since >= 1000) {
-        g_object = shown;
-        REXLOG_INFO("XM Radio popup: shown, object {:08X}, {} ms on", shown, since);
-        LookAtObject(memory, 0.0);
-        ++g_logs_done;
-        if (g_logs_done % 2 == 0) g_shown = 0;
-      }
-    }
-  }
-  if (g_scanned && !g_scanned_refs) {
-    if (auto* memory = GuestMemory(); memory && !challenges::LoadedLevel().empty()) {
-      g_scanned_refs = true;
-      ScanRefs(memory);
-    }
-    return;
-  }
-  if (g_scanned) return;
+bool Available() {
   auto* memory = GuestMemory();
-  if (!memory) return;
-  uint8_t* base = memory->virtual_membase();
-  // The image: 0x82000000 on (its code and read-only data), in 64 KB pages.
-  constexpr uint32_t kStart = 0x82000000u, kEnd = 0x83000000u, kPage = 0x10000u;
-  if (!Readable(memory, kStart, 4)) return;
-  g_scanned = true;
-  // (The song popup is the "Chiron": ARTIST: / SONG: in the string table.)
-  const char* keys[] = {"XMRadio", "SongTitle", "BandName", "MusicType", "XMRADIO", "Chiron", "chiron", "CHIRON"};
-  int found = 0;
-  for (uint32_t page = kStart; page < kEnd; page += kPage) {
-    if (!Readable(memory, page, kPage)) continue;
-    const uint8_t* p = base + page;
-    for (uint32_t i = 0; i < kPage; ++i) {
-      // The start of a string: after a zero byte.
-      if (i > 0 && p[i - 1] != 0) continue;
-      if (page + i + 64 >= kEnd || (i + 64 >= kPage && !Readable(memory, page + kPage, 64))) continue;
-      const std::string s = TextAt(p + i, 64);
-      if (s.size() < 6) continue;
-      for (const char* k : keys) {
-        if (s.find(k) == std::string::npos) continue;
-        g_found.push_back({page + i, s});
-        REXLOG_INFO("XM Radio popup: string '{}' at {:08X} (lis {}, addi {})", s, page + i,
-                    int16_t(((page + i) + 0x8000) >> 16), int16_t((page + i) & 0xFFFF));
-        ++found;
-        break;
-      }
+  return memory && LiveObject(memory, memory->virtual_membase()) != 0;
+}
+
+void Alert(const std::string& line1, const std::string& line2, const std::string& line3) {
+  std::lock_guard lock(g_mutex);
+  g_lines[0] = line1;
+  g_lines[1] = line2;
+  g_lines[2] = line3;
+  g_pending = true;
+}
+
+void GameTick(uint8_t* base, uint32_t r1, uint32_t r13) {
+  std::string lines[3];
+  {
+    std::lock_guard lock(g_mutex);
+    if (!g_pending) return;
+    auto* memory = GuestMemory();
+    if (!memory) return;
+    const uint32_t o = LiveObject(memory, base);
+    // (Not over a song's own: after it.)
+    if (!o || Load32(base, o + kState) == 2) return;
+    if (!g_strings) {
+      g_strings = memory->SystemHeapAlloc(kSlot * 3);
+      if (!g_strings) return;
     }
+    g_pending = false;
+    for (int i = 0; i < 3; ++i) lines[i] = g_lines[i];
+    for (int i = 0; i < 3; ++i) {
+      const uint32_t node = Load32(base, o + kNodes[i]);
+      // (The allocator word from the node's own string.)
+      const uint32_t old = Load32(base, node + kText);
+      const uint32_t allocator = old >= 16 && Readable(memory, old - 16, 16) ? Load32(base, old - 16) : 0;
+      Store32(base, node + kText, PutString(base, i, lines[i], allocator));
+    }
+    REXLOG_INFO("Song popup: alert '{}' / '{}' / '{}'", lines[0], lines[1], lines[2]);
   }
-  REXLOG_INFO("XM Radio popup: {} strings found in the game's image", found);
-  // (The tables in the image's data are there from the start.)
-  ScanRefs(memory);
+  // Shown as the game shows it at a new track.
+  {
+    const uint32_t o = g_object.load();
+    PPCContext ctx{};
+    ctx.r1.u64 = (r1 - 0x2000) & ~0xFull;
+    ctx.r13.u64 = r13;
+    ctx.r3.u64 = o;
+    __imp__sub_8253DE00(ctx, base);
+  }
 }
 
 }  // namespace amped3::xm_radio
 
-// The popup's show (sub_8253DE00, at its start: r3 = the object).
-void Amped3_XmRadioShow(PPCRegister& r3) {
-  using namespace amped3::xm_radio;
-  g_shown_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-                   .count();
-  g_shown = r3.u32;
-}
+// The popup's node lookup (sub_8253DC28, at its start: r3 = the object) and
+// its show (sub_8253DE00, at its start: r3 = the object): which object it is.
+void Amped3_XmRadioSetup(PPCRegister& r3) { amped3::xm_radio::g_object = r3.u32; }
+void Amped3_XmRadioShow(PPCRegister& r3) { amped3::xm_radio::g_object = r3.u32; }

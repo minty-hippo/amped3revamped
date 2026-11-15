@@ -31,6 +31,7 @@
 #include "cutscenes.h"
 
 #include "challenges.h"
+#include "xm_radio.h"
 
 namespace amped3::rail_trace {
 void Tick(uint8_t* base);  // src/rail_trace.cpp
@@ -476,6 +477,7 @@ void Amped3_CutsceneTick(PPCRegister& r1, PPCRegister& r13, PPCRegister& r31) {
       uint8_t* base = memory->virtual_membase();
       StartQueued(base, int(Load32(base, kStateMachine + 8)));
       amped3::challenges::GameTick(base, r1.u32, r13.u32);
+      amped3::xm_radio::GameTick(base, r1.u32, r13.u32);
       amped3::rail_trace::Tick(base);
     }
   }

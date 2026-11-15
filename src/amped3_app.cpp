@@ -371,6 +371,13 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                             text = "Time of day: on (Northstar keeps its own hour until you earn the Night Pass)";
                           }
                           amped3::notice::Show(text);
+                          // (And in the song popup, on a mountain: what the
+                          // weather's doing.)
+                          if (on && amped3::xm_radio::Available()) {
+                            const std::string wx = amped3::live::WeatherName();
+                            amped3::xm_radio::Alert("Weather Report", wx.empty() ? "Time of day on" : "Now: " + wx,
+                                                    "Live");
+                          }
                         });
   rex::ui::RegisterBind(kFreecamBind, "F6", "Freecam on or off (fly the camera; the HUD hidden)",
                         [] { amped3::freecam::Toggle(); });
@@ -599,7 +606,6 @@ void Amped3App::StartControllerHotkeyWatcher() {
       amped3::replay::OnPad(pad);
       amped3::night_lights::Tick();
       amped3::night_pass::Tick();
-      amped3::xm_radio::Tick();
       if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ &&
           !graphics_panel_open_ && !amped3::freecam::Active() && !amped3::replay::Active()) {
         unblock_when_released_ = false;

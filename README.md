@@ -435,8 +435,9 @@ that rule against a save that has the pass.
   behind what's in front of them, lit by the sky and by the night lights
   near them); and now and then a blizzard (strong wind streaking the snow
   sideways, the fog closing in to a few dozen metres). Or one of them fixed.
-  A notice says what's coming as the weather turns (F5's notice says what
-  it is); the clouds drift faster in the wind; in a heavy snowstorm the
+  As the weather turns it's announced in the game's own song popup (the XM
+  Radio box: "Weather Alert / Blizzard warning / Whiteout"), or a notice
+  where there's no popup (F5 on a mountain shows the weather in it too); the clouds drift faster in the wind; in a heavy snowstorm the
   night lights come on part way by day.
   The wind moves the trees (Time of Day: Wind in the Trees,
   `native_wind_sway`): their foliage sways with it and flutters, whole trees
