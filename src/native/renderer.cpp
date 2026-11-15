@@ -1860,7 +1860,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1901,7 +1901,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[45] = {};  // by CopyKind
+  VkShaderModule copy_fs_[47] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2147,6 +2147,20 @@ struct Renderer::Impl {
   float cloud_here_ = 0.0f;  // the clouds' shade at the camera (for the riders: 0..1)
   Image bloom_a_, bloom_b_, bloom_out_;
   Image* BloomScene(Image* scene);
+  // Volumetric light (SetVolumetric): the air lit by the sun (or moon) where
+  // it reaches, shadowed by the world's maps and the clouds: shafts through
+  // trees, past ridges, under clouds; thicker in mist, overcast and falling
+  // snow, and low down. Half size, marched; added to the scene. The night
+  // lights' own (their light in the air) in their pass. Replaces the god
+  // rays while on.
+  float volumetric_ = 0.0f;
+  Image vol_img_, vol_params_, vol_out_;
+  float vol_shadow_pc_[32] = {};
+  bool vol_shadow_ok_ = false, vol_world_ok_ = false;
+  float vol_cloud_[4] = {};
+  float VolumeDensity() const;  // the air's (per metre, at the camera's height)
+  bool VolumeOn() const { return volumetric_ > 0.0f && TodOn() && !Diag("novolume"); }
+  Image* VolumeScene(Image* scene);
   bool snow_done_ = false;
   Image* snow_result_ = nullptr;
   Image snow_img_;
@@ -3134,6 +3148,10 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (fog) {
         if (Image* fogged = FoggedScene(scene)) scene = fogged;
         MarkPart("effect: fog / god rays");
+      }
+      if (VolumeOn()) {
+        if (Image* lit_air = VolumeScene(scene)) scene = lit_air;
+        MarkPart("effect: volumetric light");
       }
       if (tod_sky && tod_.snow > 0.002f) {
         if (Image* snowy = SnowScene(scene)) scene = snowy;
@@ -5262,6 +5280,159 @@ void main() {
   }
 }
 )", true);
+  // Volumetric light, 1 (half size): along each pixel's ray, the air lit by
+  // the sun (or moon) where its maps say it reaches (the casters' near the
+  // camera, the world's farther: trees, props, the slopes) and the clouds
+  // don't cover; thicker low down. Steps jittered per pixel (smoothed after).
+  copy_fs_[45] = CompileBuiltin("builtin_volume", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D depth;    // full size (0: nothing)
+layout(set = 0, binding = 1) uniform sampler2D casters;  // from the sun: depth, 1 = nothing
+layout(set = 0, binding = 2) uniform sampler2D world;    // the world map
+layout(set = 0, binding = 3) uniform sampler2D params;   // 8 x 1 (below)
+layout(push_constant) uniform Maps {
+  mat4 m;                    // ndc (x, y, 1 - depth, 1) -> world
+  vec4 o0; vec4 o1; vec4 o2; // the casters' map's rows
+  vec4 a;                    // the world map's from the casters': offset x, y, scale k, flags
+} pc;
+layout(location = 0) out vec4 o;
+// params: 0 camera, the farthest (m); 1 the light's color, the air's density
+// (/m); 2 toward the light, its forward scattering (g); 3 the height it's
+// densest at, how fast it thins (/m), steps, maps (1 casters, 2 world);
+// 4 the clouds: cover, clock, height, darkness; 5 1 / size (here), the
+// depth's size.
+vec4 P(int i) { return texelFetch(params, ivec2(i, 0), 0); }
+float hash(vec2 p) {
+  p = fract(p * vec2(443.897, 441.423));
+  p += dot(p, p.yx + 19.19);
+  return fract((p.x + p.y) * p.x);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), w.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), w.x), w.y);
+}
+float Clouds(vec3 X, vec3 L, vec4 c) {
+  if (c.w <= 0.0) return 0.0;
+  vec2 q = X.xz + L.xz * (c.z / max(L.y, 0.08));
+  vec2 p = q / c.z * 0.9 + vec2(c.y * 0.006, c.y * 0.0025);
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 3; ++i) {
+    v += a * noise(p);
+    p = p * 2.03 + vec2(17.1, 9.7);
+    a *= 0.5;
+  }
+  v += 0.06;  // (the octaves left out, on average)
+  return c.w * smoothstep(1.0 - c.x - 0.03, 1.0 - c.x + 0.1, v);
+}
+float Sun(vec3 X, int maps, float dpm) {
+  vec4 Q = vec4(X, 1.0);
+  float lit = 1.0;
+  if ((maps & 1) != 0) {
+    vec2 st = vec2(dot(pc.o0, Q), dot(pc.o1, Q));
+    float n = float(textureSize(casters, 0).x);
+    vec2 tc = (0.5 + 0.5 * st) * n;
+    if (all(greaterThan(tc, vec2(1.0))) && all(lessThan(tc, vec2(n - 1.0)))) {
+      float z = texelFetch(casters, ivec2(tc), 0).r;
+      if (z < 1.0 && z < dot(pc.o2, Q) - 0.1 * dpm) lit = 0.0;
+    }
+  }
+  if ((maps & 2) != 0 && lit > 0.0) {
+    vec2 st = vec2(dot(pc.o0, Q), dot(pc.o1, Q)) * pc.a.z + pc.a.xy;
+    float n = float(textureSize(world, 0).x);
+    vec2 tc = (0.5 + 0.5 * st) * n;
+    if (all(greaterThan(tc, vec2(1.0))) && all(lessThan(tc, vec2(n - 1.0)))) {
+      float z = texelFetch(world, ivec2(tc), 0).r;
+      if (z < 1.0 && z < dot(pc.o2, Q) - 0.4 * dpm) lit = 0.0;
+    }
+  }
+  return lit;
+}
+void main() {
+  vec4 p0 = P(0), p1 = P(1), p2 = P(2), p3 = P(3), p4 = P(4), p5 = P(5);
+  vec2 uv = gl_FragCoord.xy * p5.xy;
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  float d = texelFetch(depth, ivec2(uv * p5.zw), 0).r;
+  vec3 cam = p0.xyz;
+  vec4 wf = pc.m * vec4(ndc, 0.5, 1.0);
+  vec3 dir = normalize(wf.xyz / wf.w - cam);
+  float dist = p0.w;
+  if (d > 0.0) {
+    vec4 wp = pc.m * vec4(ndc, 1.0 - d, 1.0);
+    dist = min(length(wp.xyz / wp.w - cam), p0.w);
+  }
+  int maps = int(p3.w + 0.5);
+  float dpm = length(pc.o2.xyz);
+  vec3 L = p2.xyz;
+  int steps = int(p3.z + 0.5);
+  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  float acc = 0.0;
+  float tprev = 0.0;
+  for (int i = 0; i < steps; ++i) {
+    // (Closer together near the camera: finer shafts there.)
+    float f = (float(i) + jit) / float(steps);
+    float t = dist * f * (0.35 + 0.65 * f);
+    float tn = dist * min((float(i) + 1.0) / float(steps), 1.0);
+    vec3 X = cam + dir * t;
+    float h = X.y - p3.x;
+    float dens = p1.w * clamp(exp(-h * p3.y), 0.25, 3.0);
+    float vis = Sun(X, maps, dpm) * (1.0 - Clouds(X, L, p4));
+    float dt = max(tn * (0.35 + 0.65 * tn / dist) - tprev, 0.0);
+    tprev += dt;
+    acc += dens * vis * dt;
+  }
+  // Scattered toward the camera: more looking toward the light.
+  float cs = dot(dir, L);
+  float g = p2.w;
+  float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cs, 1.5);
+  float phase = 0.3 + 0.7 * min(hg, 3.5);
+  o = vec4(p1.rgb * acc * phase, dist);
+}
+)", true);
+  // Volumetric light, 2: added to the scene, smoothed from half size (what's
+  // at the same distance: not across an outline).
+  copy_fs_[46] = CompileBuiltin("builtin_volume_add", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D vol;    // half size: rgb light, a distance
+layout(set = 0, binding = 1) uniform sampler2D scene;
+layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(push_constant) uniform Add {
+  mat4 m;
+  vec4 a;  // 1 / width, 1 / height, strength, the farthest
+  vec4 b;  // camera
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(scene, ip, 0);
+  vec2 uv = gl_FragCoord.xy * pc.a.xy;
+  float d = texelFetch(depth, ip, 0).r;
+  float dist = pc.a.w;
+  if (d > 0.0) {
+    vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+    dist = min(length(wp.xyz / wp.w - pc.b.xyz), pc.a.w);
+  }
+  ivec2 hs = textureSize(vol, 0);
+  vec2 hp = uv * vec2(hs) - 0.5;
+  ivec2 base = ivec2(floor(hp));
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int y = -1; y <= 2; ++y) {
+    for (int x = -1; x <= 2; ++x) {
+      ivec2 q = clamp(base + ivec2(x, y), ivec2(0), hs - 1);
+      vec4 v = texelFetch(vol, q, 0);
+      vec2 dd = vec2(q) - hp;
+      float w = exp(-dot(dd, dd) * 0.6) * exp(-abs(v.a - dist) / (0.06 * dist + 0.4));
+      sum += v.rgb * w;
+      wsum += w;
+    }
+  }
+  vec3 add = wsum > 1e-4 ? sum / wsum : texture(vol, uv).rgb;
+  // (Screen-like: what's bright already takes less.)
+  vec3 lit = add * pc.a.z;
+  // (Rolled off: thick shafts toward a low sun not a white wall.)
+  lit /= 1.0 + 0.9 * dot(lit, vec3(0.3, 0.59, 0.11));
+  o = vec4(c.rgb + lit * (1.0 - 0.5 * clamp(c.rgb, 0.0, 1.0)), c.a);
+}
+)", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
   // the same way), a few hundred metres up, over each point toward the sun:
   // the sun's shadow mask darkened under them.
@@ -5410,6 +5581,7 @@ layout(push_constant) uniform Lights {
   vec4 cam;  // camera position, tile size (pixels)
   vec4 a;    // 1 / width, 1 / height, how dark it is (0..1), riders told apart (0/1)
   vec4 b;    // seconds, the scene's light on the fittings (0..1), shadow steps (0: none), -
+  vec4 c;    // the air's density for their light in it (volumetric: 0 none), -
 } pc;
 layout(location = 0) out vec4 o;
 
@@ -5785,6 +5957,33 @@ void main() {
       float facing = kind == 1 ? 0.25 + 0.75 * smoothstep(0.2, 0.9, dot(-dir, axis)) : 1.0;
       add += col * (0.55 * g * g + 0.12 * g) * facing * smoothstep(400.0, 150.0, t);
     }
+    // Its light in the air (volumetric: haze, mist, falling snow), along the
+    // ray through its reach: the in-scattering of a point light, worked out
+    // (no steps): 1 / (1 + a d^2) along the ray (most near it), within its radius.
+    if (pc.c.x > 0.0 && kk > 0.001 && kind != 2 && kind != 1) {
+      float r = lp.w * 0.55;  // (the air near it: its far reach too faint to show)
+      vec3 cl = dir * t - to;  // its nearest point on the ray, from the light
+      float hq = length(cl);
+      if (hq < r) {
+        float half_len = sqrt(r * r - hq * hq);
+        float s0 = max(0.0, t - half_len) - t;
+        float s1 = min(min(pix_dist, hit_t), t + half_len) - t;
+        if (s1 > s0) {
+          const float a = 1.0;
+          float bb = sqrt((1.0 + a * hq * hq) / a);
+          float I = (atan(s1 / bb) - atan(s0 / bb)) / (a * bb);
+          float x = hq / r;
+          float win = (1.0 - x * x) * (1.0 - x * x);
+          float dirf = 1.0;
+          if (kind == 4) {
+            // (A street light: down and round from its head.)
+            vec3 v = dir * clamp(t, t + s0, t + s1) - to;
+            dirf = smoothstep(-0.35, 0.25, dot(v / max(length(v), 1e-3), vec3(0.0, -1.0, 0.0))) * 1.25 + 0.04;
+          }
+          add += col * I * win * dirf * pc.c.x;
+        }
+      }
+    }
     // A floodlight's beam in the air (night mist): along the ray where it
     // passes through the cone, out to the light's reach.
     if (kind == 1 && kk > 0.001) {
@@ -5805,7 +6004,7 @@ void main() {
             float x = dd / lp.w;
             acc += cone * (1.0 - x * x) * (1.0 - x * x) / (1.0 + dd * dd * 0.08);
           }
-          add += col * acc * stp * 0.04;
+          add += col * acc * stp * (0.04 + pc.c.x * 0.25);
         }
       }
     }
@@ -9160,6 +9359,8 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   }
   // (No god rays from the moon, nor a sun below the horizon.)
   if (TodOn()) sun_visible *= float(tod_state_.sun_disc * (1.0 - tod_state_.night));
+  // (The volumetric light's shafts instead, while it's on.)
+  if (VolumeOn() && SunShadowsOn()) sun_visible = 0.0f;
   if (rays_strength_ > 0.0f && sun_visible > 0.0f) {
     const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
     ensure(ray_mask_img_, hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, "ray_mask", false);
@@ -9186,6 +9387,111 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   dyn_ = DynState{};
   fog_result_ = out == scene ? nullptr : out;
   return fog_result_;
+}
+
+// The air's density for the volumetric light (per metre, at the camera's
+// height): a little haze always; more under a grey sky, in mist (the fog),
+// and in falling snow.
+float Renderer::Impl::VolumeDensity() const {
+  const float overcast = std::clamp(tod_.overcast, 0.0f, 1.0f);
+  const float snow = std::clamp(tod_.snow, 0.0f, 1.0f);
+  const float mist = std::max(fog_density_, 0.0f) * fog_presence_;
+  return volumetric_ * (0.0004f + 0.0015f * overcast + 0.008f * snow + 0.003f * std::min(mist, 4.0f));
+}
+
+// Volumetric light: the sun's (or moon's) in the air, marched at half size
+// through the shadow maps, then added (builtin_volume / builtin_volume_add).
+Image* Renderer::Impl::VolumeScene(Image* scene) {
+  if (!vol_shadow_ok_ || !tod_movers_map_.image) return nullptr;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples > 1 ||
+      dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1) {
+    return nullptr;
+  }
+  Image* depth = &dit->second;
+  const tod::State& t = tod_state_;
+  // The light: the sun by day; the moon's, faint, at night.
+  const double day = 1.0 - t.night;
+  double col[3] = {t.sun_color.x * day + t.moon_color.x * t.night * t.moon_bright * 0.04,
+                   t.sun_color.y * day + t.moon_color.y * t.night * t.moon_bright * 0.04,
+                   t.sun_color.z * day + t.moon_color.z * t.night * t.moon_bright * 0.05};
+  // (Through a grey sky the sun's dimmed: little to make shafts.)
+  const double dim = 1.0 - 0.8 * std::clamp(double(tod_.overcast), 0.0, 1.0);
+  const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
+  // (A low sun lights the haze far more: shafts at either end of the day,
+  // little at noon.)
+  const double low = 1.0 - tod::SmoothStep(0.06, 0.5, t.sun_elevation);
+  for (double& c : col) c *= dim * e * (0.45 + 1.5 * low);
+  if (col[0] + col[1] + col[2] < 0.002) return nullptr;
+  const uint32_t w = scene->width, h = scene->height;
+  const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
+  EndRendering();
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(vol_img_, hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, "volume");
+  ensure(vol_params_, 8, 1, VK_FORMAT_R32G32B32A32_SFLOAT, "volume_params");
+  ensure(vol_out_, w, h, scene->format, "volume_lit");
+  vol_out_.scaled = scene->scaled;
+  vol_out_.scale = scene->scale;
+  // Toward the light: back along the sun map's depth axis.
+  double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
+  const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
+  if (!(fl > 1e-12)) return nullptr;
+  const float far_m = 220.0f;
+  const int steps = volumetric_ > 1.25f ? 48 : 28;
+  {
+    Buffer staging = gpu_.CreateBuffer(8 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    float* f = reinterpret_cast<float*>(staging.mapped);
+    std::memset(f, 0, 8 * 16);
+    f[0] = cam_pos_[0];
+    f[1] = cam_pos_[1];
+    f[2] = cam_pos_[2];
+    f[3] = far_m;
+    f[4] = float(col[0]);
+    f[5] = float(col[1]);
+    f[6] = float(col[2]);
+    f[7] = VolumeDensity();
+    for (int i = 0; i < 3; ++i) f[8 + i] = float(-fd[i] / fl);
+    f[11] = 0.55f;
+    f[12] = cam_pos_[1] - 30.0f;  // densest a little below the camera (in the valleys)
+    f[13] = 1.0f / 160.0f;
+    f[14] = float(steps);
+    f[15] = float(1 | (vol_world_ok_ ? 2 : 0));
+    std::memcpy(f + 16, vol_cloud_, sizeof(vol_cloud_));
+    f[20] = 1.0f / float(hw);
+    f[21] = 1.0f / float(hh);
+    f[22] = float(w);
+    f[23] = float(h);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {8, 1, 1};
+    Barrier();
+    vk::vkCmdCopyBufferToImage(cb_, staging.buffer, vol_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    staging_.push_back(staging);
+  }
+  Barrier();
+  FullscreenPass(CopyKind::kVolume, &vol_img_, depth, &tod_movers_map_, vol_world_ok_ ? &sun_env_ : &tod_movers_map_,
+                 false, vol_shadow_pc_, 32, nullptr, &vol_params_);
+  Barrier();
+  float pc[24] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+  }
+  pc[16] = 1.0f / float(w);
+  pc[17] = 1.0f / float(h);
+  pc[18] = 1.0f;
+  pc[19] = far_m;
+  pc[20] = cam_pos_[0];
+  pc[21] = cam_pos_[1];
+  pc[22] = cam_pos_[2];
+  FullscreenPass(CopyKind::kVolumeAdd, &vol_out_, &vol_img_, scene, depth, false, pc, 24);
+  Barrier();
+  dyn_ = DynState{};
+  return &vol_out_;
 }
 
 // Time of day, at the lighting pass: its sky-light table (tf1) tinted for
@@ -9626,6 +9932,7 @@ void Renderer::Impl::TodShadows() {
   draws.swap(tod_movers_draws_);
   tod_mask_ok_ = false;
   cloud_here_ = 0.0f;
+  vol_shadow_ok_ = false;
   if (!TodOn() || !SunShadowsOn() || !sun_env_.image) return;
   // Its own frame: the world map's axes, but only ~35 m each way, centred
   // a little ahead of the camera, 2048 texels (a couple of cm each: limbs
@@ -9731,6 +10038,14 @@ void Renderer::Impl::TodShadows() {
   }
   FullscreenPass(CopyKind::kTodShadow, clouds ? &tod_mask_raw_ : &tod_mask_, depth, &tod_movers_map_,
                  world ? &sun_env_ : nullptr, false, pc, 32, nullptr, world ? tod_normal_ : nullptr);
+  // (For the air's light later: the same maps.)
+  std::memcpy(vol_shadow_pc_, pc, sizeof(pc));
+  vol_shadow_ok_ = true;
+  vol_world_ok_ = world;
+  vol_cloud_[0] = cover;
+  vol_cloud_[1] = tod_.cloud_clock > 0.0f ? tod_.cloud_clock : tod_.seconds;
+  vol_cloud_[2] = 600.0f;
+  vol_cloud_[3] = clouds ? std::min(1.0f, 0.4f + cloud_dark) : 0.0f;
   Barrier();
   if (clouds) {
     float cp[24] = {};
@@ -10147,10 +10462,12 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   // The world's depth as the lighting had it (riders told apart), when kept.
   const bool have_world = lights_wdepth_ok_ && tod_albedo_ && lights_wdepth_.width == depth->width &&
                           lights_wdepth_.height == depth->height;
-  float pc[28] = {};
+  float pc[32] = {};
   for (int c = 0; c < 4; ++c) {
     for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
   }
+  // Their light in the air (volumetric).
+  pc[28] = VolumeOn() && !Diag("novolumelights") ? VolumeDensity() * 3.0f : 0.0f;
   {
     // The light on the fittings: the sky's and the sun's (or moon's), as the
     // hour has them; the exposure.
@@ -10171,7 +10488,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   pc[27] = Diag("lightshadowdbg") ? 1.0f : 0.0f;
   pc[26] = light_shadows_ == 0 || Diag("nolightshadows") ? 0.0f : light_shadows_ == 1 ? 10.0f : 20.0f;
   FullscreenPass(CopyKind::kTodLights, &lights_out_, scene, have_world ? &lights_wdepth_ : depth,
-                 &lights_img_, false, pc, 28, nullptr, tod_albedo_ ? tod_albedo_ : &dummy_,
+                 &lights_img_, false, pc, 32, nullptr, tod_albedo_ ? tod_albedo_ : &dummy_,
                  tod_normal_, depth);
   Barrier();
   dyn_ = DynState{};
@@ -12995,7 +13312,7 @@ Renderer::Impl::~Impl() {
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
-                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_}) {
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -13457,6 +13774,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
 void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
+void Renderer::SetVolumetric(float strength) { impl_->volumetric_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetClothTextures(const std::vector<uint64_t>& hashes) { impl_->cloth_extra_ = hashes; }
 void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }

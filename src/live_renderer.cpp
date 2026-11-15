@@ -251,6 +251,13 @@ REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
                     "Native renderer: light shafts from the sun (or moon) while it's in or near "
                     "view, broken up by clouds, trees and terrain in front of it");
+REXCVAR_DEFINE_DOUBLE(native_volumetric, 1.0, "GPU",
+                      "Time of day: volumetric light: the air lit by the sun or moon where it "
+                      "reaches (shafts through the trees, past ridges and under clouds; strongest "
+                      "with a low sun) and round the night lights; thicker in mist, under a grey "
+                      "sky and in falling snow. Replaces the god rays while on (with the sun's "
+                      "shadows). 0: off, up to 2 (above 1.25: finer)")
+    .range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(native_god_rays_strength, 1.0, "GPU",
                       "Native renderer: god ray strength (0..2)")
     .range(0.0, 2.0);
@@ -2403,6 +2410,7 @@ void WorkerMain() {
           renderer->SetBloom(float(REXCVAR_GET(native_bloom)));
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
+          renderer->SetVolumetric(float(REXCVAR_GET(native_volumetric)));
           {
             // (Read again only when it changes.)
             static std::string cloth_text = "\x01";

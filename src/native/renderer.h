@@ -373,6 +373,11 @@ class Renderer {
   // pushed aside piled beside them and where they skid (0: none; 1: as
   // deep as fresh snow takes them, up to 2).
   void SetSnowTracks(float depth);
+  // Volumetric light: the air lit by the sun or moon where it reaches
+  // (shafts through trees, past ridges, under clouds) and by the night
+  // lights; thicker in mist, overcast and snowfall. Replaces the god rays
+  // while on. 0: off, 1, up to 2.
+  void SetVolumetric(float strength);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

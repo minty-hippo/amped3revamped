@@ -518,6 +518,13 @@ const std::vector<Tab>& Tabs() {
                        "Native renderer only."),
                 SliderF("native_god_rays_strength", "God ray strength",
                         "How bright the light shafts are (0 = none).", "%.2f", 0.0, 2.0),
+                SliderF("native_volumetric", "Volumetric light",
+                        "With time of day on: the air itself lit by the sun or moon where it "
+                        "reaches: real shafts through the trees, past ridges and under the "
+                        "clouds (strongest with a low sun), and the night lights glowing in the "
+                        "air round them. Thicker in mist, under a grey sky and in falling snow. "
+                        "Replaces the god rays while on. 0: off; above 1.25 finer.",
+                        "%.1f", 0.0, 2.0),
                 Toggle("native_vertex_cache", "Reuse unchanged vertex data",
                        "Copies the game's vertex buffers only when the game has written to "
                        "them, instead of every frame. Turn off if geometry ever looks stale "

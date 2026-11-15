@@ -459,6 +459,15 @@ that rule against a save that has the pass.
   0.5): the sky's own clouds, where the sky shows them, drifting across the
   slopes with the wind, the riders shaded under them too. Fainter under a
   grey sky (the sun's already dimmed). Needs the sun's shadows.
+  Volumetric light (Time of Day / Effects: Volumetric Light,
+  `native_volumetric`, 1): the air itself is lit by the sun (or, faintly,
+  the moon) wherever it reaches, so real shafts fall through the trees,
+  past ridges and under drifting clouds: marched at half size through the
+  sun's shadow maps and the clouds, smoothed and added. Strongest with a
+  low sun, faint at noon. The night lights light the air round them too
+  (worked out per light, no steps; a floodlight's beam brighter). The air
+  is thicker under a grey sky, in mist and in falling snow, and in the
+  valleys. It replaces the screen-space god rays while it's on.
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and
