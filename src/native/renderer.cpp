@@ -1508,7 +1508,7 @@ struct Renderer::Impl {
   // view (their light, glow and fitting), nearest first, at most 128.
   // far: those seen from afar instead (as points of light, 150 m to 2.5 km,
   // at most 256).
-  std::vector<std::pair<float, size_t>> VisibleLights(bool far = false) const;
+  std::vector<std::pair<float, size_t>> VisibleLights(bool afar = false) const;
   void CenterRead();
   double tod_mask_rows_[12] = {};  // c6, c7, c9
   double tod_Om_[16] = {};         // the casters' map's rows (world -> its ndc, depth)
@@ -8740,7 +8740,7 @@ void Renderer::Impl::CenterRead() {
 }
 
 // Night lights, after the scene (builtin_night_lights): on as it gets dark.
-std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights(bool far) const {
+std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights(bool afar) const {
   std::vector<std::pair<float, size_t>> out;
   // The view's side planes and its front (Gribb / Hartmann, from world ->
   // clip), each normalised: a sphere wholly outside one is out of view.
@@ -8766,9 +8766,9 @@ std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights(bool far) co
     const float* p = l.pos;
     const float dx = p[0] - cam_pos_[0], dy = p[1] - cam_pos_[1], dz = p[2] - cam_pos_[2];
     const float d2 = dx * dx + dy * dy + dz * dz;
-    if (far ? (d2 < 150.0f * 150.0f || d2 >= 2500.0f * 2500.0f) : d2 >= 400.0f * 400.0f) continue;
-    if (far && l.preview) continue;
-    if (have && far) {
+    if (afar ? (d2 < 150.0f * 150.0f || d2 >= 2500.0f * 2500.0f) : d2 >= 400.0f * 400.0f) continue;
+    if (afar && l.preview) continue;
+    if (have && afar) {
       bool in = true;
       for (int k = 0; k < 5 && in; ++k) {
         in = planes[k][0] * p[0] + planes[k][1] * p[1] + planes[k][2] * p[2] + planes[k][3] > -2.0;
@@ -8789,7 +8789,7 @@ std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights(bool far) co
     out.push_back({d2, i});
   }
   std::sort(out.begin(), out.end());
-  if (out.size() > (far ? 256u : 128u)) out.resize(far ? 256 : 128);
+  if (out.size() > (afar ? 256u : 128u)) out.resize(afar ? 256 : 128);
   return out;
 }
 

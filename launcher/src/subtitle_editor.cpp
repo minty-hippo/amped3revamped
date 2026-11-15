@@ -312,8 +312,22 @@ double SubtitleEditor::PlayPositionMs() const {
   if (!stream_ || !audio_) return playhead_ms_;
   const size_t bytes_per_frame = size_t(audio_->channels) * 4;
   const size_t queued = size_t(std::max(0, SDL_GetAudioStreamQueued(stream_))) / bytes_per_frame;
-  const size_t at = feed_frame_ > queued ? feed_frame_ - queued : 0;
+  size_t at = feed_frame_ > queued ? feed_frame_ - queued : 0;
+  // (Looping: what's queued may run from the line's end back to its start.)
+  size_t lo, hi;
+  if (LoopSpan(&lo, &hi) && feed_frame_ >= lo && feed_frame_ - lo < queued) at = hi - (queued - (feed_frame_ - lo));
   return at * 1000.0 / audio_->freq;
+}
+
+// Looping the picked line: its span in frames (false: not looping).
+bool SubtitleEditor::LoopSpan(size_t* f0, size_t* f1) const {
+  if (!loop_ || !audio_ || selected_ < 0 || selected_ >= int(clips_.size())) return false;
+  const auto& c = clips_[size_t(selected_)];
+  if (line_ < 0 || line_ >= int(c.lines.size())) return false;
+  const auto& l = c.lines[size_t(line_)];
+  *f0 = std::min(audio_->frames, size_t(double(l.start_ms) * audio_->freq / 1000.0));
+  *f1 = std::min(audio_->frames, size_t(double(l.end_ms) * audio_->freq / 1000.0));
+  return *f1 > *f0 + size_t(audio_->freq / 20);
 }
 
 void SubtitleEditor::Feed() {
@@ -321,9 +335,12 @@ void SubtitleEditor::Feed() {
   const Audio& a = *audio_;
   const size_t bpf = size_t(a.channels) * 4;
   size_t queued = size_t(std::max(0, SDL_GetAudioStreamQueued(stream_))) / bpf;
-  const size_t want = size_t(a.freq * kQueueAhead);
-  while (queued < want && feed_frame_ < a.frames) {
-    const size_t n = std::min(size_t(a.freq / 25), a.frames - feed_frame_);
+  const size_t want = size_t(a.freq * kQueueAhead * std::max(1.0f, speed_));
+  size_t lo = 0, hi = a.frames;
+  const bool looping = LoopSpan(&lo, &hi);
+  while (queued < want && (looping || feed_frame_ < a.frames)) {
+    if (looping && (feed_frame_ >= hi || feed_frame_ < lo)) feed_frame_ = lo;
+    const size_t n = std::min(size_t(a.freq / 25), (looping ? hi : a.frames) - feed_frame_);
     SDL_PutAudioStreamData(stream_, a.pcm.data() + feed_frame_ * a.channels, int(n * bpf));
     feed_frame_ += n;
     queued += n;
@@ -341,7 +358,13 @@ void SubtitleEditor::StartPlaying() {
   }
   if (!EnsureStream(&stream_, &stream_channels_, &stream_freq_, *audio_, &status_)) return;
   if (playhead_ms_ >= audio_->Ms() - 30.0) playhead_ms_ = 0;
+  size_t lo, hi;
+  if (LoopSpan(&lo, &hi)) {
+    const double a = lo * 1000.0 / audio_->freq, b = hi * 1000.0 / audio_->freq;
+    if (playhead_ms_ < a || playhead_ms_ >= b - 30.0) playhead_ms_ = a;
+  }
   SDL_ClearAudioStream(stream_);
+  SDL_SetAudioStreamFrequencyRatio(stream_, speed_);
   feed_frame_ = std::min(audio_->frames, size_t(playhead_ms_ * audio_->freq / 1000.0));
   playing_ = true;
   Feed();
@@ -373,6 +396,7 @@ void SubtitleEditor::ScrubTo(double ms) {
     for (int c = 0; c < a.channels; ++c) grain[f * a.channels + c] *= g;
   }
   SDL_ClearAudioStream(stream_);
+  SDL_SetAudioStreamFrequencyRatio(stream_, 1.0f);
   SDL_PutAudioStreamData(stream_, grain.data(), int(grain.size() * 4));
 }
 
@@ -410,6 +434,72 @@ void SubtitleEditor::Undo(bool redo) {
   line_ = std::min(line_, int(clips_[size_t(s.clip)].lines.size()) - 1);
   dirty_ = true;
   status_ = redo ? "Redone." : "Undone.";
+}
+
+// ---- splitting and joining ------------------------------------------------------
+
+bool SubtitleEditor::SplitAtPlayhead() {
+  if (selected_ < 0 || selected_ >= int(clips_.size())) return false;
+  sf::Clip& c = clips_[size_t(selected_)];
+  // The picked line, or the one under the playhead.
+  int i = line_;
+  if (i < 0 || i >= int(c.lines.size()) || playhead_ms_ <= c.lines[size_t(i)].start_ms ||
+      playhead_ms_ >= c.lines[size_t(i)].end_ms) {
+    i = -1;
+    for (int k = 0; k < int(c.lines.size()); ++k) {
+      if (playhead_ms_ > c.lines[size_t(k)].start_ms && playhead_ms_ < c.lines[size_t(k)].end_ms) i = k;
+    }
+  }
+  if (i < 0) {
+    status_ = "Put the playhead inside the line to split.";
+    return false;
+  }
+  Remember();
+  sf::Line& l = c.lines[size_t(i)];
+  const uint32_t at = uint32_t(playhead_ms_);
+  // The words: split at the space nearest the same share of the text.
+  const double share = double(at - l.start_ms) / double(l.end_ms - l.start_ms);
+  const size_t want = size_t(share * double(l.text.size()));
+  size_t cut = std::string::npos;
+  for (size_t k = 0; k < l.text.size(); ++k) {
+    if (l.text[k] != ' ') continue;
+    if (cut == std::string::npos ||
+        std::llabs(static_cast<long long>(k) - static_cast<long long>(want)) <
+            std::llabs(static_cast<long long>(cut) - static_cast<long long>(want))) {
+      cut = k;
+    }
+  }
+  sf::Line second = l;
+  second.start_ms = at;
+  l.end_ms = at;
+  if (cut != std::string::npos) {
+    second.text = l.text.substr(cut + 1);
+    l.text = l.text.substr(0, cut);
+  } else {
+    second.text = "";
+  }
+  c.lines.insert(c.lines.begin() + i + 1, second);
+  line_ = i + 1;
+  status_ = "Split.";
+  return true;
+}
+
+bool SubtitleEditor::JoinNext() {
+  if (selected_ < 0 || selected_ >= int(clips_.size())) return false;
+  sf::Clip& c = clips_[size_t(selected_)];
+  if (line_ < 0 || line_ + 1 >= int(c.lines.size())) {
+    status_ = "No line after it to join.";
+    return false;
+  }
+  Remember();
+  sf::Line& a = c.lines[size_t(line_)];
+  const sf::Line& b = c.lines[size_t(line_) + 1];
+  a.start_ms = std::min(a.start_ms, b.start_ms);
+  a.end_ms = std::max(a.end_ms, b.end_ms);
+  a.text = a.text.empty() ? b.text : b.text.empty() ? a.text : a.text + " " + b.text;
+  c.lines.erase(c.lines.begin() + line_ + 1);
+  status_ = "Joined.";
+  return true;
 }
 
 // ---- the timeline -----------------------------------------------------------------
@@ -463,6 +553,7 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
       drag_line_ = hit_line;
       line_ = hit_line;
       drag_grab_ms_ = to_ms(mx) - c.lines[size_t(hit_line)].start_ms;
+      snap_playhead_ms_ = playhead_ms_;
       Remember();
       if (io.MouseClickedCount[0] >= 2 && hit == 4) {
         // (Double-click a line: play it.)
@@ -497,15 +588,39 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
     } else if (drag_line_ >= 0 && drag_line_ < int(c.lines.size())) {
       sf::Line& l = c.lines[size_t(drag_line_)];
       const uint32_t s0 = l.start_ms, e0 = l.end_ms;
+      // Edges snap to the other lines' and to where the playhead was (within
+      // a few pixels; Alt: not).
+      auto snap = [&](double t) {
+        if (io.KeyAlt) return t;
+        const double reach = 7.0 * unit / w * view_len_ms_;
+        double best = t, best_d = reach;
+        auto consider = [&](double v) {
+          if (std::fabs(v - t) < best_d) {
+            best_d = std::fabs(v - t);
+            best = v;
+          }
+        };
+        consider(snap_playhead_ms_);
+        for (int k = 0; k < int(c.lines.size()); ++k) {
+          if (k == drag_line_) continue;
+          consider(c.lines[size_t(k)].start_ms);
+          consider(c.lines[size_t(k)].end_ms);
+        }
+        return best;
+      };
       if (drag_ == 2) {
-        l.start_ms = uint32_t(std::clamp(ms, 0.0, double(l.end_ms) - 100.0));
+        l.start_ms = uint32_t(std::clamp(snap(ms), 0.0, double(l.end_ms) - 100.0));
       } else if (drag_ == 3) {
-        l.end_ms = uint32_t(std::clamp(ms, double(l.start_ms) + 100.0, total));
+        l.end_ms = uint32_t(std::clamp(snap(ms), double(l.start_ms) + 100.0, total));
       } else {
         const double dur = double(l.end_ms - l.start_ms);
-        const double s = std::clamp(ms - drag_grab_ms_, 0.0, std::max(0.0, total - dur));
-        l.start_ms = uint32_t(s);
-        l.end_ms = uint32_t(s + dur);
+        double st = ms - drag_grab_ms_;
+        // (Whichever end is nearer something.)
+        const double by_start = snap(st) - st, by_end = snap(st + dur) - (st + dur);
+        st += std::fabs(by_start) > 0 && (std::fabs(by_end) == 0 || std::fabs(by_start) <= std::fabs(by_end)) ? by_start : by_end;
+        st = std::clamp(st, 0.0, std::max(0.0, total - dur));
+        l.start_ms = uint32_t(st);
+        l.end_ms = uint32_t(st + dur);
       }
       if (l.start_ms != s0 || l.end_ms != e0) {
         changed = true;
@@ -769,6 +884,7 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
   const float body_h = display.y - ImGui::GetCursorPosY() - pad;
   ImGui::BeginChild("##clips", ImVec2(list_w, body_h), ImGuiChildFlags_Borders);
   const std::string needle = Lower(search_);
+  visible_.clear();
   for (int i = 0; i < int(clips_.size()); ++i) {
     const sf::Clip& c = clips_[size_t(i)];
     if (filter_ == 1 && c.kind != sf::Kind::kStory) continue;
@@ -785,7 +901,12 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
     std::string src = c.source;
     if (src.size() > 60) src = "..." + src.substr(src.size() - 57);
     ImGui::PushID(i);
+    visible_.push_back(i);
     if (ImGui::Selectable("##clip", selected_ == i, 0, ImVec2(0, px * 2.3f))) Select(i);
+    if (selected_ == i && scroll_to_selected_) {
+      ImGui::SetScrollHereY(0.4f);
+      scroll_to_selected_ = false;
+    }
     ImGui::SameLine(px * 0.4f);
     ImGui::BeginGroup();
     ImGui::TextUnformatted(label.c_str());
@@ -815,8 +936,29 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       ImGui::Text("%s / %s", Clock(playhead_ms_).c_str(),
                   Clock(Ready() ? audio_->Ms() : double(c.duration_ms)).c_str());
       ImGui::SameLine();
-      if (ImGui::Button("Fit")) view_len_ms_ = 0;
+      {
+        // Slower, to catch every word (the pitch drops with it).
+        const float speeds[] = {0.5f, 0.75f, 1.0f};
+        const char* names[] = {"0.5x", "0.75x", "1x"};
+        int cur = speed_ <= 0.5f ? 0 : speed_ < 1.0f ? 1 : 2;
+        ImGui::SetNextItemWidth(70 * unit);
+        if (ImGui::Combo("##speed", &cur, names, 3)) {
+          speed_ = speeds[cur];
+          if (playing_) {
+            StopPlaying();
+            StartPlaying();
+          }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Playing speed");
+      }
       ImGui::SameLine();
+      if (ImGui::Checkbox("Loop line", &loop_) && playing_) {
+        StopPlaying();
+        StartPlaying();
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play the picked line over and over (L)");
+      ImGui::SameLine();
+      if (ImGui::Button("Fit")) view_len_ms_ = 0;
       const bool have_line = line_ >= 0 && line_ < int(c.lines.size());
       ImGui::BeginDisabled(!have_line);
       if (ImGui::Button("Start here [")) {
@@ -831,6 +973,12 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
         c.lines[size_t(line_)].end_ms = uint32_t(std::max(playhead_ms_, double(c.lines[size_t(line_)].start_ms) + 100.0));
         changed = true;
       }
+      ImGui::SameLine();
+      if (ImGui::Button("Split /")) changed |= SplitAtPlayhead();
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Split the picked line in two at the playhead (its words too)");
+      ImGui::SameLine();
+      if (ImGui::Button("Join next")) changed |= JoinNext();
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Join the picked line and the one after it (M)");
       ImGui::EndDisabled();
       ImGui::SameLine();
       bool edited = c.edited;
@@ -977,9 +1125,11 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
         "Timeline: click or drag to scrub (you hear it as you go), drag a line to move it or its ends to "
         "retime it, double-click a line to play it or an empty spot to add one; wheel zooms, Shift+wheel "
         "pans. Space plays / pauses, Left / Right step (Shift: a second), [ and ] set the picked line's "
-        "start and end at the playhead, Up / Down pick a line. Speakers: 1 white, 2 yellow, 3 pink, "
-        "4 green (click for the next, right-click for the one before). Ctrl+Z / Ctrl+Y undo and redo, "
-        "Ctrl+S saves.");
+        "start and end at the playhead, Up / Down pick a line, / splits it at the playhead, M joins it "
+        "to the next, L loops it. Dragged edges snap to other lines and the playhead (Alt: not). "
+        "Speakers: 1 white, 2 yellow, 3 pink, 4 green (click for the next, right-click for the one "
+        "before, or the keys 1 to 4). Page Up / Down: the previous / next clip. Ctrl+Z / Ctrl+Y undo "
+        "and redo, Ctrl+S saves.");
     ImGui::PopStyleColor();
     ImGui::EndChild();
   } else {
@@ -1017,6 +1167,42 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       }
     }
     const bool have_line = line_ >= 0 && line_ < int(c.lines.size());
+    // Speaker of the picked line: 1 to 4.
+    const ImGuiKey digits[4] = {ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4};
+    for (int k = 0; k < 4 && have_line; ++k) {
+      if (!io.KeyCtrl && ImGui::IsKeyPressed(digits[k], false) && c.lines[size_t(line_)].speaker != k) {
+        Remember();
+        c.lines[size_t(line_)].speaker = k;
+        c.edited = dirty_ = true;
+      }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_L, false)) {
+      loop_ = !loop_;
+      if (playing_) {
+        StopPlaying();
+        StartPlaying();
+      }
+    }
+    if (have_line && ImGui::IsKeyPressed(ImGuiKey_Slash, false) && SplitAtPlayhead()) c.edited = dirty_ = true;
+    if (have_line && ImGui::IsKeyPressed(ImGuiKey_M, false) && JoinNext()) c.edited = dirty_ = true;
+    // The next / previous clip in the list.
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown) || ImGui::IsKeyPressed(ImGuiKey_PageUp)) {
+      const bool down = ImGui::IsKeyPressed(ImGuiKey_PageDown);
+      auto it = std::find(visible_.begin(), visible_.end(), selected_);
+      int to = -1;
+      if (it == visible_.end()) {
+        if (!visible_.empty()) to = visible_.front();
+      } else if (down && it + 1 != visible_.end()) {
+        to = *(it + 1);
+      } else if (!down && it != visible_.begin()) {
+        to = *(it - 1);
+      }
+      if (to >= 0) {
+        Select(to);
+        scroll_to_selected_ = true;
+        return close;
+      }
+    }
     if (have_line && ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false)) {
       Remember();
       sf::Line& l = c.lines[size_t(line_)];

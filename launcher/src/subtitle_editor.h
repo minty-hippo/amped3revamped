@@ -68,6 +68,12 @@ class SubtitleEditor {
   void Feed();
   double PlayPositionMs() const;
   bool Ready() const;  // the selected clip's sound is here
+  bool LoopSpan(size_t* f0, size_t* f1) const;
+  // The picked line (or the one under the playhead) cut in two there; the
+  // picked line and the next made one. False (and why, in the status) if
+  // there's nothing to do.
+  bool SplitAtPlayhead();
+  bool JoinNext();
   fs::path ToolPath() const;
   // Undo: the selected clip as it was before an edit.
   void Remember();
@@ -109,6 +115,11 @@ class SubtitleEditor {
   double drag_grab_ms_ = 0;
   bool was_playing_ = false;
   double last_scrub_ms_ = -1;
+  double snap_playhead_ms_ = 0;  // where the playhead was when a drag began
+  float speed_ = 1.0f;           // playing speed
+  bool loop_ = false;            // the picked line over and over
+  std::vector<int> visible_;     // the clips listed, in order (PageUp / PageDown)
+  bool scroll_to_selected_ = false;
 
   struct Step {
     int clip;

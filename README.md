@@ -549,8 +549,13 @@ playhead, and below it the line being heard as the game shows it.
 | Pick a line | Click it, or Up / Down |
 | Add a line | Double-click an empty spot on the timeline, **+** after a line, or **Add one at the playhead** |
 | Zoom / pan | Wheel / Shift+wheel; drag in the strip under the timeline; **Fit** |
+| Split the picked line at the playhead (its words too) / join it to the next | `/` or **Split** / M or **Join next** |
+| Loop the picked line; play slower (0.5x, 0.75x) | L or **Loop line**; the speed box |
+| Speaker of the picked line | 1 to 4 |
+| Previous / next clip | Page Up / Page Down |
 | Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
 
+Dragged edges snap to the other lines' and to the playhead (hold Alt not to).
 Lines that end before they start, or run into the next one, are marked red.
 Save (Ctrl+S) and the game picks it up within a couple of seconds, even while
 it runs. A corrected clip is marked so, and Make subtitles again keeps it as
