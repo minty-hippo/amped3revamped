@@ -460,7 +460,8 @@ int main(int argc, char** argv) {
   float freecam[5] = {};
   bool use_freecam = false;
   bool ao_debug = false;
-  amped3::native::Renderer::TimeOfDay tod;  // --tod hour [--tod-moon phase] [--tod-clouds cover]
+  amped3::native::Renderer::TimeOfDay tod;
+  float eye = 0.0f;  // --eye strength (eye adaptation)  // --tod hour [--tod-moon phase] [--tod-clouds cover]
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
   fs::path rewrite;  // write the loaded frame back out in capture format (tests the writer)
   // Draw counts to stop at, each drawn by a fresh renderer and dumped to
@@ -530,6 +531,8 @@ int main(int argc, char** argv) {
       tod.hour = std::stof(argv[++i]);
     } else if (a == "--tod-moon" && i + 1 < argc) {
       tod.moon_phase = std::stof(argv[++i]);
+    } else if (a == "--eye" && i + 1 < argc) {
+      eye = std::stof(argv[++i]);
     } else if (a == "--tod-night" && i + 1 < argc) {
       tod.night_light = std::stof(argv[++i]);
     } else if (a == "--tod-clouds" && i + 1 < argc) {
@@ -840,6 +843,7 @@ int main(int argc, char** argv) {
     if (speed_blur >= 0.0f) renderer.SetSpeedBlur(1.0f, 1.0f / 60.0f, speed_blur);
     if (fog > 0.0f) renderer.SetFog(fog, fog_start);
     renderer.SetTimeOfDay(tod);
+    renderer.SetEyeAdaptation(eye);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
     if (shadow_res > 0.0f || shadow_distance > 0.0f) renderer.SetShadows(shadow_res, shadow_distance);
@@ -879,7 +883,7 @@ int main(int argc, char** argv) {
     if (!final_image.name.empty()) {
       WritePng(renderer, final_image, out / "frame.png");
       std::cout << "Wrote " << (out / "frame.png").string() << " (" << final_image.name << ")\n";
-      std::cout << "Mountain hour " << renderer.MountainHour() << "\n";
+      std::cout << "Mountain hour " << renderer.MountainHour() << ", exposure " << renderer.Exposure() << "\n";
     }
     if (dump) DumpAll(renderer, out);
     if (output_test && !final_image.name.empty()) {

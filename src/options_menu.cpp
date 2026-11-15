@@ -392,6 +392,11 @@ const std::vector<Tab>& Tabs() {
                         0.0, 3.0),
                 SliderF("native_fog_start", "Fog start distance",
                         "How far away the fog begins, in metres.", "%.0f m", 0.0, 1000.0),
+                SliderF("native_eye_adaptation", "Eye adaptation",
+                        "HDR-style: the lighting brightens in the dark (night, forest) and "
+                        "tones down in glare, easing over a second or two like eyes "
+                        "adjusting. 0: off. Part of Revamped Graphics. Native renderer only.",
+                        "%.1f", 0.0, 1.0),
                 Toggle("native_time_of_day", "Dynamic time of day (F5)",
                        "The sun and moon move across the sky: the mountain's light, its "
                        "colors, the sky, stars and drifting clouds follow the hour, from "

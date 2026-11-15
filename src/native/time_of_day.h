@@ -192,7 +192,7 @@ inline State At(const Layout& l, double hour, double moon_phase, double night_li
   // The moon's: faint and blue, coming in once the sun is well down.
   const double dark = SmoothStep(-3.0 * kDeg, -10.0 * kDeg, e);
   const double moon_up = SmoothStep(0.0, 8.0 * kDeg, me);
-  const double moon_k = 0.22 * night_light * (0.25 + 0.75 * s.moon_bright) * moon_up * dark;
+  const double moon_k = 0.13 * night_light * (0.25 + 0.75 * s.moon_bright) * moon_up * dark;
   const Vec3 moon_scale{moon_k * 0.62, moon_k * 0.74, moon_k * 1.0};
   if (e > -3.0 * kDeg || moon_up <= 0.0) {
     s.light = s.sun;

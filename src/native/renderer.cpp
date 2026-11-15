@@ -1737,7 +1737,7 @@ struct Renderer::Impl {
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
-    kMoverBlur = 33, kTodSky = 34, kTodTint = 35
+    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1778,7 +1778,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[36] = {};  // by CopyKind
+  VkShaderModule copy_fs_[37] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2041,18 +2041,37 @@ struct Renderer::Impl {
   bool tod_sky_done_ = false;
   Image* tod_sky_result_ = nullptr;
   bool TodOn() const { return tod_.on && tod_state_.valid; }
+  // The lighting's change this frame (time of day and/or eye adaptation):
+  // toward the light (time of day), its color and the sky's light scaled.
+  bool lm_on_ = false, lm_set_dir_ = false;
+  tod::Vec3 lm_dir_, lm_light_scale_{1, 1, 1}, lm_ambient_scale_{1, 1, 1};
+  bool LightModOn() const { return lm_on_; }
+  // Eye adaptation (SetEyeAdaptation): the exposure the lighting is scaled
+  // by, easing toward what the scene's average brightness (measured a few
+  // frames back: read back without waiting) calls for.
+  float eye_strength_ = 0.0f;
+  double exposure_ = 1.0;
+  Buffer eye_rb_;                 // 4 slots of 16 bytes: the measure, by frame % 4
+  double eye_rb_exposure_[4] = {};
+  uint64_t eye_rb_frame_[4] = {};
+  Image eye_img_;
+  bool eye_done_ = false;
+  void EyeUpdate();
+  void EyeMeasure(Image* scene);
   bool TodNoGameShadows() const { return TodOn() && tod_state_.away >= 0.5; }
   void TodLightingInputs(const Draw& d, const GpuState& st);
   // The game's lighting block in a copy of constants (time of day).
   void TodLightingBlock(uint32_t* c, int dir_reg, int sh_base, int sun_base) const {
-    const tod::State& t = tod_state_;
     float v[4];
-    std::memcpy(v, &c[dir_reg * 4], 16);
-    v[0] = float(t.light.x);
-    v[1] = float(t.light.y);
-    v[2] = float(t.light.z);
-    std::memcpy(&c[dir_reg * 4], v, 16);
-    const double amb[3] = {t.ambient_scale.x, t.ambient_scale.y, t.ambient_scale.z};
+    if (lm_set_dir_) {
+      std::memcpy(v, &c[dir_reg * 4], 16);
+      v[0] = float(lm_dir_.x);
+      v[1] = float(lm_dir_.y);
+      v[2] = float(lm_dir_.z);
+      std::memcpy(&c[dir_reg * 4], v, 16);
+    }
+    const tod::Vec3& ls = lm_light_scale_;
+    const double amb[3] = {lm_ambient_scale_.x, lm_ambient_scale_.y, lm_ambient_scale_.z};
     for (int r = 0; r < 24; ++r) {
       const float k = float(amb[(r / 4) % 3]);
       std::memcpy(v, &c[(sh_base + r) * 4], 16);
@@ -2061,9 +2080,9 @@ struct Renderer::Impl {
     }
     for (int r = 0; r < 4; ++r) {
       std::memcpy(v, &c[(sun_base + r) * 4], 16);
-      v[0] *= float(t.light_scale.x);
-      v[1] *= float(t.light_scale.y);
-      v[2] *= float(t.light_scale.z);
+      v[0] *= float(ls.x);
+      v[1] *= float(ls.y);
+      v[2] *= float(ls.z);
       std::memcpy(&c[(sun_base + r) * 4], v, 16);
     }
   }
@@ -2889,8 +2908,9 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   // moved away from it.)
   const bool movers = world_detail_ > 0 && !TodNoGameShadows();
   const bool tod_sky = TodOn();
+  const bool eye = eye_strength_ > 0.0f;
   if (light_seen_ && !tiling_.width && tex_base == scene_base_) composite_seen_ = true;
-  if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky) && light_seen_ &&
+  if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky || eye) && light_seen_ &&
       !tiling_.width &&
       tex_base == scene_base_) {
     auto sit = resolved_.find(tex_base);
@@ -2905,6 +2925,8 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
         if (Image* sky = TodSky(scene)) scene = sky;
         MarkPart("effect: time of day sky");
       }
+      // How bright the lit scene is (eye adaptation).
+      if (eye) EyeMeasure(scene);
       // Riders in the world's shade first (they're lit by themselves).
       if (movers) {
         if (Image* shaded = ShadedMovers(scene)) scene = shaded;
@@ -4721,7 +4743,7 @@ layout(push_constant) uniform Sky {
   vec4 moon;    // toward the moon, its brightness (phase, 0..1)
   vec4 painted; // toward the panorama's painted sun, how much to dim it
   vec4 sun_col; // the sun's color, cloud cover (0..1)
-  vec4 sz;      // 1 / width, 1 / height, dusk (0..1), -
+  vec4 sz;      // 1 / width, 1 / height, dusk (0..1), exposure (eye adaptation)
 } pc;
 layout(location = 0) out vec4 o;
 float hash(vec2 p) {
@@ -4794,12 +4816,12 @@ void main() {
     sky /= n;
     vec3 span = sky - solid;
     float f = clamp(dot(col.rgb - solid, span) / max(dot(span, span), 1e-5), 0.0, 1.0);
-    o = vec4(col.rgb + f * (recolor(sky, dir) - sky), col.a);
+    o = vec4(col.rgb + f * (recolor(sky, dir) * pc.sz.w - sky), col.a);
     return;
   }
   float up = clamp(dir.y, 0.0, 1.0);
   float night = pc.r.w;
-  vec3 c = recolor(col.rgb, dir);
+  vec3 c = recolor(col.rgb, dir) * pc.sz.w;
   // Open sky: not a gap between branches (no stars glittering in the trees).
   float open_sky = 1.0;
   {
@@ -4877,6 +4899,27 @@ void main() {
          pc.sun.w * pc.painted.w;
   }
   o = vec4(c, col.a);
+}
+)", true);
+  // Eye adaptation: the scene's average brightness (log luminance over a
+  // grid, the middle counting most).
+  copy_fs_[36] = CompileBuiltin("builtin_eye_measure", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(location = 0) out vec4 o;
+void main() {
+  float sum = 0.0, wsum = 0.0;
+  for (int y = 0; y < 18; ++y) {
+    for (int x = 0; x < 32; ++x) {
+      vec2 uv = (vec2(x, y) + 0.5) / vec2(32.0, 18.0);
+      vec3 c = textureLod(scene, uv, 0.0).rgb;
+      float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      vec2 d = (uv - 0.5) * vec2(1.6, 2.0);
+      float w = exp(-dot(d, d) * 1.5);
+      sum += log(max(l, 0.002)) * w;
+      wsum += w;
+    }
+  }
+  o = vec4(sum / wsum);
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -6031,6 +6074,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
     // Time of day: the day laid out around the mountain's own sun (again
     // when it changes: another mountain).
     tod_state_ = tod::State{};
+    lm_on_ = false;
     std::memcpy(tod_ref_, st.ps_consts.data() + 14 * 4, sizeof(tod_ref_));
     tod_ref_ok_ = sun_valid_;
     if (sun_valid_) {
@@ -6041,8 +6085,21 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
         tod_layout_ = tod::MakeLayout({tod_game_light_[0], tod_game_light_[1], tod_game_light_[2]});
         tod_mountain_hour_ = float(tod_layout_.mountain_hour);
       }
-      if (tod_.on) {
-        tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
+      if (tod_.on) tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
+      EyeUpdate();
+      lm_on_ = TodOn() || eye_strength_ > 0.0f;
+      lm_set_dir_ = TodOn();
+      const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
+      if (TodOn()) {
+        lm_dir_ = tod_state_.light;
+        const tod::Vec3& l = tod_state_.light_scale;
+        const tod::Vec3& a = tod_state_.ambient_scale;
+        lm_light_scale_ = {l.x * e, l.y * e, l.z * e};
+        lm_ambient_scale_ = {a.x * e, a.y * e, a.z * e};
+      } else {
+        lm_light_scale_ = lm_ambient_scale_ = {e, e, e};
+      }
+      if (lm_on_) {
         std::vector<uint32_t> c(1024, 0u);
         std::memcpy(&c[14 * 4], tod_ref_, sizeof(tod_ref_));
         TodLightingBlock(c.data(), 14, 15, 39);
@@ -7589,7 +7646,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
 // the hour; the white stand-in for the game's fixed shadows made.
 void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   tod_lut_ok_ = false;
-  if (!TodOn()) return;
+  if (!LightModOn()) return;
   auto ensure = [&](Image& im, uint32_t w, uint32_t h, VkFormat f, const char* name) {
     if (im.image && im.width == w && im.height == h && im.format == f) return false;
     if (im.image) Retire(im);
@@ -7613,12 +7670,71 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   ensure(tod_lut_, src->width, src->height, VK_FORMAT_R16G16B16A16_SFLOAT, "tod_sky_light");
   Barrier();
   // What the air adds: as bright and as blue as the sky's light.
-  const tod::Vec3& a = tod_state_.ambient_scale;
+  const tod::Vec3& a = lm_ambient_scale_;
   float pc[4] = {float(a.x), float(a.y), float(a.z), 0.0f};
   FullscreenPass(CopyKind::kTodTint, &tod_lut_, src, nullptr, nullptr, false, pc, 4);
   Barrier();
   tod_lut_src_ = src;
   tod_lut_ok_ = true;
+  dyn_ = DynState{};
+}
+
+// Eye adaptation, at the lighting pass: the measure from 4 frames back (the
+// GPU long done with it) and the exposure eased toward what it calls for:
+// brighter in the dark (slowly, as eyes do), darker in bright snow (faster).
+void Renderer::Impl::EyeUpdate() {
+  if (eye_strength_ <= 0.0f) {
+    exposure_ = 1.0;
+    return;
+  }
+  const int slot = int(frame_number_ % 4);
+  if (eye_rb_.buffer && eye_rb_frame_[slot] && frame_number_ >= eye_rb_frame_[slot] + 4) {
+    float mean_log;
+    std::memcpy(&mean_log, eye_rb_.mapped + slot * 16, 4);
+    eye_rb_frame_[slot] = 0;
+    const double shown = std::exp(double(mean_log));
+    const double scene = shown / std::max(eye_rb_exposure_[slot], 1e-3);
+    if (std::isfinite(scene) && scene > 1e-5) {
+      // What the scene's average brightness calls for (0.42: about the
+      // game's own look by day), part of the way (the strength), within
+      // what eyes do: down a little in glare, up to 2x in the dark.
+      const double target =
+          std::clamp(std::pow(0.42 / scene, double(eye_strength_)), 0.75, 2.0);
+      const double dt = std::clamp(double(speed_dt_), 0.001, 0.25);
+      const double tau = target > exposure_ ? 2.0 : 0.7;
+      exposure_ += (target - exposure_) * (1.0 - std::exp(-dt / tau));
+      if (Diag("eyesnap")) exposure_ = target;  // (the replayer: no easing)
+    }
+  }
+}
+
+// Eye adaptation, after the scene: its average brightness (log, center
+// weighted) to a 1 x 1 image, copied to this frame's read-back slot.
+void Renderer::Impl::EyeMeasure(Image* scene) {
+  if (eye_done_) return;
+  eye_done_ = true;
+  if (scene->samples > 1) return;
+  EndRendering();
+  if (!eye_img_.image) {
+    eye_img_ = gpu_.CreateImage(1, 1, VK_FORMAT_R32_SFLOAT, false, "eye_measure");
+    ToGeneral(cb_, eye_img_);
+  }
+  if (!eye_rb_.buffer) {
+    eye_rb_ = gpu_.CreateBuffer(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  }
+  Barrier();
+  float pc[4] = {0, 0, 0, 0};
+  FullscreenPass(CopyKind::kEyeMeasure, &eye_img_, scene, nullptr, nullptr, true, pc, 4);
+  Barrier();
+  const int slot = int(frame_number_ % 4);
+  VkBufferImageCopy region{};
+  region.bufferOffset = VkDeviceSize(slot) * 16;
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {1, 1, 1};
+  vk::vkCmdCopyImageToBuffer(cb_, eye_img_.image, VK_IMAGE_LAYOUT_GENERAL, eye_rb_.buffer, 1, &region);
+  Barrier();
+  eye_rb_frame_[slot] = frame_number_;
+  eye_rb_exposure_[slot] = eye_strength_ > 0.0f ? exposure_ : 1.0;
   dyn_ = DynState{};
 }
 
@@ -7705,6 +7821,7 @@ Image* Renderer::Impl::TodSky(Image* scene) {
   pc[27] = std::clamp(tod_.clouds, 0.0f, 1.0f);
   pc[28] = 1.0f / float(w);
   pc[29] = 1.0f / float(h);
+  pc[31] = eye_strength_ > 0.0f ? float(exposure_) : 1.0f;
   pc[30] = float(1.0 - tod::SmoothStep(2.0 * tod::kDeg, 20.0 * tod::kDeg, t.sun_elevation)) *
            float(tod::SmoothStep(-8.0 * tod::kDeg, -1.0 * tod::kDeg, t.sun_elevation));
   FullscreenPass(CopyKind::kTodSky, &tod_sky_img_, scene, depth, &tod_colors_, false, pc, 32);
@@ -8401,7 +8518,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       // Time of day: the sky-light table tinted; the game's fixed shadows
       // (the painted slopes, tf2; the shadow map, tf0) gone once the sun has
       // moved well away from where they were made for.
-      if (stage == 1 && TodOn() && ps->info.ucode_hash == kLightingPixelShader) {
+      if (stage == 1 && LightModOn() && ps->info.ucode_hash == kLightingPixelShader) {
         if (b.fetch_constant == 1 && tod_lut_ok_ && hit->second.image == tod_lut_src_) im = &tod_lut_;
         if ((b.fetch_constant == 2 || b.fetch_constant == 0) && TodNoGameShadows() &&
             tod_white_.image) {
@@ -8636,7 +8753,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     std::memcpy(out + 10 * 16, c10, 16);
   }
   uint32_t vc[1024];
-  if (TodOn() && TodNeeds(0, *vs) &&
+  if (LightModOn() && TodNeeds(0, *vs) &&
       (std::memcpy(vc, st.vs_consts.data(), sizeof(vc)), TodApply(0, *vs, vc))) {
     uint8_t* out;
     offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
@@ -8669,14 +8786,14 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // red, then green, then blue, the first band; then the second band the
   // same); the sun's color (4 sets). The lighting pass has it at c14, c15,
   // c39; vertex-lit things (riders, characters) at c238, c206, c230.
-  if (TodOn() && ps->info.ucode_hash == kLightingPixelShader) {
+  if (LightModOn() && ps->info.ucode_hash == kLightingPixelShader) {
     if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
     TodLightingBlock(fc_consts, 14, 15, 39);
     lit_src = fc_consts;
     uint8_t* out;
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
     std::memcpy(out, fc_consts, ConstBytes(*ps));
-  } else if (TodOn() && TodNeeds(1, *ps)) {
+  } else if (LightModOn() && TodNeeds(1, *ps)) {
     if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
     if (TodApply(1, *ps, fc_consts)) {
       lit_src = fc_consts;
@@ -10238,7 +10355,8 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(blur_img_);
   gpu_.DestroyImage(radial_img_);
   gpu_.DestroyImage(fog_img_);
-  for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_}) {
+  if (eye_rb_.buffer) gpu_.DestroyBuffer(eye_rb_);
+  for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -10357,6 +10475,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   radial_done_ = false;
   fog_done_ = false;
   tod_sky_done_ = false;
+  eye_done_ = false;
   ao_done_ = false;
   ao_depth_ok_ = false;
   ao_late_ok_ = false;
@@ -10656,6 +10775,8 @@ const std::string& Renderer::device_name() const { return impl_->gpu_.device_nam
 
 void Renderer::SetMapClouds(bool on) { impl_->map_clouds_ = on; }
 void Renderer::SetTimeOfDay(const TimeOfDay& tod) { impl_->tod_ = tod; }
+void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }
+float Renderer::Exposure() const { return float(impl_->eye_strength_ > 0.0f ? impl_->exposure_ : 1.0); }
 float Renderer::MountainHour() const { return impl_->tod_mountain_hour_; }
 void Renderer::SetInCutscene(bool scene) { impl_->in_scene_ = scene; }
 void Renderer::SetHideInterface(bool hide) { impl_->hide_interface_ = hide; }

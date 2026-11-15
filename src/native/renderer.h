@@ -311,6 +311,11 @@ class Renderer {
   void SetTimeOfDay(const TimeOfDay& tod);
   // The hour the mountain is made for (its own sun), -1 before a lit frame.
   float MountainHour() const;
+  // Eye adaptation (HDR-style): the lighting brightened in the dark and
+  // toned down in glare, easing over a second or two like eyes adjusting,
+  // from the scene's average brightness. strength 0 off .. 1 full.
+  void SetEyeAdaptation(float strength);
+  float Exposure() const;  // the exposure in use (1: none)
   // Whether the game has its trail map open (game state 7), each frame: the
   // map clouds play only for cuts to or from it (not, say, the camera cut of a
   // challenge restart). Never called (the replayer): any riding <-> overview

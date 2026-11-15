@@ -155,6 +155,11 @@ REXCVAR_DEFINE_DOUBLE(native_fog_density, 1.0, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_fog_start, 300.0, "GPU",
                       "Native renderer: distance fog starts this far from the camera (metres)")
     .range(0.0, 1000.0);
+REXCVAR_DEFINE_DOUBLE(native_eye_adaptation, 0.6, "GPU",
+                      "Native renderer: eye adaptation (HDR-style, part of Revamped Graphics): "
+                      "the lighting brightens in the dark (night, forest) and tones down in "
+                      "glare, easing over a second or two like eyes adjusting. 0: off, 1: full")
+    .range(0.0, 1.0);
 REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
                     "Native renderer: dynamic time of day (F5): the sun and moon move across "
                     "the sky, the mountain's light, sky, stars and clouds follow the hour; "
@@ -2167,6 +2172,7 @@ void WorkerMain() {
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
           tod.seconds = float(std::fmod(tod_seconds, 100000.0));
           renderer->SetTimeOfDay(tod);
+          renderer->SetEyeAdaptation(revamped ? float(REXCVAR_GET(native_eye_adaptation)) : 0.0f);
           g_tod_hour = float(tod_hour);
         }
         renderer->SetHideInterface(g_hide_interface.load());

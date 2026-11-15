@@ -419,6 +419,13 @@ worked out from that, so it fits each mountain's own look.
   dimmed once the real one has moved away), drifting clouds, the sun's disc,
   the moon's disc lit from the sun's side (its phase), stars at night. The
   distance fog and god rays take their colors from it.
+- Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
+  of Revamped Graphics; works with time of day off too): HDR-style, like
+  Half-Life 2's. The lighting is brightened in the dark (night, forest,
+  up to 2x) and toned down in glare, easing over a second or two (into the
+  dark slower, as eyes do). It scales the lighting itself rather than the
+  finished picture, so dark scenes don't band. By day it stays close to the
+  game's own look.
 - The clock runs while the game does (it stops when paused and in a replay).
   Settings: Minutes per Day (`native_tod_day_minutes`, 24; 0 stops it), Set the
   Hour (`native_tod_start_hour`, -1 = the mountain's own), Moon Phase, Cloud
