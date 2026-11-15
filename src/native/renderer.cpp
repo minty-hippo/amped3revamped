@@ -5093,6 +5093,7 @@ layout(location = 0) out vec4 o;
 vec4 g_vp[4];
 float g_jitter;
 vec4 g_dbg = vec4(0.0);
+float g_noise;  // per pixel, 0..1 (the beams' steps)
 float ShadowTo(vec3 P, vec3 N, vec3 L, int steps, bool riders) {
   vec3 start = P + N * 0.06;
   vec3 seg = L - start;
@@ -5315,6 +5316,7 @@ void main() {
     alb = min(c.rgb / max(pc.b.y, 0.12), vec3(0.85));
   }
   vec3 add = vec3(0.0);
+  g_noise = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
   int shadow_steps = int(pc.b.z + 0.5);
   if (shadow_steps > 0 && d > 0.0) {
     for (int r = 0; r < 4; ++r) g_vp[r] = texelFetch(lights, ivec2(r, 3), 0);
@@ -5399,6 +5401,20 @@ void main() {
           fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), axis)) * 1.4 + 0.04;
         }
         vec3 lit = alb * col * fall * ndl * 1.6;
+        // A sheen toward the camera (snow and ice catch it), and on the snow
+        // the odd crystal glinting, changing as the view moves.
+        vec3 L = dl / max(dist, 1e-3);
+        vec3 hv = normalize(L - dir);
+        float facing = max(dot(N, L), 0.0);
+        if (facing > 0.0) {
+          float snow = rider ? 0.0 : smoothstep(0.45, 0.7, dot(alb, vec3(0.333)));
+          float sheen = pow(max(dot(N, hv), 0.0), 28.0) * (0.12 + 0.3 * snow);
+          vec3 cell = floor(P * 28.0);
+          float glint = step(0.993, Hash(dot(cell, vec3(1.0, 57.0, 113.0)) +
+                                         dot(floor(hv * 6.0), vec3(7.1, 11.3, 13.7)))) *
+                        snow * smoothstep(40.0, 10.0, pix_dist);
+          lit += col * fall * facing * (sheen + glint * 3.0);
+        }
         // Its shadows (what's lit enough to show one).
         if (shadow_steps > 0 && dot(lit, vec3(1.0)) > 0.004) {
           float sv = ShadowTo(P, N, lp.xyz, shadow_steps, pc.a.w > 0.5);
@@ -5417,6 +5433,30 @@ void main() {
       float g = size * size / (perp * perp + size * size);
       float facing = kind == 1 ? 0.25 + 0.75 * smoothstep(0.2, 0.9, dot(-dir, axis)) : 1.0;
       add += col * (0.55 * g * g + 0.12 * g) * facing * smoothstep(400.0, 150.0, t);
+    }
+    // A floodlight's beam in the air (night mist): along the ray where it
+    // passes through the cone, out to the light's reach.
+    if (kind == 1 && kk > 0.001) {
+      vec3 oc = pc.cam.xyz - lp.xyz;
+      float bq = dot(oc, dir), cq = dot(oc, oc) - lp.w * lp.w;
+      float disc = bq * bq - cq;
+      if (disc > 0.0) {
+        float sq = sqrt(disc);
+        float t0 = max(-bq - sq, 0.3), t1 = min(-bq + sq, min(pix_dist, hit_t));
+        if (t1 > t0) {
+          const int N_STEPS = 10;
+          float stp = (t1 - t0) / float(N_STEPS);
+          float acc = 0.0;
+          for (int j = 0; j < N_STEPS; ++j) {
+            vec3 v = pc.cam.xyz + dir * (t0 + (float(j) + g_noise) * stp) - lp.xyz;
+            float dd = length(v);
+            float cone = smoothstep(0.86, 0.95, dot(v / max(dd, 1e-3), axis));
+            float x = dd / lp.w;
+            acc += cone * (1.0 - x * x) * (1.0 - x * x) / (1.0 + dd * dd * 0.08);
+          }
+          add += col * acc * stp * 0.04;
+        }
+      }
     }
     // The fitting itself (by day too), when the ray passes near it.
     // (How far the fitting reaches from its light: a lamp post down to the ground.)

@@ -463,7 +463,9 @@ that rule against a save that has the pass.
   passing by, with a glow round each. Each light casts shadows (riders, trees,
   posts, buildings: anything drawn, moving or not), traced from what it lights
   toward it through the depth on screen; something out of view casts none.
-  Time of Day tab: Night Light Shadows (Off, On, Fine). Far off (past 150 m,
+  Time of Day tab: Night Light Shadows (Off, On, Fine). The snow catches a
+  sheen toward the camera from each light, with the odd crystal glinting as
+  the view moves, and a floodlight's beam shows in the night air. Far off (past 150 m,
   out to 2.5 km) each light is a point of light instead, fading in as its
   glow up close fades out, hidden behind slopes and trees in front of it.
   Each pixel only weighs the lights that can reach it (the screen in 32-pixel
