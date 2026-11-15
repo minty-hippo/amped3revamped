@@ -401,9 +401,9 @@ const std::vector<Tab>& Tabs() {
                        "The sun and moon move across the sky: the mountain's light, its "
                        "colors, the sky, stars and drifting clouds follow the hour, from "
                        "sunrise through dusk to a moonlit night. Each mountain starts at the "
-                       "hour it was made for and looks as the game has it then. The game's "
-                       "own fixed shadows fade out once the sun has moved well away from "
-                       "where they were made for. Native renderer only."),
+                       "hour it was made for and looks as the game has it then. Shadows follow "
+                       "the sun and moon (riders and objects always; the world's with World "
+                       "shadows baked). Native renderer only."),
                 SliderF("native_tod_start_hour", "Set the hour",
                         "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
                         -1.0, 24.0),

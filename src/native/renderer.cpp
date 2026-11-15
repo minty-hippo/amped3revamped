@@ -1460,6 +1460,16 @@ struct Renderer::Impl {
   // copy the lighting reads instead of its tf2.
   Image baked_;
   Image* baked_src_ = nullptr;
+  bool baked_tod_ = false;  // baked for the time of day's sun (not saved, not loaded)
+  // The time of day's shadows of riders, rails and objects (the game's
+  // shadow pass's casters, drawn again from the hour's sun into a map like
+  // the world's) as a screen mask the lighting reads in place of the game's
+  // shadow map (its tf0; the lookup rows c6, c7, c9 the screen's).
+  Image tod_movers_map_, tod_mask_;
+  std::vector<CasterDraw> tod_movers_draws_;
+  bool tod_mask_ok_ = false;
+  Image* tod_game_map_ = nullptr;  // the game's shadow map (the lighting's tf0) this frame
+  double tod_mask_rows_[12] = {};  // c6, c7, c9
   bool baked_ok_ = false;
   void BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16], bool bake);
   void ShiftMap(Image* map, Image* scratch, int64_t dx, int64_t dy);
@@ -1468,7 +1478,10 @@ struct Renderer::Impl {
   bool movers_done_ = false;
   Image* movers_result_ = nullptr;
   Image* ShadedMovers(Image* scene);
-  void DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map, const double O[16]);
+  // clip_to_world: the draws' clip space to world (null: the scene camera's,
+  // its depth as the lighting has it).
+  void DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map, const double O[16],
+                      const double* clip_to_world = nullptr);
   void PrepareSunShadows(const Draw& d, const GpuState& st);
   void DrawSunShadows(const Draw& d, const GpuState& st);
   float next_shadow_av_ = 1.0f, next_shadow_fade_ = 1.0f;
@@ -1737,7 +1750,7 @@ struct Renderer::Impl {
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
-    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36
+    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1778,7 +1791,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[37] = {};  // by CopyKind
+  VkShaderModule copy_fs_[38] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2060,6 +2073,7 @@ struct Renderer::Impl {
   void EyeMeasure(Image* scene);
   bool TodNoGameShadows() const { return TodOn() && tod_state_.away >= 0.5; }
   void TodLightingInputs(const Draw& d, const GpuState& st);
+  void TodShadows();
   // The game's lighting block in a copy of constants (time of day).
   void TodLightingBlock(uint32_t* c, int dir_reg, int sh_base, int sun_base) const {
     float v[4];
@@ -2904,9 +2918,8 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   const bool radial = speed_strength_ > 0.0f && speed_amount_ > 0.002f;
   const bool fog = (fog_density_ > 0.0f || rays_strength_ > 0.0f) && fog_presence_ > 0.002f;
   const bool ao = ao_strength_ > 0.0f;
-  // (Riders shaded from the mountain's own sun: not once the hour's has
-  // moved away from it.)
-  const bool movers = world_detail_ > 0 && !TodNoGameShadows();
+  // (With the time of day, from the hour's sun: the world maps follow it.)
+  const bool movers = world_detail_ > 0;
   const bool tod_sky = TodOn();
   const bool eye = eye_strength_ > 0.0f;
   if (light_seen_ && !tiling_.width && tex_base == scene_base_) composite_seen_ = true;
@@ -4922,6 +4935,48 @@ void main() {
   o = vec4(sum / wsum);
 }
 )", true);
+  // Time of day: each pixel's shade from the riders, rails and objects
+  // (their map from the hour's sun), percentage closer, for the lighting.
+  copy_fs_[37] = CompileBuiltin("builtin_tod_shadow", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D depth;   // the scene's (0: nothing)
+layout(set = 0, binding = 1) uniform sampler2D casters; // from the sun: depth, 1 = nothing
+layout(push_constant) uniform Mask {
+  mat4 m;  // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
+  vec4 o0; vec4 o1; vec4 o2;  // the map's rows
+  vec4 a;  // 1 / width, 1 / height, bias (depth), texels a side
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.a.xy;
+  float d = textureLod(depth, uv, 0.0).r;
+  if (d <= 0.0) {
+    o = vec4(1.0);
+    return;
+  }
+  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  if (abs(wp.w) < 1e-9) {
+    o = vec4(1.0);
+    return;
+  }
+  vec4 P = vec4(wp.xyz / wp.w, 1.0);
+  vec2 st = vec2(dot(pc.o0, P), dot(pc.o1, P));
+  float zr = dot(pc.o2, P);
+  float n = pc.a.w;
+  vec2 tc = (0.5 + 0.5 * st) * n;
+  if (any(lessThan(tc, vec2(2.0))) || any(greaterThan(tc, vec2(n - 2.0)))) {
+    o = vec4(1.0);
+    return;
+  }
+  float lit = 0.0;
+  for (int y = -1; y <= 2; ++y) {
+    for (int x = -1; x <= 2; ++x) {
+      float z = texelFetch(casters, ivec2(tc + vec2(x, y) - 0.5), 0).r;
+      lit += (z >= 1.0 || z >= zr - pc.a.z) ? 1.0 : 0.0;
+    }
+  }
+  o = vec4(lit / 16.0);
+}
+)", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(push_constant) uniform Tiles { vec4 a; } pc;  // a.x: block size (8: from the map; 1: spread)
@@ -4990,8 +5045,9 @@ void main() {
   // on them has been drawn): baked outright. Pass 2 (q.w = 1): the rest,
   // only ever darker than the painted map (blended by min): whatever casts
   // on them may not have been drawn yet (a tree's crown above the view).
+  // (q.w = 2, the time of day: every ray, outright.)
   bool sunward_seen = texelFetch(seen, ivec2(tc), 0).r > 0.5;
-  if (sunward_seen == (pc.q.w > 0.5)) discard;
+  if (pc.q.w < 1.5 && sunward_seen == (pc.q.w > 0.5)) discard;
   float tm = 2.0 * pc.p.w / float(n.x);  // metres per texel
   float zpm = 1.0 / pc.p.z;               // depth per metre
   // The surface's slope (from the height map: the gentler side each way, so
@@ -5025,7 +5081,7 @@ void main() {
     }
   }
   if (bn == 0.0) {
-    if (pc.q.w > 0.5) discard;
+    if (pc.q.w > 0.5 && pc.q.w < 1.5) discard;
     o = vec4(1.0);
     return;
   }
@@ -6460,13 +6516,14 @@ void Renderer::Impl::PrepareSunShadows(const Draw& d, const GpuState& st) {
 // reprojected in its vertex shader, camera clip -> world (the lighting's
 // inverse view-projection, which takes x, y, 1 - depth) -> the map (rows O).
 void Renderer::Impl::DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map,
-                                    const double O[16]) {
+                                    const double O[16], const double* clip_to_world) {
   if (draws.empty()) return;
   double OI[16];
+  const double* inv = clip_to_world ? clip_to_world : game_inv_vp_;
   for (int r = 0; r < 4; ++r) {
     for (int c = 0; c < 4; ++c) {
       double v = 0;
-      for (int k = 0; k < 4; ++k) v += O[r * 4 + k] * game_inv_vp_[k * 4 + c];  // as the game drew them
+      for (int k = 0; k < 4; ++k) v += O[r * 4 + k] * inv[k * 4 + c];  // as the game drew them
       OI[r * 4 + c] = v;
     }
   }
@@ -6488,11 +6545,13 @@ void Renderer::Impl::DrawIntoSunMap(std::vector<CasterDraw>& draws, Image* map,
     // and offset make its depth: 1 - depth = (1 - zo) w - zs z).
     const double zs = c.sys.ndc_scale[2], zo = c.sys.ndc_offset[2];
     const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -zs, 1.0 - zo, 0, 0, 0, 1};
+    static const double kI[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const double* Kp = clip_to_world ? kI : K;
     SystemConstants sys = c.sys;
     for (int r = 0; r < 4; ++r) {
       for (int col = 0; col < 4; ++col) {
         double v = 0;
-        for (int k = 0; k < 4; ++k) v += OI[r * 4 + k] * K[k * 4 + col];
+        for (int k = 0; k < 4; ++k) v += OI[r * 4 + k] * Kp[k * 4 + col];
         sys.reproject[col * 4 + r] = float(v);  // column-major
       }
     }
@@ -6572,8 +6631,9 @@ void Renderer::Impl::SunCycle(const double cam[3], const double dir[3]) {
     sun_next_phase_ = sun_phase_ + 1;
     return;
   }
-  // What's saved (and while it's being read).
-  if (bake_saved_only_ && (bake_loaded_ || (bake_io_.upload && bake_io_.state.load() != 0)) &&
+  // What's saved (and while it's being read). (Not for the time of day.)
+  if (bake_saved_only_ && !TodOn() &&
+      (bake_loaded_ || (bake_io_.upload && bake_io_.state.load() != 0)) &&
       !Diag("sunevery")) {
     return;
   }
@@ -6642,6 +6702,34 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     if (f[1] > 0.0) {  // travelling down from the sun
       for (double& v : f) v = -v;
     }
+  }
+  // The time of day: the hour's sun (or moon), kept at least a few degrees
+  // up (lower, its light is all but gone and the shadows endless).
+  if (Diag("sun")) std::fprintf(stderr, "sun: game f %.4f %.4f %.4f\n", f[0], f[1], f[2]);
+  // The time of day: shadows from the hour's sun (or moon). Each mountain's
+  // shadows come from higher than its light does (an artist's choice: the
+  // game's shadow map and painted shadows are for a sun some 20 degrees
+  // higher, a little round): the same lift and turn, the full amount from the
+  // mountain's own sun's height up, none at the horizon (long low shadows at
+  // dawn and dusk).
+  if (TodOn()) {
+    const double* L0 = nullptr;
+    double l0[3] = {tod_game_light_[0], tod_game_light_[1], tod_game_light_[2]};
+    L0 = l0;
+    const double s0[3] = {-f[0], -f[1], -f[2]};
+    auto elev = [](const double* v) { return std::asin(std::clamp(v[1], -1.0, 1.0)); };
+    auto azim = [](const double* v) { return std::atan2(v[2], v[0]); };
+    const double e0 = elev(L0), es0 = elev(s0);
+    const double daz = std::remainder(azim(s0) - azim(L0), 2.0 * tod::kPi);
+    const double l[3] = {lm_dir_.x, lm_dir_.y, lm_dir_.z};
+    const double e = elev(l);
+    const double k = e0 > 0.02 ? std::clamp(e / e0, 0.0, 1.0) : 1.0;
+    const double es = std::clamp(e + (es0 - e0) * k, 0.06, 1.45);
+    const double az = azim(l) + daz * k;
+    const double ch = std::cos(es);
+    f[0] = -ch * std::cos(az);
+    f[1] = -std::sin(es);
+    f[2] = -ch * std::sin(az);
   }
   // The light's view-projection: a shadow pass draw whose c0-c3 rows x, y, w
   // are the lighting's (x = 2 c6 - c9, y = c9 - 2 c7, w = c9, give or take
@@ -6756,6 +6844,7 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
       sun_ref_ = dot3(cam, f);
       sun_href_ = cam[1];
       for (Image* im : {&sun_env_, &sun_height_}) ClearImage(im, far_depth, 1.0f, 0, false, true, true);
+      sun_next_phase_ = 0;  // an update from now (the world drawn into them again)
       ClearImage(&sun_seen_, far_depth, 0.0f, 0, true, false, false);
       FlushPendingClears();
       sun_map_ok_ = true;
@@ -6934,6 +7023,8 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
       const double p1[3] = {cam[0] - f[0], cam[1] - f[1], cam[2] - f[2]};
       sun_depth_per_m_ = depth_at(p1) - depth_at(cam);
       if (!(sun_depth_per_m_ > 0.0)) sun_depth_per_m_ = 0.0;
+      // (The game's map is for its own sun: not once the hour's is away.)
+      if (TodNoGameShadows()) sun_depth_per_m_ = 0.0;
     }
   }
   for (int i = 0; i < 3; ++i) prep_pc[28 + i] = float(f[i]);
@@ -7091,7 +7182,7 @@ void Renderer::Impl::BakeIoTick(Image* src) {
   if (io.upload) {
     // A saved bake read: copied in (if it's still this mountain's).
     if (io.ok && baked_.image && baked_src_ == src && baked_.width == io.w &&
-        baked_.height == io.h && io.sig == bake_sig_applied_) {
+        baked_.height == io.h && io.sig == bake_sig_applied_ && !baked_tod_) {
       EndRendering();
       VkBufferImageCopy r{};
       r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -7162,9 +7253,12 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
   BakeIoTick(src);
   const uint32_t mult = uint32_t(world_detail_);
   const uint32_t w = std::min(src->width * mult, 16384u), h = std::min(src->height * mult, 16384u);
-  if (!baked_.image || baked_.width != w || baked_.height != h || baked_src_ != src) {
+  // (Time of day: baked for the hour's sun, from nothing; the mountain's
+  // own again after.)
+  if (!baked_.image || baked_.width != w || baked_.height != h || baked_src_ != src ||
+      baked_tod_ != TodOn()) {
     // Another mountain (or size): what's baked for the last one saved first.
-    if (baked_.image && bake_dirty_ && bake_io_.state.load() == 0) BakeSave();
+    if (baked_.image && bake_dirty_ && !baked_tod_ && bake_io_.state.load() == 0) BakeSave();
     if (baked_.image) Retire(baked_);
     baked_ = gpu_.CreateImage(w, h, VK_FORMAT_R8_UNORM, false, "world_shadows");
     // Read as all four channels (whichever the lighting's fetch picks).
@@ -7185,14 +7279,25 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     for (const auto& [name, t] : textures_) {
       if (&t.image == src) bake_key_ = t.hash;
     }
-    // The painted map, magnified (until a saved one is in).
+    baked_tod_ = TodOn();
+    // The painted map, magnified (until a saved one is in); for the time of
+    // day: lit everywhere until baked.
     const float inv[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
-    FullscreenPass(CopyKind::kBakeInit, &baked_, src, nullptr, nullptr, true, inv, 4);
+    if (baked_tod_) {
+      VkClearColorValue one{};
+      for (float& v : one.float32) v = 1.0f;
+      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vk::vkCmdClearColorImage(cb_, baked_.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+      Barrier();
+    } else {
+      FullscreenPass(CopyKind::kBakeInit, &baked_, src, nullptr, nullptr, true, inv, 4);
+    }
     if (Diag("sun")) std::fprintf(stderr, "sun: world shadows %ux%u\n", w, h);
     // A saved one: read in the background.
     const std::string path = BakePath(w, h);
     std::error_code ec;
-    if (!path.empty() && bake_io_.state.load() == 0 && std::filesystem::exists(path, ec)) {
+    if (!baked_tod_ && !path.empty() && bake_io_.state.load() == 0 &&
+        std::filesystem::exists(path, ec)) {
       BakeIo& io = bake_io_;
       io.buffer = gpu_.CreateBuffer(VkDeviceSize(w) * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
       io.upload = true;
@@ -7271,13 +7376,21 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     pc[26] = float(cam_pos_[2]);
     pc[28] = float(w);
     pc[29] = float(h);
-    pc[27] = 0.0f;
-    FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
-                   &rect);
-    pc[27] = 1.0f;
-    FullscreenPass(CopyKind::kBakeMin, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
-                   &rect);
-    bake_dirty_ = true;
+    if (baked_tod_) {
+      // The time of day: every ray baked outright (the sun moves on: what
+      // was dark before mustn't stay dark), nothing saved.
+      pc[27] = 2.0f;
+      FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
+                     &rect);
+    } else {
+      pc[27] = 0.0f;
+      FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
+                     &rect);
+      pc[27] = 1.0f;
+      FullscreenPass(CopyKind::kBakeMin, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc,
+                     32, &rect);
+      bake_dirty_ = true;
+    }
   }
   // Saved every half a minute or so while there's something new.
   if (bake_dirty_ && (frame_number_ >= bake_last_save_ + 1800 || Diag("bakesave"))) BakeSave();
@@ -7646,6 +7759,10 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
 // the hour; the white stand-in for the game's fixed shadows made.
 void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   tod_lut_ok_ = false;
+  {
+    std::string n0;
+    tod_game_map_ = TodOn() ? TextureFor(d, 0, st, &n0) : nullptr;
+  }
   if (!LightModOn()) return;
   auto ensure = [&](Image& im, uint32_t w, uint32_t h, VkFormat f, const char* name) {
     if (im.image && im.width == w && im.height == h && im.format == f) return false;
@@ -7661,6 +7778,7 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vk::vkCmdClearColorImage(cb_, tod_white_.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
   }
+  TodShadows();
   std::string note;
   Image* src = TextureFor(d, 1, st, &note);
   if (!src || src->depth || src->samples > 1 || src->width > 4096 || src->height > 4096) {
@@ -7735,6 +7853,109 @@ void Renderer::Impl::EyeMeasure(Image* scene) {
   Barrier();
   eye_rb_frame_[slot] = frame_number_;
   eye_rb_exposure_[slot] = eye_strength_ > 0.0f ? exposure_ : 1.0;
+  dyn_ = DynState{};
+}
+
+// Time of day, at the lighting pass: the riders', rails' and objects'
+// shadows from the hour's sun (the game's shadow pass's casters drawn again
+// into a map like the world's, its frame), as a screen mask.
+void Renderer::Impl::TodShadows() {
+  std::vector<CasterDraw> draws;
+  draws.swap(tod_movers_draws_);
+  tod_mask_ok_ = false;
+  if (!TodOn() || !SunShadowsOn() || !sun_env_.image) return;
+  // Its own frame: the world map's axes, but only ~35 m each way, centred
+  // a little ahead of the camera, 2048 texels (a couple of cm each: limbs
+  // and rails cast).
+  const uint32_t n = 2048;
+  const double Rm = 35.0;
+  if (!tod_movers_map_.image || tod_movers_map_.width != n) {
+    if (tod_movers_map_.image) Retire(tod_movers_map_);
+    tod_movers_map_ = gpu_.CreateImage(n, n, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "tod_casters");
+    ToGeneral(cb_, tod_movers_map_);
+    return;  // (recorded into from the next frame)
+  }
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
+      dit->second.samples > 1) {
+    return;
+  }
+  Image* depth = &dit->second;
+  double Vinv[16], vp[16];
+  if (!Invert4(inv_vp_, vp)) return;
+  const float far_depth[4] = {0, 0, 0, 0};
+  ClearImage(&tod_movers_map_, far_depth, 1.0f, 0, false, true, true);
+  FlushPendingClears();
+  double Om[16] = {};
+  {
+    double ahead[3] = {cam_pos_[0], cam_pos_[1], cam_pos_[2]};
+    double mid[4] = {};
+    const double ndc[4] = {0.0, 0.0, 0.5, 1.0};
+    for (int r = 0; r < 4; ++r) {
+      for (int c = 0; c < 4; ++c) mid[r] += inv_vp_[r * 4 + c] * ndc[c];
+    }
+    if (std::fabs(mid[3]) > 1e-12) {
+      const double vx = mid[0] / mid[3] - cam_pos_[0], vz = mid[2] / mid[3] - cam_pos_[2];
+      const double nh = std::sqrt(vx * vx + vz * vz);
+      if (nh > 1e-6) {
+        ahead[0] += 0.4 * Rm * vx / nh;
+        ahead[2] += 0.4 * Rm * vz / nh;
+      }
+    }
+    const double texel = 2.0 * Rm / double(n);
+    auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    // (Whole texels: the shadows don't crawl as the camera moves.)
+    const double a1 = std::round(dot3(ahead, sun_e1_) / texel) * texel;
+    const double a2 = std::round(dot3(ahead, sun_e2_) / texel) * texel;
+    for (int i = 0; i < 3; ++i) {
+      Om[0 * 4 + i] = sun_e1_[i] / Rm;
+      Om[1 * 4 + i] = sun_e2_[i] / Rm;
+    }
+    Om[0 * 4 + 3] = -a1 / Rm;
+    Om[1 * 4 + 3] = -a2 / Rm;
+    for (int i = 0; i < 4; ++i) Om[2 * 4 + i] = sun_O_[2 * 4 + i];
+    Om[15] = 1.0;
+  }
+  if (sun_light_ok_ && Invert4(sun_light_vp_, Vinv)) {
+    DrawIntoSunMap(draws, &tod_movers_map_, Om, Vinv);
+    EndRendering();
+  }
+  if (!tod_mask_.image || tod_mask_.width != depth->width || tod_mask_.height != depth->height) {
+    if (tod_mask_.image) Retire(tod_mask_);
+    tod_mask_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask");
+    // Read as all four channels (whichever the lighting's fetch picks).
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = tod_mask_.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8_UNORM;
+    vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                      VK_COMPONENT_SWIZZLE_R};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk::Check(vk::vkCreateImageView(gpu_.device, &vci, nullptr, &tod_mask_.sample_view),
+              "time of day shadow mask view");
+    ToGeneral(cb_, tod_mask_);
+  }
+  Barrier();
+  float pc[32] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
+  }
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 4; ++c) pc[16 + r * 4 + c] = float(Om[r * 4 + c]);
+  }
+  pc[28] = 1.0f / float(depth->width);
+  pc[29] = 1.0f / float(depth->height);
+  pc[30] = float(0.06 / kSunDepth);
+  pc[31] = float(n);
+  FullscreenPass(CopyKind::kTodShadow, &tod_mask_, depth, &tod_movers_map_, nullptr, false, pc, 32);
+  Barrier();
+  // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
+  for (int i = 0; i < 4; ++i) {
+    tod_mask_rows_[0 + i] = 0.5 * vp[0 * 4 + i] + 0.5 * vp[3 * 4 + i];
+    tod_mask_rows_[4 + i] = -0.5 * vp[1 * 4 + i] + 0.5 * vp[3 * 4 + i];
+    tod_mask_rows_[8 + i] = vp[3 * 4 + i];
+  }
+  tod_mask_ok_ = true;
   dyn_ = DynState{};
 }
 
@@ -8518,10 +8739,18 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       // Time of day: the sky-light table tinted; the game's fixed shadows
       // (the painted slopes, tf2; the shadow map, tf0) gone once the sun has
       // moved well away from where they were made for.
+      // (The snow trails' lookup into the game's shadow map: the mask.)
+      if (stage == 1 && TodOn() && tod_mask_ok_ && light_seen_ && tod_game_map_ &&
+          hit->second.image == tod_game_map_ && ps->info.ucode_hash != kLightingPixelShader) {
+        im = &tod_mask_;
+      }
       if (stage == 1 && LightModOn() && ps->info.ucode_hash == kLightingPixelShader) {
         if (b.fetch_constant == 1 && tod_lut_ok_ && hit->second.image == tod_lut_src_) im = &tod_lut_;
-        if ((b.fetch_constant == 2 || b.fetch_constant == 0) && TodNoGameShadows() &&
-            tod_white_.image) {
+        // (World shadows: the slopes' map baked for the hour's sun, kept.)
+        if (b.fetch_constant == 0 && tod_mask_ok_) {
+          im = &tod_mask_;
+        } else if ((b.fetch_constant == 2 || b.fetch_constant == 0) && TodNoGameShadows() &&
+            tod_white_.image && !(im == &baked_ && baked_tod_)) {
           im = &tod_white_;
         }
       }
@@ -8752,12 +8981,28 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     for (int i = 0; i < 4; ++i) c10[i] = shadow_av_ * (c10[i] - c12[i]) + c12[i];
     std::memcpy(out + 10 * 16, c10, 16);
   }
-  uint32_t vc[1024];
-  if (LightModOn() && TodNeeds(0, *vs) &&
-      (std::memcpy(vc, st.vs_consts.data(), sizeof(vc)), TodApply(0, *vs, vc))) {
-    uint8_t* out;
-    offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
-    std::memcpy(out, vc, ConstBytes(*vs));
+  // (The snow trails take the riders' shadows from the shadow map, rows
+  // c9, c10 over c12: the time of day's mask, through the screen's rows.)
+  const bool trail_tod = TodOn() && tod_mask_ok_ && vs->info.ucode_hash == kTrailVertexShader;
+  const bool vs_needs = LightModOn() && TodNeeds(0, *vs);
+  if (vs_needs || trail_tod) {
+    uint32_t vc[1024];
+    std::memcpy(vc, st.vs_consts.data(), sizeof(vc));
+    bool changed = vs_needs && TodApply(0, *vs, vc);
+    if (trail_tod) {
+      for (int r = 0; r < 3; ++r) {
+        const int reg = r == 0 ? 9 : r == 1 ? 10 : 12;
+        float v[4];
+        for (int i = 0; i < 4; ++i) v[i] = float(tod_mask_rows_[r * 4 + i]);
+        std::memcpy(&vc[reg * 4], v, 16);
+      }
+      changed = true;
+    }
+    if (changed) {
+      uint8_t* out;
+      offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
+      std::memcpy(out, vc, ConstBytes(*vs));
+    }
   }
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
   // Freecam: the lighting pass works out each pixel's world position from
@@ -8789,6 +9034,14 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   if (LightModOn() && ps->info.ucode_hash == kLightingPixelShader) {
     if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
     TodLightingBlock(fc_consts, 14, 15, 39);
+    if (tod_mask_ok_) {
+      for (int r = 0; r < 3; ++r) {
+        const int reg = r == 0 ? 6 : r == 1 ? 7 : 9;
+        float v[4];
+        for (int i = 0; i < 4; ++i) v[i] = float(tod_mask_rows_[r * 4 + i]);
+        std::memcpy(&fc_consts[reg * 4], v, 16);
+      }
+    }
     lit_src = fc_consts;
     uint8_t* out;
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
@@ -8827,7 +9080,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     std::memcpy(c7, src + 7 * 4, 16);
     std::memcpy(c9, src + 9 * 4, 16);
     for (int i = 0; i < 4; ++i) c7[i] = shadow_av_ * (c7[i] - c9[i]) + c9[i];
-    std::memcpy(out + 7 * 16, c7, 16);
+    if (!(TodOn() && tod_mask_ok_)) std::memcpy(out + 7 * 16, c7, 16);  // (the time of day's: the screen's)
     // The fade (shadows gone at raw scene depth c10.x, whole from c11.x)
     // moved out with the reach.
     float c10[4], c11[4];
@@ -9171,6 +9424,13 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       sun_light_sys_ = sys;
       // Its casters' shaders (not the terrain's): the game casts those.
       if (ps->info.ucode_hash != kTerrainShadowPixelShader) shadow_caster_vs_.insert(vh);
+      // The time of day: the same casters (riders, rails, objects) drawn
+      // again from the hour's sun (TodLightingInputs).
+      if (TodOn() && ps->info.ucode_hash != kTerrainShadowPixelShader && tod_movers_map_.image) {
+        const VkPipeline mp = PipelineFor(d, st, *vs, *ps, kNoColors, &tod_movers_map_, 0, false,
+                                          false, false, true);
+        if (mp) keep(mp, tod_movers_draws_, true);
+      }
       // The light's view-projection: c0-c3 of a draw with world-space
       // vertices (found at the lighting pass among these).
       if (light_candidates_.size() < 256) {
@@ -10356,7 +10616,8 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(radial_img_);
   gpu_.DestroyImage(fog_img_);
   if (eye_rb_.buffer) gpu_.DestroyBuffer(eye_rb_);
-  for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_}) {
+  for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
+                    &tod_movers_map_, &tod_mask_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -10963,6 +11224,12 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   if (impl_->reactive_img_.image) out.push_back(Describe(&impl_->reactive_img_));
   if (impl_->sun_out_.image) out.push_back(Describe(&impl_->sun_out_));
   if (impl_->baked_.image && impl_->Diag("dumpbake")) out.push_back(Describe(&impl_->baked_));
+  if (impl_->Diag("dumptod")) {
+    out.clear();
+    for (auto* im : {&impl_->tod_mask_, &impl_->tod_movers_map_, &impl_->sun_env_}) {
+      if (im->image) out.push_back(Describe(im));
+    }
+  }
   if (impl_->Diag("dumpbake")) {
     for (auto* im : {&impl_->sun_height_, &impl_->sun_env_, &impl_->movers_shade_}) {
       if (im->image) out.push_back(Describe(im));

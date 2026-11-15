@@ -221,6 +221,25 @@ inline State At(const Layout& l, double hour, double moon_phase, double night_li
   const double moon_light = s.moon_bright * moon_up;
   SkyColors(e, moon_light, &s.zenith, &s.horizon, &s.glow);
   SkyColors(e0, 0.0, &s.mountain_zenith, &s.mountain_horizon, &s.mountain_glow);
+  // The sky's light takes the sky's color too: bluer by day than the
+  // mountain's (often warm) hour, deep blue at night (its hue only, part way).
+  {
+    auto lum = [](const Vec3& v) { return 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z; };
+    const Vec3 a{s.zenith.x * 0.85 + s.horizon.x * 0.15, s.zenith.y * 0.85 + s.horizon.y * 0.15,
+                 s.zenith.z * 0.85 + s.horizon.z * 0.15};
+    const Vec3 b{s.mountain_zenith.x * 0.85 + s.mountain_horizon.x * 0.15,
+                 s.mountain_zenith.y * 0.85 + s.mountain_horizon.y * 0.15,
+                 s.mountain_zenith.z * 0.85 + s.mountain_horizon.z * 0.15};
+    const double la = std::max(lum(a), 1e-4), lb = std::max(lum(b), 1e-4);
+    auto hue = [&](double x, double y) {
+      return std::pow(std::clamp((x / la) / std::max(y / lb, 1e-4), 0.5, 2.0), 0.45);
+    };
+    const Vec3 h{hue(a.x, b.x), hue(a.y, b.y), hue(a.z, b.z)};
+    const double hl = lum(h);
+    s.ambient_scale.x *= h.x / hl;
+    s.ambient_scale.y *= h.y / hl;
+    s.ambient_scale.z *= h.z / hl;
+  }
   const double c = s.sun.x * l.mountain_sun.x + s.sun.y * l.mountain_sun.y + s.sun.z * l.mountain_sun.z;
   const double ang = std::acos(std::clamp(c, -1.0, 1.0));
   s.away = std::max(SmoothStep(8.0 * kDeg, 20.0 * kDeg, ang), 1.0 - up);

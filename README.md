@@ -430,10 +430,20 @@ worked out from that, so it fits each mountain's own look.
   Settings: Minutes per Day (`native_tod_day_minutes`, 24; 0 stops it), Set the
   Hour (`native_tod_start_hour`, -1 = the mountain's own), Moon Phase, Cloud
   Cover, Night Brightness.
-- Shadows: the game's own shadows are made for each mountain's fixed sun, so
-  they fade out once the sun has moved well away from it. Shadows for the
-  moving sun and moon from the World Shadows maps, and lights that come on at
-  night (lift towers, buildings), are the next steps.
+- Shadows follow the sun (and the moon at night):
+  - riders, rails and objects: the game's own shadow casters drawn again from
+    the hour's sun into a fine map around the camera (a couple of cm a texel),
+    as a screen mask the lighting and the snow trails read in place of the
+    game's shadow map;
+  - the world (terrain, trees, props): the World Shadows maps drawn from the
+    hour's sun and baked into the slopes around the camera as it goes (not
+    saved; the saved bakes are for the mountain's own sun). Needs World
+    Shadows (Baked); with Painted, the slopes have none once the sun has moved
+    away from the mountain's.
+  Each mountain's shadows come from somewhat higher than its light (the
+  game's choice): kept, easing to true long shadows toward sunrise and
+  sunset, so at the mountain's own hour they match the game's.
+- Lights that come on at night (lift towers, buildings) are the next step.
 
 ## Subtitles
 
