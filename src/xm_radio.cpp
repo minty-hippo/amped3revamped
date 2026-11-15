@@ -164,10 +164,15 @@ void LookAtObject(rex::memory::Memory* memory, double now) {
     // 20 s: made and freed with the mountain).
     g_next_find = now + 20.0;
     g_objects.clear();
-    for (uint32_t page = 0x40000000u; page < 0x60000000u && g_objects.size() < 16; page += 0x1000u) {
-      if (!Readable(memory, page, 0x1000u)) continue;
-      for (uint32_t i = 0; i < 0x1000u; i += 4) {
-        if (Be32(base, page + i) == kVtable) g_objects.push_back(page + i);
+    // (Its state a small number: not just a pointer to the vtable.)
+    const uint32_t ranges[][2] = {{0x82000000u, 0x83000000u}, {0x40000000u, 0x80000000u}, {0xA0000000u, 0xE0000000u}};
+    for (const auto& r : ranges) {
+      for (uint64_t page = r[0]; page < r[1] && g_objects.size() < 16; page += 0x1000u) {
+        if (!Readable(memory, uint32_t(page), 0x1000u)) continue;
+        for (uint32_t i = 0; i + 0x100 <= 0x1000u; i += 4) {
+          const uint32_t a = uint32_t(page) + i;
+          if (Be32(base, a) == kVtable && Be32(base, a + 140) <= 4) g_objects.push_back(a);
+        }
       }
     }
     std::string list;
