@@ -1506,7 +1506,9 @@ struct Renderer::Impl {
   bool center_probe_ = true;  // SetCenterProbe
   // The night lights that can show this frame: within 400 m, their reach in
   // view (their light, glow and fitting), nearest first, at most 128.
-  std::vector<std::pair<float, size_t>> VisibleLights() const;
+  // far: those seen from afar instead (as points of light, 150 m to 2.5 km,
+  // at most 256).
+  std::vector<std::pair<float, size_t>> VisibleLights(bool far = false) const;
   void CenterRead();
   double tod_mask_rows_[12] = {};  // c6, c7, c9
   double tod_Om_[16] = {};         // the casters' map's rows (world -> its ndc, depth)
@@ -5073,13 +5075,14 @@ void main() {
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D world_depth;  // at the lighting (0: nothing)
 layout(set = 0, binding = 2) uniform sampler2D lights;       // n x 3: pos, radius; color, intensity; dir, kind
-                                                             // (row 3: world from the camera -> clip)
+                                                             // (row 3: world from the camera -> clip;
+                                                             // rows 4, 5: points afar; 8..: the tiles)
 layout(set = 0, binding = 3) uniform sampler2D albedo;
 layout(set = 0, binding = 4) uniform sampler2D normals;      // xyz * 2 - 1
 layout(set = 0, binding = 5) uniform sampler2D depth;        // now (with the riders)
 layout(push_constant) uniform Lights {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
-  vec4 cam;  // camera position, count
+  vec4 cam;  // camera position, tile size (pixels)
   vec4 a;    // 1 / width, 1 / height, how dark it is (0..1), riders told apart (0/1)
   vec4 b;    // seconds, the scene's light on the fittings (0..1), shadow steps (0: none), -
 } pc;
@@ -5254,8 +5257,11 @@ void main() {
   vec2 uv = gl_FragCoord.xy * pc.a.xy;
   vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
   float k = pc.a.z;
-  int count = int(pc.cam.w);
-  if (count == 0) {
+  // This pixel's tile: the lights that can reach it.
+  ivec2 tile = ivec2(gl_FragCoord.xy) / int(pc.cam.w + 0.5);
+  ivec2 tile_base = ivec2(tile.x, 8 + tile.y * 9);
+  int tile_n = int(texelFetch(lights, tile_base, 0).x + 0.5);
+  if (tile_n == 0) {
     o = c;
     return;
   }
@@ -5319,7 +5325,32 @@ void main() {
   float hit_t = pix_dist;
   vec3 hit_col = vec3(0.0);
   bool hit = false;
-  for (int i = 0; i < count; ++i) {
+  for (int e = 0; e < tile_n; ++e) {
+    int slot = e + 1;
+    vec4 tv = texelFetch(lights, tile_base + ivec2(0, slot / 4), 0);
+    int i = int(tv[slot % 4] + 0.5);
+    if (i >= 256) {
+      // A light afar: a point of light, hidden behind what's in front of it
+      // (5 looks round its middle: no flicker at an edge).
+      vec4 sa = texelFetch(lights, ivec2(i - 256, 4), 0);
+      vec4 sc = texelFetch(lights, ivec2(i - 256, 5), 0);
+      vec2 dpx = (ndc - sa.xy) * 0.5 / pc.a.xy;
+      float q = dot(dpx, dpx) / (sa.w * sa.w);
+      if (q > 16.0) continue;
+      vec2 cuv = vec2(sa.x * 0.5 + 0.5, 0.5 - sa.y * 0.5);
+      vec2 off = pc.a.xy * max(sa.w * 0.5, 1.0);
+      float seen = 0.0;
+      for (int s = 0; s < 5; ++s) {
+        vec2 o2 = s == 0 ? vec2(0.0) : vec2(s == 1 ? 1.0 : s == 2 ? -1.0 : 0.0, s == 3 ? 1.0 : s == 4 ? -1.0 : 0.0);
+        float sd = textureLod(depth, cuv + o2 * off, 0.0).r;
+        seen += (sd <= 0.0 || sd < sa.z * 0.9995) ? 0.2 : 0.0;
+      }
+      // (What's drawn here in front of it: only a little of its halo over that.)
+      if (dn > sa.z * 1.0005) seen *= 0.3;
+      float g = 1.0 / (1.0 + q);
+      add += sc.rgb * (g * g * 1.6 + 0.08 * g) * seen * (1.0 - smoothstep(9.0, 16.0, q));
+      continue;
+    }
     vec4 lp = texelFetch(lights, ivec2(i, 0), 0);
     vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
     vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
@@ -8669,7 +8700,7 @@ void Renderer::Impl::CenterRead() {
 }
 
 // Night lights, after the scene (builtin_night_lights): on as it gets dark.
-std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights() const {
+std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights(bool far) const {
   std::vector<std::pair<float, size_t>> out;
   // The view's side planes and its front (Gribb / Hartmann, from world ->
   // clip), each normalised: a sphere wholly outside one is out of view.
@@ -8695,8 +8726,15 @@ std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights() const {
     const float* p = l.pos;
     const float dx = p[0] - cam_pos_[0], dy = p[1] - cam_pos_[1], dz = p[2] - cam_pos_[2];
     const float d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 >= 400.0f * 400.0f) continue;
-    if (have) {
+    if (far ? (d2 < 150.0f * 150.0f || d2 >= 2500.0f * 2500.0f) : d2 >= 400.0f * 400.0f) continue;
+    if (far && l.preview) continue;
+    if (have && far) {
+      bool in = true;
+      for (int k = 0; k < 5 && in; ++k) {
+        in = planes[k][0] * p[0] + planes[k][1] * p[1] + planes[k][2] * p[2] + planes[k][3] > -2.0;
+      }
+      if (!in) continue;
+    } else if (have) {
       // (Its light's reach; its glow and fitting a few metres round it,
       // more far off; a lamp post down to the ground.)
       const double reach = std::max<double>({l.radius, 4.0 + 0.03 * std::sqrt(double(d2)),
@@ -8711,7 +8749,7 @@ std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights() const {
     out.push_back({d2, i});
   }
   std::sort(out.begin(), out.end());
-  if (out.size() > 128) out.resize(128);
+  if (out.size() > (far ? 256u : 128u)) out.resize(far ? 256 : 128);
   return out;
 }
 
@@ -8727,8 +8765,100 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   }
   // Those that can show (in view), the nearest 128.
   const std::vector<std::pair<float, size_t>> nearby = VisibleLights();
-  if (Diag("lightcull")) std::fprintf(stderr, "night lights: %zu placed, %zu in view\n", lights_.size(), nearby.size());
-  if (nearby.empty()) return nullptr;
+  // Afar, after dark: each a point of light.
+  std::vector<std::pair<float, size_t>> distant;
+  if (dark > 0.001) distant = VisibleLights(true);
+  if (Diag("lightcull")) {
+    std::fprintf(stderr, "night lights: %zu placed, %zu in view, %zu afar\n", lights_.size(), nearby.size(),
+                 distant.size());
+  }
+  if (nearby.empty() && distant.empty()) return nullptr;
+  double vp[16];
+  if (!Invert4(inv_vp_, vp)) return nullptr;
+  // The screen in tiles, each with the lights that can reach its pixels
+  // (nearest first): rows 8.. of the lights image, 9 a tile (its count and
+  // 3 entries, then 4 a texel; 35 at most). An entry: a light (0..127) or a
+  // point afar (256 + n).
+  constexpr int kTile = 32, kTileRows = 9, kPerTile = 35;
+  const int W = int(scene->width), H = int(scene->height);
+  const int tiles_x = (W + kTile - 1) / kTile, tiles_y = (H + kTile - 1) / kTile;
+  const uint32_t img_w = uint32_t(std::max(256, tiles_x));
+  const uint32_t img_h = uint32_t(8 + tiles_y * kTileRows);
+  std::vector<std::vector<uint16_t>> tiles(size_t(tiles_x) * tiles_y);
+  // World -> pixels (x, y), with w (false: behind the camera).
+  auto project = [&](double x, double y, double z, double* px, double* py, double* ndz) {
+    const double c[4] = {vp[0] * x + vp[1] * y + vp[2] * z + vp[3], vp[4] * x + vp[5] * y + vp[6] * z + vp[7],
+                         vp[8] * x + vp[9] * y + vp[10] * z + vp[11], vp[12] * x + vp[13] * y + vp[14] * z + vp[15]};
+    if (c[3] <= 1e-6) return false;
+    *px = (c[0] / c[3] * 0.5 + 0.5) * W;
+    *py = (0.5 - c[1] / c[3] * 0.5) * H;
+    if (ndz) *ndz = c[2] / c[3];
+    return true;
+  };
+  auto bin = [&](double x0, double y0, double x1, double y1, uint16_t entry) {
+    const int tx0 = std::clamp(int(std::floor(x0 / kTile)), 0, tiles_x - 1);
+    const int tx1 = std::clamp(int(std::floor(x1 / kTile)), 0, tiles_x - 1);
+    const int ty0 = std::clamp(int(std::floor(y0 / kTile)), 0, tiles_y - 1);
+    const int ty1 = std::clamp(int(std::floor(y1 / kTile)), 0, tiles_y - 1);
+    if (x1 < 0 || y1 < 0 || x0 >= W || y0 >= H) return;
+    for (int ty = ty0; ty <= ty1; ++ty) {
+      for (int tx = tx0; tx <= tx1; ++tx) {
+        auto& t = tiles[size_t(ty) * tiles_x + tx];
+        if (t.size() < kPerTile) t.push_back(entry);
+      }
+    }
+  };
+  for (size_t j = 0; j < nearby.size(); ++j) {
+    const Renderer::NightLight& l = lights_[nearby[j].second];
+    const double dist = std::sqrt(double(nearby[j].first));
+    // What it reaches: its light; its glow, fitting (a lamp post's pole).
+    const double arm = std::sqrt(double(l.dir[0] * l.dir[0] + l.dir[1] * l.dir[1] + l.dir[2] * l.dir[2]));
+    const double R = std::max({double(std::max(l.radius, 0.5f)), 4.0 * (0.18 + 0.004 * dist), arm + 1.0});
+    double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
+    bool whole = dist < R * 1.2;
+    for (int c = 0; c < 8 && !whole; ++c) {
+      double px, py;
+      if (!project(l.pos[0] + (c & 1 ? R : -R), l.pos[1] + (c & 2 ? R : -R), l.pos[2] + (c & 4 ? R : -R), &px,
+                   &py, nullptr)) {
+        whole = true;
+        break;
+      }
+      x0 = std::min(x0, px);
+      x1 = std::max(x1, px);
+      y0 = std::min(y0, py);
+      y1 = std::max(y1, py);
+    }
+    if (whole) {
+      x0 = y0 = 0;
+      x1 = W;
+      y1 = H;
+    }
+    bin(x0, y0, x1, y1, uint16_t(j));
+  }
+  struct Sprite {
+    float x, y, d, r, rgb[3];
+  };
+  std::vector<Sprite> sprites;
+  const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
+  for (const auto& [d2, i] : distant) {
+    const Renderer::NightLight& l = lights_[i];
+    const double dist = std::sqrt(double(d2));
+    double px, py, ndz;
+    if (!project(l.pos[0], l.pos[1], l.pos[2], &px, &py, &ndz)) continue;
+    // Fades in as the glow up close fades out, and away again at the far end.
+    const double fade = dark * tod::SmoothStep(150.0, 400.0, dist) * (1.0 - tod::SmoothStep(1800.0, 2500.0, dist));
+    if (fade < 0.002) continue;
+    // A few pixels across (more for a bright one), a little smaller far off.
+    const double r = H / 720.0 * 2.2 * std::sqrt(std::max(double(l.intensity), 0.2)) *
+                     (1.25 - 0.45 * tod::SmoothStep(150.0, 2500.0, dist));
+    Sprite sp{float(px / W * 2.0 - 1.0), float(1.0 - py / H * 2.0), float(1.0 - ndz), float(r), {}};
+    const double k = l.intensity * e * fade * (l.kind == 1 ? 1.4 : 1.0);
+    for (int c = 0; c < 3; ++c) sp.rgb[c] = float(l.color[c] * k);
+    const uint16_t entry = uint16_t(256 + sprites.size());
+    sprites.push_back(sp);
+    bin(px - r * 4.0, py - r * 4.0, px + r * 4.0, py + r * 4.0, entry);
+  }
+  if (nearby.empty() && sprites.empty()) return nullptr;
   EndRendering();
   auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
     if (im.image && im.width == iw && im.height == ih && im.format == f) return;
@@ -8736,21 +8866,22 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     im = gpu_.CreateImage(iw, ih, f, false, name);
     ToGeneral(cb_, im);
   };
-  ensure(lights_img_, 128, 4, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
+  ensure(lights_img_, img_w, img_h, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
   ensure(lights_out_, scene->width, scene->height, scene->format, "night_lit");
   lights_out_.scaled = scene->scaled;
   lights_out_.scale = scene->scale;
   {
-    Buffer staging = gpu_.CreateBuffer(128 * 4 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    const size_t bytes = size_t(img_w) * img_h * 16;
+    Buffer staging = gpu_.CreateBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     float* f = reinterpret_cast<float*>(staging.mapped);
-    std::memset(f, 0, 128 * 4 * 16);
+    std::memset(f, 0, bytes);
+    const size_t row = size_t(img_w) * 4;  // floats a row
     {
       // Row 3: world (from the camera) -> clip, its rows (the shadows' steps
       // onto the screen; worked out here in double, from the camera so
       // nothing's lost far from the origin).
-      double vp[16];
-      if (Invert4(inv_vp_, vp)) {
-        float* r = f + 384 * 4;
+      {
+        float* r = f + 3 * row;
         for (int i = 0; i < 4; ++i) {
           r[i * 4 + 0] = float(vp[i * 4 + 0]);
           r[i * 4 + 1] = float(vp[i * 4 + 1]);
@@ -8760,11 +8891,10 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
         }
       }
     }
-    const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
     for (size_t j = 0; j < nearby.size(); ++j) {
       const Renderer::NightLight& l = lights_[nearby[j].second];
       float* a = f + j * 4;
-      float* b = f + (128 + j) * 4;
+      float* b = f + row + j * 4;
       a[0] = l.pos[0];
       a[1] = l.pos[1];
       a[2] = l.pos[2];
@@ -8773,15 +8903,39 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
       b[1] = l.color[1];
       b[2] = l.color[2];
       b[3] = float(l.intensity * e);
-      float* c = f + (256 + j) * 4;
+      float* c = f + 2 * row + j * 4;
       c[0] = l.dir[0];
       c[1] = l.dir[1];
       c[2] = l.dir[2];
       c[3] = float((l.kind & 3) | (l.preview ? 4 : 0) | (l.selected ? 8 : 0));
     }
+    // Rows 4, 5: the points afar (ndc x, y, depth, radius in pixels; color).
+    for (size_t n = 0; n < sprites.size(); ++n) {
+      float* a = f + 4 * row + n * 4;
+      float* b = f + 5 * row + n * 4;
+      a[0] = sprites[n].x;
+      a[1] = sprites[n].y;
+      a[2] = sprites[n].d;
+      a[3] = sprites[n].r;
+      b[0] = sprites[n].rgb[0];
+      b[1] = sprites[n].rgb[1];
+      b[2] = sprites[n].rgb[2];
+    }
+    // The tiles.
+    for (int ty = 0; ty < tiles_y; ++ty) {
+      for (int tx = 0; tx < tiles_x; ++tx) {
+        const auto& t = tiles[size_t(ty) * tiles_x + tx];
+        float* base = f + size_t(8 + ty * kTileRows) * row + size_t(tx) * 4;
+        base[0] = float(t.size());
+        for (size_t k = 0; k < t.size(); ++k) {
+          const size_t slot = k + 1;
+          base[(slot / 4) * row + slot % 4] = float(t[k]);
+        }
+      }
+    }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {128, 4, 1};
+    region.imageExtent = {img_w, img_h, 1};
     Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, lights_img_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
                                &region);
@@ -8806,7 +8960,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   pc[16] = cam_pos_[0];
   pc[17] = cam_pos_[1];
   pc[18] = cam_pos_[2];
-  pc[19] = float(nearby.size());
+  pc[19] = float(kTile);
   pc[20] = 1.0f / float(scene->width);
   pc[21] = 1.0f / float(scene->height);
   pc[22] = float(dark);

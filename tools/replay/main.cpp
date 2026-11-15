@@ -881,6 +881,19 @@ int main(int argc, char** argv) {
         }
         lights.push_back(l);
       }
+      if (std::getenv("A3_TEST_FAR")) {
+        // Lights far off ahead (200 m to 1.5 km), in a fan: points of light.
+        for (int k = 0; k < 40; ++k) {
+          amped3::native::Renderer::NightLight l;
+          const float ahead = 200.0f + 35.0f * float(k), side = float((k * 37) % 21 - 10) * 0.05f * ahead;
+          float fwd[3] = {g[3], 0.0f, g[5]};
+          const float n = std::sqrt(fwd[0] * fwd[0] + fwd[2] * fwd[2]);
+          for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + fwd[i] / n * ahead + g[6 + i] * side;
+          l.pos[1] = g[1] - 0.06f * ahead;
+          if (k % 3 == 1) { l.color[0] = 1.0f; l.color[1] = 0.55f; l.color[2] = 0.25f; }
+          lights.push_back(l);
+        }
+      }
       if (std::getenv("A3_TEST_BEHIND")) {
         // Lights out of view (behind the camera, far to the sides), and one
         // behind but near enough to light what's ahead: culled or kept.
