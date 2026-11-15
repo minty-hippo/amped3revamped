@@ -357,6 +357,9 @@ void SetOn(bool on) {
     return;
   }
   g_active = on;
+  // The rider back in control: the light editor goes off with the freecam
+  // (B, F6, L3+R3, or anything else that ends it).
+  if (!on && night_lights::EditorOn()) night_lights::SetEditor(false);
   REXLOG_INFO("Freecam {} ({})", on ? "on" : "off",
               g_mode.load() == Mode::kNoclip ? "noclip" : "view");
   if (g_host.block_game_input) g_host.block_game_input(on);
@@ -409,7 +412,10 @@ void OnPad(const pad::Snapshot& pad) {
   static uint16_t last_buttons = 0;
   uint16_t pressed = uint16_t(pad.buttons & ~last_buttons);
   last_buttons = pad.buttons;
-  if (!g_active.load()) return;
+  if (!g_active.load()) {
+    if (night_lights::EditorOn()) night_lights::SetEditor(false);  // never without the freecam
+    return;
+  }
   using namespace rex::input;
   Keys keys;
   {
@@ -478,8 +484,7 @@ void OnPad(const pad::Snapshot& pad) {
     buttons &= uint16_t(~kEditor);
   }
   if ((pressed & X_INPUT_GAMEPAD_B) || keys.leave) {
-    night_lights::SetEditor(false);
-    SetOn(false);
+    SetOn(false);  // (the editor with it)
     return;
   }
   if (pressed & X_INPUT_GAMEPAD_BACK) help_bar::Toggle();

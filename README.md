@@ -451,10 +451,12 @@ worked out from that, so it fits each mountain's own look.
   the ground), floodlights (a housing shining a cone out and down from where
   it's mounted), lit windows (the wall's own texture lit up and tinted) and
   campfires (stones, logs and flickering flames) that come on as it gets
-  dark, lighting the snow and slopes around them with a glow round each.
+  dark, lighting the snow and slopes around them, and riders and characters
+  passing by, with a glow round each.
   Placed with the light editor: in the freecam with time of day on, D-pad up
   / L. A preview (ghostly blue, lit even by day) follows the cross at the
-  middle of the screen, mounted on the surface there.
+  middle of the screen, mounted on the surface there. The editor ends with
+  the freecam: as soon as the rider has control again, it's off.
   | Editor | Controller | Keyboard |
   |---|---|---|
   | Place one | A | Enter |

@@ -881,6 +881,16 @@ int main(int argc, char** argv) {
         }
         lights.push_back(l);
       }
+      if (std::getenv("A3_TEST_RIDER")) {
+        // One lamp beside where the rider is (just ahead of the camera): its
+        // light on the rider.
+        lights.clear();
+        amped3::native::Renderer::NightLight l;
+        for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * 4.0f + g[6 + i] * 2.2f;
+        l.radius = 12.0f;
+        l.intensity = 1.5f;
+        lights.push_back(l);
+      }
       if (std::getenv("A3_TEST_CLOSE")) {
         // Each kind close in front (the fittings up close).
         lights.clear();

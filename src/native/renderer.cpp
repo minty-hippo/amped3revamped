@@ -5061,8 +5061,9 @@ void main() {
 }
 )", true);
   // Night lights: each lamp's light on the world (the lighting's albedo and
-  // normals: as the game lights it), a glow round each lamp in the air, the
-  // riders (drawn after the lighting) glowing only.
+  // normals: as the game lights it) and on the riders (drawn after the
+  // lighting: their surface from the depth, their color from the scene), a
+  // glow round each lamp in the air.
   copy_fs_[38] = CompileBuiltin("builtin_night_lights", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D world_depth;  // at the lighting (0: nothing)
@@ -5229,6 +5230,28 @@ void main() {
   }
   vec3 N = normalize(textureLod(normals, uv, 0.0).xyz * 2.0 - 1.0);
   vec3 alb = textureLod(albedo, uv, 0.0).rgb;
+  if (rider && d > 0.0) {
+    // A rider (drawn after the lighting: no albedo or normals of its own):
+    // its surface from the depth next to it (the nearer side: not across
+    // its outline), its color from how the scene shows it under the
+    // night's light.
+    // (Three pixels out, each way: the depth's steps no grain in the light.)
+    ivec2 ip = ivec2(gl_FragCoord.xy);
+    const int R = 3;
+    float dxp = texelFetch(depth, ip + ivec2(R, 0), 0).r, dxm = texelFetch(depth, ip - ivec2(R, 0), 0).r;
+    float dyp = texelFetch(depth, ip + ivec2(0, R), 0).r, dym = texelFetch(depth, ip - ivec2(0, R), 0).r;
+    bool use_xp = abs(dxp - dn) < abs(dxm - dn), use_yp = abs(dyp - dn) < abs(dym - dn);
+    vec2 px = pc.a.xy * 2.0 * float(R);
+    vec2 nx = ndc + vec2(use_xp ? px.x : -px.x, 0.0), ny = ndc + vec2(0.0, use_yp ? -px.y : px.y);
+    vec4 wx = pc.m * vec4(nx, 1.0 - (use_xp ? dxp : dxm), 1.0);
+    vec4 wy = pc.m * vec4(ny, 1.0 - (use_yp ? dyp : dym), 1.0);
+    vec3 ex = (wx.xyz / wx.w - P) * (use_xp ? 1.0 : -1.0);
+    vec3 ey = (wy.xyz / wy.w - P) * (use_yp ? 1.0 : -1.0);
+    vec3 nr = cross(ey, ex);
+    N = dot(nr, nr) > 1e-12 ? normalize(nr) : -dir;
+    if (dot(N, dir) > 0.0) N = -N;  // (toward the camera)
+    alb = min(c.rgb / max(pc.b.y, 0.12), vec3(0.85));
+  }
   vec3 add = vec3(0.0);
   // The nearest fitting in front of what's drawn: its color (solid).
   float hit_t = pix_dist;
@@ -5254,10 +5277,10 @@ void main() {
     vec3 col = lc.rgb * lc.w * flick * kk;
     vec3 own = lc.rgb * lc.w * flick;  // (its glow at full)
     // On the world.
-    if (d > 0.0 && !rider && kk > 0.001) {
+    if (d > 0.0 && kk > 0.001) {
       vec3 dl = lp.xyz - P;
       float dist = length(dl);
-      if (kind == 2) {
+      if (kind == 2 && !rider) {
         // A window: the wall's own texture lit up within it (its color
         // tinted, glowing), facing the way it was placed.
         vec3 nrm = normalize(vec3(axis.x, 0.0, axis.z) + vec3(0.0, 1e-4, 0.0));
