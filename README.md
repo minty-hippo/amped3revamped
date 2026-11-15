@@ -463,6 +463,15 @@ that rule against a save that has the pass.
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and
   sunny slopes don't wash out.
+- Snow tracks (Effects: Snow Tracks, `native_snow_tracks`, 1; works with
+  time of day off too): every board's trail (the game's own, which fades
+  after a few metres) is pressed into the snow and kept, for a couple of
+  hundred metres round you: a packed groove, smooth where the grooming's
+  ridges were, with the snow it pushed aside heaped along its sides. A
+  skid ploughs that snow ahead of the board into a pile where it stops.
+  The lighting shades them (they're in its normals), riders' and lamps'
+  light included. Falling snow fills them in over a couple of minutes.
+  (From the game's trail draws, drawn again from above each frame.)
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,

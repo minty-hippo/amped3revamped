@@ -392,6 +392,12 @@ const std::vector<Tab>& Tabs() {
                         0.0, 3.0),
                 SliderF("native_fog_start", "Fog start distance",
                         "How far away the fog begins, in metres.", "%.0f m", 0.0, 1000.0),
+                SliderF("native_snow_tracks", "Snow tracks",
+                        "The boards' tracks pressed into the snow and kept for a couple of "
+                        "hundred metres round you (the game's own fade after a few), the snow "
+                        "they push aside heaped beside them, a pile where a board skids to a "
+                        "stop. Falling snow fills them in. 0: off. Native renderer only.",
+                        "%.1f", 0.0, 2.0),
                 SliderF("native_eye_adaptation", "Eye adaptation",
                         "HDR-style: the lighting brightens in the dark (night, forest) and "
                         "tones down in glare, easing over a second or two like eyes "

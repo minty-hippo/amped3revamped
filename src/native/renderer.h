@@ -369,6 +369,10 @@ class Renderer {
   // The clouds' shadows drifting over the slopes (time of day; 0: none, 1:
   // darkest).
   void SetCloudShadows(float darkness);
+  // Snow tracks: the boards' trails pressed into the snow and kept, the snow
+  // pushed aside piled beside them and where they skid (0: none; 1: as
+  // deep as fresh snow takes them, up to 2).
+  void SetSnowTracks(float depth);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

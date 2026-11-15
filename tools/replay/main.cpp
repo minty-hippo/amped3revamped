@@ -463,7 +463,8 @@ int main(int argc, char** argv) {
   amped3::native::Renderer::TimeOfDay tod;
   float eye = 0.0f;  // --eye strength (eye adaptation)
   float bloom = 0.0f;
-  float cloud_shadows = 0.0f;  // --cloud-shadows  // --bloom strength
+  float cloud_shadows = 0.0f;  // --cloud-shadows
+  float tracks = 0.0f;  // --tracks  // --bloom strength
   bool test_lights = false;  // --test-lights: a few night lights ahead of the camera  // --tod hour [--tod-moon phase] [--tod-clouds cover]
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
   fs::path rewrite;  // write the loaded frame back out in capture format (tests the writer)
@@ -542,6 +543,8 @@ int main(int argc, char** argv) {
       tod.night_light = std::stof(argv[++i]);
     } else if (a == "--tod-overcast" && i + 1 < argc) {
       tod.overcast = std::stof(argv[++i]);
+    } else if (a == "--tracks" && i + 1 < argc) {
+      tracks = std::stof(argv[++i]);
     } else if (a == "--cloud-shadows" && i + 1 < argc) {
       cloud_shadows = std::stof(argv[++i]);
     } else if (a == "--bloom" && i + 1 < argc) {
@@ -865,6 +868,7 @@ int main(int argc, char** argv) {
     renderer.SetEyeAdaptation(eye);
     renderer.SetBloom(bloom);
   renderer.SetCloudShadows(cloud_shadows);
+  renderer.SetSnowTracks(tracks);
     renderer.SetCollectInstances(test_lights);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);

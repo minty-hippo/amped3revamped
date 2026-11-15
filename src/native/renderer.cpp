@@ -1859,7 +1859,8 @@ struct Renderer::Impl {
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
-    kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42
+    kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
+    kTracksMerge = 43, kTracksApply = 44
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1900,7 +1901,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[43] = {};  // by CopyKind
+  VkShaderModule copy_fs_[45] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2119,6 +2120,29 @@ struct Renderer::Impl {
   // glowing out over what's round them; quarter-size, blurred twice.
   float bloom_ = 0.0f;
   float cloud_shadows_ = 0.0f;  // how dark the clouds' shadows are (0: none)
+  // Snow tracks (SetSnowTracks): the boards' trails pressed into the snow and
+  // kept (a map from above, 4096 texels of 5 cm round the camera: r how deep
+  // a groove, g the snow pushed up beside it), the snow they push aside piled
+  // at their sides and where they skid. From the game's own trail draws
+  // (each frame's drawn again from above into a stamp round the camera).
+  // Applied to the lighting's normals and albedo.
+  float tracks_ = 0.0f;
+  static constexpr uint32_t kTracksN = 4096, kTracksW = 1024;
+  static constexpr double kTracksTexel = 0.05;
+  Image tracks_map_, tracks_scratch_, tracks_stamp_, tracks_tmp_;
+  Image tracks_albedo_, tracks_normal_;
+  Image* tracks_albedo_src_ = nullptr;
+  Image* tracks_normal_src_ = nullptr;
+  bool tracks_ok_ = false;     // this frame's lighting given them
+  bool tracks_valid_ = false;  // the map holds this place's tracks
+  int64_t tracks_cx_ = 0, tracks_cz_ = 0;  // the map's middle (in texels of the world)
+  double tracks_last_cam_[3] = {};
+  std::vector<CasterDraw> tracks_draws_;
+  std::unordered_set<uint64_t> tracks_seen_;
+  void TracksUpdate();
+  void TracksInputs(const Draw& d, const GpuState& st, Image* albedo_in);
+  void SceneInputs(const Draw& d, const GpuState& st);
+  uint32_t lighting_aa_ = 0;  // the lighting pass's sample mask (its inputs made for it)
   Image tod_mask_raw_;  // the sun's shadows before the clouds'
   float cloud_here_ = 0.0f;  // the clouds' shade at the camera (for the riders: 0..1)
   Image bloom_a_, bloom_b_, bloom_out_;
@@ -3062,7 +3086,11 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   const bool movers = world_detail_ > 0;
   const bool tod_sky = TodOn();
   const bool eye = eye_strength_ > 0.0f;
-  if (light_seen_ && !tiling_.width && tex_base == scene_base_) composite_seen_ = true;
+  if (light_seen_ && !tiling_.width && tex_base == scene_base_) {
+    composite_seen_ = true;
+    // (This frame's trails into the kept tracks, once.)
+    if (!tracks_draws_.empty()) TracksUpdate();
+  }
   if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky || eye) && light_seen_ &&
       !tiling_.width &&
       tex_base == scene_base_) {
@@ -5102,6 +5130,129 @@ void main() {
 )", true);
   // Time of day: each pixel's shade from the riders, rails and objects
   // (their map from the hour's sun), percentage closer, for the lighting.
+  // Snow tracks, 1: this frame's trails (drawn from above into the stamp:
+  // depth under 1 where one is) pressed into the kept map, its window round
+  // the camera: the groove where a board went; beside it the snow it pushed
+  // aside (what it cut fresh nearby, and any pile it ran over, pushed on:
+  // a skid ploughs a heap up ahead of it). a.y < 0: the whole map filling in
+  // (falling snow) by a.z.
+  copy_fs_[43] = CompileBuiltin("builtin_tracks_merge", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D stamp;   // 1: nothing
+layout(set = 0, binding = 1) uniform sampler2D tracks;  // r groove, g pushed up
+layout(push_constant) uniform Merge { vec4 a; } pc;     // the window's corner in the map, filled, push
+layout(location = 0) out vec4 o;
+float Cov(ivec2 t) {
+  ivec2 n = textureSize(stamp, 0);
+  if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, n))) return 0.0;
+  return texelFetch(stamp, t, 0).r < 1.0 ? 1.0 : 0.0;
+}
+vec2 Old(ivec2 m) { return texelFetch(tracks, clamp(m, ivec2(0), textureSize(tracks, 0) - 1), 0).rg; }
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy);
+  if (pc.a.y < -0.5) {
+    vec2 old = Old(t);
+    o = vec4(old.r * (1.0 - pc.a.z), old.g * (1.0 - 0.6 * pc.a.z), 0.0, 1.0);
+    return;
+  }
+  ivec2 m = t + ivec2(pc.a.xy);
+  vec2 old = Old(m);
+  float cov = Cov(t);
+  float pushed = 0.0;
+  if (cov < 1.0) {
+    for (int i = 0; i < 24; ++i) {
+      float r = sqrt((float(i) + 0.5) / 24.0) * 7.0;
+      float th = float(i) * 2.39996323;
+      ivec2 off = ivec2(round(vec2(cos(th), sin(th)) * r));
+      if (off == ivec2(0)) continue;
+      float c = Cov(t + off);
+      if (c <= 0.0) continue;
+      vec2 on = Old(m + off);
+      pushed += (max(c - on.r, 0.0) + on.g * 0.8) * (1.0 - r / 8.0);
+    }
+  }
+  float groove = max(old.r, cov);
+  float berm = old.g * (1.0 - cov) + pc.a.w * pushed;
+  o = vec4(groove, clamp(berm, 0.0, 1.0), 0.0, 1.0);
+}
+)", true);
+  // Snow tracks, 2: the lighting's albedo (a.w 0) or normals (1) with the
+  // tracks: the groove's walls and floor and the heaps beside it shaped into
+  // the normals, packed snow a touch greyer, the heaps grainy.
+  copy_fs_[44] = CompileBuiltin("builtin_tracks_apply", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;      // albedo or normals
+layout(set = 0, binding = 1) uniform sampler2D normals;
+layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(set = 0, binding = 3) uniform sampler2D tracks;
+layout(push_constant) uniform Apply {
+  mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
+  vec4 g;   // the map's texel 0 (world x, z), texels per metre, mode
+  vec4 s;   // groove depth (m), heap height (m), 1 / width, 1 / height
+} pc;
+layout(location = 0) out vec4 o;
+float H(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+vec2 T(vec2 tc) {
+  vec2 f = tc - 0.5;
+  ivec2 i = ivec2(floor(f));
+  vec2 w = f - floor(f);
+  ivec2 n = textureSize(tracks, 0) - 1;
+  vec2 a = texelFetch(tracks, clamp(i, ivec2(0), n), 0).rg;
+  vec2 b = texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0).rg;
+  vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
+  vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
+  return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+// Height (m): soft over a texel or so.
+float Ht(vec2 tc) {
+  vec2 t = (T(tc + vec2(0.6, 0.6)) + T(tc + vec2(-0.6, 0.6)) + T(tc + vec2(0.6, -0.6)) + T(tc - vec2(0.6))) * 0.25;
+  return -pc.s.x * t.r + pc.s.y * t.g * (1.0 - t.r);
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(src, ip, 0);
+  o = c;
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) return;
+  vec2 uv = gl_FragCoord.xy * pc.s.zw;
+  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  vec3 P = w.xyz / w.w;
+  vec2 tc = (P.xz - pc.g.xy) * pc.g.z;
+  vec2 n2 = vec2(textureSize(tracks, 0));
+  if (any(lessThan(tc, vec2(2.0))) || any(greaterThan(tc, n2 - 2.0))) return;
+  vec3 N = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
+  if (N.y < 0.4) return;  // the ground (snow), not walls
+  vec2 t = T(tc);
+  if (pc.g.w > 1.5) {
+    o = vec4(t.r, t.g, 0.0, 1.0);
+    return;
+  }
+  if (t.r + t.g < 0.003) return;
+  if (pc.g.w < 0.5) {
+    // Packed in the groove (a little greyer, bluer); the heaps grainy.
+    float grain = H(floor(P.xz * 30.0));
+    vec3 col = c.rgb * mix(vec3(1.0), vec3(0.92, 0.95, 1.0), t.r * (1.0 - 0.5 * t.g));
+    col *= 1.0 + t.g * (1.0 - t.r) * (0.03 + 0.08 * (grain - 0.5));
+    o = vec4(col, c.a);
+  } else {
+    float e = 1.0;
+    float hx = (Ht(tc + vec2(e, 0.0)) - Ht(tc - vec2(e, 0.0))) * pc.g.z / (2.0 * e);
+    float hz = (Ht(tc + vec2(0.0, e)) - Ht(tc - vec2(0.0, e))) * pc.g.z / (2.0 * e);
+    // (Packed smooth in the groove: the grooming's ridges pressed out, the
+    // surface's normal averaged round about.)
+    vec3 Ns = N;
+    if (t.r > 0.01) {
+      ivec2 sz = textureSize(normals, 0) - 1;
+      vec3 a = vec3(0.0);
+      for (int i = 0; i < 4; ++i) {
+        ivec2 off = ivec2(i == 0 ? 4 : (i == 1 ? -4 : 0), i == 2 ? 4 : (i == 3 ? -4 : 0));
+        a += texelFetch(normals, clamp(ip + off, ivec2(0), sz), 0).xyz * 2.0 - 1.0;
+      }
+      Ns = normalize(mix(N, normalize(a + N), 0.8 * t.r));
+    }
+    vec3 n = normalize(Ns + vec3(-hx, 0.0, -hz));
+    o = vec4(n * 0.5 + 0.5, c.a);
+  }
+}
+)", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
   // the same way), a few hundred metres up, over each point toward the sun:
   // the sun's shadow mask darkened under them.
@@ -9030,48 +9181,217 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
 
 // Time of day, at the lighting pass: its sky-light table (tf1) tinted for
 // the hour; the white stand-in for the game's fixed shadows made.
+// Snow tracks, kept: this frame's trail draws drawn again from above into
+// the stamp (round the camera), pressed into the map (its window), the map
+// moved along with the camera (a quarter of it at a time) and filling in
+// while it snows.
+void Renderer::Impl::TracksUpdate() {
+  std::vector<CasterDraw> draws;
+  draws.swap(tracks_draws_);
+  tracks_seen_.clear();
+  if (tracks_ <= 0.0f || Diag("notracks")) {
+    tracks_valid_ = false;
+    return;
+  }
+  auto make = [&](Image& im, uint32_t n, VkFormat f, bool depth, const char* name) {
+    if (im.image && im.width == n && im.format == f) return false;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(n, n, f, depth, name);
+    ToGeneral(cb_, im);
+    return true;
+  };
+  EndRendering();
+  bool fresh = make(tracks_map_, kTracksN, VK_FORMAT_R8G8_UNORM, false, "snow_tracks");
+  make(tracks_scratch_, kTracksN, VK_FORMAT_R8G8_UNORM, false, "snow_tracks_scratch");
+  make(tracks_stamp_, kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp");
+  make(tracks_tmp_, kTracksW, VK_FORMAT_R8G8_UNORM, false, "snow_tracks_window");
+  const int64_t tx = std::llround(cam_pos_[0] / kTracksTexel), tz = std::llround(cam_pos_[2] / kTracksTexel);
+  const double jx = cam_pos_[0] - tracks_last_cam_[0], jy = cam_pos_[1] - tracks_last_cam_[1],
+               jz = cam_pos_[2] - tracks_last_cam_[2];
+  const bool jump = jx * jx + jy * jy + jz * jz > 150.0 * 150.0;
+  std::memcpy(tracks_last_cam_, cam_pos_, sizeof(tracks_last_cam_));
+  const int64_t N = kTracksN, W = kTracksW;
+  if (fresh || !tracks_valid_ || jump) {
+    // (A new place: another mountain, a restart.)
+    const float zero[4] = {0, 0, 0, 0};
+    ClearImage(&tracks_map_, zero, 1.0f, 0, true, false, false);
+    FlushPendingClears();
+    tracks_cx_ = tx;
+    tracks_cz_ = tz;
+    tracks_valid_ = true;
+  } else if (std::llabs(tx - tracks_cx_) > N / 4 || std::llabs(tz - tracks_cz_) > N / 4) {
+    ShiftMap(&tracks_map_, &tracks_scratch_, tx - tracks_cx_, tz - tracks_cz_);
+    tracks_cx_ = tx;
+    tracks_cz_ = tz;
+  }
+  // Falling snow fills them in (a heavy fall: in a couple of minutes), the
+  // whole map every so often.
+  {
+    static auto last = std::chrono::steady_clock::now();
+    static float pending = 0.0f;
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.25f);
+    last = now;
+    if (TodOn()) pending += std::clamp(tod_.snow, 0.0f, 1.0f) * dt / 90.0f;
+    if (pending > 0.03f) {
+      float pc[4] = {0.0f, -1.0f, std::min(pending, 1.0f), 0.0f};
+      Barrier();
+      FullscreenPass(CopyKind::kTracksMerge, &tracks_scratch_, &tracks_stamp_, &tracks_map_, nullptr,
+                     false, pc, 4);
+      Barrier();
+      VkImageCopy all{};
+      all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      all.extent = {uint32_t(N), uint32_t(N), 1};
+      vk::vkCmdCopyImage(cb_, tracks_scratch_.image, VK_IMAGE_LAYOUT_GENERAL, tracks_map_.image,
+                         VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+      Barrier();
+      pending = 0.0f;
+    }
+  }
+  if (draws.empty()) {
+    dyn_ = DynState{};
+    return;
+  }
+  // The window: round the camera, in the map.
+  const int64_t ox = std::clamp<int64_t>(tx - tracks_cx_ + N / 2 - W / 2, 0, N - W);
+  const int64_t oz = std::clamp<int64_t>(tz - tracks_cz_ + N / 2 - W / 2, 0, N - W);
+  const double x0 = double(tracks_cx_ - N / 2 + ox) * kTracksTexel;
+  const double z0 = double(tracks_cz_ - N / 2 + oz) * kTracksTexel;
+  const double span = double(W) * kTracksTexel;
+  const float far_depth[4] = {0, 0, 0, 0};
+  ClearImage(&tracks_stamp_, far_depth, 1.0f, 0, false, true, true);
+  FlushPendingClears();
+  const double O[16] = {2.0 / span, 0, 0, -1.0 - 2.0 * x0 / span,
+                        0, 0, 2.0 / span, -1.0 - 2.0 * z0 / span,
+                        0, -1.0 / 1000.0, 0, 0.5 + cam_pos_[1] / 1000.0,
+                        0, 0, 0, 1};
+  DrawIntoSunMap(draws, &tracks_stamp_, O, nullptr);
+  // (How much each cut pushes up beside it.)
+  float pc[4] = {float(ox), float(oz), 0.0f, 0.09f};
+  Barrier();
+  FullscreenPass(CopyKind::kTracksMerge, &tracks_tmp_, &tracks_stamp_, &tracks_map_, nullptr, false, pc, 4);
+  Barrier();
+  VkImageCopy r{};
+  r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.dstOffset = {int32_t(ox), int32_t(oz), 0};
+  r.extent = {uint32_t(W), uint32_t(W), 1};
+  vk::vkCmdCopyImage(cb_, tracks_tmp_.image, VK_IMAGE_LAYOUT_GENERAL, tracks_map_.image,
+                     VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+  Barrier();
+  dyn_ = DynState{};
+}
+
+// Snow tracks, at the lighting pass: its albedo (after the fresh snow) and
+// normals with the tracks in them, given to it instead of its own.
+void Renderer::Impl::TracksInputs(const Draw& d, const GpuState& st, Image* albedo_in) {
+  tracks_ok_ = false;
+  tracks_albedo_src_ = tracks_normal_src_ = nullptr;
+  if (tracks_ <= 0.0f || !tracks_valid_ || !tracks_map_.image) return;
+  std::string n0;
+  Image* a3 = TextureFor(d, 3, st, &n0);
+  Image* n4 = TextureFor(d, 4, st, &n0);
+  auto dit = resolved_.find(depth_base_);
+  if (!a3 || !n4 || a3->depth || n4->depth || a3->samples != 1 || n4->samples != 1 || n4 == &dummy_ ||
+      dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
+      dit->second.width != a3->width || dit->second.height != a3->height ||
+      n4->width != a3->width || n4->height != a3->height) {
+    return;
+  }
+  if (!albedo_in) albedo_in = a3;
+  EndRendering();
+  auto ensure = [&](Image& im, const Image* like, const char* name) {
+    if (im.image && im.width == like->width && im.height == like->height && im.format == like->format) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(like->width, like->height, like->format, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(tracks_albedo_, a3, "snow_tracks_albedo");
+  ensure(tracks_normal_, n4, "snow_tracks_normals");
+  // (Sampled as the lighting samples its own: at the same scale.)
+  tracks_albedo_.scaled = a3->scaled;
+  tracks_albedo_.scale = a3->scale;
+  tracks_normal_.scaled = n4->scaled;
+  tracks_normal_.scale = n4->scale;
+  float pc[24] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+  }
+  const int64_t N = kTracksN;
+  pc[16] = float(double(tracks_cx_ - N / 2) * kTracksTexel);
+  pc[17] = float(double(tracks_cz_ - N / 2) * kTracksTexel);
+  pc[18] = float(1.0 / kTracksTexel);
+  pc[20] = 0.06f * tracks_;  // a groove's depth (m)
+  pc[21] = 0.1f * tracks_;   // a heap's height
+  pc[22] = 1.0f / float(a3->width);
+  pc[23] = 1.0f / float(a3->height);
+  Barrier();
+  pc[19] = Diag("tracksshow") ? 2.0f : 0.0f;
+  FullscreenPass(CopyKind::kTracksApply, &tracks_albedo_, albedo_in, n4, &dit->second, false, pc, 24,
+                 nullptr, &tracks_map_);
+  pc[19] = 1.0f;
+  FullscreenPass(CopyKind::kTracksApply, &tracks_normal_, n4, n4, &dit->second, false, pc, 24, nullptr,
+                 &tracks_map_);
+  Barrier();
+  dyn_ = DynState{};
+  tracks_albedo_src_ = a3;
+  tracks_normal_src_ = n4;
+  tracks_ok_ = true;
+}
+
+// The lighting's albedo and normals with the fresh snow and the boards'
+// tracks in them (its own replaced by these). Again for each of the game's
+// two lighting passes (its two samples, with MSAA: each resolved anew).
+void Renderer::Impl::SceneInputs(const Draw& d, const GpuState& st) {
+  std::string n0;
+  // Fresh snow: on what faces up (the albedo whitened, by its normals),
+  // patchy at first, given to the lighting instead of its own.
+  snow_cover_ok_ = false;
+  snow_albedo_src_ = nullptr;
+  if (TodOn() && tod_.snow_cover > 0.01f && !Diag("nosnowcover")) {
+    Image* a3 = TextureFor(d, 3, st, &n0);
+    Image* n4 = TextureFor(d, 4, st, &n0);
+    auto dit = resolved_.find(depth_base_);
+    if (a3 && n4 && !a3->depth && a3->samples == 1 && n4 != &dummy_ && dit != resolved_.end() &&
+        dit->second.format == VK_FORMAT_R32_SFLOAT && dit->second.width == a3->width &&
+        dit->second.height == a3->height) {
+      EndRendering();
+      if (!snow_albedo_.image || snow_albedo_.width != a3->width || snow_albedo_.height != a3->height ||
+          snow_albedo_.format != a3->format) {
+        if (snow_albedo_.image) Retire(snow_albedo_);
+        snow_albedo_ = gpu_.CreateImage(a3->width, a3->height, a3->format, false, "snow_cover_albedo");
+        ToGeneral(cb_, snow_albedo_);
+      }
+      float pc[24] = {};
+      for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+      }
+      pc[16] = std::clamp(tod_.snow_cover, 0.0f, 1.0f);
+      pc[17] = 1.0f / float(a3->width);
+      pc[18] = 1.0f / float(a3->height);
+      pc[20] = tod_.wind[0];
+      pc[21] = tod_.wind[1];
+      pc[22] = float(cam_pos_[0]);
+      pc[23] = float(cam_pos_[2]);
+      Barrier();
+      FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 24);
+      Barrier();
+      dyn_ = DynState{};
+      snow_albedo_src_ = a3;
+      snow_cover_ok_ = true;
+    }
+  }
+  // The boards' tracks pressed into it (over the fresh snow).
+  TracksInputs(d, st, snow_cover_ok_ ? &snow_albedo_ : nullptr);
+}
+
 void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   tod_lut_ok_ = false;
   {
     std::string n0;
     tod_game_map_ = TodOn() ? TextureFor(d, 0, st, &n0) : nullptr;
-    // Fresh snow: on what faces up (the albedo whitened, by its normals),
-    // patchy at first, given to the lighting instead of its own.
-    snow_cover_ok_ = false;
-    snow_albedo_src_ = nullptr;
-    if (TodOn() && tod_.snow_cover > 0.01f && !Diag("nosnowcover")) {
-      Image* a3 = TextureFor(d, 3, st, &n0);
-      Image* n4 = TextureFor(d, 4, st, &n0);
-      auto dit = resolved_.find(depth_base_);
-      if (a3 && n4 && !a3->depth && a3->samples == 1 && n4 != &dummy_ && dit != resolved_.end() &&
-          dit->second.format == VK_FORMAT_R32_SFLOAT && dit->second.width == a3->width &&
-          dit->second.height == a3->height) {
-        EndRendering();
-        if (!snow_albedo_.image || snow_albedo_.width != a3->width || snow_albedo_.height != a3->height ||
-            snow_albedo_.format != a3->format) {
-          if (snow_albedo_.image) Retire(snow_albedo_);
-          snow_albedo_ = gpu_.CreateImage(a3->width, a3->height, a3->format, false, "snow_cover_albedo");
-          ToGeneral(cb_, snow_albedo_);
-        }
-        float pc[24] = {};
-        for (int c = 0; c < 4; ++c) {
-          for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
-        }
-        pc[16] = std::clamp(tod_.snow_cover, 0.0f, 1.0f);
-        pc[17] = 1.0f / float(a3->width);
-        pc[18] = 1.0f / float(a3->height);
-        pc[20] = tod_.wind[0];
-        pc[21] = tod_.wind[1];
-        pc[22] = float(cam_pos_[0]);
-        pc[23] = float(cam_pos_[2]);
-        Barrier();
-        FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 24);
-        Barrier();
-        dyn_ = DynState{};
-        snow_albedo_src_ = a3;
-        snow_cover_ok_ = true;
-      }
-    }
+    SceneInputs(d, st);
     // (The albedo is the scene's own image, lit over by this pass: a copy.)
     tod_albedo_ = nullptr;
     bool preview = false;
@@ -9092,7 +9412,9 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
       }
       Barrier();
       const float one[4] = {1, 1, 1, 0};
-      FullscreenPass(CopyKind::kTodTint, &lights_albedo_, snow_cover_ok_ && alb == snow_albedo_src_ ? &snow_albedo_ : alb,
+      FullscreenPass(CopyKind::kTodTint, &lights_albedo_,
+                     tracks_ok_ && alb == tracks_albedo_src_ ? &tracks_albedo_
+                     : snow_cover_ok_ && alb == snow_albedo_src_ ? &snow_albedo_ : alb,
                      nullptr, nullptr, false, one, 4);
       Barrier();
       tod_albedo_ = &lights_albedo_;
@@ -9118,6 +9440,7 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
       dyn_ = DynState{};
     }
     tod_normal_ = TodOn() ? TextureFor(d, 4, st, &n0) : nullptr;
+    if (tod_normal_ && tracks_ok_ && tod_normal_ == tracks_normal_src_) tod_normal_ = &tracks_normal_;
   }
   if (!LightModOn()) return;
   auto ensure = [&](Image& im, uint32_t w, uint32_t h, VkFormat f, const char* name) {
@@ -10465,7 +10788,16 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     Skip(number, !vs->error.empty() ? vs->error : ps->error);
     return;
   }
-  if (ps->info.ucode_hash == kLightingPixelShader && !light_seen_) NoteLightingPass(d, st);
+  if (ps->info.ucode_hash == kLightingPixelShader) {
+    if (!light_seen_) {
+      lighting_aa_ = st.reg(0x2312) & 0xF;
+      NoteLightingPass(d, st);
+    } else if ((snow_cover_ok_ || tracks_ok_) && (st.reg(0x2312) & 0xF) != lighting_aa_) {
+      // (The next sample's lighting: its own albedo and normals resolved.)
+      lighting_aa_ = st.reg(0x2312) & 0xF;
+      SceneInputs(d, st);
+    }
+  }
   // Diagnostics: A3_SKIP_VS=<hash>[,<hash>...] not drawn (which draws are
   // what); A3_SKIP_TEX the same by the first texture's hash.
   if (static const char* skip = std::getenv("A3_SKIP_VS"); skip) {
@@ -10614,6 +10946,11 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
             tod_white_.image && !(im == &baked_ && baked_tod_)) {
           im = &tod_white_;
         }
+      }
+      // (The boards' tracks pressed into the snow.)
+      if (stage == 1 && tracks_ok_ && ps->info.ucode_hash == kLightingPixelShader) {
+        if (b.fetch_constant == 3 && hit->second.image == tracks_albedo_src_) im = &tracks_albedo_;
+        if (b.fetch_constant == 4 && hit->second.image == tracks_normal_src_) im = &tracks_normal_;
       }
       const std::string& note = hit->second.note;
       // Diagnostics: vertex textures replaced ("novtex") or sampled plainly
@@ -11238,6 +11575,44 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // Sun shadows: the scene pass's trees and props (before the lighting),
   // kept to be drawn again from the sun into the tree map; the shadow
   // pass's terrain, to be drawn again alone (the ground under the casters).
+  // Snow tracks: the trails' draws (each trail once: the game draws it in
+  // several passes), kept to be drawn again from above.
+  if (tracks_ > 0.0f && light_seen_ && max_draws_ == UINT32_MAX && vs->info.ucode_hash == kTrailVertexShader &&
+      (d.prim == 4 || d.prim == 5 || d.prim == 6) && tracks_draws_.size() < 64) {
+    uint64_t key = uint64_t(d.count) << 40;
+    if (!d.up_vertices.empty()) {
+      key ^= std::hash<std::string>{}(d.up_vertices);
+    } else {
+      key ^= uint64_t(first_index) * 2654435761ull ^ offsets[1];
+    }
+    if (tracks_seen_.insert(key).second) {
+      if (!tracks_stamp_.image) {
+        tracks_stamp_ = gpu_.CreateImage(kTracksW, kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp");
+        ToGeneral(cb_, tracks_stamp_);
+      }
+      static const std::vector<Image*> kNoColors;
+      const VkPipeline tp = PipelineFor(d, st, *vs, *ps, kNoColors, &tracks_stamp_, 0, false, false, false, true);
+      if (tp) {
+        CasterDraw c{};
+        c.pipeline = tp;
+        c.tex_sets[0] = tex_sets[0];
+        c.tex_sets[1] = tex_sets[1];
+        std::memcpy(c.offsets, offsets, sizeof(offsets));
+        c.indexed = indexed;
+        c.index_type = index_type;
+        c.index_buffer = cur_index_buffer_;
+        c.first = first_index;
+        c.count = indexed ? index_count : d.count;
+        c.sys = sys;
+        // (Only where the trail shows: its texture's soft edges left out.)
+        if (!Diag("tracksnoalpha")) {
+          c.sys.alpha_func = 6;  // greater or equal
+          c.sys.alpha_ref = 0.05f;
+        }
+        tracks_draws_.push_back(c);
+      }
+    }
+  }
   if (SunShadowsOn() && max_draws_ == UINT32_MAX && depth && d.up_vertices.empty() &&
       (d.prim == 4 || d.prim == 5 || d.prim == 6 || d.prim == 13)) {
     auto keep = [&](VkPipeline pl, std::vector<CasterDraw>& to, bool alpha_test) {
@@ -12565,7 +12940,8 @@ Renderer::Impl::~Impl() {
   if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_}) {
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -13026,6 +13402,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
 }
 void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
+void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetClothTextures(const std::vector<uint64_t>& hashes) { impl_->cloth_extra_ = hashes; }
 void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }

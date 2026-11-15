@@ -70,6 +70,7 @@ const std::vector<Tab>& Tabs() {
            {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_god_rays", "God Rays"},
            {"native_eye_adaptation", "Eye Adaptation", Kind::kSlider, 0.0, 1.0, 0.1},
+           {"native_snow_tracks", "Snow Tracks", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_shadow_resolution", "Shadow Resolution", Kind::kStops, 0, 0, 0,
             {{"100", "1x"}, {"150", "1.5x"}, {"200", "2x"}, {"300", "3x"}, {"400", "4x"}}},
            {"native_shadow_distance", "Shadow Distance", Kind::kStops, 0, 0, 0,
