@@ -1478,6 +1478,18 @@ struct Renderer::Impl {
   bool lights_done_ = false;
   Image* lights_result_ = nullptr;
   Image* NightLights(Image* scene, Image* depth);
+  // Object instances (SetCollectInstances): this frame's scene draws, then
+  // as object -> world (affine ones only: placed objects, not the terrain or
+  // what's drawn in the camera's own space).
+  bool collect_instances_ = false;
+  struct PendingInstance {
+    uint64_t key;
+    double m[16];
+    double zs, zo;
+  };
+  std::vector<PendingInstance> pending_instances_;
+  std::vector<Renderer::Instance> instances_;
+  void ResolveInstances();
   // The middle of the screen's depth, read back 4 frames later (CenterPoint).
   Buffer center_rb_;
   uint64_t center_frame_[4] = {};
@@ -6264,6 +6276,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
       if (tod_.on) tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
       EyeUpdate();
       CenterRead();
+      ResolveInstances();
       lm_on_ = TodOn() || eye_strength_ > 0.0f;
       lm_set_dir_ = TodOn();
       const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
@@ -8122,6 +8135,41 @@ void Renderer::Impl::TodShadows() {
   dyn_ = DynState{};
 }
 
+void Renderer::Impl::ResolveInstances() {
+  std::vector<PendingInstance> pend;
+  pend.swap(pending_instances_);
+  if (!collect_instances_) {
+    instances_.clear();
+    return;
+  }
+  instances_.clear();
+  size_t affine = 0;
+  for (const PendingInstance& p : pend) {
+    const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -p.zs, 1.0 - p.zo, 0, 0, 0, 1};
+    double KM[16], W[16];
+    Mul4(K, p.m, KM);
+    Mul4(inv_vp_, KM, W);  // (this frame's, the game's camera: at the lighting pass before the freecam)
+    // Affine (an object placed in the world): the bottom row 0 0 0 w.
+    const double w = W[15];
+    if (!(std::fabs(w) > 1e-9)) continue;
+    const double off = std::fabs(W[12]) + std::fabs(W[13]) + std::fabs(W[14]);
+    if (off > 1e-4 * std::fabs(w)) continue;
+    Renderer::Instance in;
+    in.key = p.key;
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 4; ++c) in.m[r * 4 + c] = float(W[r * 4 + c] / w);
+    }
+    // (Each object once: some are drawn in several parts.)
+    bool dup = false;
+    for (auto it = instances_.rbegin(); it != instances_.rend() && it - instances_.rbegin() < 8; ++it) {
+      if (it->key == in.key && std::memcmp(it->m, in.m, sizeof(in.m)) == 0) dup = true;
+    }
+    ++affine;
+    if (!dup) instances_.push_back(in);
+  }
+  if (Diag("instances")) std::fprintf(stderr, "instances: %zu drawn, %zu placed, %zu kept\n", pend.size(), affine, instances_.size());
+}
+
 // The screen's middle: its depth copied to this frame's read-back slot (with
 // the view it goes with), read 4 frames later (CenterRead).
 void Renderer::Impl::CenterProbe(Image* depth) {
@@ -9732,6 +9780,29 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
     }
   }
+  // Night lights on every copy of an object (SetCollectInstances): the scene
+  // pass's draws with an object -> clip matrix in c0..c3, kept to be turned
+  // into object -> world at the lighting pass (its view then known).
+  if (collect_instances_ && !light_seen_ && tiling_.width && depth && (st.reg(0x2200) & 6) == 6 &&
+      !vs->info.dynamic_constants && max_draws_ == UINT32_MAX && pending_instances_.size() < 8192) {
+    PendingInstance pi;
+    uint64_t key = 0xCBF29CE484222325ull;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 0x100000001B3ull; key ^= key >> 29; };
+    const std::hash<std::string_view> hs;
+    mix(hs(d.vs));
+    mix(hs(d.index_data));
+    for (const auto& [vf, name] : d.vmem) mix(hs(name));
+    mix((uint64_t(d.start) << 32) | d.count);
+    pi.key = key;
+    for (int i = 0; i < 16; ++i) {
+      float f;
+      std::memcpy(&f, &st.vs_consts[i], 4);
+      pi.m[i] = f;
+    }
+    pi.zs = sys.ndc_scale[2];
+    pi.zo = sys.ndc_offset[2];
+    pending_instances_.push_back(pi);
+  }
   // Speed blur: how close the nearest character is (the rider, when riding).
   if (light_seen_ && tiling_.width && depth && vs->info.dynamic_constants &&
       max_draws_ == UINT32_MAX) {
@@ -11335,6 +11406,8 @@ uint64_t Renderer::MountainKey() const {
   }
   return h;
 }
+void Renderer::SetCollectInstances(bool on) { impl_->collect_instances_ = on; }
+const std::vector<Renderer::Instance>& Renderer::Instances() const { return impl_->instances_; }
 bool Renderer::CenterPoint(float out[3]) const {
   if (!impl_->center_ok_) return false;
   std::memcpy(out, impl_->center_pt_, sizeof(impl_->center_pt_));

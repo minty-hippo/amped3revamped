@@ -847,6 +847,7 @@ int main(int argc, char** argv) {
     if (fog > 0.0f) renderer.SetFog(fog, fog_start);
     renderer.SetTimeOfDay(tod);
     renderer.SetEyeAdaptation(eye);
+    renderer.SetCollectInstances(test_lights);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);
     if (shadow_res > 0.0f || shadow_distance > 0.0f) renderer.SetShadows(shadow_res, shadow_distance);
@@ -870,7 +871,33 @@ int main(int argc, char** argv) {
         }
         lights.push_back(l);
       }
+      if (const char* mk = std::getenv("A3_TEST_MESH")) {
+        // Lights on every copy of a mesh (8 m up its own y): the copies found.
+        const uint64_t key = std::stoull(mk, nullptr, 16);
+        for (const auto& in : renderer.Instances()) {
+          if (in.key != key) continue;
+          amped3::native::Renderer::NightLight l;
+          for (int r = 0; r < 3; ++r) l.pos[r] = in.m[r * 4 + 1] * 8.0f + in.m[r * 4 + 3];
+          l.radius = 20.0f;
+          lights.push_back(l);
+          std::cout << "mesh light at " << l.pos[0] << " " << l.pos[1] << " " << l.pos[2] << "\n";
+        }
+      }
       renderer.SetNightLights(lights);
+      std::map<uint64_t, int> counts;
+      for (const auto& in : renderer.Instances()) ++counts[in.key];
+      std::cout << "Instances " << renderer.Instances().size() << " of " << counts.size() << " meshes\n";
+      int shown = 0;
+      for (const auto& [k, n] : counts) {
+        if (n >= 4 && shown++ < 12) {
+          std::cout << "  mesh " << std::hex << k << std::dec << " x" << n << ":";
+          int j = 0;
+          for (const auto& in : renderer.Instances()) {
+            if (in.key == k && j++ < 4) std::cout << " (" << in.m[3] << " " << in.m[7] << " " << in.m[11] << ")";
+          }
+          std::cout << "\n";
+        }
+      }
       std::cout << "Test lights around " << g[0] << " " << g[1] << " " << g[2] << "\n";
     }
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";

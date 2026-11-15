@@ -685,6 +685,8 @@ uint64_t g_mountain_key = 0;
 std::mutex g_lights_mutex;
 std::vector<native::Renderer::NightLight> g_lights;  // SetNightLights
 bool g_lights_changed = false;
+std::vector<native::Renderer::Instance> g_instances;  // (g_game_camera_mutex)
+uint64_t g_instances_version = 0;
 
 std::mutex g_status_mutex;
 Status g_status;
@@ -2178,6 +2180,7 @@ void WorkerMain() {
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
           tod.seconds = float(std::fmod(tod_seconds, 100000.0));
           renderer->SetTimeOfDay(tod);
+          renderer->SetCollectInstances(tod.on);
           {
             std::lock_guard lock(g_lights_mutex);
             if (g_lights_changed) {
@@ -2307,6 +2310,10 @@ void WorkerMain() {
         if (have) std::memcpy(g_freecam_pose, pose, sizeof(pose));
         g_center_valid = renderer->CenterPoint(g_center);
         g_mountain_key = renderer->MountainKey();
+        if (!renderer->Instances().empty() || !g_instances.empty()) {
+          g_instances = renderer->Instances();
+          ++g_instances_version;
+        }
       }
       if (stats.camera_signature && !f->replay) {
         std::lock_guard lock(g_game_camera_mutex);
@@ -2411,6 +2418,11 @@ void SetNightLights(const std::vector<native::Renderer::NightLight>& lights) {
   std::lock_guard lock(g_lights_mutex);
   g_lights = lights;
   g_lights_changed = true;
+}
+uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since) {
+  std::lock_guard lock(g_game_camera_mutex);
+  if (g_instances_version != since) *out = g_instances;
+  return g_instances_version;
 }
 uint64_t MountainKey() {
   std::lock_guard lock(g_game_camera_mutex);

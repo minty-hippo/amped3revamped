@@ -4,7 +4,8 @@
 // the logs folder, one light a line: x y z  r g b  radius intensity.
 //
 // Placed from the freecam (freecam.cpp): the point at the middle of the
-// screen, in one of a few kinds (a lamp, a floodlight, a window, a fire).
+// screen, in one of a few kinds (a lamp, a floodlight, a window, a fire),
+// one light or one on every copy of the object aimed at.
 
 #pragma once
 
@@ -19,6 +20,9 @@ void Install(const std::filesystem::path& folder);
 void Tick();
 // Freecam editing. Each returns a short line for a notice.
 std::string Place();          // at the middle of the screen, the current kind
+// The same, on every copy of the object aimed at (each lift tower, each
+// lamp post: found by its mesh, more as they come into view).
+std::string PlaceOnEveryCopy();
 std::string RemoveNearest();  // the one nearest the middle of the screen
 std::string NextKind();
 std::string KindName();

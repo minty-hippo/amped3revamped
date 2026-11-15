@@ -99,7 +99,7 @@ struct Keys {
   bool leave = false;
   bool switch_mode = false;
   // Night lights (time of day): place, remove, the kind to place.
-  bool light_place = false, light_remove = false, light_kind = false;
+  bool light_place = false, light_remove = false, light_kind = false, light_every = false;
 } g_keys;
 
 std::atomic<bool> g_show_help{true};
@@ -154,6 +154,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     items.push_back(noclip ? "D-pad down / N: view mode" : "D-pad down / N: noclip mode");
     if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
       items.push_back("D-pad up / L: place a night light (" + night_lights::KindName() + ")");
+      items.push_back("A / O: a light on every copy of the object (lift towers, posts)");
       items.push_back("D-pad right / J: light kind");
       items.push_back("D-pad left / K: remove a light");
     }
@@ -192,6 +193,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const bool light_place = g_keys.light_place || ImGui::IsKeyPressed(ImGuiKey_L, false);
     const bool light_remove = g_keys.light_remove || ImGui::IsKeyPressed(ImGuiKey_K, false);
     const bool light_kind = g_keys.light_kind || ImGui::IsKeyPressed(ImGuiKey_J, false);
+    const bool light_every = g_keys.light_every || ImGui::IsKeyPressed(ImGuiKey_O, false);
     if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     float mouse[2] = {g_keys.mouse[0], g_keys.mouse[1]};
     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
@@ -205,6 +207,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     g_keys.light_place = light_place;
     g_keys.light_remove = light_remove;
     g_keys.light_kind = light_kind;
+    g_keys.light_every = light_every;
     g_keys.mouse[0] = mouse[0];
     g_keys.mouse[1] = mouse[1];
   }
@@ -349,7 +352,7 @@ void OnPad(const pad::Snapshot& pad) {
     keys = g_keys;
     g_keys.mouse[0] = g_keys.mouse[1] = 0.0f;
     g_keys.reset = g_keys.leave = g_keys.switch_mode = false;
-    g_keys.light_place = g_keys.light_remove = g_keys.light_kind = false;
+    g_keys.light_place = g_keys.light_remove = g_keys.light_kind = g_keys.light_every = false;
   }
   if ((pressed & X_INPUT_GAMEPAD_B) || keys.leave) {
     SetOn(false);
@@ -389,6 +392,9 @@ void OnPad(const pad::Snapshot& pad) {
   // aren't where the camera is).
   if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
     if ((pressed & X_INPUT_GAMEPAD_DPAD_UP) || keys.light_place) notice::Show(night_lights::Place());
+    if ((pressed & X_INPUT_GAMEPAD_A) || keys.light_every) {
+      notice::Show(night_lights::PlaceOnEveryCopy());
+    }
     if ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) || keys.light_remove) {
       notice::Show(night_lights::RemoveNearest());
     }

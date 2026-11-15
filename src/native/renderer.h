@@ -322,6 +322,15 @@ class Renderer {
   void SetNightLights(const std::vector<NightLight>& lights);
   // The mountain (0 before a lit frame): an id for its lights' file.
   uint64_t MountainKey() const;
+  // Objects placed in the world, as drawn last frame (with
+  // SetCollectInstances on): which mesh (a hash) and object -> world (3 x 4,
+  // rows). For night lights on every copy of an object.
+  struct Instance {
+    uint64_t key = 0;
+    float m[12] = {};
+  };
+  void SetCollectInstances(bool on);
+  const std::vector<Instance>& Instances() const;
   // The world point at the middle of the screen, a few frames back (false:
   // sky or not known yet): where a light is placed.
   bool CenterPoint(float out[3]) const;

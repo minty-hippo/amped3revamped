@@ -91,6 +91,9 @@ bool FreecamPose(float out[6]);
 void SetNightLights(const std::vector<native::Renderer::NightLight>& lights);
 // The mountain shown (0: not known yet): its night lights' file.
 uint64_t MountainKey();
+// Objects placed in the world as last drawn (time of day on): copied out
+// when newer than `since`; returns the version.
+uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since);
 // The world point at the middle of the screen (false: sky, or not known).
 bool CenterPoint(float out[3]);
 
