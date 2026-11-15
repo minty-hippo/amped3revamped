@@ -436,8 +436,9 @@ that rule against a save that has the pass.
   near them); and now and then a blizzard (strong wind streaking the snow
   sideways, the fog closing in to a few dozen metres). Or one of them fixed.
   As the weather turns it's announced in the game's own song popup (the XM
-  Radio box: "Weather Alert / Blizzard warning / Whiteout"), or a notice
-  where there's no popup (F5 on a mountain shows the weather in it too); the clouds drift faster in the wind; in a heavy snowstorm the
+  Radio box: "Weather Alert / Gusts 55 km/h / Whiteout"), with a forecast a
+  minute ahead ("Forecast / Snow on the way / Next hour"), or a notice where
+  there's no popup (F5 on a mountain shows the weather in it too); the clouds drift faster in the wind; in a heavy snowstorm the
   night lights come on part way by day.
   The wind moves the trees (Time of Day: Wind in the Trees,
   `native_wind_sway`): their foliage sways with it and flutters, whole trees
@@ -488,7 +489,8 @@ that rule against a save that has the pass.
   the view moves, and a floodlight's beam shows in the night air. Far off (past 150 m,
   out to 2.5 km) each light is a point of light instead, fading in as its
   glow up close fades out, hidden behind slopes and trees in front of it.
-  Each pixel only weighs the lights that can reach it (the screen in 32-pixel
+  The lights come on one by one as it gets dark, each stuttering on as it
+  warms up. Each pixel only weighs the lights that can reach it (the screen in 32-pixel
   tiles, each with its own list).
   Placed with the light editor: in the freecam with time of day on, D-pad up
   / L. A preview (ghostly blue, lit even by day) follows the cross at the

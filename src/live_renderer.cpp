@@ -725,6 +725,8 @@ struct WeatherNow {
   double wind_angle = 0.7;   // radians, drifting
   uint32_t rng = 0x2545F491u;
   bool started = false;
+  int next_kind = 0;        // what comes next (rolled ahead, for the forecast)
+  bool forecast_told = false;
 };
 WeatherNow g_weather;
 std::atomic<int> g_weather_kind{-1};  // (WeatherName)
@@ -737,11 +739,48 @@ float Rand(uint32_t* s) {
 }
 
 // The weather `dt` seconds on (the clock `t`). setting: native_weather.
+// What follows what (a blizzard only out of snow or grey skies).
+int RollNext(WeatherNow& w, int from) {
+  static constexpr float kNext[4][4] = {
+      {0.0f, 0.7f, 0.3f, 0.0f},
+      {0.4f, 0.0f, 0.5f, 0.1f},
+      {0.25f, 0.5f, 0.0f, 0.25f},
+      {0.0f, 0.2f, 0.8f, 0.0f},
+  };
+  float r = Rand(&w.rng);
+  for (int k = 0; k < 4; ++k) {
+    if (r < kNext[from][k]) return k;
+    r -= kNext[from][k];
+  }
+  return from;
+}
+
+// A report in the game's own song popup when it's there (line 1, line 2,
+// the short cyan line 3), else the port's notice (`plain`).
+void Report(const char* l1, const std::string& l2, const char* l3, const std::string& plain) {
+  if (xm_radio::Available()) {
+    xm_radio::Alert(l1, l2, l3);
+  } else {
+    notice::Show(plain);
+  }
+}
+
 void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes) {
   if (!w.started) {
     w.started = true;
     w.rng ^= uint32_t(std::chrono::steady_clock::now().time_since_epoch().count());
     w.next_change = t + minutes * 60.0 * (0.5 + Rand(&w.rng));
+    w.next_kind = RollNext(w, w.kind);
+  }
+  // The forecast: a minute ahead of a change.
+  if (setting == 1 && !w.forecast_told && w.next_kind != w.kind && t >= w.next_change - 60.0) {
+    w.forecast_told = true;
+    static constexpr const char* kForecast[4][2] = {{"Clearing soon", "The sky should clear soon"},
+                                                    {"Clouds on the way", "Clouds are on the way"},
+                                                    {"Snow on the way", "Snow is on the way"},
+                                                    {"Blizzard coming", "A blizzard is coming"}};
+    Report(w.next_kind == 3 ? "Weather Alert" : "Forecast", kForecast[w.next_kind][0], "Next hour",
+           kForecast[w.next_kind][1]);
   }
   if (setting >= 2) {
     w.kind = std::clamp(setting - 2, 0, 3);
@@ -749,23 +788,10 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
     w.kind = 0;
   } else if (t >= w.next_change) {
     const int prev_kind = w.kind;
-    // What follows what (a blizzard only out of snow or grey skies).
-    static constexpr float kNext[4][4] = {
-        {0.0f, 0.7f, 0.3f, 0.0f},
-        {0.4f, 0.0f, 0.5f, 0.1f},
-        {0.25f, 0.5f, 0.0f, 0.25f},
-        {0.0f, 0.2f, 0.8f, 0.0f},
-    };
-    float r = Rand(&w.rng);
-    int next = w.kind;
-    for (int k = 0; k < 4; ++k) {
-      if (r < kNext[w.kind][k]) {
-        next = k;
-        break;
-      }
-      r -= kNext[w.kind][k];
-    }
+    const int next = w.next_kind;
     w.kind = next;
+    w.next_kind = RollNext(w, next);
+    w.forecast_told = false;
     // A blizzard is short.
     const double len = minutes * 60.0 * (0.5 + Rand(&w.rng)) * (next == 3 ? 0.5 : 1.0);
     w.next_change = t + len;
@@ -780,11 +806,10 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
                                                    {"Weather Report", "Clouds rolling in", "Overcast"},
                                                    {"Weather Report", "Snow is falling", "Snowing"},
                                                    {"Weather Alert", "Blizzard warning", "Whiteout"}};
-      if (xm_radio::Available()) {
-        xm_radio::Alert(kPopup[next][0], kPopup[next][1], kPopup[next][2]);
-      } else {
-        notice::Show(kComing[next]);
-      }
+      // (A blizzard: the wind it brings, in km/h.)
+      std::string line2 = kPopup[next][1];
+      if (next == 3) line2 = "Gusts " + std::to_string(int(kWeather[3].wind * 3.6f * 1.4f)) + " km/h";
+      Report(kPopup[next][0], line2, kPopup[next][2], kComing[next]);
     }
   }
   // Easing toward it: the sky over a minute or so, snow and mist a little

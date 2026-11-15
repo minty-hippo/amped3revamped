@@ -5467,8 +5467,13 @@ void main() {
     int code = int(ld.w + 0.5);
     int kind = code & 7;
     bool preview = (code & 8) != 0, selected = (code & 16) != 0;
-    // How lit: after dark; a preview shows its light by day too.
-    float kk = preview ? max(k, 0.6) : k;
+    // How lit: after dark, each coming on at its own moment as it gets dark
+    // (stuttering on as it warms up); a preview shows its light by day too.
+    float hid = Hash(dot(lp.xyz, vec3(0.131, 0.713, 0.377)));
+    float on_at = hid * 0.3;
+    float kk = smoothstep(on_at, on_at + 0.1, k);
+    if (kk > 0.0 && kk < 1.0) kk *= 0.55 + 0.45 * step(0.4, Hash(floor(pc.b.x * 14.0) + hid * 97.0));
+    if (preview) kk = max(k, 0.6);
     vec3 axis = normalize(ld.xyz);
     // (A bulb: dir is its mounting, out from the surface: the arm back to it.)
     g_arm = -ld.xyz;
