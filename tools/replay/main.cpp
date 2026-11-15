@@ -538,6 +538,14 @@ int main(int argc, char** argv) {
       eye = std::stof(argv[++i]);
     } else if (a == "--tod-night" && i + 1 < argc) {
       tod.night_light = std::stof(argv[++i]);
+    } else if (a == "--tod-overcast" && i + 1 < argc) {
+      tod.overcast = std::stof(argv[++i]);
+    } else if (a == "--tod-snow" && i + 1 < argc) {
+      tod.snow = std::stof(argv[++i]);
+    } else if (a == "--tod-wind" && i + 1 < argc) {
+      tod.wind[0] = std::stof(argv[++i]);
+    } else if (a == "--tod-seconds" && i + 1 < argc) {
+      tod.seconds = std::stof(argv[++i]);
     } else if (a == "--tod-clouds" && i + 1 < argc) {
       tod.clouds = std::stof(argv[++i]);
     } else if (a == "--fog" && i + 1 < argc) {

@@ -91,6 +91,9 @@ bool FreecamPose(float out[6]);
 void SetNightLights(const std::vector<native::Renderer::NightLight>& lights);
 // The mountain shown (0: not known yet): its night lights' file.
 uint64_t MountainKey();
+// The weather now ("clear", "overcast", "snowing", "a blizzard"; "" with the
+// time of day off).
+const char* WeatherName();
 // What the night lights need from the renderer each frame (any thread):
 // objects' placements (lights on every copy, or the editor), the screen's
 // middle read back (the editor). Off: neither is done.

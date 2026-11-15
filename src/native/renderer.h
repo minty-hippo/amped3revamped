@@ -307,6 +307,13 @@ class Renderer {
     float clouds = 0.35f;      // cover, 0..1
     float night_light = 1.0f;  // how much light the night has (1: moonlit snow)
     float seconds = 0.0f;      // a clock for the clouds' drift and the stars' twinkle
+    // Weather: a grey sky over (0..1: the sun and moon dimmed, the light
+    // flat and soft, the sky and its light greyed, stars hidden), snow
+    // falling (0..1: none to a blizzard), the wind (m/s, its direction in
+    // the world's x / z).
+    float overcast = 0.0f;
+    float snow = 0.0f;
+    float wind[2] = {0.0f, 0.0f};
   };
   void SetTimeOfDay(const TimeOfDay& tod);
   // The hour the mountain is made for (its own sun), -1 before a lit frame.

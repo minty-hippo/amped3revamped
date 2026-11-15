@@ -184,6 +184,14 @@ REXCVAR_DEFINE_DOUBLE(native_tod_moon_phase, 0.5, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_tod_clouds, 0.35, "GPU",
                       "Time of day: how much of the sky drifting clouds cover (0: none)")
     .range(0.0, 1.0);
+REXCVAR_DEFINE_INT32(native_weather, 1, "GPU",
+                     "Time of day: the weather. 0: always clear; 1: changing (clear spells, "
+                     "grey skies, snow showers, now and then a blizzard); 2: clear; 3: overcast; "
+                     "4: snowing; 5: blizzard")
+    .range(0, 5);
+REXCVAR_DEFINE_DOUBLE(native_weather_minutes, 6.0, "GPU",
+                      "Time of day, changing weather: about how many minutes each spell lasts")
+    .range(1.0, 120.0);
 REXCVAR_DEFINE_DOUBLE(native_tod_night_light, 1.0, "GPU",
                       "Time of day: how light the night is (1: moonlit snow you can ride by)")
     .range(0.2, 3.0);
@@ -687,6 +695,92 @@ float g_freecam_pose[6] = {};  // the renderer's freecam, last frame (FreecamPos
 bool g_freecam_pose_valid = false;
 float g_center[3] = {};  // the screen's middle in the world (CenterPoint)
 std::atomic<bool> g_need_instances{false}, g_need_center{false};  // SetLightNeeds
+
+// ---- weather ----
+// Kinds: clear, overcast, snowing, blizzard; each a grey sky over, snow
+// falling, wind and mist (the fog closing in) it eases toward.
+struct WeatherKind {
+  const char* name;
+  float overcast, snow, wind, mist;
+};
+constexpr WeatherKind kWeather[4] = {
+    {"clear", 0.0f, 0.0f, 1.5f, 0.0f},
+    {"overcast", 0.85f, 0.0f, 3.0f, 0.08f},
+    {"snowing", 0.92f, 0.55f, 3.5f, 0.3f},
+    {"a blizzard", 1.0f, 1.0f, 11.0f, 1.0f},
+};
+struct WeatherNow {
+  int kind = 0;
+  double next_change = 0.0;  // the clock (seconds) it changes at
+  float overcast = 0, snow = 0, wind = 1.5f, mist = 0;
+  double wind_angle = 0.7;   // radians, drifting
+  uint32_t rng = 0x2545F491u;
+  bool started = false;
+};
+WeatherNow g_weather;
+std::atomic<int> g_weather_kind{-1};  // (WeatherName)
+
+float Rand(uint32_t* s) {
+  *s ^= *s << 13;
+  *s ^= *s >> 17;
+  *s ^= *s << 5;
+  return float(*s & 0xFFFFFF) / float(0x1000000);
+}
+
+// The weather `dt` seconds on (the clock `t`). setting: native_weather.
+void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes) {
+  if (!w.started) {
+    w.started = true;
+    w.rng ^= uint32_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    w.next_change = t + minutes * 60.0 * (0.5 + Rand(&w.rng));
+  }
+  if (setting >= 2) {
+    w.kind = std::clamp(setting - 2, 0, 3);
+  } else if (setting == 0) {
+    w.kind = 0;
+  } else if (t >= w.next_change) {
+    // What follows what (a blizzard only out of snow or grey skies).
+    static constexpr float kNext[4][4] = {
+        {0.0f, 0.7f, 0.3f, 0.0f},
+        {0.4f, 0.0f, 0.5f, 0.1f},
+        {0.25f, 0.5f, 0.0f, 0.25f},
+        {0.0f, 0.2f, 0.8f, 0.0f},
+    };
+    float r = Rand(&w.rng);
+    int next = w.kind;
+    for (int k = 0; k < 4; ++k) {
+      if (r < kNext[w.kind][k]) {
+        next = k;
+        break;
+      }
+      r -= kNext[w.kind][k];
+    }
+    w.kind = next;
+    // A blizzard is short.
+    const double len = minutes * 60.0 * (0.5 + Rand(&w.rng)) * (next == 3 ? 0.5 : 1.0);
+    w.next_change = t + len;
+    REXLOG_INFO("Weather: {}", kWeather[next].name);
+  }
+  // Easing toward it: the sky over a minute or so, snow and mist a little
+  // quicker, the wind's direction wandering.
+  const WeatherKind& k = kWeather[w.kind];
+  auto ease = [&](float& v, float to, double tau) { v += float((to - v) * (1.0 - std::exp(-dt / tau))); };
+  if (dt > 0.0) {
+    ease(w.overcast, k.overcast, 50.0);
+    ease(w.snow, k.snow, 25.0);
+    ease(w.wind, k.wind, 20.0);
+    ease(w.mist, k.mist, 30.0);
+    w.wind_angle += (Rand(&w.rng) - 0.5) * 0.15 * dt;
+  }
+  if (setting != 1) {
+    // (A fixed weather: at once.)
+    w.overcast = k.overcast;
+    w.snow = k.snow;
+    w.mist = k.mist;
+    if (dt <= 0.0) w.wind = k.wind;
+  }
+  g_weather_kind = w.kind;
+}
 float g_center_normal[3] = {0.0f, 1.0f, 0.0f};
 bool g_center_valid = false;
 uint64_t g_mountain_key = 0;
@@ -2190,6 +2284,28 @@ void WorkerMain() {
           tod.clouds = float(REXCVAR_GET(native_tod_clouds));
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
           tod.seconds = float(std::fmod(tod_seconds, 100000.0));
+          // The weather: on with the time of day (as its clock runs).
+          {
+            const int setting = tod.on ? int(REXCVAR_GET(native_weather)) : 0;
+            WeatherStep(g_weather, setting, tod_seconds, running ? dt : 0.0,
+                        REXCVAR_GET(native_weather_minutes));
+            if (tod.on) {
+              tod.overcast = g_weather.overcast;
+              tod.snow = g_weather.snow;
+              tod.wind[0] = float(std::cos(g_weather.wind_angle) * g_weather.wind);
+              tod.wind[1] = float(std::sin(g_weather.wind_angle) * g_weather.wind);
+              // The fog closing in: heavy snow a few hundred metres, a
+              // blizzard a few dozen.
+              if (g_weather.mist > 0.002f) {
+                const double base = revamped && REXCVAR_GET(native_fog) ? REXCVAR_GET(native_fog_density) : 0.0;
+                const double fog_start = revamped && REXCVAR_GET(native_fog) ? REXCVAR_GET(native_fog_start) : 300.0;
+                renderer->SetFog(float(base + 28.0 * g_weather.mist * g_weather.mist + 3.0 * g_weather.mist),
+                                 float(fog_start + (12.0 - fog_start) * std::min(1.0, g_weather.mist * 1.5)));
+              }
+            } else {
+              g_weather_kind = -1;
+            }
+          }
           renderer->SetTimeOfDay(tod);
           // (Only what the night lights use: copies to follow, the editor.)
           renderer->SetCollectInstances(tod.on && g_need_instances.load());
@@ -2441,6 +2557,10 @@ uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since)
 void SetLightNeeds(bool instances, bool center) {
   g_need_instances = instances;
   g_need_center = center;
+}
+const char* WeatherName() {
+  const int k = g_weather_kind.load();
+  return k >= 0 && k < 4 ? kWeather[k].name : "";
 }
 uint64_t MountainKey() {
   std::lock_guard lock(g_game_camera_mutex);

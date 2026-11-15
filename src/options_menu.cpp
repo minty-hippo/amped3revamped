@@ -422,6 +422,12 @@ const std::vector<Tab>& Tabs() {
                 SliderF("native_tod_night_light", "Night brightness",
                         "How light the night is (1: moonlit snow you can ride by).", "%.1f",
                         0.2, 3.0),
+                Choices("native_weather", "Weather",
+                        "With time of day on: grey skies (soft light, faint shadows), snow falling "
+                        "(lit by the lamps at night) and blizzards (wind and the fog closing in). "
+                        "Changing: each spell lasts a few minutes and eases into the next.",
+                        {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"},
+                         {"5", "Blizzard"}}),
                 Choices("native_night_light_shadows", "Night light shadows",
                         "Shadows from the lamps, floodlights and fires: riders, trees, posts "
                         "and buildings each cast one from every light near them. Traced "

@@ -246,4 +246,35 @@ inline State At(const Layout& l, double hour, double moon_phase, double night_li
   return s;
 }
 
+// Weather over the hour: a grey sky (overcast 0..1). The sun's (or moon's)
+// light mostly gone (soft, faint shadows), the sky's light a little brighter
+// by day (the cloud lit from above) and greyer, the sky itself greyed and
+// darker, the stars and the sun's disc hidden behind it.
+inline void ApplyWeather(State* s, double overcast) {
+  const double k = std::clamp(overcast, 0.0, 1.0);
+  if (k <= 0.0) return;
+  auto lum = [](const Vec3& v) { return 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z; };
+  auto grey = [&](Vec3* v, double amount, double scale) {
+    const double l = lum(*v) * scale;
+    v->x = v->x + (l - v->x) * amount;
+    v->y = v->y + (l - v->y) * amount;
+    v->z = v->z + (l - v->z) * amount;
+  };
+  const double direct = 1.0 - 0.82 * k;
+  s->light_scale = {s->light_scale.x * direct, s->light_scale.y * direct, s->light_scale.z * direct};
+  // (Some of what the sun lost comes back as the cloud's own glow.)
+  const double day = 1.0 - s->night;
+  const double fill = 1.0 + 0.08 * k * day;
+  s->ambient_scale = {s->ambient_scale.x * fill, s->ambient_scale.y * fill, s->ambient_scale.z * fill};
+  grey(&s->ambient_scale, 0.55 * k, 1.0);
+  grey(&s->zenith, 0.85 * k, 0.8 - 0.15 * k);
+  grey(&s->horizon, 0.8 * k, 0.95);
+  grey(&s->glow, 0.9 * k, 0.9);
+  s->stars *= (1.0 - k) * (1.0 - k);
+  s->sun_disc *= 1.0 - k;
+  s->moon_bright *= 1.0 - 0.9 * k;
+  // (The game's own painted shadows: gone under a grey sky.)
+  s->away = std::max(s->away, k);
+}
+
 }  // namespace amped3::native::tod

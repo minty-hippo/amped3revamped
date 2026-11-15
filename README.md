@@ -427,6 +427,14 @@ that rule against a save that has the pass.
   dimmed once the real one has moved away), drifting clouds, the sun's disc,
   the moon's disc lit from the sun's side (its phase), stars at night. The
   distance fog and god rays take their colors from it.
+- Weather (Time of Day: Weather, `native_weather`; Changing by default):
+  spells of a few minutes (`native_weather_minutes`) easing one into the
+  next: clear; overcast (a grey sky: the sun's light mostly gone, the light
+  soft and all round, shadows faint, the game's painted shadows faded, the
+  sky and stars hidden); snowing (flakes falling through the scene, hidden
+  behind what's in front of them, lit by the sky and by the night lights
+  near them); and now and then a blizzard (strong wind streaking the snow
+  sideways, the fog closing in to a few dozen metres). Or one of them fixed.
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,

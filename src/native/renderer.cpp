@@ -1792,7 +1792,8 @@ struct Renderer::Impl {
     kClouds = 17, kReactiveMerge = 18, kReactiveView = 19, kAo = 20, kAoBlur = 21, kAoApply = 22,
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
-    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38
+    kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
+    kSnow = 39
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1833,7 +1834,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[39] = {};  // by CopyKind
+  VkShaderModule copy_fs_[40] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2031,6 +2032,12 @@ struct Renderer::Impl {
   Image fog_img_;
   bool fog_done_ = false;
   Image* FoggedScene(Image* scene);
+  // Weather: falling snow over the scene (tod_.snow), hidden behind what's
+  // in front of each flake.
+  bool snow_done_ = false;
+  Image* snow_result_ = nullptr;
+  Image snow_img_;
+  Image* SnowScene(Image* scene);
   // God rays (SetGodRays): strength, the light mask and its shafts (half
   // size) and the scene with them.
   float rays_strength_ = 0.0f;
@@ -3010,6 +3017,10 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (fog) {
         if (Image* fogged = FoggedScene(scene)) scene = fogged;
         MarkPart("effect: fog / god rays");
+      }
+      if (tod_sky && tod_.snow > 0.002f) {
+        if (Image* snowy = SnowScene(scene)) scene = snowy;
+        MarkPart("effect: snow");
       }
       if (blur) {
         if (Image* blurred = BlurredScene(scene)) scene = blurred;
@@ -5006,7 +5017,8 @@ layout(set = 0, binding = 3) uniform sampler2D normals; // the lighting's (xyz *
 layout(push_constant) uniform Mask {
   mat4 m;  // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
   vec4 o0; vec4 o1; vec4 o2;  // the casters' map's rows
-  vec4 a;  // the world map's ndc from the casters' (x k + a.z, y k + a.w... ): offset x, y, k, on
+  vec4 a;  // the world map's ndc from the casters' (x k + a.z, y k + a.w... ): offset x, y, k,
+           // on (0.5) + how much an overcast sky softens them (thousandths)
 } pc;
 layout(location = 0) out vec4 o;
 void main() {
@@ -5046,7 +5058,7 @@ void main() {
   // Trees and props (the world map: their trunks and the stumps under them,
   // which the lighting shades by this map, not the slopes' one), looked up
   // off the surface along its normal (the surface itself is in the map too).
-  if (pc.a.w > 0.5) {
+  if (fract(pc.a.w) > 0.25) {
     vec3 N = normalize(textureLod(normals, uv, 0.0).xyz * 2.0 - 1.0);
     vec4 Q = vec4(P.xyz + N * 0.3 - fd * 0.15, 1.0);
     vec2 st = vec2(dot(pc.o0, Q), dot(pc.o1, Q)) * pc.a.z + pc.a.xy;
@@ -5064,6 +5076,8 @@ void main() {
       lit = min(lit, l / 9.0);
     }
   }
+  // (A grey sky: the light all round, shadows faint.)
+  lit = mix(lit, 1.0, floor(pc.a.w) / 1000.0);
   o = vec4(lit);
 }
 )", true);
@@ -5541,6 +5555,118 @@ void main() {
   vec3 base = hit ? hit_col : c.rgb;
   o = vec4(base + add, c.a);
   if (pc.b.w > 0.5) o = g_dbg;  // (diagnostics: shadow, rider, falloff)
+}
+)", true);
+  // Falling snow: flakes in a grid of cells moving with the wind, met at
+  // distances along each pixel's ray (nearer slices finer), hidden behind
+  // what's drawn in front of them.
+  copy_fs_[39] = CompileBuiltin("builtin_snow", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2) uniform sampler2D lights;  // the night lights' (tiles of 32 px)
+layout(push_constant) uniform Snow {
+  mat4 m;     // ndc (x, y, 1 - depth, 1) -> world, from the camera
+  vec4 t;     // seconds, how much snow (0..1), a pixel's angle (radians), flake size scale
+              // (negative: the night lights are there to light the flakes)
+  vec4 vel;   // the flakes' velocity (m/s; wind and fall), streak length (s)
+  vec4 col;   // the flakes' color (lit), -
+  vec4 a;     // 1 / width, 1 / height, -, -
+} pc;
+layout(location = 0) out vec4 o;
+
+vec3 Hash3(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy * pc.a.xy;
+  vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec4 mid = pc.m * vec4(ndc, 0.5, 1.0);
+  vec3 dir = normalize(mid.xyz / mid.w);
+  float d = textureLod(depth, uv, 0.0).r;
+  float scene_dist = 1e9;
+  if (d > 0.0) {
+    vec4 wp = pc.m * vec4(ndc, 1.0 - d, 1.0);
+    scene_dist = length(wp.xyz / wp.w);
+  }
+  float amount = pc.t.y;
+  float tt = pc.t.x;
+  vec3 vel = pc.vel.xyz;
+  vec3 cam = vec3(pc.col.w, pc.a.z, pc.a.w);
+  // A streak: where the flake was a moment ago (blurred in strong wind).
+  vec3 streak = vel * pc.vel.w;
+  float acc = 0.0;
+  vec3 acc_col = vec3(0.0);
+  // The night lights near this pixel (its tile's), lighting the flakes.
+  bool lit_by_lamps = pc.t.w < 0.0;
+  ivec2 tile_base = ivec2(ivec2(gl_FragCoord.xy) / 32) + ivec2(0, 8);
+  tile_base.y = 8 + (ivec2(gl_FragCoord.xy) / 32).y * 9;
+  int tile_n = lit_by_lamps ? int(texelFetch(lights, tile_base, 0).x + 0.5) : 0;
+  float dark = lit_by_lamps ? texelFetch(lights, ivec2(4, 3), 0).x : 0.0;
+  for (int k = 0; k < 16; ++k) {
+    float r = 0.5 * pow(1.25, float(k));  // 0.5 m .. about 14 m
+    float cell = r * 0.16;
+    if (r - cell > scene_dist) break;
+    // The cell (in the snow's own frame, moving with it) where the ray is r
+    // out, and the flake in it (if any: fewer in light snow).
+    vec3 pm = cam + dir * r - vel * tt;
+    vec3 ci = floor(pm / cell);
+    vec3 h = Hash3(ci + float(k) * 31.7);
+    if (h.x > amount * 0.9) continue;
+    vec3 h2 = Hash3(ci.yzx * 1.7 + 11.3 + float(k));
+    vec3 cm = (ci + 0.2 + 0.6 * h2) * cell;
+    // (Fluttering as it falls.)
+    cm.x += 0.12 * cell * sin(tt * 1.7 + h.y * 40.0);
+    cm.z += 0.12 * cell * cos(tt * 1.3 + h.z * 40.0);
+    vec3 B = cm + vel * tt - cam;  // from the camera
+    vec3 A = B - streak;
+    // The nearest point of its streak to the ray.
+    vec3 u = B - A;
+    float uu = dot(u, u), sseg = 1.0;
+    if (uu > 1e-8) {
+      float bd = dot(dir, u), den = uu - bd * bd;
+      sseg = den > 1e-8 ? clamp((bd * dot(dir, A) - dot(u, A)) / den, 0.0, 1.0) : 1.0;
+    }
+    vec3 X = A + u * sseg;
+    float tc = dot(X, dir);
+    if (tc < 0.4 || abs(tc - r) > cell * 0.5 || tc > scene_dist) continue;
+    float perp = length(X - dir * tc);
+    float size = (0.006 + 0.006 * h.y) * abs(pc.t.w);
+    // At least most of a pixel across (dimmer for it: as bright overall).
+    float rad = max(size, tc * pc.t.z * 0.7);
+    float f = smoothstep(rad, rad * 0.25, perp) * min(1.0, (size * size) / (rad * rad) * 1.5);
+    f /= 1.0 + sqrt(uu) / (12.0 * size);  // (a streak: its light spread along it)
+    f *= smoothstep(0.45, 1.0, tc) * (1.0 - smoothstep(10.0, 14.0, tc));
+    if (f <= 0.0) continue;
+    // Lit by the sky, and the lamps near it (each flake bright in a lamp's
+    // light).
+    vec3 fc = pc.col.rgb;
+    if (dark > 0.001) {
+      vec3 W = cam + X;
+      for (int e = 0; e < tile_n; ++e) {
+        int slot = e + 1;
+        vec4 tv = texelFetch(lights, tile_base + ivec2(0, slot / 4), 0);
+        int i = int(tv[slot % 4] + 0.5);
+        if (i >= 256) continue;
+        vec4 lp = texelFetch(lights, ivec2(i, 0), 0);
+        vec3 dl = lp.xyz - W;
+        float dist = length(dl);
+        if (dist >= lp.w) continue;
+        vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
+        vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
+        float x = dist / lp.w;
+        float fall = (1.0 - x * x) * (1.0 - x * x) / (1.0 + dist * dist * 0.06);
+        if ((int(ld.w + 0.5) & 3) == 1) fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), normalize(ld.xyz))) * 1.4 + 0.04;
+        fc += lc.rgb * lc.w * dark * fall * 1.2;
+      }
+    }
+    acc += f;
+    acc_col += fc * f;
+  }
+  float cover = clamp(acc, 0.0, 0.9);
+  o = vec4(c.rgb * (1.0 - cover) + acc_col * (cover / max(acc, 1e-4)), c.a);
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -6714,7 +6840,10 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
         tod_layout_ = tod::MakeLayout({tod_game_light_[0], tod_game_light_[1], tod_game_light_[2]});
         tod_mountain_hour_ = float(tod_layout_.mountain_hour);
       }
-      if (tod_.on) tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
+      if (tod_.on) {
+        tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
+        tod::ApplyWeather(&tod_state_, tod_.overcast);
+      }
       EyeUpdate();
       CenterRead();
       ResolveInstances();
@@ -8241,6 +8370,91 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
   return ao_result_;
 }
 
+Image* Renderer::Impl::SnowScene(Image* scene) {
+  if (snow_done_) return snow_result_;
+  snow_done_ = true;
+  snow_result_ = nullptr;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
+      dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1) {
+    return nullptr;
+  }
+  // (Not on the trail map and the like: no rider about.)
+  const float amount = std::clamp(tod_.snow, 0.0f, 1.0f) * fog_presence_;
+  if (amount < 0.002f) return nullptr;
+  Image* depth = &dit->second;
+  const uint32_t w = scene->width, h = scene->height;
+  EndRendering();
+  if (!snow_img_.image || snow_img_.width != w || snow_img_.height != h || snow_img_.format != scene->format) {
+    if (snow_img_.image) Retire(snow_img_);
+    snow_img_ = gpu_.CreateImage(w, h, scene->format, false, "snow");
+    ToGeneral(cb_, snow_img_);
+  }
+  snow_img_.scaled = scene->scaled;
+  snow_img_.scale = scene->scale;
+  float pc[32] = {};
+  // ndc -> world, less the camera (the flakes are placed from it).
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) {
+      double v = inv_vp_[r * 4 + c];
+      if (r < 3) v -= cam_pos_[r] * inv_vp_[12 + c];
+      pc[c * 4 + r] = float(v);
+    }
+  }
+  // A pixel's angle: the view's height in ndc over the screen's pixels.
+  double pix = 0.0015;
+  {
+    auto ray = [&](double y, double out[3]) {
+      double v[4] = {};
+      const double n[4] = {0.0, y, 0.5, 1.0};
+      for (int r = 0; r < 4; ++r) {
+        for (int k = 0; k < 4; ++k) v[r] += inv_vp_[r * 4 + k] * n[k];
+      }
+      for (int r = 0; r < 3; ++r) out[r] = v[r] / v[3] - cam_pos_[r];
+    };
+    double a[3], b[3];
+    ray(0.0, a);
+    ray(1.0, b);
+    const double la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    const double d = std::sqrt((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]) +
+                               (b[2] - a[2]) * (b[2] - a[2]));
+    if (la > 1e-9 && d > 0) pix = d / la / (h * 0.5);
+  }
+  pc[16] = float(std::fmod(double(tod_.seconds), 600.0));
+  pc[17] = amount;
+  pc[18] = float(pix);
+  pc[19] = 1.0f + 0.4f * std::clamp(tod_.snow - 0.6f, 0.0f, 0.4f) / 0.4f;  // (big flakes in a heavy fall)
+  // Falling about 1 m/s, carried by the wind; streaked over 1/30 s.
+  pc[20] = tod_.wind[0];
+  pc[21] = -1.1f - 0.3f * tod_.snow;
+  pc[22] = tod_.wind[1];
+  pc[23] = 1.0f / 90.0f;
+  {
+    // Lit by the sky (and a little the sun or moon), as the snow on the
+    // ground: about its brightness by day, dim at night.
+    auto lum = [](const tod::Vec3& v) { return 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z; };
+    const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
+    const double k = std::clamp((0.75 * lum(tod_state_.ambient_scale) + 0.35 * lum(tod_state_.light_scale)) * e, 0.03, 1.2);
+    pc[24] = float(0.86 * k);
+    pc[25] = float(0.89 * k);
+    pc[26] = float(0.95 * k);
+  }
+  pc[27] = cam_pos_[0];
+  pc[28] = 1.0f / float(w);
+  pc[29] = 1.0f / float(h);
+  pc[30] = cam_pos_[1];
+  pc[31] = cam_pos_[2];
+  Barrier();
+  // The night lights (their tiles), when drawn this frame.
+  const bool lamps = lights_result_ != nullptr && lights_img_.image && lights_img_.width >= 256;
+  if (lamps) pc[19] = -pc[19];
+  FullscreenPass(CopyKind::kSnow, &snow_img_, scene, depth, lamps ? &lights_img_ : &dummy_, false, pc, 32);
+  Barrier();
+  dyn_ = DynState{};
+  snow_result_ = &snow_img_;
+  return snow_result_;
+}
+
 Image* Renderer::Impl::FoggedScene(Image* scene) {
   if (fog_done_) return fog_result_;
   fog_done_ = true;
@@ -8591,8 +8805,9 @@ void Renderer::Impl::TodShadows() {
     pc[28] = float(-Om[0 * 4 + 3] * k + sun_O_[0 * 4 + 3]);
     pc[29] = float(-Om[1 * 4 + 3] * k + sun_O_[1 * 4 + 3]);
     pc[30] = float(k);
-    pc[31] = 1.0f;
+    pc[31] = 0.5f;
   }
+  pc[31] += std::floor(std::clamp(0.85f * tod_.overcast, 0.0f, 1.0f) * 1000.0f);
   FullscreenPass(CopyKind::kTodShadow, &tod_mask_, depth, &tod_movers_map_, world ? &sun_env_ : nullptr,
                  false, pc, 32, nullptr, world ? tod_normal_ : nullptr);
   Barrier();
@@ -8929,6 +9144,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
           r[i * 4 + 3] = float(vp[i * 4 + 0] * cam_pos_[0] + vp[i * 4 + 1] * cam_pos_[1] +
                                vp[i * 4 + 2] * cam_pos_[2] + vp[i * 4 + 3]);
         }
+        r[16] = float(dark);  // (texel 4: how dark, for the snow's flakes)
       }
     }
     for (size_t j = 0; j < nearby.size(); ++j) {
@@ -9097,7 +9313,8 @@ Image* Renderer::Impl::TodSky(Image* scene) {
   pc[24] = float(t.sun_color.x);
   pc[25] = float(t.sun_color.y);
   pc[26] = float(t.sun_color.z);
-  pc[27] = std::clamp(tod_.clouds, 0.0f, 1.0f);
+  // (An overcast sky: clouded over.)
+  pc[27] = std::clamp(tod_.clouds + (1.0f - tod_.clouds) * tod_.overcast, 0.0f, 1.0f);
   pc[28] = 1.0f / float(w);
   pc[29] = 1.0f / float(h);
   pc[31] = eye_strength_ > 0.0f ? float(exposure_) : 1.0f;
@@ -11745,7 +11962,7 @@ Renderer::Impl::~Impl() {
   if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_}) {
+                    &lights_albedo_, &lights_wdepth_, &snow_img_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -11863,6 +12080,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   up_result_ = nullptr;
   radial_done_ = false;
   fog_done_ = false;
+  snow_done_ = false;
   tod_sky_done_ = false;
   eye_done_ = false;
   lights_done_ = false;
