@@ -557,6 +557,7 @@ void Tick() {
   }
   if (publish) Publish();
   if (g_dirty && Clock::now() - g_last_save > std::chrono::seconds(5)) Save();
+  live::SetLightNeeds(g_editor || !g_s.templates.empty(), g_editor);
 }
 
 void SetEditor(bool on) {

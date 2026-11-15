@@ -1503,6 +1503,10 @@ struct Renderer::Impl {
   float center_normal_[3] = {0.0f, 1.0f, 0.0f};
   bool center_normal_ok_ = false;
   void CenterProbe(Image* depth);
+  bool center_probe_ = true;  // SetCenterProbe
+  // The night lights that can show this frame: within 400 m, their reach in
+  // view (their light, glow and fitting), nearest first, at most 128.
+  std::vector<std::pair<float, size_t>> VisibleLights() const;
   void CenterRead();
   double tod_mask_rows_[12] = {};  // c6, c7, c9
   double tod_Om_[16] = {};         // the casters' map's rows (world -> its ndc, depth)
@@ -2984,7 +2988,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
                           ? &dit->second
                           : nullptr;
         if (dimg) {
-          CenterProbe(dimg);
+          if (center_probe_) CenterProbe(dimg);
           if (Image* lit = NightLights(scene, dimg)) scene = lit;
           MarkPart("effect: night lights");
         }
@@ -8285,7 +8289,9 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
     tod_albedo_ = nullptr;
     bool preview = false;
     for (const auto& l : lights_) preview |= l.preview || l.selected;
-    Image* alb = TodOn() && !lights_.empty() && (tod_state_.night > 0.25 || preview)
+    // (Copies only with a light in view to use them.)
+    Image* alb = TodOn() && !lights_.empty() && (tod_state_.night > 0.25 || preview) &&
+                         !VisibleLights().empty()
                      ? TextureFor(d, 3, st, &n0)
                      : nullptr;
     if (alb && !alb->depth && alb->samples == 1) {
@@ -8663,6 +8669,52 @@ void Renderer::Impl::CenterRead() {
 }
 
 // Night lights, after the scene (builtin_night_lights): on as it gets dark.
+std::vector<std::pair<float, size_t>> Renderer::Impl::VisibleLights() const {
+  std::vector<std::pair<float, size_t>> out;
+  // The view's side planes and its front (Gribb / Hartmann, from world ->
+  // clip), each normalised: a sphere wholly outside one is out of view.
+  double vp[16];
+  double planes[5][4];
+  const bool have = Invert4(inv_vp_, vp);
+  if (have) {
+    const int rows[5][2] = {{0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 0}};
+    for (int k = 0; k < 5; ++k) {
+      for (int j = 0; j < 4; ++j) {
+        const double w = vp[12 + j];
+        planes[k][j] = rows[k][0] < 0 ? w : w + rows[k][1] * vp[rows[k][0] * 4 + j];
+      }
+      const double n = std::sqrt(planes[k][0] * planes[k][0] + planes[k][1] * planes[k][1] +
+                                 planes[k][2] * planes[k][2]);
+      if (n > 1e-12) {
+        for (double& v : planes[k]) v /= n;
+      }
+    }
+  }
+  for (size_t i = 0; i < lights_.size(); ++i) {
+    const auto& l = lights_[i];
+    const float* p = l.pos;
+    const float dx = p[0] - cam_pos_[0], dy = p[1] - cam_pos_[1], dz = p[2] - cam_pos_[2];
+    const float d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= 400.0f * 400.0f) continue;
+    if (have) {
+      // (Its light's reach; its glow and fitting a few metres round it,
+      // more far off; a lamp post down to the ground.)
+      const double reach = std::max<double>({l.radius, 4.0 + 0.03 * std::sqrt(double(d2)),
+                                             std::sqrt(double(l.dir[0] * l.dir[0] + l.dir[1] * l.dir[1] +
+                                                              l.dir[2] * l.dir[2])) + 1.0});
+      bool in = true;
+      for (int k = 0; k < 5 && in; ++k) {
+        in = planes[k][0] * p[0] + planes[k][1] * p[1] + planes[k][2] * p[2] + planes[k][3] > -reach;
+      }
+      if (!in) continue;
+    }
+    out.push_back({d2, i});
+  }
+  std::sort(out.begin(), out.end());
+  if (out.size() > 128) out.resize(128);
+  return out;
+}
+
 Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   if (lights_done_) return lights_result_;
   lights_done_ = true;
@@ -8673,17 +8725,10 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
       depth->width != scene->width || depth->height != scene->height || scene->samples > 1) {
     return nullptr;
   }
-  // The nearest 128 to the camera (within 400 m).
-  std::vector<std::pair<float, size_t>> nearby;
-  for (size_t i = 0; i < lights_.size(); ++i) {
-    const float* p = lights_[i].pos;
-    const float dx = p[0] - cam_pos_[0], dy = p[1] - cam_pos_[1], dz = p[2] - cam_pos_[2];
-    const float d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 < 400.0f * 400.0f) nearby.push_back({d2, i});
-  }
+  // Those that can show (in view), the nearest 128.
+  const std::vector<std::pair<float, size_t>> nearby = VisibleLights();
+  if (Diag("lightcull")) std::fprintf(stderr, "night lights: %zu placed, %zu in view\n", lights_.size(), nearby.size());
   if (nearby.empty()) return nullptr;
-  std::sort(nearby.begin(), nearby.end());
-  if (nearby.size() > 128) nearby.resize(128);
   EndRendering();
   auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
     if (im.image && im.width == iw && im.height == ih && im.format == f) return;
@@ -11938,6 +11983,7 @@ uint64_t Renderer::MountainKey() const {
   return h;
 }
 void Renderer::SetCollectInstances(bool on) { impl_->collect_instances_ = on; }
+void Renderer::SetCenterProbe(bool on) { impl_->center_probe_ = on; }
 const std::vector<Renderer::Instance>& Renderer::Instances() const { return impl_->instances_; }
 bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   if (!impl_->center_ok_) return false;

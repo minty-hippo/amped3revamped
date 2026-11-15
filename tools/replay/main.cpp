@@ -881,6 +881,17 @@ int main(int argc, char** argv) {
         }
         lights.push_back(l);
       }
+      if (std::getenv("A3_TEST_BEHIND")) {
+        // Lights out of view (behind the camera, far to the sides), and one
+        // behind but near enough to light what's ahead: culled or kept.
+        const float spots[4][2] = {{-60.0f, 0.0f}, {-30.0f, 40.0f}, {5.0f, -120.0f}, {-3.0f, 0.0f}};
+        for (const auto& sp : spots) {
+          amped3::native::Renderer::NightLight l;
+          for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * sp[0] + g[6 + i] * sp[1];
+          l.radius = 12.0f;
+          lights.push_back(l);
+        }
+      }
       if (std::getenv("A3_TEST_RIDER")) {
         // One lamp beside where the rider is (just ahead of the camera): its
         // light on the rider.

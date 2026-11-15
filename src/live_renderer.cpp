@@ -686,6 +686,7 @@ bool g_game_camera_valid = false;
 float g_freecam_pose[6] = {};  // the renderer's freecam, last frame (FreecamPose)
 bool g_freecam_pose_valid = false;
 float g_center[3] = {};  // the screen's middle in the world (CenterPoint)
+std::atomic<bool> g_need_instances{false}, g_need_center{false};  // SetLightNeeds
 float g_center_normal[3] = {0.0f, 1.0f, 0.0f};
 bool g_center_valid = false;
 uint64_t g_mountain_key = 0;
@@ -2190,7 +2191,9 @@ void WorkerMain() {
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
           tod.seconds = float(std::fmod(tod_seconds, 100000.0));
           renderer->SetTimeOfDay(tod);
-          renderer->SetCollectInstances(tod.on);
+          // (Only what the night lights use: copies to follow, the editor.)
+          renderer->SetCollectInstances(tod.on && g_need_instances.load());
+          renderer->SetCenterProbe(tod.on && g_need_center.load());
           {
             std::lock_guard lock(g_lights_mutex);
             if (g_lights_changed) {
@@ -2434,6 +2437,10 @@ uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since)
   std::lock_guard lock(g_game_camera_mutex);
   if (g_instances_version != since) *out = g_instances;
   return g_instances_version;
+}
+void SetLightNeeds(bool instances, bool center) {
+  g_need_instances = instances;
+  g_need_center = center;
 }
 uint64_t MountainKey() {
   std::lock_guard lock(g_game_camera_mutex);

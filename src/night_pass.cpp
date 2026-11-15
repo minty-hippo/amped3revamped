@@ -87,6 +87,8 @@ void Tick() {
   }
   g_at_mountain = level == kMountain;
   if (!g_at_mountain.load()) return;
+  // (Nothing more to learn this load: earned, and logged if asked.)
+  if (g_earned.load() && (g_logged || !REXCVAR_GET(trace_challenges))) return;
   const std::vector<challenges::Info> list = challenges::List();
   // (The initiators come with the mountain's entities: wait for them.)
   const bool ready = std::any_of(list.begin(), list.end(),

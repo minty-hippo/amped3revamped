@@ -341,6 +341,9 @@ class Renderer {
   // sky or not known yet): where a light is placed.
   // normal: the surface's there (facing the camera), when asked for.
   bool CenterPoint(float out[3], float normal[3] = nullptr) const;
+  // Whether to read the screen's middle back each frame (for CenterPoint:
+  // the light editor); off saves a copy and two barriers a frame.
+  void SetCenterProbe(bool on);
   // Eye adaptation (HDR-style): the lighting brightened in the dark and
   // toned down in glare, easing over a second or two like eyes adjusting,
   // from the scene's average brightness. strength 0 off .. 1 full.
