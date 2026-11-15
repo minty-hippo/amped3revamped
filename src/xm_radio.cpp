@@ -26,7 +26,13 @@ rex::memory::Memory* GuestMemory() {
 bool Readable(rex::memory::Memory* memory, uint32_t address, uint32_t size) {
   auto* heap = memory->LookupHeap(address);
   if (!heap) return false;
-  return heap->QueryRangeAccess(address, address + size - 1) != rex::memory::PageAccess::kNoAccess;
+  if (heap->QueryRangeAccess(address, address + size - 1) == rex::memory::PageAccess::kNoAccess) return false;
+  // Committed (reserved pages can carry a protection with nothing behind them).
+  for (uint32_t a = address & ~0xFFFu; a < address + size; a += 0x1000u) {
+    rex::memory::HeapAllocationInfo info{};
+    if (!heap->QueryRegionInfo(a, &info) || !(info.state & rex::memory::kMemoryAllocationCommit)) return false;
+  }
+  return true;
 }
 
 // Printable ASCII text at p (up to its end), or "".
@@ -61,23 +67,25 @@ void ScanRefs(rex::memory::Memory* memory) {
   if (Readable(memory, 0x8286EAF8u, 16)) {
     REXLOG_INFO("XM Radio popup: holder 0x8286EAF8 = {:08X} {:08X} {:08X} {:08X}", be32(0x8286EAF8u),
                 be32(0x8286EAFCu), be32(0x8286EB00u), be32(0x8286EB04u));
-    // The scene object it points at, its first words.
+    // What it points at, its first words.
     const uint32_t obj = be32(0x8286EAF8u);
-    if (obj && Readable(memory, obj, 256)) {
+    if (obj && Readable(memory, obj, 4) && Readable(memory, obj + 252, 4)) {
       std::string line;
       for (uint32_t i = 0; i < 64; ++i) line += fmt::format("{:08X}{}", be32(obj + i * 4), i % 8 == 7 ? " | " : " ");
       REXLOG_INFO("XM Radio popup: object {:08X}: {}", obj, line);
     }
   }
-  constexpr uint32_t kPage = 0x10000u;
+  // (Page by page, 4 KB each, only those readable: a 64 KB range can have
+  // holes.) The image's data first: tables of names are kept there.
+  constexpr uint32_t kPage = 0x1000u;
   int logged = 0;
-  const uint32_t ranges[][2] = {{0x40000000u, 0x80000000u}, {0x82000000u, 0x83000000u}, {0xA0000000u, 0xC0000000u}};
+  const uint32_t ranges[][2] = {{0x82000000u, 0x83000000u}};
   for (const auto& r : ranges) {
     for (uint64_t page = r[0]; page < r[1] && logged < 80; page += kPage) {
       if (!Readable(memory, uint32_t(page), kPage)) continue;
       for (uint32_t i = 0; i < kPage; i += 4) {
         const uint32_t v = be32(uint32_t(page) + i);
-        if ((v & 0xFFF00000u) != 0x82000000u) continue;
+        if ((v & 0xFF000000u) != 0x82000000u) continue;
         for (const auto& w : wants) {
           if (v != w.value) continue;
           REXLOG_INFO("XM Radio popup: {} pointed to from {:08X}", w.what, uint32_t(page) + i);
@@ -128,6 +136,8 @@ void Tick() {
     }
   }
   REXLOG_INFO("XM Radio popup: {} strings found in the game's image", found);
+  // (The tables in the image's data are there from the start.)
+  ScanRefs(memory);
 }
 
 }  // namespace amped3::xm_radio
