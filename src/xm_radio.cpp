@@ -4,6 +4,7 @@
 
 #include "challenges.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include <rex/logging.h>
+#include <rex/ppc/context.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
@@ -115,8 +117,12 @@ void ScanRefs(rex::memory::Memory* memory) {
 // following their pointers to UTF-16 text.
 constexpr uint32_t kVtable = 0x82883830u;
 uint32_t g_object = 0;
-std::vector<uint32_t> g_objects;  // every object with its vtable (one shows)
-double g_next_look = 0.0, g_next_find = 0.0;
+// Set by the hook on its show (sub_8253DE00): the object, and when (the
+// watcher logs it then and a second later, after its text's set).
+std::atomic<uint32_t> g_shown{0};
+std::atomic<int64_t> g_shown_ms{0};
+int g_logs_done = 0;
+double g_next_look = 0.0;
 bool g_text_logged = false;
 
 uint32_t Be32(uint8_t* base, uint32_t a) {
@@ -159,32 +165,8 @@ std::string Utf16At(rex::memory::Memory* memory, uint8_t* base, uint32_t a) {
 
 void LookAtObject(rex::memory::Memory* memory, double now) {
   uint8_t* base = memory->virtual_membase();
-  if (g_objects.empty() || now >= g_next_find) {
-    // Find them: objects whose first word is the class's vtable (every
-    // 20 s: made and freed with the mountain).
-    g_next_find = now + 20.0;
-    g_objects.clear();
-    // (Its state a small number: not just a pointer to the vtable.)
-    const uint32_t ranges[][2] = {{0x82000000u, 0x83000000u}, {0x40000000u, 0x80000000u}, {0xA0000000u, 0xE0000000u}};
-    for (const auto& r : ranges) {
-      for (uint64_t page = r[0]; page < r[1] && g_objects.size() < 16; page += 0x1000u) {
-        if (!Readable(memory, uint32_t(page), 0x1000u)) continue;
-        for (uint32_t i = 0; i + 0x100 <= 0x1000u; i += 4) {
-          const uint32_t a = uint32_t(page) + i;
-          if (Be32(base, a) == kVtable && Be32(base, a + 140) <= 4) g_objects.push_back(a);
-        }
-      }
-    }
-    std::string list;
-    for (uint32_t o : g_objects) list += fmt::format(" {:08X} (state {})", o, Readable(memory, o, 0x100) ? Be32(base, o + 140) : 0);
-    REXLOG_INFO("XM Radio popup: objects:{}", list);
-  }
-  // The one showing (state 2).
-  g_object = 0;
-  for (uint32_t o : g_objects) {
-    if (Readable(memory, o, 0x100) && Be32(base, o) == kVtable && Be32(base, o + 140) == 2) g_object = o;
-  }
-  if (!g_object) return;
+  (void)now;
+  if (!g_object || !Readable(memory, g_object, 0xA4)) return;
   // Each text node: its words, and any that lead to UTF-16 text (directly,
   // or one pointer further).
   bool any = false;
@@ -215,9 +197,7 @@ void LookAtObject(rex::memory::Memory* memory, double now) {
     }
   }
   const uint32_t state = Be32(base, g_object + 140);
-  // (Logged while it shows, text found or not.)
-  if ((any || state == 2) && !g_text_logged) {
-    g_text_logged = true;
+  {
     std::string words;
     for (uint32_t i = 0; i < 64; ++i) words += fmt::format("{:08X} ", Be32(base, g_object + i * 4));
     REXLOG_INFO("XM Radio popup: object {:08X} (state {}): {}", g_object, state, words);
@@ -244,16 +224,20 @@ void LookAtObject(rex::memory::Memory* memory, double now) {
 }  // namespace
 
 void Tick() {
-  // On a mountain, every couple of seconds: the popup's object and its text.
-  if (g_scanned && !g_text_logged) {
-    if (auto* memory = GuestMemory(); memory && !challenges::LoadedLevel().empty()) {
-      const double now = double(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now().time_since_epoch())
-                                    .count()) /
-                         1000.0;
-      if (now >= g_next_look) {
-        g_next_look = now + 0.5;
-        LookAtObject(memory, now);
+  // The popup shown (the hook): its object and text, then and a second on
+  // (the first two shows).
+  if (const uint32_t shown = g_shown.load(); shown && g_logs_done < 4) {
+    if (auto* memory = GuestMemory()) {
+      const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+      const int64_t since = ms - g_shown_ms.load();
+      if ((g_logs_done % 2 == 0) || since >= 1000) {
+        g_object = shown;
+        REXLOG_INFO("XM Radio popup: shown, object {:08X}, {} ms on", shown, since);
+        LookAtObject(memory, 0.0);
+        ++g_logs_done;
+        if (g_logs_done % 2 == 0) g_shown = 0;
       }
     }
   }
@@ -300,3 +284,12 @@ void Tick() {
 }
 
 }  // namespace amped3::xm_radio
+
+// The popup's show (sub_8253DE00, at its start: r3 = the object).
+void Amped3_XmRadioShow(PPCRegister& r3) {
+  using namespace amped3::xm_radio;
+  g_shown_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count();
+  g_shown = r3.u32;
+}

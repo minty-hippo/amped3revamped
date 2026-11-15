@@ -181,6 +181,13 @@ name = "Amped3_GuiLuaLoad"
 address = 0x821A0BF0
 registers = ["r4", "r5", "r6"]
 
+# The song popup (src/xm_radio.cpp): its show, sub_8253DE00, at its start
+# (r3 = the popup's object).
+[[midasm_hook]]
+name = "Amped3_XmRadioShow"
+address = 0x8253DE00
+registers = ["r3"]
+
 # The string table loader (sub_821B16D0) once it has set up a table it read
 # (r30 = the table, r29 = its size).
 [[midasm_hook]]
