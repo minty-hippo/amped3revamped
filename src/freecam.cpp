@@ -103,8 +103,8 @@ struct Keys {
   // J kind, Delete delete, , . turn, Page Up / Down pick, Backspace back,
   // Ctrl+Z undo.
   bool ed_toggle = false, ed_place = false, ed_every = false, ed_kind = false, ed_delete = false,
-       ed_back = false, ed_undo = false;
-  int ed_turn = 0, ed_pick = 0;
+       ed_back = false, ed_undo = false, ed_color = false;
+  int ed_turn = 0, ed_pick = 0, ed_tilt = 0;
 } g_keys;
 
 std::atomic<bool> g_show_help{true};
@@ -168,9 +168,11 @@ class Overlay final : public rex::ui::ImGuiDialog {
           "Y / O: on every copy of the object",
           picked ? "X / Delete: delete it" : "X / J: kind",
           "D-pad left right / , .: turn",
+          "D-pad up down / [ ]: tilt",
+          "R3 / K: color",
           "LB RB / Page Up Down: pick a placed light",
-          "D-pad down / Ctrl+Z: undo",
-          picked ? "B / Backspace: unpick" : "B / Backspace / D-pad up: done",
+          "Start / Ctrl+Z: undo",
+          picked ? "B / Backspace: unpick" : "B / Backspace: done",
           "View / H: hide controls",
       };
     } else if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
@@ -190,7 +192,8 @@ class Overlay final : public rex::ui::ImGuiDialog {
       const std::string picked = night_lights::SelectionName();
       const std::string line1 = picked.empty() ? "Placing: " + night_lights::KindName()
                                                : "Picked: " + picked;
-      const std::string line2 = std::to_string(night_lights::Count()) + " lights on this mountain";
+      const std::string line2 = (picked.empty() ? night_lights::PreviewDetails() + "   " : std::string()) +
+                                std::to_string(night_lights::Count()) + " lights on this mountain";
       const float tw = std::max(font->CalcTextSizeA(px, FLT_MAX, 0, line1.c_str()).x,
                                 font->CalcTextSizeA(px * 0.75f, FLT_MAX, 0, line2.c_str()).x);
       const ImVec2 a(w * 0.5f - tw * 0.5f - px, h * 0.06f), b(w * 0.5f + tw * 0.5f + px, h * 0.06f + px * 2.4f);
@@ -247,6 +250,8 @@ class Overlay final : public rex::ui::ImGuiDialog {
     ed.ed_undo = g_keys.ed_undo || (io.KeyCtrl && hit(ImGuiKey_Z));
     ed.ed_turn = g_keys.ed_turn + int(hit(ImGuiKey_Period)) - int(hit(ImGuiKey_Comma));
     ed.ed_pick = g_keys.ed_pick + int(hit(ImGuiKey_PageDown)) - int(hit(ImGuiKey_PageUp));
+    ed.ed_tilt = g_keys.ed_tilt + int(hit(ImGuiKey_RightBracket)) - int(hit(ImGuiKey_LeftBracket));
+    ed.ed_color = g_keys.ed_color || hit(ImGuiKey_K);
     if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     float mouse[2] = {g_keys.mouse[0], g_keys.mouse[1]};
     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
@@ -266,6 +271,8 @@ class Overlay final : public rex::ui::ImGuiDialog {
     g_keys.ed_undo = ed.ed_undo;
     g_keys.ed_turn = ed.ed_turn;
     g_keys.ed_pick = ed.ed_pick;
+    g_keys.ed_tilt = ed.ed_tilt;
+    g_keys.ed_color = ed.ed_color;
     g_keys.mouse[0] = mouse[0];
     g_keys.mouse[1] = mouse[1];
   }
@@ -411,18 +418,20 @@ void OnPad(const pad::Snapshot& pad) {
     g_keys.mouse[0] = g_keys.mouse[1] = 0.0f;
     g_keys.reset = g_keys.leave = g_keys.switch_mode = false;
     g_keys.ed_toggle = g_keys.ed_place = g_keys.ed_every = g_keys.ed_kind = g_keys.ed_delete =
-        g_keys.ed_back = g_keys.ed_undo = false;
-    g_keys.ed_turn = g_keys.ed_pick = 0;
+        g_keys.ed_back = g_keys.ed_undo = g_keys.ed_color = false;
+    g_keys.ed_turn = g_keys.ed_pick = g_keys.ed_tilt = 0;
   }
   // The light editor (time of day on; not in a replay: the replay's frames
   // aren't where the camera is): D-pad up (L) on and off. While on, it has
   // A, B, X, Y, the bumpers and the D-pad.
   const bool can_edit = live::TimeOfDayHour() >= 0.0f && !replay::Active();
   if (!can_edit && night_lights::EditorOn()) night_lights::SetEditor(false);
-  if (can_edit && ((pressed & X_INPUT_GAMEPAD_DPAD_UP) || keys.ed_toggle)) {
+  // (On: D-pad up, which then tilts; off: B, or L.)
+  if (can_edit && (((pressed & X_INPUT_GAMEPAD_DPAD_UP) && !night_lights::EditorOn()) || keys.ed_toggle)) {
     const bool on = !night_lights::EditorOn();
     night_lights::SetEditor(on);
     notice::Show(on ? "Light editor: aim the cross where a light goes" : "Light editor off");
+    pressed &= uint16_t(~X_INPUT_GAMEPAD_DPAD_UP);
   }
   uint16_t buttons = pad.buttons;
   if (night_lights::EditorOn()) {
@@ -430,7 +439,8 @@ void OnPad(const pad::Snapshot& pad) {
                                  X_INPUT_GAMEPAD_Y | X_INPUT_GAMEPAD_LEFT_SHOULDER |
                                  X_INPUT_GAMEPAD_RIGHT_SHOULDER | X_INPUT_GAMEPAD_DPAD_UP |
                                  X_INPUT_GAMEPAD_DPAD_DOWN | X_INPUT_GAMEPAD_DPAD_LEFT |
-                                 X_INPUT_GAMEPAD_DPAD_RIGHT;
+                                 X_INPUT_GAMEPAD_DPAD_RIGHT | X_INPUT_GAMEPAD_START |
+                                 X_INPUT_GAMEPAD_RIGHT_THUMB;
     const bool picked = night_lights::HasSelection();
     std::string say;
     if ((pressed & X_INPUT_GAMEPAD_A) || keys.ed_place) say = night_lights::Place();
@@ -443,10 +453,18 @@ void OnPad(const pad::Snapshot& pad) {
     int turn = keys.ed_turn + ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) -
                ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
     if (turn) say = night_lights::Rotate(15.0f * float(turn));
+    const int tilt = keys.ed_tilt + ((pressed & X_INPUT_GAMEPAD_DPAD_UP) ? 1 : 0) -
+                     ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) ? 1 : 0);
+    if (tilt) say = night_lights::TiltBy(10.0f * float(tilt));
+    // (R3 alone: with L3 it's the freecam's own.)
+    if (((pressed & X_INPUT_GAMEPAD_RIGHT_THUMB) && !(pad.buttons & X_INPUT_GAMEPAD_LEFT_THUMB)) ||
+        keys.ed_color) {
+      say = night_lights::NextColor(1);
+    }
     const int pick = keys.ed_pick + ((pressed & X_INPUT_GAMEPAD_RIGHT_SHOULDER) ? 1 : 0) -
                      ((pressed & X_INPUT_GAMEPAD_LEFT_SHOULDER) ? 1 : 0);
     if (pick) say = night_lights::Select(pick);
-    if ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) || keys.ed_undo) say = night_lights::Undo();
+    if ((pressed & X_INPUT_GAMEPAD_START) || keys.ed_undo) say = night_lights::Undo();
     if ((pressed & X_INPUT_GAMEPAD_B) || keys.ed_back) {
       if (picked) {
         say = night_lights::Deselect();

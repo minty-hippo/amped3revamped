@@ -38,6 +38,20 @@ constexpr Kind kKinds[] = {
 };
 constexpr int kKindCount = int(sizeof(kKinds) / sizeof(kKinds[0]));
 
+// Colors to pick from (-1: the kind's own).
+struct Tint {
+  const char* name;
+  float color[3];
+};
+constexpr Tint kTints[] = {
+    {"warm white", {1.0f, 0.78f, 0.5f}},  {"daylight", {1.0f, 0.95f, 0.88f}},
+    {"cool white", {0.8f, 0.9f, 1.0f}},   {"amber", {1.0f, 0.6f, 0.2f}},
+    {"red", {1.0f, 0.22f, 0.16f}},        {"green", {0.35f, 1.0f, 0.42f}},
+    {"blue", {0.32f, 0.52f, 1.0f}},       {"purple", {0.75f, 0.38f, 1.0f}},
+    {"pink", {1.0f, 0.45f, 0.75f}},
+};
+constexpr int kTintCount = int(sizeof(kTints) / sizeof(kTints[0]));
+
 // A light on every copy of an object: which object (its mesh), where on it
 // and which way (its own space), and the light.
 struct Template {
@@ -68,7 +82,9 @@ State g_s;
 std::vector<State> g_undo;  // before each change (the last 50)
 int g_kind = 0;
 bool g_editor = false;
-float g_yaw = 0.0f;  // the preview's turn (degrees)
+float g_yaw = 0.0f;    // the preview's turn (degrees)
+float g_pitch = 0.0f;  // and tilt (degrees, up)
+int g_tint = -1;       // its color (kTints; -1: the kind's own)
 // The picked light: one placed (index), or a template's copy (template, the
 // copy's position: copies come and go).
 struct Pick {
@@ -271,6 +287,24 @@ bool ToLocal(const Instance& in, const float p[3], float out[3], bool dir = fals
   return true;
 }
 
+// Tilted up (positive) or down in its vertical plane, keeping its length and
+// way round (not past straight up or down).
+void Tilt(float v[3], float degrees) {
+  const float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (len < 1e-6f) return;
+  float h = std::sqrt(v[0] * v[0] + v[2] * v[2]);
+  float ax = 1.0f, az = 0.0f;
+  if (h > 1e-5f) {
+    ax = v[0] / h;
+    az = v[2] / h;
+  }
+  const float e = std::clamp(std::atan2(v[1], h) + degrees * 3.14159265f / 180.0f, -1.48f, 1.48f);
+  h = std::cos(e) * len;
+  v[0] = ax * h;
+  v[1] = std::sin(e) * len;
+  v[2] = az * h;
+}
+
 void TurnY(float v[3], float degrees) {
   const float a = degrees * 3.14159265f / 180.0f, c = std::cos(a), s = std::sin(a);
   const float x = v[0] * c - v[2] * s, z = v[0] * s + v[2] * c;
@@ -303,7 +337,7 @@ bool AimedLight(Light* l) {
   float cpos[3], fwd[3] = {0.0f, 0.0f, 1.0f};
   Camera(cpos, fwd);
   const bool ground = n[1] > 0.7f;
-  for (int i = 0; i < 3; ++i) l->color[i] = k.color[i];
+  for (int i = 0; i < 3; ++i) l->color[i] = g_tint >= 0 ? kTints[g_tint].color[i] : k.color[i];
   l->radius = k.radius;
   l->intensity = k.intensity;
   l->kind = g_kind;
@@ -328,10 +362,9 @@ bool AimedLight(Light* l) {
       // A bulb: off a wall or tower on an arm (0.4 m), or on a post (2.4 m)
       // off the ground; the arm back to the surface (its length: dir's).
       const float arm = ground ? 2.4f : 0.4f;
-      for (int i = 0; i < 3; ++i) {
-        l->pos[i] = p[i] + n[i] * arm;
-        l->dir[i] = n[i] * arm;
-      }
+      for (int i = 0; i < 3; ++i) l->dir[i] = n[i] * arm;
+      if (!ground) Tilt(l->dir, g_pitch);  // (the arm up or down off the wall)
+      for (int i = 0; i < 3; ++i) l->pos[i] = p[i] + l->dir[i];
       break;
     }
     case 1: {
@@ -343,6 +376,7 @@ bool AimedLight(Light* l) {
       l->dir[0] = out[0] * c;
       l->dir[1] = -s;
       l->dir[2] = out[2] * c;
+      Tilt(l->dir, g_pitch);
       break;
     }
     case 2:
@@ -351,6 +385,7 @@ bool AimedLight(Light* l) {
       l->dir[0] = out[0];
       l->dir[1] = 0.0f;
       l->dir[2] = out[2];
+      Tilt(l->dir, g_pitch);  // (a sloping wall, a roof light)
       break;
     default:
       // A campfire: on the ground (its light over the logs).
@@ -643,6 +678,77 @@ std::string Rotate(float degrees) {
   return "Turned " + Describe();
 }
 
+std::string TiltBy(float degrees) {
+  std::lock_guard lock(g_mutex);
+  if (!g_pick.on) {
+    g_pitch = std::clamp(g_pitch + degrees, -80.0f, 80.0f);
+    return "Tilted " + std::to_string(int(std::lround(g_pitch))) + " degrees";
+  }
+  Remember();
+  auto tilt = [&](float pos[3], float dir[3], int kind) {
+    if (kind == 3) return;  // (a fire stays level)
+    if (kind == 0) {
+      float base[3];
+      for (int i = 0; i < 3; ++i) base[i] = pos[i] - dir[i];
+      Tilt(dir, degrees);
+      for (int i = 0; i < 3; ++i) pos[i] = base[i] + dir[i];
+    } else {
+      Tilt(dir, degrees);
+    }
+  };
+  if (!g_pick.every) {
+    Light& l = g_s.lights[g_pick.index];
+    tilt(l.pos, l.dir, l.kind);
+    std::memcpy(g_pick.pos, l.pos, 12);
+  } else {
+    Template& t = g_s.templates[g_pick.index];
+    tilt(t.local, t.local_dir, t.light.kind);
+    std::vector<Found> keep;
+    for (const Found& f : g_s.found) {
+      if (f.tmpl != g_pick.index) keep.push_back(f);
+    }
+    g_s.found.swap(keep);
+    Discover();
+  }
+  Changed();
+  Publish();
+  return "Tilted " + Describe();
+}
+
+std::string NextColor(int step) {
+  std::lock_guard lock(g_mutex);
+  if (!g_pick.on) {
+    // The preview: through the colors, back to the kind's own.
+    g_tint = (g_tint + 1 + step + (kTintCount + 1)) % (kTintCount + 1) - 1;
+    return std::string("Color: ") + (g_tint < 0 ? std::string(kKinds[g_kind].name) + "'s own" : kTints[g_tint].name);
+  }
+  Remember();
+  // The picked one: the next color after the one it has.
+  const Light* now = Picked();
+  int at = -1;
+  if (now) {
+    for (int i = 0; i < kTintCount; ++i) {
+      if (std::fabs(kTints[i].color[0] - now->color[0]) + std::fabs(kTints[i].color[1] - now->color[1]) +
+              std::fabs(kTints[i].color[2] - now->color[2]) < 0.02f) {
+        at = i;
+      }
+    }
+  }
+  const int next = ((at + step) % kTintCount + kTintCount) % kTintCount;
+  const float* c = kTints[next].color;
+  if (!g_pick.every) {
+    std::memcpy(g_s.lights[g_pick.index].color, c, 12);
+  } else {
+    std::memcpy(g_s.templates[g_pick.index].light.color, c, 12);
+    for (Found& f : g_s.found) {
+      if (f.tmpl == g_pick.index) std::memcpy(f.light.color, c, 12);
+    }
+  }
+  Changed();
+  Publish();
+  return std::string("Color: ") + kTints[next].name;
+}
+
 std::string Select(int step) {
   std::lock_guard lock(g_mutex);
   const std::vector<Entry> order = Order();
@@ -751,6 +857,15 @@ std::string Undo() {
 std::string KindName() {
   std::lock_guard lock(g_mutex);
   return kKinds[g_kind].name;
+}
+
+std::string PreviewDetails() {
+  std::lock_guard lock(g_mutex);
+  char b[96];
+  std::snprintf(b, sizeof(b), "%s, turned %d, tilted %d",
+                g_tint < 0 ? "its own color" : kTints[g_tint].name, int(std::lround(g_yaw)),
+                int(std::lround(g_pitch)));
+  return b;
 }
 
 std::string SelectionName() {

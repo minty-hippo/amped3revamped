@@ -884,23 +884,37 @@ int main(int argc, char** argv) {
       if (std::getenv("A3_TEST_CLOSE")) {
         // Each kind close in front (the fittings up close).
         lights.clear();
-        const float side[3] = {-2.2f, 0.0f, 2.2f};
+        const float side[3] = {-2.6f, 1.6f, 3.4f};
         const int kinds[3] = {0, 1, 3};
+        const char* only = std::getenv("A3_TEST_ONLY");  // (one kind: its digit)
         for (int k = 0; k < 3; ++k) {
           amped3::native::Renderer::NightLight l;
           for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * 5.0f + g[6 + i] * side[k];
           l.pos[1] = g[1] - 1.4f;
           l.kind = kinds[k];
-          if (l.kind == 1) {
-            for (int i = 0; i < 3; ++i) l.dir[i] = g[3 + i];
-            l.dir[1] -= 0.4f;
+          if (l.kind == 0) {  // a lamp post (2.4 m)
+            l.pos[1] = g[1] - 3.3f + 2.4f;
+            l.dir[0] = 0.0f; l.dir[1] = 2.4f; l.dir[2] = 0.0f;
+          }
+          if (l.kind == 1) {  // facing the camera (the lens seen)
+            for (int i = 0; i < 3; ++i) l.dir[i] = -g[3 + i] - g[6 + i] * 0.5f;
+            l.dir[1] = -0.3f;
+            l.pos[1] = g[1] - 0.8f;
+            for (int i = 0; i < 3; ++i) l.pos[i] -= g[3 + i] * 1.8f;
           }
           if (l.kind == 3) {
             l.pos[1] = g[1] - 2.9f;
             l.color[0] = 1.0f; l.color[1] = 0.52f; l.color[2] = 0.2f;
           }
-          lights.push_back(l);
+          if (!only || only[0] - '0' == l.kind) lights.push_back(l);
         }
+        // A lamp off a "wall" (its bracket toward the camera's right).
+        amped3::native::Renderer::NightLight w;
+        for (int i = 0; i < 3; ++i) w.pos[i] = g[i] + g[3 + i] * 6.0f + g[6 + i] * -0.8f;
+        w.pos[1] = g[1] - 0.6f;
+        for (int i = 0; i < 3; ++i) w.dir[i] = -g[6 + i] * 0.4f;
+        w.dir[1] = 0.0f;
+        if (!only) lights.push_back(w);
       }
       if (const char* mk = std::getenv("A3_TEST_MESH")) {
         // Lights on every copy of a mesh (8 m up its own y): the copies found.

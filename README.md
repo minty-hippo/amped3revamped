@@ -461,9 +461,11 @@ worked out from that, so it fits each mountain's own look.
   | On every copy of the object (each lift tower, post, chair, building: copies light up as they come into view and follow objects that move) | Y | O |
   | Kind (lamp, floodlight, window, campfire) | X | J |
   | Turn (the preview or the picked light) | D-pad left / right | , . |
+  | Tilt up / down (a floodlight's aim, a lamp's arm, a window's slope) | D-pad up / down | [ ] |
+  | Color (warm, daylight, cool, amber, red, green, blue, purple, pink) | R3 | K |
   | Pick a placed light, object by object (it pulses gold) | LB / RB | Page Up / Down |
   | Delete the picked light (all copies when it's on every copy) | X | Delete |
-  | Undo | D-pad down | Ctrl+Z |
+  | Undo | Start | Ctrl+Z |
   | Unpick, then leave the editor | B | Backspace |
   Kept per mountain in `lights\<id>.txt` next to the logs folder, so they can
   be shared.

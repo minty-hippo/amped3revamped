@@ -32,6 +32,8 @@ std::string Place();             // the preview, as one light
 std::string PlaceOnEveryCopy();  // the preview, on every copy of the object under it
 std::string NextKind(int step);  // the kind to place
 std::string Rotate(float degrees);  // the preview, or the picked light (all copies)
+std::string TiltBy(float degrees);  // up (+) or down, the same
+std::string NextColor(int step);    // the preview's or the picked light's color
 std::string Select(int step);    // pick the next / previous placed light (by object)
 bool HasSelection();
 std::string Deselect();
@@ -39,6 +41,7 @@ std::string DeleteSelected();
 std::string Undo();
 // For the editor's panel: what's being placed, what's picked, how many.
 std::string KindName();
+std::string PreviewDetails();  // its color, turn and tilt
 std::string SelectionName();
 int Count();
 
