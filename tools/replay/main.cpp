@@ -886,7 +886,18 @@ int main(int argc, char** argv) {
         // light on the rider.
         lights.clear();
         amped3::native::Renderer::NightLight l;
-        for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * 4.0f + g[6 + i] * 2.2f;
+        // (=2: beyond the rider, its shadow toward the camera.)
+        const bool beyond = std::getenv("A3_TEST_RIDER")[0] == '2';
+        for (int i = 0; i < 3; ++i) {
+          l.pos[i] = g[i] + g[3 + i] * (beyond ? 11.0f : 4.0f) + g[6 + i] * (beyond ? 1.0f : 2.2f);
+        }
+        if (beyond) l.radius = 20.0f;
+        if (std::getenv("A3_TEST_RIDER")[0] == '3') {
+          // (=3: low off to the side: the rider's shadow across the snow.)
+          for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * 5.0f + g[6 + i] * 3.5f;
+          l.pos[1] = g[1] + 0.6f;
+          l.radius = 16.0f;
+        }
         l.radius = 12.0f;
         l.intensity = 1.5f;
         lights.push_back(l);

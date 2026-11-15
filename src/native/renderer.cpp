@@ -2100,6 +2100,7 @@ struct Renderer::Impl {
   // by, easing toward what the scene's average brightness (measured a few
   // frames back: read back without waiting) calls for.
   float eye_strength_ = 0.0f;
+  int light_shadows_ = 1;  // SetLightShadows
   double exposure_ = 1.0;
   Buffer eye_rb_;                 // 4 slots of 16 bytes: the measure, by frame % 4
   double eye_rb_exposure_[4] = {};
@@ -5068,6 +5069,7 @@ void main() {
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D world_depth;  // at the lighting (0: nothing)
 layout(set = 0, binding = 2) uniform sampler2D lights;       // n x 3: pos, radius; color, intensity; dir, kind
+                                                             // (row 3: world from the camera -> clip)
 layout(set = 0, binding = 3) uniform sampler2D albedo;
 layout(set = 0, binding = 4) uniform sampler2D normals;      // xyz * 2 - 1
 layout(set = 0, binding = 5) uniform sampler2D depth;        // now (with the riders)
@@ -5075,9 +5077,48 @@ layout(push_constant) uniform Lights {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
   vec4 cam;  // camera position, count
   vec4 a;    // 1 / width, 1 / height, how dark it is (0..1), riders told apart (0/1)
-  vec4 b;    // seconds, the scene's light on the fittings (0..1), -, -
+  vec4 b;    // seconds, the scene's light on the fittings (0..1), shadow steps (0: none), -
 } pc;
 layout(location = 0) out vec4 o;
+
+// A light's shadow: from P toward the light (at L), stepping through the
+// depth on screen (riders and all); 1: nothing in the way.
+vec4 g_vp[4];
+float g_jitter;
+vec4 g_dbg = vec4(0.0);
+float ShadowTo(vec3 P, vec3 N, vec3 L, int steps, bool riders) {
+  vec3 start = P + N * 0.06;
+  vec3 seg = L - start;
+  float len = length(seg);
+  if (len < 0.4) return 1.0;
+  float vis = 1.0;
+  // Up to 0.35 m short of the light (the surface it's mounted on).
+  float stop = 1.0 - 0.35 / len;
+  for (int i = 0; i < steps; ++i) {
+    // (Closer together near the surface: the contact; jittered per pixel.)
+    float f = (float(i) + g_jitter) / float(steps);
+    f = f * f * stop;
+    vec3 S = start + seg * f;
+    vec4 sr = vec4(S - pc.cam.xyz, 1.0);
+    vec4 cs = vec4(dot(g_vp[0], sr), dot(g_vp[1], sr), dot(g_vp[2], sr), dot(g_vp[3], sr));
+    if (cs.w <= 1e-4) break;
+    vec3 nd = cs.xyz / cs.w;
+    vec2 suv = vec2(nd.x * 0.5 + 0.5, 0.5 - nd.y * 0.5);
+    if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) break;
+    float sd = riders ? textureLod(depth, suv, 0.0).r : textureLod(world_depth, suv, 0.0).r;
+    if (sd <= 0.0) continue;  // (sky)
+    vec4 wq = pc.m * vec4(nd.xy, 1.0 - sd, 1.0);
+    float scene_dist = length(wq.xyz / wq.w - pc.cam.xyz);
+    float s_dist = length(S - pc.cam.xyz);
+    float gap = s_dist - scene_dist;  // > 0: something in front of the step
+    float bias = 0.04 + 0.0025 * s_dist;
+    float thick = 0.7 + 0.01 * s_dist;  // (no deeper than this: not what's behind)
+    float occ = smoothstep(bias, bias * 2.5, gap) * smoothstep(thick, thick * 0.6, gap);
+    vis = min(vis, 1.0 - occ);
+    if (vis < 0.02) break;
+  }
+  return vis;
+}
 
 // The fittings, in each light's own frame (origin at the light; z along its
 // direction for a floodlight): x distance, y material (0 dark metal, 1 lit
@@ -5217,10 +5258,21 @@ void main() {
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
   float dw = textureLod(world_depth, uv, 0.0).r;
   float dn = textureLod(depth, uv, 0.0).r;
-  bool rider = pc.a.w > 0.5 && dn > dw * 1.01 + 1e-7;  // (not the snow trails, just above)
-  float d = pc.a.w > 0.5 ? dn : dw;
   vec4 mid = pc.m * vec4(ndc, 0.5, 1.0);
   vec3 dir = normalize(mid.xyz / mid.w - pc.cam.xyz);
+  // A rider: in front of the world by more than the snow trails lie above it
+  // (in metres: the same up close as far off).
+  bool rider = false;
+  if (pc.a.w > 0.5 && dn > dw * 1.0005 + 1e-7) {
+    vec4 pn = pc.m * vec4(ndc, 1.0 - dn, 1.0);
+    float far_w = 1e9;
+    if (dw > 0.0) {
+      vec4 pw = pc.m * vec4(ndc, 1.0 - dw, 1.0);
+      far_w = length(pw.xyz / pw.w - pc.cam.xyz);
+    }
+    rider = far_w - length(pn.xyz / pn.w - pc.cam.xyz) > 0.12;
+  }
+  float d = rider ? dn : dw;
   float pix_dist = 1e9;
   vec3 P = vec3(0.0);
   if (d > 0.0) {
@@ -5253,6 +5305,12 @@ void main() {
     alb = min(c.rgb / max(pc.b.y, 0.12), vec3(0.85));
   }
   vec3 add = vec3(0.0);
+  int shadow_steps = int(pc.b.z + 0.5);
+  if (shadow_steps > 0 && d > 0.0) {
+    for (int r = 0; r < 4; ++r) g_vp[r] = texelFetch(lights, ivec2(r, 3), 0);
+    // (Interleaved gradient noise: the steps' banding into fine grain.)
+    g_jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  }
   // The nearest fitting in front of what's drawn: its color (solid).
   float hit_t = pix_dist;
   vec3 hit_col = vec3(0.0);
@@ -5305,7 +5363,14 @@ void main() {
         if (kind == 1) {  // a floodlight: a cone along its direction
           fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), axis)) * 1.4 + 0.04;
         }
-        add += alb * col * fall * ndl * 1.6;
+        vec3 lit = alb * col * fall * ndl * 1.6;
+        // Its shadows (what's lit enough to show one).
+        if (shadow_steps > 0 && dot(lit, vec3(1.0)) > 0.004) {
+          float sv = ShadowTo(P, N, lp.xyz, shadow_steps, pc.a.w > 0.5);
+          if (pc.b.w > 0.5) g_dbg = vec4(sv, rider ? 1.0 : 0.0, fall, 1.0);
+          lit *= mix(0.08, 1.0, sv);
+        }
+        add += lit;
       }
     }
     // The glow in the air round the bulb, the lens, the flames.
@@ -5400,6 +5465,7 @@ void main() {
   }
   vec3 base = hit ? hit_col : c.rgb;
   o = vec4(base + add, c.a);
+  if (pc.b.w > 0.5) o = g_dbg;  // (diagnostics: shadow, rider, falloff)
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -8625,14 +8691,30 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     im = gpu_.CreateImage(iw, ih, f, false, name);
     ToGeneral(cb_, im);
   };
-  ensure(lights_img_, 128, 3, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
+  ensure(lights_img_, 128, 4, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
   ensure(lights_out_, scene->width, scene->height, scene->format, "night_lit");
   lights_out_.scaled = scene->scaled;
   lights_out_.scale = scene->scale;
   {
-    Buffer staging = gpu_.CreateBuffer(128 * 3 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Buffer staging = gpu_.CreateBuffer(128 * 4 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     float* f = reinterpret_cast<float*>(staging.mapped);
-    std::memset(f, 0, 128 * 3 * 16);
+    std::memset(f, 0, 128 * 4 * 16);
+    {
+      // Row 3: world (from the camera) -> clip, its rows (the shadows' steps
+      // onto the screen; worked out here in double, from the camera so
+      // nothing's lost far from the origin).
+      double vp[16];
+      if (Invert4(inv_vp_, vp)) {
+        float* r = f + 384 * 4;
+        for (int i = 0; i < 4; ++i) {
+          r[i * 4 + 0] = float(vp[i * 4 + 0]);
+          r[i * 4 + 1] = float(vp[i * 4 + 1]);
+          r[i * 4 + 2] = float(vp[i * 4 + 2]);
+          r[i * 4 + 3] = float(vp[i * 4 + 0] * cam_pos_[0] + vp[i * 4 + 1] * cam_pos_[1] +
+                               vp[i * 4 + 2] * cam_pos_[2] + vp[i * 4 + 3]);
+        }
+      }
+    }
     const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
     for (size_t j = 0; j < nearby.size(); ++j) {
       const Renderer::NightLight& l = lights_[nearby[j].second];
@@ -8654,7 +8736,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {128, 3, 1};
+    region.imageExtent = {128, 4, 1};
     Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, lights_img_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
                                &region);
@@ -8684,6 +8766,9 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   pc[21] = 1.0f / float(scene->height);
   pc[22] = float(dark);
   pc[23] = Diag("lightsdbg") ? 2.0f : have_world ? 1.0f : 0.0f;
+  // Shadows: steps along each ray toward a light (0: none).
+  pc[27] = Diag("lightshadowdbg") ? 1.0f : 0.0f;
+  pc[26] = light_shadows_ == 0 || Diag("nolightshadows") ? 0.0f : light_shadows_ == 1 ? 10.0f : 20.0f;
   FullscreenPass(CopyKind::kTodLights, &lights_out_, scene, have_world ? &lights_wdepth_ : depth,
                  &lights_img_, false, pc, 28, nullptr, tod_albedo_ ? tod_albedo_ : &dummy_,
                  tod_normal_, depth);
@@ -11867,6 +11952,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   }
   return true;
 }
+void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }
 float Renderer::Exposure() const { return float(impl_->eye_strength_ > 0.0f ? impl_->exposure_ : 1.0); }
 float Renderer::MountainHour() const { return impl_->tod_mountain_hour_; }

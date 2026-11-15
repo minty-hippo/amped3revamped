@@ -452,7 +452,10 @@ worked out from that, so it fits each mountain's own look.
   it's mounted), lit windows (the wall's own texture lit up and tinted) and
   campfires (stones, logs and flickering flames) that come on as it gets
   dark, lighting the snow and slopes around them, and riders and characters
-  passing by, with a glow round each.
+  passing by, with a glow round each. Each light casts shadows (riders, trees,
+  posts, buildings: anything drawn, moving or not), traced from what it lights
+  toward it through the depth on screen; something out of view casts none.
+  Time of Day tab: Night Light Shadows (Off, On, Fine).
   Placed with the light editor: in the freecam with time of day on, D-pad up
   / L. A preview (ghostly blue, lit even by day) follows the cross at the
   middle of the screen, mounted on the surface there. The editor ends with

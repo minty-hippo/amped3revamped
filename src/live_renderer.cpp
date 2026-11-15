@@ -160,6 +160,11 @@ REXCVAR_DEFINE_DOUBLE(native_eye_adaptation, 0.6, "GPU",
                       "the lighting brightens in the dark (night, forest) and tones down in "
                       "glare, easing over a second or two like eyes adjusting. 0: off, 1: full")
     .range(0.0, 1.0);
+REXCVAR_DEFINE_INT32(native_night_light_shadows, 1, "GPU",
+                     "Time of day: shadows from the night lights (riders, trees, posts, "
+                     "buildings each casting one from every lamp near them), traced through "
+                     "what's on screen. 0: off, 1: on, 2: finer")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
                     "Native renderer: dynamic time of day (F5): the sun and moon move across "
                     "the sky, the mountain's light, sky, stars and clouds follow the hour; "
@@ -2189,6 +2194,7 @@ void WorkerMain() {
               g_lights_changed = false;
             }
           }
+          renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)));
           renderer->SetEyeAdaptation(revamped ? float(REXCVAR_GET(native_eye_adaptation)) : 0.0f);
           g_tod_hour = tod.on ? float(tod_hour) : -1.0f;
         }

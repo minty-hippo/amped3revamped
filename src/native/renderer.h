@@ -345,6 +345,10 @@ class Renderer {
   // toned down in glare, easing over a second or two like eyes adjusting,
   // from the scene's average brightness. strength 0 off .. 1 full.
   void SetEyeAdaptation(float strength);
+  // Night lights' shadows: each light traced toward from what it lights,
+  // through the depth on screen (the world, riders, objects: anything drawn,
+  // moving or not). 0 off, 1 on, 2 finer.
+  void SetLightShadows(int quality);
   float Exposure() const;  // the exposure in use (1: none)
   // Whether the game has its trail map open (game state 7), each frame: the
   // map clouds play only for cuts to or from it (not, say, the camera cut of a

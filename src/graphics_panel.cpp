@@ -94,6 +94,8 @@ const std::vector<Tab>& Tabs() {
             {{"0", "New"}, {"0.25", "First quarter"}, {"0.5", "Full"}, {"0.75", "Last quarter"}}},
            {"native_tod_clouds", "Cloud Cover", Kind::kSlider, 0.0, 1.0, 0.05},
            {"native_tod_night_light", "Night Brightness", Kind::kSlider, 0.2, 3.0, 0.1},
+           {"native_night_light_shadows", "Night Light Shadows", Kind::kStops, 0, 0, 0,
+            {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}},
        }},
       {"Display",
        {

@@ -418,6 +418,11 @@ const std::vector<Tab>& Tabs() {
                 SliderF("native_tod_night_light", "Night brightness",
                         "How light the night is (1: moonlit snow you can ride by).", "%.1f",
                         0.2, 3.0),
+                Choices("native_night_light_shadows", "Night light shadows",
+                        "Shadows from the lamps, floodlights and fires: riders, trees, posts "
+                        "and buildings each cast one from every light near them. Traced "
+                        "through what's on screen (something out of view casts none).",
+                        {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}),
                 Choices("native_shadow_resolution", "Shadow resolution",
                         "The sun's shadow map (riders, rails, jumps and objects, and the trees "
                         "with Tree shadows; the mountains' shadows are painted into the slopes), "
