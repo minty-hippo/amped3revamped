@@ -52,6 +52,12 @@ class App {
   // destroyed).
   void SetRenderer(SDL_Renderer* renderer);
   void OnAction(Action action);
+  // Testing (AMPED3_LAUNCHER_EDITOR): straight to the subtitle editor.
+  void OpenSubtitleEditor();
+  // Before SDL quits (the editor's sound output).
+  void Shutdown() { editor_.Shutdown(); }
+  // Drawing every frame for a while (the subtitle editor playing its sound).
+  bool Animating() const { return page_ == Page::kSubtitleEditor && editor_.Playing(); }
   void Draw(ImFont* font);  // inside an ImGui frame
   bool QuitRequested() const { return quit_; }
   // The window should stay open (a job is running).

@@ -204,6 +204,7 @@ int main(int, char**) {
       }
       return list;
     }();
+    if (frame == 2 && std::getenv("AMPED3_LAUNCHER_EDITOR")) app.OpenSubtitleEditor();
     static size_t script_at = 0;
     if (script_at < script.size() && frame % 10 == 0) app.OnAction(script[script_at++]);
     if (const char* shot = std::getenv("AMPED3_LAUNCHER_SCREENSHOT");
@@ -220,9 +221,10 @@ int main(int, char**) {
     }
     SDL_RenderPresent(renderer);
     // Idle: no need to redraw faster.
-    if (!app.Busy()) SDL_WaitEventTimeout(nullptr, 50);
+    if (!app.Busy() && !app.Animating()) SDL_WaitEventTimeout(nullptr, 50);
   }
 
+  app.Shutdown();
   for (SDL_Gamepad* g : pads) SDL_CloseGamepad(g);
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();

@@ -535,8 +535,23 @@ white.
 shouted lines, and the speakers can be wrong. The launcher's **Subtitles >
 Edit subtitles** lists every clip (search the words or the sound; filter
 story, movies, riding, corrected) and edits its lines: the words, the start
-and end times, and the speaker (click the coloured number). **Play** plays
-the sound itself (written out from your game files), or from a line with `>`.
+and end times, and the speaker (click the coloured number). Choosing a clip
+fetches its sound (written out from your game files) and shows it on a
+timeline: the waveform, each line on it in its speaker's colour, the
+playhead, and below it the line being heard as the game shows it.
+
+| Subtitle editor | |
+|---|---|
+| Scrub (heard as you drag) | Click or drag on the timeline; Left / Right step 0.1 s (Shift: 1 s) |
+| Play / pause from the playhead | Space, **Play**, or `>` on a line (from just before it); double-click a line on the timeline |
+| Retime a line | Drag its ends on the timeline, drag it to move it, or drag the times (double-click to type) |
+| Start / end of the picked line at the playhead | `[` / `]` (or **Start here** / **End here**) |
+| Pick a line | Click it, or Up / Down |
+| Add a line | Double-click an empty spot on the timeline, **+** after a line, or **Add one at the playhead** |
+| Zoom / pan | Wheel / Shift+wheel; drag in the strip under the timeline; **Fit** |
+| Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
+
+Lines that end before they start, or run into the next one, are marked red.
 Save (Ctrl+S) and the game picks it up within a couple of seconds, even while
 it runs. A corrected clip is marked so, and Make subtitles again keeps it as
 it is. The file is plain text too (`subtitles\amped3.subtitles`, described in

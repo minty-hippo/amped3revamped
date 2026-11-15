@@ -933,6 +933,16 @@ void App::Activate(Row row) {
   }
 }
 
+void App::OpenSubtitleEditor() {
+  std::string error;
+  if (editor_.Open(install_dir_, source_dir_, &error)) {
+    page_ = Page::kSubtitleEditor;
+    notice_.clear();
+  } else {
+    notice_ = error;
+  }
+}
+
 void App::OnAction(Action action) {
   if (page_ == Page::kSubtitleEditor) {
     if (action == Action::kBack && editor_.Back()) OpenPage(Page::kSubtitles);
