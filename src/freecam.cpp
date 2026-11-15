@@ -99,7 +99,12 @@ struct Keys {
   bool leave = false;
   bool switch_mode = false;
   // Night lights (time of day): place, remove, the kind to place.
-  bool light_place = false, light_remove = false, light_kind = false, light_every = false;
+  // The light editor (keyboard): L on / off, Enter place, O on every copy,
+  // J kind, Delete delete, , . turn, Page Up / Down pick, Backspace back,
+  // Ctrl+Z undo.
+  bool ed_toggle = false, ed_place = false, ed_every = false, ed_kind = false, ed_delete = false,
+       ed_back = false, ed_undo = false;
+  int ed_turn = 0, ed_pick = 0;
 } g_keys;
 
 std::atomic<bool> g_show_help{true};
@@ -152,25 +157,66 @@ class Overlay final : public rex::ui::ImGuiDialog {
     if (!noclip || paused) items.push_back("LB RB / Z C: zoom");
     items.push_back("Y / R: back to the game's camera");
     items.push_back(noclip ? "D-pad down / N: view mode" : "D-pad down / N: noclip mode");
-    if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
-      items.push_back("D-pad up / L: place a night light (" + night_lights::KindName() + ")");
-      items.push_back("A / O: a light on every copy of the object (lift towers, posts)");
-      items.push_back("D-pad right / J: light kind");
-      items.push_back("D-pad left / K: remove a light");
+    const bool editor = night_lights::EditorOn();
+    if (editor) {
+      // The light editor's own controls (the camera's stay as they are).
+      const bool picked = night_lights::HasSelection();
+      title = "LIGHT EDITOR";
+      items = {
+          "Sticks / LT RT: fly",
+          "A / Enter: place a " + night_lights::KindName(),
+          "Y / O: on every copy of the object",
+          picked ? "X / Delete: delete it" : "X / J: kind",
+          "D-pad left right / , .: turn",
+          "LB RB / Page Up Down: pick a placed light",
+          "D-pad down / Ctrl+Z: undo",
+          picked ? "B / Backspace: unpick" : "B / Backspace / D-pad up: done",
+          "View / H: hide controls",
+      };
+    } else if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
+      items.push_back("D-pad up / L: light editor (night lights)");
     }
-    items.push_back("View / H: hide controls");
-    items.push_back("B / tap L3+R3 / F6: leave");
+    if (!editor) {
+      items.push_back("View / H: hide controls");
+      items.push_back("B / tap L3+R3 / F6: leave");
+    }
     help_bar::Draw(io, title, items, replay::Active() ? replay::BarRows() : 0);
-    // A small cross at the middle: where a light goes.
-    if (live::TimeOfDayHour() >= 0.0f && help_bar::Visible()) {
-      ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (editor) {
+      // A card at the top: what's being placed (or what's picked) and how
+      // many lights the mountain has.
+      const float px = std::max(14.0f, h * 0.024f);
+      ImFont* font = amped3::UiFont(px);
+      const std::string picked = night_lights::SelectionName();
+      const std::string line1 = picked.empty() ? "Placing: " + night_lights::KindName()
+                                               : "Picked: " + picked;
+      const std::string line2 = std::to_string(night_lights::Count()) + " lights on this mountain";
+      const float tw = std::max(font->CalcTextSizeA(px, FLT_MAX, 0, line1.c_str()).x,
+                                font->CalcTextSizeA(px * 0.75f, FLT_MAX, 0, line2.c_str()).x);
+      const ImVec2 a(w * 0.5f - tw * 0.5f - px, h * 0.06f), b(w * 0.5f + tw * 0.5f + px, h * 0.06f + px * 2.4f);
+      dl->AddRectFilled(a, b, IM_COL32(0, 0, 0, 150), px * 0.35f);
+      dl->AddRect(a, b, picked.empty() ? IM_COL32(90, 200, 255, 200) : IM_COL32(255, 210, 60, 220),
+                  px * 0.35f, 0, 2.0f);
+      dl->AddText(font, px, ImVec2(w * 0.5f - font->CalcTextSizeA(px, FLT_MAX, 0, line1.c_str()).x * 0.5f,
+                                   a.y + px * 0.25f),
+                  IM_COL32(255, 255, 255, 240), line1.c_str());
+      dl->AddText(font, px * 0.75f,
+                  ImVec2(w * 0.5f - font->CalcTextSizeA(px * 0.75f, FLT_MAX, 0, line2.c_str()).x * 0.5f,
+                         a.y + px * 1.4f),
+                  IM_COL32(200, 200, 200, 220), line2.c_str());
+    }
+    // A cross at the middle: where a light goes (in the editor, always).
+    if (editor || (live::TimeOfDayHour() >= 0.0f && help_bar::Visible())) {
       const ImVec2 c(w * 0.5f, h * 0.5f);
       const float r = std::max(6.0f, h * 0.008f);
       for (int pass = 0; pass < 2; ++pass) {
-        const ImU32 col = pass ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160);
+        const ImU32 col = pass ? (editor ? IM_COL32(120, 210, 255, 240) : IM_COL32(255, 255, 255, 220))
+                               : IM_COL32(0, 0, 0, 160);
         const float t = pass ? 1.5f : 3.5f;
-        dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), col, t);
-        dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r), col, t);
+        dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x - r * 0.35f, c.y), col, t);
+        dl->AddLine(ImVec2(c.x + r * 0.35f, c.y), ImVec2(c.x + r, c.y), col, t);
+        dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y - r * 0.35f), col, t);
+        dl->AddLine(ImVec2(c.x, c.y + r * 0.35f), ImVec2(c.x, c.y + r), col, t);
       }
     }
   }
@@ -190,10 +236,17 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const bool reset = g_keys.reset || ImGui::IsKeyPressed(ImGuiKey_R, false);
     const bool leave = g_keys.leave || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     const bool switch_mode = g_keys.switch_mode || ImGui::IsKeyPressed(ImGuiKey_N, false);
-    const bool light_place = g_keys.light_place || ImGui::IsKeyPressed(ImGuiKey_L, false);
-    const bool light_remove = g_keys.light_remove || ImGui::IsKeyPressed(ImGuiKey_K, false);
-    const bool light_kind = g_keys.light_kind || ImGui::IsKeyPressed(ImGuiKey_J, false);
-    const bool light_every = g_keys.light_every || ImGui::IsKeyPressed(ImGuiKey_O, false);
+    auto hit = [](ImGuiKey key) { return ImGui::IsKeyPressed(key, false); };
+    Keys ed;
+    ed.ed_toggle = g_keys.ed_toggle || hit(ImGuiKey_L);
+    ed.ed_place = g_keys.ed_place || hit(ImGuiKey_Enter) || hit(ImGuiKey_KeypadEnter);
+    ed.ed_every = g_keys.ed_every || hit(ImGuiKey_O);
+    ed.ed_kind = g_keys.ed_kind || hit(ImGuiKey_J);
+    ed.ed_delete = g_keys.ed_delete || hit(ImGuiKey_Delete);
+    ed.ed_back = g_keys.ed_back || hit(ImGuiKey_Backspace);
+    ed.ed_undo = g_keys.ed_undo || (io.KeyCtrl && hit(ImGuiKey_Z));
+    ed.ed_turn = g_keys.ed_turn + int(hit(ImGuiKey_Period)) - int(hit(ImGuiKey_Comma));
+    ed.ed_pick = g_keys.ed_pick + int(hit(ImGuiKey_PageDown)) - int(hit(ImGuiKey_PageUp));
     if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     float mouse[2] = {g_keys.mouse[0], g_keys.mouse[1]};
     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
@@ -204,10 +257,15 @@ class Overlay final : public rex::ui::ImGuiDialog {
     g_keys.reset = reset;
     g_keys.leave = leave;
     g_keys.switch_mode = switch_mode;
-    g_keys.light_place = light_place;
-    g_keys.light_remove = light_remove;
-    g_keys.light_kind = light_kind;
-    g_keys.light_every = light_every;
+    g_keys.ed_toggle = ed.ed_toggle;
+    g_keys.ed_place = ed.ed_place;
+    g_keys.ed_every = ed.ed_every;
+    g_keys.ed_kind = ed.ed_kind;
+    g_keys.ed_delete = ed.ed_delete;
+    g_keys.ed_back = ed.ed_back;
+    g_keys.ed_undo = ed.ed_undo;
+    g_keys.ed_turn = ed.ed_turn;
+    g_keys.ed_pick = ed.ed_pick;
     g_keys.mouse[0] = mouse[0];
     g_keys.mouse[1] = mouse[1];
   }
@@ -342,7 +400,7 @@ bool Active() { return g_active.load(); }
 
 void OnPad(const pad::Snapshot& pad) {
   static uint16_t last_buttons = 0;
-  const uint16_t pressed = uint16_t(pad.buttons & ~last_buttons);
+  uint16_t pressed = uint16_t(pad.buttons & ~last_buttons);
   last_buttons = pad.buttons;
   if (!g_active.load()) return;
   using namespace rex::input;
@@ -352,9 +410,57 @@ void OnPad(const pad::Snapshot& pad) {
     keys = g_keys;
     g_keys.mouse[0] = g_keys.mouse[1] = 0.0f;
     g_keys.reset = g_keys.leave = g_keys.switch_mode = false;
-    g_keys.light_place = g_keys.light_remove = g_keys.light_kind = g_keys.light_every = false;
+    g_keys.ed_toggle = g_keys.ed_place = g_keys.ed_every = g_keys.ed_kind = g_keys.ed_delete =
+        g_keys.ed_back = g_keys.ed_undo = false;
+    g_keys.ed_turn = g_keys.ed_pick = 0;
+  }
+  // The light editor (time of day on; not in a replay: the replay's frames
+  // aren't where the camera is): D-pad up (L) on and off. While on, it has
+  // A, B, X, Y, the bumpers and the D-pad.
+  const bool can_edit = live::TimeOfDayHour() >= 0.0f && !replay::Active();
+  if (!can_edit && night_lights::EditorOn()) night_lights::SetEditor(false);
+  if (can_edit && ((pressed & X_INPUT_GAMEPAD_DPAD_UP) || keys.ed_toggle)) {
+    const bool on = !night_lights::EditorOn();
+    night_lights::SetEditor(on);
+    notice::Show(on ? "Light editor: aim the cross where a light goes" : "Light editor off");
+  }
+  uint16_t buttons = pad.buttons;
+  if (night_lights::EditorOn()) {
+    constexpr uint16_t kEditor = X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B | X_INPUT_GAMEPAD_X |
+                                 X_INPUT_GAMEPAD_Y | X_INPUT_GAMEPAD_LEFT_SHOULDER |
+                                 X_INPUT_GAMEPAD_RIGHT_SHOULDER | X_INPUT_GAMEPAD_DPAD_UP |
+                                 X_INPUT_GAMEPAD_DPAD_DOWN | X_INPUT_GAMEPAD_DPAD_LEFT |
+                                 X_INPUT_GAMEPAD_DPAD_RIGHT;
+    const bool picked = night_lights::HasSelection();
+    std::string say;
+    if ((pressed & X_INPUT_GAMEPAD_A) || keys.ed_place) say = night_lights::Place();
+    if ((pressed & X_INPUT_GAMEPAD_Y) || keys.ed_every) say = night_lights::PlaceOnEveryCopy();
+    if (pressed & X_INPUT_GAMEPAD_X) {
+      say = picked ? night_lights::DeleteSelected() : night_lights::NextKind(1);
+    }
+    if (keys.ed_kind) say = night_lights::NextKind(1);
+    if (keys.ed_delete) say = night_lights::DeleteSelected();
+    int turn = keys.ed_turn + ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) -
+               ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
+    if (turn) say = night_lights::Rotate(15.0f * float(turn));
+    const int pick = keys.ed_pick + ((pressed & X_INPUT_GAMEPAD_RIGHT_SHOULDER) ? 1 : 0) -
+                     ((pressed & X_INPUT_GAMEPAD_LEFT_SHOULDER) ? 1 : 0);
+    if (pick) say = night_lights::Select(pick);
+    if ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) || keys.ed_undo) say = night_lights::Undo();
+    if ((pressed & X_INPUT_GAMEPAD_B) || keys.ed_back) {
+      if (picked) {
+        say = night_lights::Deselect();
+      } else {
+        night_lights::SetEditor(false);
+        say = "Light editor off";
+      }
+    }
+    if (!say.empty()) notice::Show(say);
+    pressed &= uint16_t(~kEditor);
+    buttons &= uint16_t(~kEditor);
   }
   if ((pressed & X_INPUT_GAMEPAD_B) || keys.leave) {
+    night_lights::SetEditor(false);
     SetOn(false);
     return;
   }
@@ -387,20 +493,6 @@ void OnPad(const pad::Snapshot& pad) {
     }
   } else {
     g_paused_view = false;
-  }
-  // Night lights (time of day on; not in a replay: the replay's frames
-  // aren't where the camera is).
-  if (live::TimeOfDayHour() >= 0.0f && !replay::Active()) {
-    if ((pressed & X_INPUT_GAMEPAD_DPAD_UP) || keys.light_place) notice::Show(night_lights::Place());
-    if ((pressed & X_INPUT_GAMEPAD_A) || keys.light_every) {
-      notice::Show(night_lights::PlaceOnEveryCopy());
-    }
-    if ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) || keys.light_remove) {
-      notice::Show(night_lights::RemoveNearest());
-    }
-    if ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) || keys.light_kind) {
-      notice::Show(night_lights::NextKind());
-    }
   }
   if ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) || keys.switch_mode) {
     const Mode m = g_mode.load() == Mode::kNoclip ? Mode::kView : Mode::kNoclip;
@@ -445,8 +537,8 @@ void OnPad(const pad::Snapshot& pad) {
   in.look[1] = std::clamp(Stick(pad.ry) + keys.look[1], -1.0f, 1.0f);
   in.look_delta[0] = keys.mouse[0];
   in.look_delta[1] = keys.mouse[1];
-  in.zoom = std::clamp(float(bool(pad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER)) -
-                           float(bool(pad.buttons & X_INPUT_GAMEPAD_LEFT_SHOULDER)) + keys.zoom,
+  in.zoom = std::clamp(float(bool(buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER)) -
+                           float(bool(buttons & X_INPUT_GAMEPAD_LEFT_SHOULDER)) + keys.zoom,
                        -1.0f, 1.0f);
   // L3 (alone: with R3 it leaves): faster until the left stick lets go.
   const bool stick_moving = Stick(pad.lx) != 0.0f || Stick(pad.ly) != 0.0f;
@@ -456,7 +548,7 @@ void OnPad(const pad::Snapshot& pad) {
   if (!stick_moving && !(pressed & X_INPUT_GAMEPAD_LEFT_THUMB)) g_boost = false;
   float scale = keys.speed_scale;
   if (g_boost) scale *= 4.0f;
-  if (pad.buttons & X_INPUT_GAMEPAD_X) scale *= 0.25f;
+  if (buttons & X_INPUT_GAMEPAD_X) scale *= 0.25f;
   in.speed = 8.0f * scale;
   if (g_mode.load() == Mode::kNoclip) {
     std::lock_guard lock(g_noclip.mutex);

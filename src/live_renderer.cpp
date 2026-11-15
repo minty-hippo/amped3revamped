@@ -680,6 +680,7 @@ bool g_game_camera_valid = false;
 float g_freecam_pose[6] = {};  // the renderer's freecam, last frame (FreecamPose)
 bool g_freecam_pose_valid = false;
 float g_center[3] = {};  // the screen's middle in the world (CenterPoint)
+float g_center_normal[3] = {0.0f, 1.0f, 0.0f};
 bool g_center_valid = false;
 uint64_t g_mountain_key = 0;
 std::mutex g_lights_mutex;
@@ -2308,7 +2309,7 @@ void WorkerMain() {
         std::lock_guard lock(g_game_camera_mutex);
         g_freecam_pose_valid = have;
         if (have) std::memcpy(g_freecam_pose, pose, sizeof(pose));
-        g_center_valid = renderer->CenterPoint(g_center);
+        g_center_valid = renderer->CenterPoint(g_center, g_center_normal);
         g_mountain_key = renderer->MountainKey();
         if (!renderer->Instances().empty() || !g_instances.empty()) {
           g_instances = renderer->Instances();
@@ -2428,10 +2429,11 @@ uint64_t MountainKey() {
   std::lock_guard lock(g_game_camera_mutex);
   return g_mountain_key;
 }
-bool CenterPoint(float out[3]) {
+bool CenterPoint(float out[3], float normal[3]) {
   std::lock_guard lock(g_game_camera_mutex);
   if (!g_center_valid) return false;
   std::memcpy(out, g_center, sizeof(g_center));
+  if (normal) std::memcpy(normal, g_center_normal, sizeof(g_center_normal));
   return true;
 }
 bool FreecamPose(float out[6]) {

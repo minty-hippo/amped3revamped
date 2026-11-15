@@ -322,6 +322,8 @@ class Renderer {
     // window (the wall's own texture lit up, facing dir), 3 a campfire.
     int kind = 0;
     float dir[3] = {0.0f, -1.0f, 0.0f};
+    bool preview = false;   // where one would go (the light editor): ghostly, lit by day too
+    bool selected = false;  // picked in the light editor: pulsing
   };
   void SetNightLights(const std::vector<NightLight>& lights);
   // The mountain (0 before a lit frame): an id for its lights' file.
@@ -337,7 +339,8 @@ class Renderer {
   const std::vector<Instance>& Instances() const;
   // The world point at the middle of the screen, a few frames back (false:
   // sky or not known yet): where a light is placed.
-  bool CenterPoint(float out[3]) const;
+  // normal: the surface's there (facing the camera), when asked for.
+  bool CenterPoint(float out[3], float normal[3] = nullptr) const;
   // Eye adaptation (HDR-style): the lighting brightened in the dark and
   // toned down in glare, easing over a second or two like eyes adjusting,
   // from the scene's average brightness. strength 0 off .. 1 full.

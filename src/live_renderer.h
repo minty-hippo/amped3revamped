@@ -95,7 +95,8 @@ uint64_t MountainKey();
 // when newer than `since`; returns the version.
 uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since);
 // The world point at the middle of the screen (false: sky, or not known).
-bool CenterPoint(float out[3]);
+// normal: the surface's there, facing the camera (when asked for).
+bool CenterPoint(float out[3], float normal[3] = nullptr);
 
 // Instant replay: the last seconds of riding kept (setting replay_seconds),
 // played again in place of the game's frames (pause the game first: the

@@ -1,11 +1,16 @@
-// amped3 - night lights (time of day): lamps and lit windows placed around
-// each mountain, coming on as it gets dark (native renderer: the light on the
-// world and a glow round each). Kept per mountain in lights\<id>.txt next to
-// the logs folder, one light a line: x y z  r g b  radius intensity.
+// amped3 - night lights (time of day): lamps, floodlights, lit windows and
+// campfires placed around each mountain, coming on as it gets dark (native
+// renderer: the light on the world, a glow, and each one's fitting). Kept
+// per mountain in lights\<id>.txt next to the logs folder.
 //
-// Placed from the freecam (freecam.cpp): the point at the middle of the
-// screen, in one of a few kinds (a lamp, a floodlight, a window, a fire),
-// one light or one on every copy of the object aimed at.
+// Placed from the freecam's light editor (freecam.cpp): a preview follows
+// the cross at the middle of the screen, mounted on the surface there (out
+// along its normal: a bulb on an arm, a floodlight on a wall or post aimed
+// down and out, a window on the wall, a fire on the ground); placed as one
+// light or on every copy of the object aimed at (each lift tower, post...:
+// told by its mesh; copies light up as they come into view, and follow
+// objects that move). Placed lights can be picked in turn (by object),
+// turned, deleted; every change can be undone.
 
 #pragma once
 
@@ -16,16 +21,25 @@ namespace amped3::night_lights {
 
 void Install(const std::filesystem::path& folder);
 // Each frame or so (any thread): the mountain's lights loaded when it
-// changes, handed to the renderer.
+// changes, copies found and followed, the preview moved, handed to the
+// renderer.
 void Tick();
-// Freecam editing. Each returns a short line for a notice.
-std::string Place();          // at the middle of the screen, the current kind
-// The same, on every copy of the object aimed at (each lift tower, each
-// lamp post: found by its mesh, more as they come into view).
-std::string PlaceOnEveryCopy();
-std::string RemoveNearest();  // the one nearest the middle of the screen
-std::string NextKind();
+
+// The light editor (the freecam). Each action returns a line for a notice.
+void SetEditor(bool on);
+bool EditorOn();
+std::string Place();             // the preview, as one light
+std::string PlaceOnEveryCopy();  // the preview, on every copy of the object under it
+std::string NextKind(int step);  // the kind to place
+std::string Rotate(float degrees);  // the preview, or the picked light (all copies)
+std::string Select(int step);    // pick the next / previous placed light (by object)
+bool HasSelection();
+std::string Deselect();
+std::string DeleteSelected();
+std::string Undo();
+// For the editor's panel: what's being placed, what's picked, how many.
 std::string KindName();
+std::string SelectionName();
 int Count();
 
 }  // namespace amped3::night_lights

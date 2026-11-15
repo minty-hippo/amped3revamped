@@ -1486,6 +1486,8 @@ struct Renderer::Impl {
     uint64_t key;
     double m[16];
     double zs, zo;
+    bool has_world;
+    double world[12];  // object -> world found in its constants (has_world)
   };
   std::vector<PendingInstance> pending_instances_;
   std::vector<Renderer::Instance> instances_;
@@ -1496,6 +1498,9 @@ struct Renderer::Impl {
   double center_inv_[4][16] = {};
   float center_pt_[3] = {};
   bool center_ok_ = false;
+  uint32_t center_size_[4][2] = {};
+  float center_normal_[3] = {0.0f, 1.0f, 0.0f};
+  bool center_normal_ok_ = false;
   void CenterProbe(Image* depth);
   void CenterRead();
   double tod_mask_rows_[12] = {};  // c6, c7, c9
@@ -5089,11 +5094,24 @@ float sdCylY(vec3 p, float y0, float y1, float r) {
   return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
 }
 vec2 opU(vec2 a, vec2 b) { return a.x < b.x ? a : b; }
+vec3 g_arm;  // a bulb: from it back to where it's mounted (world axes)
 vec2 Model(int kind, vec3 p) {
-  if (kind == 0) {  // a bulb hanging from its cap and cable
+  if (kind == 0) {
     vec2 d = vec2(length(p) - 0.09, 1.0);
-    d = opU(d, vec2(sdCylY(p, 0.06, 0.16, 0.05), 0.0));
-    d = opU(d, vec2(sdCylY(p, 0.16, 0.9, 0.008), 0.0));
+    d = opU(d, vec2(sdCylY(p, 0.06, 0.14, 0.05), 0.0));
+    float L = length(g_arm);
+    if (g_arm.y < -0.7 * L) {
+      // On a post: the pole down to the ground.
+      d = opU(d, vec2(sdCapsule(p, vec3(0.0, -0.08, 0.0), g_arm, 0.035), 0.0));
+    } else if (g_arm.y > 0.7 * L) {
+      // Hanging from above: the cable up.
+      d = opU(d, vec2(sdCapsule(p, vec3(0.0, 0.14, 0.0), g_arm, 0.008), 0.0));
+    } else {
+      // Off a wall or tower: a stem up and a bracket back to it.
+      vec3 top = vec3(0.0, 0.26, 0.0);
+      d = opU(d, vec2(sdCapsule(p, vec3(0.0, 0.12, 0.0), top, 0.015), 0.0));
+      d = opU(d, vec2(sdCapsule(p, top, vec3(g_arm.x, 0.26, g_arm.z), 0.022), 0.0));
+    }
     return d;
   }
   if (kind == 1) {  // a floodlight: a housing, its lens forward, a yoke behind
@@ -5158,16 +5176,23 @@ void main() {
     vec4 lp = texelFetch(lights, ivec2(i, 0), 0);
     vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
     vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
-    int kind = int(ld.w + 0.5);
+    int code = int(ld.w + 0.5);
+    int kind = code & 3;
+    bool preview = (code & 4) != 0, selected = (code & 8) != 0;
+    // How lit: after dark; a preview shows its light by day too.
+    float kk = preview ? max(k, 0.6) : k;
     vec3 axis = normalize(ld.xyz);
+    // (A bulb: dir is its mounting, out from the surface: the arm back to it.)
+    g_arm = -ld.xyz;
     float flick = 1.0;
     if (kind == 3) {  // a fire flickers
       float t = pc.b.x * 9.0 + float(i) * 3.1;
       flick = 0.82 + 0.1 * sin(t) + 0.08 * sin(t * 2.7 + 1.3) + 0.05 * Hash(floor(t * 1.5));
     }
-    vec3 col = lc.rgb * lc.w * flick;
+    vec3 col = lc.rgb * lc.w * flick * kk;
+    vec3 own = lc.rgb * lc.w * flick;  // (its glow at full)
     // On the world.
-    if (d > 0.0 && !rider && k > 0.001) {
+    if (d > 0.0 && !rider && kk > 0.001) {
       vec3 dl = lp.xyz - P;
       float dist = length(dl);
       if (kind == 2) {
@@ -5180,6 +5205,12 @@ void main() {
         if (abs(l3.x) < 0.65 && abs(l3.y) < 0.55 && abs(l3.z) < 0.4) {
           float edge = smoothstep(0.65, 0.58, abs(l3.x)) * smoothstep(0.55, 0.48, abs(l3.y));
           add += (alb * col * 2.4 + col * 0.18) * edge;
+          // (The panel's outline while previewed or picked.)
+          if (preview || selected) {
+            float rim = max(smoothstep(0.55, 0.65, abs(l3.x)), smoothstep(0.45, 0.55, abs(l3.y)));
+            add += (preview ? vec3(0.3, 0.8, 1.0) : vec3(1.0, 0.85, 0.2)) * rim *
+                   (0.35 + 0.2 * sin(pc.b.x * 6.0));
+          }
         }
       }
       if (dist < lp.w) {
@@ -5195,7 +5226,7 @@ void main() {
     // The glow in the air round the bulb, the lens, the flames.
     vec3 to = lp.xyz - pc.cam.xyz;
     float t = dot(to, dir);
-    if (k > 0.001 && t > 0.3 && t < min(pix_dist, hit_t) + 0.5 && kind != 2) {
+    if (kk > 0.001 && t > 0.3 && t < min(pix_dist, hit_t) + 0.5 && kind != 2) {
       float perp = length(to - dir * t);
       float size = (kind == 1 ? 0.18 : 0.12) + 0.004 * t;
       float g = size * size / (perp * perp + size * size);
@@ -5234,8 +5265,11 @@ void main() {
               vec3 cc = base * amb;
               // Lit by its own light (the fire's logs and stones), glowing
               // where it's the light (the bulb, the lens, the embers).
-              if (kind == 3 && mat != 4) cc += base * col * 0.8 * k * clamp(1.0 - length(q + vec3(0.0, 0.2, 0.0)) * 1.5, 0.0, 1.0);
-              if (mat == 1 || mat == 4) cc = mix(cc, col * (mat == 4 ? 1.2 : 1.6), k);
+              if (kind == 3 && mat != 4) cc += base * col * 0.8 * clamp(1.0 - length(q + vec3(0.0, 0.2, 0.0)) * 1.5, 0.0, 1.0);
+              if (mat == 1 || mat == 4) cc = mix(cc, own * (mat == 4 ? 1.2 : 1.6), kk);
+              // A preview: a ghostly blue; picked: pulsing gold.
+              if (preview) cc = mix(cc, vec3(0.35, 0.8, 1.0), 0.4 + 0.15 * sin(pc.b.x * 6.0));
+              if (selected) cc = mix(cc, vec3(1.0, 0.85, 0.2), 0.35 + 0.25 * sin(pc.b.x * 6.0));
               hit_col = cc;
               hit_t = s;
               hit = true;
@@ -5247,7 +5281,7 @@ void main() {
         }
       }
       // The flames (a fire, after dark): glowing over the logs, flickering.
-      if (kind == 3 && k > 0.001 && perp < 0.8) {
+      if (kind == 3 && kk > 0.001 && perp < 0.8) {
         float glow = 0.0;
         for (int j = 0; j < 16; ++j) {
           float s = t - 0.6 + float(j) * 0.075;
@@ -5260,7 +5294,7 @@ void main() {
           float dd = length(q.xz + vec2(wob, 0.0));
           glow += smoothstep(r, r * 0.3, dd) * 0.09;
         }
-        add += vec3(1.0, 0.55, 0.18) * glow * 2.2 * flick;
+        add += vec3(1.0, 0.55, 0.18) * glow * 2.2 * flick * kk;
       }
     }
   }
@@ -5270,7 +5304,7 @@ void main() {
     return;
   }
   vec3 base = hit ? hit_col : c.rgb;
-  o = vec4(base + add * k, c.a);
+  o = vec4(base + add, c.a);
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -8088,7 +8122,9 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
     tod_game_map_ = TodOn() ? TextureFor(d, 0, st, &n0) : nullptr;
     // (The albedo is the scene's own image, lit over by this pass: a copy.)
     tod_albedo_ = nullptr;
-    Image* alb = TodOn() && !lights_.empty() && tod_state_.night > 0.25
+    bool preview = false;
+    for (const auto& l : lights_) preview |= l.preview || l.selected;
+    Image* alb = TodOn() && !lights_.empty() && (tod_state_.night > 0.25 || preview)
                      ? TextureFor(d, 3, st, &n0)
                      : nullptr;
     if (alb && !alb->depth && alb->samples == 1) {
@@ -8327,15 +8363,28 @@ void Renderer::Impl::ResolveInstances() {
     double KM[16], W[16];
     Mul4(K, p.m, KM);
     Mul4(inv_vp_, KM, W);  // (this frame's, the game's camera: at the lighting pass before the freecam)
-    // Affine (an object placed in the world): the bottom row 0 0 0 w.
-    const double w = W[15];
-    if (!(std::fabs(w) > 1e-9)) continue;
-    const double off = std::fabs(W[12]) + std::fabs(W[13]) + std::fabs(W[14]);
-    if (off > 1e-4 * std::fabs(w)) continue;
+    // Affine (an object placed in the world): the bottom row 0 0 0 w; not
+    // the view's own (the world drawn as it is: the placement is elsewhere).
     Renderer::Instance in;
     in.key = p.key;
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 4; ++c) in.m[r * 4 + c] = float(W[r * 4 + c] / w);
+    const double w = W[15];
+    bool placed = std::fabs(w) > 1e-9 &&
+                  std::fabs(W[12]) + std::fabs(W[13]) + std::fabs(W[14]) <= 1e-4 * std::fabs(w);
+    if (placed) {
+      double id = 0.0;
+      for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) id += std::fabs(W[r * 4 + c] / w - (r == c ? 1.0 : 0.0));
+      }
+      if (id < 1e-2) placed = false;  // the identity: world space
+    }
+    if (placed) {
+      for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) in.m[r * 4 + c] = float(W[r * 4 + c] / w);
+      }
+    } else if (p.has_world) {
+      for (int i = 0; i < 12; ++i) in.m[i] = float(p.world[i]);
+    } else {
+      continue;
     }
     // (Each object once: some are drawn in several parts.)
     bool dup = false;
@@ -8351,15 +8400,19 @@ void Renderer::Impl::ResolveInstances() {
 // The screen's middle: its depth copied to this frame's read-back slot (with
 // the view it goes with), read 4 frames later (CenterRead).
 void Renderer::Impl::CenterProbe(Image* depth) {
-  if (!center_rb_.buffer) center_rb_ = gpu_.CreateBuffer(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  // 9 x 9 texels round the middle (its depth, and the surface's tilt there).
+  if (!center_rb_.buffer) center_rb_ = gpu_.CreateBuffer(4 * 512, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  if (depth->width < 16 || depth->height < 16) return;
   EndRendering();
   Barrier();
   const int slot = int(frame_number_ % 4);
   VkBufferImageCopy region{};
-  region.bufferOffset = VkDeviceSize(slot) * 16;
+  region.bufferOffset = VkDeviceSize(slot) * 512;
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageOffset = {int32_t(depth->width / 2), int32_t(depth->height / 2), 0};
-  region.imageExtent = {1, 1, 1};
+  region.imageOffset = {int32_t(depth->width / 2) - 4, int32_t(depth->height / 2) - 4, 0};
+  region.imageExtent = {9, 9, 1};
+  center_size_[slot][0] = depth->width;
+  center_size_[slot][1] = depth->height;
   vk::vkCmdCopyImageToBuffer(cb_, depth->image, VK_IMAGE_LAYOUT_GENERAL, center_rb_.buffer, 1, &region);
   Barrier();
   center_frame_[slot] = frame_number_;
@@ -8369,21 +8422,64 @@ void Renderer::Impl::CenterProbe(Image* depth) {
 void Renderer::Impl::CenterRead() {
   const int slot = int(frame_number_ % 4);
   if (!center_rb_.buffer || !center_frame_[slot] || frame_number_ < center_frame_[slot] + 4) return;
-  float d;
-  std::memcpy(&d, center_rb_.mapped + slot * 16, 4);
+  float blk[81];
+  std::memcpy(blk, center_rb_.mapped + slot * 512, sizeof(blk));
   center_frame_[slot] = 0;
-  if (!(d > 0.0f) || !std::isfinite(d)) {
+  const double W = center_size_[slot][0], H = center_size_[slot][1];
+  // The world point at texel (dx, dy) from the middle (false: nothing there).
+  auto at = [&](int dx, int dy, double out[3]) {
+    const float d = blk[(dy + 4) * 9 + (dx + 4)];
+    if (!(d > 0.0f) || !std::isfinite(d)) return false;
+    const double px = std::floor(W / 2) + dx + 0.5, py = std::floor(H / 2) + dy + 0.5;
+    const double n[4] = {px / W * 2.0 - 1.0, 1.0 - py / H * 2.0, 1.0 - double(d), 1.0};
+    double w[4] = {};
+    for (int r = 0; r < 4; ++r) {
+      for (int k = 0; k < 4; ++k) w[r] += center_inv_[slot][r * 4 + k] * n[k];
+    }
+    if (std::fabs(w[3]) < 1e-12) return false;
+    for (int i = 0; i < 3; ++i) out[i] = w[i] / w[3];
+    return true;
+  };
+  double c[3];
+  if (!at(0, 0, c)) {
     center_ok_ = false;
     return;
   }
-  const double n[4] = {0.0, 0.0, 1.0 - double(d), 1.0};
-  double w[4] = {};
-  for (int r = 0; r < 4; ++r) {
-    for (int k = 0; k < 4; ++k) w[r] += center_inv_[slot][r * 4 + k] * n[k];
-  }
-  if (std::fabs(w[3]) < 1e-12) return;
-  for (int i = 0; i < 3; ++i) center_pt_[i] = float(w[i] / w[3]);
+  for (int i = 0; i < 3; ++i) center_pt_[i] = float(c[i]);
   center_ok_ = true;
+  // The surface's normal: across and down, each side the nearer one (an edge
+  // is a different surface), facing the camera.
+  double e[4][3];
+  const bool ok[4] = {at(4, 0, e[0]), at(-4, 0, e[1]), at(0, 4, e[2]), at(0, -4, e[3])};
+  auto dist2 = [&](const double* p) {
+    return (p[0] - c[0]) * (p[0] - c[0]) + (p[1] - c[1]) * (p[1] - c[1]) + (p[2] - c[2]) * (p[2] - c[2]);
+  };
+  double dx[3], dy[3];
+  const int ix = ok[0] && (!ok[1] || dist2(e[0]) < dist2(e[1])) ? 0 : (ok[1] ? 1 : -1);
+  const int iy = ok[2] && (!ok[3] || dist2(e[2]) < dist2(e[3])) ? 2 : (ok[3] ? 3 : -1);
+  center_normal_ok_ = false;
+  if (ix < 0 || iy < 0) return;
+  for (int i = 0; i < 3; ++i) {
+    dx[i] = (e[ix][i] - c[i]) * (ix == 0 ? 1.0 : -1.0);
+    dy[i] = (e[iy][i] - c[i]) * (iy == 2 ? 1.0 : -1.0);
+  }
+  double n[3] = {dy[1] * dx[2] - dy[2] * dx[1], dy[2] * dx[0] - dy[0] * dx[2], dy[0] * dx[1] - dy[1] * dx[0]};
+  const double nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (!(nl > 1e-9)) return;
+  // Toward the camera (its position: the view's at w = 0... the middle's
+  // ray backwards).
+  double near_pt[3];
+  {
+    const double nn[4] = {0.0, 0.0, 1.0, 1.0};
+    double w[4] = {};
+    for (int r = 0; r < 4; ++r) {
+      for (int k = 0; k < 4; ++k) w[r] += center_inv_[slot][r * 4 + k] * nn[k];
+    }
+    for (int i = 0; i < 3; ++i) near_pt[i] = std::fabs(w[3]) > 1e-12 ? w[i] / w[3] : c[i];
+  }
+  const double to_cam = (near_pt[0] - c[0]) * n[0] + (near_pt[1] - c[1]) * n[1] + (near_pt[2] - c[2]) * n[2];
+  for (int i = 0; i < 3; ++i) center_normal_[i] = float(n[i] / nl * (to_cam < 0 ? -1.0 : 1.0));
+  center_normal_ok_ = true;
 }
 
 // Night lights, after the scene (builtin_night_lights): on as it gets dark.
@@ -8440,7 +8536,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
       c[0] = l.dir[0];
       c[1] = l.dir[1];
       c[2] = l.dir[2];
-      c[3] = float(l.kind);
+      c[3] = float((l.kind & 3) | (l.preview ? 4 : 0) | (l.selected ? 8 : 0));
     }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -9976,8 +10072,11 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // Night lights on every copy of an object (SetCollectInstances): the scene
   // pass's draws with an object -> clip matrix in c0..c3, kept to be turned
   // into object -> world at the lighting pass (its view then known).
+  // (Shaders that take the view-projection in c0..c3 and the object's
+  // placement elsewhere: three rows at right angles, of about the same
+  // length, kept too.)
   if (collect_instances_ && !light_seen_ && tiling_.width && depth && (st.reg(0x2200) & 6) == 6 &&
-      !vs->info.dynamic_constants && max_draws_ == UINT32_MAX && pending_instances_.size() < 8192) {
+      max_draws_ == UINT32_MAX && pending_instances_.size() < 8192) {
     PendingInstance pi;
     uint64_t key = 0xCBF29CE484222325ull;
     auto mix = [&](uint64_t v) { key = (key ^ v) * 0x100000001B3ull; key ^= key >> 29; };
@@ -9994,6 +10093,46 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     }
     pi.zs = sys.ndc_scale[2];
     pi.zo = sys.ndc_offset[2];
+    pi.has_world = false;
+    {
+      const uint32_t* c = st.vs_consts.data();
+      const uint32_t last = vs->info.dynamic_constants ? std::min(vs->info.relative_constant_base, 253u) : 253u;
+      auto used = [&](uint32_t r) { return (vs->info.float_constants[r >> 5] >> (r & 31)) & 1u; };
+      for (uint32_t r = 4; r + 2 <= last && !pi.has_world; ++r) {
+        if (!used(r) || !used(r + 1) || !used(r + 2)) continue;
+        double row[3][4];
+        for (int i = 0; i < 3; ++i) {
+          for (int j = 0; j < 4; ++j) {
+            float f;
+            std::memcpy(&f, &c[(r + i) * 4 + j], 4);
+            row[i][j] = f;
+          }
+        }
+        // Columns of the 3 x 3 part (the axes): about equally long,
+        // at right angles; the translation finite.
+        double len[3];
+        bool ok = true;
+        for (int j = 0; j < 3 && ok; ++j) {
+          len[j] = std::sqrt(row[0][j] * row[0][j] + row[1][j] * row[1][j] + row[2][j] * row[2][j]);
+          ok = len[j] > 0.05 && len[j] < 50.0;
+        }
+        if (!ok) continue;
+        for (int a = 0; a < 3 && ok; ++a) {
+          for (int b = a + 1; b < 3 && ok; ++b) {
+            const double dt = row[0][a] * row[0][b] + row[1][a] * row[1][b] + row[2][a] * row[2][b];
+            ok = std::fabs(dt) < 0.02 * len[a] * len[b];
+          }
+        }
+        if (!ok || std::fabs(len[0] - len[1]) > 0.2 * len[0] || std::fabs(len[0] - len[2]) > 0.2 * len[0]) continue;
+        for (int i = 0; i < 3 && ok; ++i) ok = std::isfinite(row[i][3]) && std::fabs(row[i][3]) < 1e5;
+        // (A matrix with no translation is a rotation for normals: not the placement.)
+        if (!ok || std::fabs(row[0][3]) + std::fabs(row[1][3]) + std::fabs(row[2][3]) < 1e-3) continue;
+        for (int i = 0; i < 3; ++i) {
+          for (int j = 0; j < 4; ++j) pi.world[i * 4 + j] = row[i][j];
+        }
+        pi.has_world = true;
+      }
+    }
     pending_instances_.push_back(pi);
   }
   // Speed blur: how close the nearest character is (the rider, when riding).
@@ -11601,9 +11740,17 @@ uint64_t Renderer::MountainKey() const {
 }
 void Renderer::SetCollectInstances(bool on) { impl_->collect_instances_ = on; }
 const std::vector<Renderer::Instance>& Renderer::Instances() const { return impl_->instances_; }
-bool Renderer::CenterPoint(float out[3]) const {
+bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   if (!impl_->center_ok_) return false;
   std::memcpy(out, impl_->center_pt_, sizeof(impl_->center_pt_));
+  if (normal) {
+    if (impl_->center_normal_ok_) {
+      std::memcpy(normal, impl_->center_normal_, sizeof(impl_->center_normal_));
+    } else {
+      normal[0] = normal[2] = 0.0f;
+      normal[1] = 1.0f;
+    }
+  }
   return true;
 }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }

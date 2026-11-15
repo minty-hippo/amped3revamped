@@ -447,20 +447,25 @@ worked out from that, so it fits each mountain's own look.
   Each mountain's shadows come from somewhat higher than its light (the
   game's choice): kept, easing to true long shadows toward sunrise and
   sunset, so at the mountain's own hour they match the game's.
-- Night lights: lamps (a hanging bulb), floodlights (a housing shining a cone
-  the way the camera looked when placed), lit windows (the wall's own texture
-  lit up and tinted where it was placed, facing the camera) and campfires
-  (stones, logs and flickering flames) that come on as it
-  gets dark, lighting the snow and slopes around them (as the game's own
-  lighting does: its colors and surface directions) with a glow round each
-  in the air. Placed from the freecam with time of day on: aim the cross at
-  the middle of the screen, D-pad up / L places a light there, D-pad right /
-  J picks the kind, D-pad left / K removes the nearest one. A / O puts a
-  light on every copy of the object aimed at (each tower of a lift, each lamp
-  post: the object is told by its mesh, and copies light up as they come
-  into view); removing one of those removes them all. Kept per mountain in
-  `lights\<id>.txt` next to the logs folder (one light a line:
-  x y z  r g b  radius intensity; `T` lines the every-copy ones), so they can
+- Night lights: lamps (a bulb on an arm off a wall or tower, on a post off
+  the ground), floodlights (a housing shining a cone out and down from where
+  it's mounted), lit windows (the wall's own texture lit up and tinted) and
+  campfires (stones, logs and flickering flames) that come on as it gets
+  dark, lighting the snow and slopes around them with a glow round each.
+  Placed with the light editor: in the freecam with time of day on, D-pad up
+  / L. A preview (ghostly blue, lit even by day) follows the cross at the
+  middle of the screen, mounted on the surface there.
+  | Editor | Controller | Keyboard |
+  |---|---|---|
+  | Place one | A | Enter |
+  | On every copy of the object (each lift tower, post, chair, building: copies light up as they come into view and follow objects that move) | Y | O |
+  | Kind (lamp, floodlight, window, campfire) | X | J |
+  | Turn (the preview or the picked light) | D-pad left / right | , . |
+  | Pick a placed light, object by object (it pulses gold) | LB / RB | Page Up / Down |
+  | Delete the picked light (all copies when it's on every copy) | X | Delete |
+  | Undo | D-pad down | Ctrl+Z |
+  | Unpick, then leave the editor | B | Backspace |
+  Kept per mountain in `lights\<id>.txt` next to the logs folder, so they can
   be shared.
 
 ## Subtitles
