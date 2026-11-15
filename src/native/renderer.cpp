@@ -5859,6 +5859,7 @@ layout(set = 0, binding = 2) uniform sampler2D depth;
 layout(push_constant) uniform Cover {
   mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
   vec4 a;   // how much (0..1), 1 / width, 1 / height, -
+  vec4 b;   // the wind (m/s, x / z), the camera's x, z
 } pc;
 layout(location = 0) out vec4 o;
 float H(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -5867,8 +5868,23 @@ float N(vec2 p) {
   f = f * f * (3.0 - 2.0 * f);
   return mix(mix(H(i), H(i + vec2(1, 0)), f.x), mix(H(i + vec2(0, 1)), H(i + vec2(1, 1)), f.x), f.y);
 }
+float H3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float N3(vec3 p) {
+  vec3 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = mix(mix(H3(i), H3(i + vec3(1, 0, 0)), f.x), mix(H3(i + vec3(0, 1, 0)), H3(i + vec3(1, 1, 0)), f.x), f.y);
+  float b = mix(mix(H3(i + vec3(0, 0, 1)), H3(i + vec3(1, 0, 1)), f.x), mix(H3(i + vec3(0, 1, 1)), H3(i + vec3(1, 1, 1)), f.x), f.y);
+  return mix(a, b, f.z);
+}
+vec3 World(vec2 frag, float d) {
+  vec2 uv = frag * pc.a.yz;
+  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  return w.xyz / w.w;
+}
+float Lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
+  ivec2 sz = textureSize(depth, 0) - 1;
   vec4 c = texelFetch(albedo, ip, 0);
   float d = texelFetch(depth, ip, 0).r;
   if (d <= 0.0) {
@@ -5876,18 +5892,61 @@ void main() {
     return;
   }
   vec3 n = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
-  vec2 uv = gl_FragCoord.xy * pc.a.yz;
-  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
-  vec3 P = w.xyz / w.w;
+  vec3 P = World(gl_FragCoord.xy, d);
   float k = pc.a.x;
-  // Patchy: two scales of noise on the ground plan.
-  float noise = 0.65 * N(P.xz * 1.3) + 0.35 * N(P.xz * 5.1 + P.y);
-  // Where it lies: up-facing surfaces first, steeper ones as it deepens.
-  float lie = smoothstep(0.8 - 0.3 * k, 1.0 - 0.22 * k, n.y + 0.25 * (noise - 0.5));
-  float amount = lie * smoothstep(0.0, 0.35, k + 0.3 * (noise - 0.5)) * min(0.85, k * 1.4);
-  vec3 snow = vec3(0.86, 0.89, 0.93) * (0.94 + 0.08 * noise);
+  float dist = length(P.xz - pc.b.zw);
+  // The texture's own detail (against its neighbourhood): kept in the snow,
+  // its bright parts (what's lit from above: the tops of needles, bark
+  // ridges) catching it first, its dark gaps last.
+  float lum = Lum(c.rgb);
+  float mean = 0.0;
+  for (int t = 0; t < 4; ++t) {
+    ivec2 off = ivec2(t == 0 ? 2 : (t == 1 ? -2 : 0), t == 2 ? 2 : (t == 3 ? -2 : 0));
+    mean += Lum(texelFetch(albedo, clamp(ip + off, ivec2(0), sz), 0).rgb);
+  }
+  mean = max(mean * 0.25, 0.02);
+  float detail = clamp(lum / mean, 0.4, 1.7);
+  // Foliage (green): its normals point up across whole boughs, so not by
+  // them: by its top edges on screen (what's above it farther off, or sky:
+  // the upper side of a bough) and its lit needles.
+  float foliage = smoothstep(0.015, 0.06, c.g - max(c.r, c.b) * 0.92);
+  float edge = 0.0;
+  for (int t = 0; t < 3; ++t) {
+    int s = t == 0 ? 1 : (t == 1 ? 3 : 6);
+    ivec2 q = ivec2(ip.x, max(ip.y - s, 0));
+    float dq = texelFetch(depth, q, 0).r;
+    float gap = dq <= 0.0 ? 1e9 : length(World(vec2(q) + 0.5, dq).xz - pc.b.zw) - dist;
+    edge = max(edge, smoothstep(0.25, 1.0, gap) * (t == 0 ? 1.0 : (t == 1 ? 0.75 : 0.45)));
+  }
+  // Patchy: by where it is (3D: no streaks down walls and trunks), two scales.
+  float big = 0.65 * N(P.xz * 1.3) + 0.35 * N(P.xz * 5.1 + P.y);
+  float clump = N3(P * 7.0) * 0.6 + N3(P * 19.0) * 0.4;
+  // Plastered on the side the wind blows at (hard in a blizzard).
+  float wind_v = length(pc.b.xy);
+  vec3 wdir = wind_v > 0.1 ? vec3(-pc.b.x, 0.0, -pc.b.y) / wind_v : vec3(0.0);
+  float windward = max(dot(n, wdir), 0.0) * smoothstep(2.0, 12.0, wind_v);
+  // Where it lies on solid things: up-facing first, steeper as it deepens;
+  // on walls and posts a patchy crust, more on the windward side.
+  float up = smoothstep(0.75 - 0.35 * k, 0.98 - 0.25 * k, n.y + 0.25 * (big - 0.5));
+  float side = smoothstep(0.55, 0.85, clump + 0.25 * k + 0.35 * windward - 0.35 * max(-n.y, 0.0)) *
+               (0.35 + 0.65 * windward) * step(-0.6, n.y);
+  float solid = max(up, side * k) + edge * 0.6 * step(-0.2, n.y);
+  // On boughs: their top edges heavily, the rest in clumps on the lit
+  // needles (the dark gaps between left green); farther off (a bough a
+  // pixel or two) more evenly, still not all white.
+  float near_f = smoothstep(60.0, 15.0, dist);
+  float tufts = smoothstep(0.7 - 0.25 * k, 1.0 - 0.2 * k, clump * 0.7 + 0.45 * (detail - 1.0) + 0.2);
+  float bough = max(edge * smoothstep(0.1, 0.5, k), tufts * 0.85) * mix(0.62, 1.0, near_f) + 0.15 * k * k;
+  float lie = mix(solid, bough, foliage);
+  float amount = clamp(lie, 0.0, 1.0) * smoothstep(0.0, 0.35, k + 0.3 * (big - 0.5)) *
+                 min(0.92, k * 1.4);
+  // The snow itself: not flat white: shaded with the texture's detail, a
+  // little blue in its hollows, brighter clumps.
+  vec3 snow = vec3(0.86, 0.89, 0.93) * (0.9 + 0.12 * clump);
+  snow *= mix(1.0, detail, 0.45);
+  snow = mix(snow, snow * vec3(0.88, 0.93, 1.02), smoothstep(1.0, 0.6, detail) * 0.6);
   // (Already white: left as it is.)
-  o = vec4(mix(c.rgb, max(c.rgb, snow), clamp(amount, 0.0, 1.0)), c.a);
+  o = vec4(mix(c.rgb, max(c.rgb, snow), amount), c.a);
 }
 )", true);
   // Bloom: 0 the bright parts (soft threshold), 1 a 9-tap blur along a
@@ -9001,8 +9060,12 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
         pc[16] = std::clamp(tod_.snow_cover, 0.0f, 1.0f);
         pc[17] = 1.0f / float(a3->width);
         pc[18] = 1.0f / float(a3->height);
+        pc[20] = tod_.wind[0];
+        pc[21] = tod_.wind[1];
+        pc[22] = float(cam_pos_[0]);
+        pc[23] = float(cam_pos_[2]);
         Barrier();
-        FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 20);
+        FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 24);
         Barrier();
         dyn_ = DynState{};
         snow_albedo_src_ = a3;

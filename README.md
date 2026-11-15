@@ -446,7 +446,11 @@ that rule against a save that has the pass.
   gusts sweeping across; gently when calm, hard in a blizzard. Snow that
   falls settles (Snow Settles, `native_snow_cover`): on tree boughs, roofs,
   rocks and props, wherever they face up, patchy at first, building over a
-  few minutes of snowfall and melting slowly after. Banners
+  few minutes of snowfall and melting slowly after. It isn't flat white: on
+  the pines it lies along the tops of the boughs and in clumps on the lit
+  needles, the green showing between (a dusting, then frosted, then heavy);
+  posts, walls and trunks get a patchy crust, thicker on the side the wind
+  blows at; the textures' own detail shows through the snow. Banners
   billow and ripple too (those known by their texture: Northstar's so far;
   more can be added by their texture hashes in `native_wind_cloth`). Their
   shadows move with them, and the motion blur and upscaler see the
