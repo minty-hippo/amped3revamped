@@ -94,6 +94,7 @@ const std::vector<Tab>& Tabs() {
            {"native_tod_moon_phase", "Moon Phase", Kind::kStops, 0, 0, 0,
             {{"0", "New"}, {"0.25", "First quarter"}, {"0.5", "Full"}, {"0.75", "Last quarter"}}},
            {"native_tod_clouds", "Cloud Cover", Kind::kSlider, 0.0, 1.0, 0.05},
+           {"native_cloud_shadows", "Cloud Shadows", Kind::kSlider, 0.0, 1.0, 0.1},
            {"native_tod_night_light", "Night Brightness", Kind::kSlider, 0.2, 3.0, 0.1},
            {"native_weather", "Weather", Kind::kStops, 0, 0, 0,
             {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"}, {"5", "Blizzard"}}},

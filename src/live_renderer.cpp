@@ -167,6 +167,10 @@ REXCVAR_DEFINE_DOUBLE(native_bloom, 0.5, "GPU",
                       "Time of day: glow around lamps, fires and other small bright things "
                       "(strongest at night; broad lit snow doesn't glow). 0: off, up to 2")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_DOUBLE(native_cloud_shadows, 0.5, "GPU",
+                      "Time of day: the clouds' shadows drifting across the slopes with the "
+                      "wind. 0: off, 1: darkest")
+    .range(0.0, 1.0);
 REXCVAR_DEFINE_INT32(native_night_light_shadows, 1, "GPU",
                      "Time of day: shadows from the night lights (riders, trees, posts, "
                      "buildings each casting one from every lamp near them), traced through "
@@ -2391,6 +2395,7 @@ void WorkerMain() {
           }
           renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)));
           renderer->SetBloom(float(REXCVAR_GET(native_bloom)));
+          renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           {
             // (Read again only when it changes.)
             static std::string cloth_text = "\x01";

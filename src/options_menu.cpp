@@ -440,6 +440,11 @@ const std::vector<Tab>& Tabs() {
                         "and buildings each cast one from every light near them. Traced "
                         "through what's on screen (something out of view casts none).",
                         {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}),
+                SliderF("native_cloud_shadows", "Cloud shadows",
+                        "With time of day on: the clouds' shadows drift across the slopes "
+                        "with the wind (the sky's own clouds, where they are). Needs the sun's "
+                        "shadows (Revamped Graphics). 0: off.",
+                        "%.1f", 0.0, 1.0),
                 SliderF("native_bloom", "Light glow",
                         "With time of day on: a soft glow around lamps, fires and other small "
                         "bright things, strongest at night (broad lit snow doesn't glow). 0: off.",

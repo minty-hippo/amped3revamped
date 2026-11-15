@@ -366,6 +366,9 @@ class Renderer {
   // Time of day: bloom (0 off .. 2): the lamps, fires and the sun on snow
   // glowing out over what's round them (stronger at night).
   void SetBloom(float strength);
+  // The clouds' shadows drifting over the slopes (time of day; 0: none, 1:
+  // darkest).
+  void SetCloudShadows(float darkness);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

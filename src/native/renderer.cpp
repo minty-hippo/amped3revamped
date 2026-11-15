@@ -1859,7 +1859,7 @@ struct Renderer::Impl {
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
-    kSnow = 39, kSnowCover = 40, kBloom = 41
+    kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1900,7 +1900,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[42] = {};  // by CopyKind
+  VkShaderModule copy_fs_[43] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2118,6 +2118,9 @@ struct Renderer::Impl {
   // Bloom (SetBloom): the bright parts (lamps, fires, the sun on snow)
   // glowing out over what's round them; quarter-size, blurred twice.
   float bloom_ = 0.0f;
+  float cloud_shadows_ = 0.0f;  // how dark the clouds' shadows are (0: none)
+  Image tod_mask_raw_;  // the sun's shadows before the clouds'
+  float cloud_here_ = 0.0f;  // the clouds' shade at the camera (for the riders: 0..1)
   Image bloom_a_, bloom_b_, bloom_out_;
   Image* BloomScene(Image* scene);
   bool snow_done_ = false;
@@ -5099,6 +5102,64 @@ void main() {
 )", true);
   // Time of day: each pixel's shade from the riders, rails and objects
   // (their map from the hour's sun), percentage closer, for the lighting.
+  // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
+  // the same way), a few hundred metres up, over each point toward the sun:
+  // the sun's shadow mask darkened under them.
+  copy_fs_[42] = CompileBuiltin("builtin_cloud_shadow", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D depth;
+layout(set = 0, binding = 1) uniform sampler2D mask;  // the sun's shadows
+layout(push_constant) uniform Clouds {
+  mat4 m;     // ndc (x, y, 1 - depth, 1) -> world
+  vec4 sun;   // toward the sun, cloud cover
+  vec4 c;     // seconds (the clouds' clock), height (m), darkness, -
+} pc;
+layout(location = 0) out vec4 o;
+float hash(vec2 p) {
+  p = fract(p * vec2(443.897, 441.423));
+  p += dot(p, p.yx + 19.19);
+  return fract((p.x + p.y) * p.x);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), w.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), w.x), w.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; ++i) {
+    v += a * noise(p);
+    p = p * 2.03 + vec2(17.1, 9.7);
+    a *= 0.5;
+  }
+  return v;
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  float lit = texelFetch(mask, ip, 0).r;
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) {
+    o = vec4(lit);
+    return;
+  }
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(depth, 0));
+  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  if (abs(wp.w) < 1e-9) {
+    o = vec4(lit);
+    return;
+  }
+  vec3 P = wp.xyz / wp.w;
+  vec3 L = pc.sun.xyz;
+  // (Where its ray toward the sun meets the layer; the layer's scale as the
+  // sky draws it: 0.9 a height.)
+  vec2 q = P.xz + L.xz * (pc.c.y / max(L.y, 0.08));
+  vec2 p = q / pc.c.y * 0.9 + vec2(pc.c.x * 0.006, pc.c.x * 0.0025);
+  float n = fbm(p);
+  float cover = pc.sun.w;
+  // (Its shade: where it's thick enough, the edge soft over some metres.)
+  float cloud = smoothstep(1.0 - cover - 0.03, 1.0 - cover + 0.1, n);
+  o = vec4(lit * (1.0 - pc.c.z * cloud));
+}
+)", true);
   copy_fs_[37] = CompileBuiltin("builtin_tod_shadow", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D depth;   // the scene's (0: nothing)
 layout(set = 0, binding = 1) uniform sampler2D casters; // from the sun: depth, 1 = nothing
@@ -6192,7 +6253,9 @@ void main() {
       }
     }
   }
-  o = vec4(1.0 - pc.p.z * max(world_sh, self_sh) * facing);
+  // (Under a cloud: the sun's light gone all round.)
+  float cloud_sh = fract(pc.p.w) / 0.4;
+  o = vec4((1.0 - pc.p.z * max(world_sh, self_sh) * facing) * (1.0 - pc.p.z * cloud_sh * facing));
 }
 )", true);
   // The sun maps' rays whose sunward side (the ground and 45 m towards the
@@ -8397,6 +8460,8 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
   sp[29] = tod_self ? float(-1.0 / kSunDepth) : self ? float(sun_depth_per_m_) : 0.0f;
   sp[30] = 0.5f;  // how much of their light the shade takes
   sp[31] = from_baked ? 2.0f : Diag("moverdbg") ? 1.0f : 0.0f;
+  // (The clouds' shade where they are, in its fraction: under 0.4.)
+  sp[31] += 0.4f * std::clamp(cloud_here_, 0.0f, 0.99f);
   FullscreenPass(CopyKind::kMoverShade, &movers_shade_, &movers_pos_, &sun_env_,
                  tod_self ? &tod_movers_map_ : self ? &sun_zo_ : nullptr, false, sp, 32, nullptr,
                  from_baked ? &baked_ : nullptr);
@@ -9087,10 +9152,40 @@ void Renderer::Impl::EyeMeasure(Image* scene) {
 // Time of day, at the lighting pass: the riders', rails' and objects'
 // shadows from the hour's sun (the game's shadow pass's casters drawn again
 // into a map like the world's, its frame), as a screen mask.
+// The cloud layer's noise as the shaders have it (builtin_cloud_shadow).
+namespace {
+float CloudHash(float x, float y) {
+  auto fr = [](float v) { return v - std::floor(v); };
+  x = fr(x * 443.897f);
+  y = fr(y * 441.423f);
+  const float d = x * (y + 19.19f) + y * (x + 19.19f);
+  x += d;
+  y += d;
+  return fr((x + y) * x);
+}
+float CloudNoise(float x, float y) {
+  const float ix = std::floor(x), iy = std::floor(y), fx = x - ix, fy = y - iy;
+  const float wx = fx * fx * (3.0f - 2.0f * fx), wy = fy * fy * (3.0f - 2.0f * fy);
+  const float a = CloudHash(ix, iy), b = CloudHash(ix + 1, iy), c = CloudHash(ix, iy + 1), d = CloudHash(ix + 1, iy + 1);
+  return (a + (b - a) * wx) + ((c + (d - c) * wx) - (a + (b - a) * wx)) * wy;
+}
+float CloudFbm(float x, float y) {
+  float v = 0.0f, a = 0.5f;
+  for (int i = 0; i < 5; ++i) {
+    v += a * CloudNoise(x, y);
+    x = x * 2.03f + 17.1f;
+    y = y * 2.03f + 9.7f;
+    a *= 0.5f;
+  }
+  return v;
+}
+}  // namespace
+
 void Renderer::Impl::TodShadows() {
   std::vector<CasterDraw> draws;
   draws.swap(tod_movers_draws_);
   tod_mask_ok_ = false;
+  cloud_here_ = 0.0f;
   if (!TodOn() || !SunShadowsOn() || !sun_env_.image) return;
   // Its own frame: the world map's axes, but only ~35 m each way, centred
   // a little ahead of the camera, 2048 texels (a couple of cm each: limbs
@@ -9183,9 +9278,45 @@ void Renderer::Impl::TodShadows() {
     pc[31] = 0.5f;
   }
   pc[31] += std::floor(std::clamp(0.85f * tod_.overcast, 0.0f, 1.0f) * 1000.0f);
-  FullscreenPass(CopyKind::kTodShadow, &tod_mask_, depth, &tod_movers_map_, world ? &sun_env_ : nullptr,
-                 false, pc, 32, nullptr, world ? tod_normal_ : nullptr);
+  // The clouds' shadows over it (a second pass: from a copy).
+  const float cover = std::clamp(tod_.clouds + (1.0f - tod_.clouds) * tod_.overcast, 0.0f, 1.0f);
+  // (Under a grey sky the sun's already dimmed: its clouds' shadows fainter.)
+  const float cloud_dark = cloud_shadows_ * (1.0f - 0.8f * std::clamp(tod_.overcast, 0.0f, 1.0f));
+  const bool clouds = cloud_dark > 0.01f && cover > 0.02f && !Diag("nocloudshadows");
+  if (clouds && (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width ||
+                 tod_mask_raw_.height != depth->height)) {
+    if (tod_mask_raw_.image) Retire(tod_mask_raw_);
+    tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
+    ToGeneral(cb_, tod_mask_raw_);
+  }
+  FullscreenPass(CopyKind::kTodShadow, clouds ? &tod_mask_raw_ : &tod_mask_, depth, &tod_movers_map_,
+                 world ? &sun_env_ : nullptr, false, pc, 32, nullptr, world ? tod_normal_ : nullptr);
   Barrier();
+  if (clouds) {
+    float cp[24] = {};
+    for (int c = 0; c < 4; ++c) {
+      for (int r = 0; r < 4; ++r) cp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+    }
+    // Toward the sun: back along the sun map's depth axis.
+    double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
+    const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
+    for (int i = 0; i < 3; ++i) cp[16 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
+    cp[19] = cover;
+    cp[20] = tod_.cloud_clock > 0.0f ? tod_.cloud_clock : tod_.seconds;
+    cp[21] = 600.0f;
+    cp[22] = cloud_dark;
+    // (At the camera, for the riders.)
+    {
+      const float H = cp[21], ly = std::max(cp[17], 0.08f);
+      const float qx = float(cam_pos_[0]) + cp[16] * H / ly, qz = float(cam_pos_[2]) + cp[18] * H / ly;
+      const float n = CloudFbm(qx / H * 0.9f + cp[20] * 0.006f, qz / H * 0.9f + cp[20] * 0.0025f);
+      const float lo = 1.0f - cover - 0.03f, hi = 1.0f - cover + 0.1f;
+      const float t = std::clamp((n - lo) / (hi - lo), 0.0f, 1.0f);
+      cloud_here_ = cloud_dark * t * t * (3.0f - 2.0f * t);
+    }
+    FullscreenPass(CopyKind::kCloudShadow, &tod_mask_, depth, &tod_mask_raw_, nullptr, false, cp, 24);
+    Barrier();
+  }
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
   for (int i = 0; i < 4; ++i) {
     tod_mask_rows_[0 + i] = 0.5 * vp[0 * 4 + i] + 0.5 * vp[3 * 4 + i];
@@ -12371,7 +12502,7 @@ Renderer::Impl::~Impl() {
   if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_}) {
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -12831,6 +12962,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   return true;
 }
 void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetClothTextures(const std::vector<uint64_t>& hashes) { impl_->cloth_extra_ = hashes; }
 void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }

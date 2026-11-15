@@ -451,6 +451,10 @@ that rule against a save that has the pass.
   more can be added by their texture hashes in `native_wind_cloth`). Their
   shadows move with them, and the motion blur and upscaler see the
   movement.
+  The clouds cast shadows (Time of Day: Cloud Shadows, `native_cloud_shadows`,
+  0.5): the sky's own clouds, where the sky shows them, drifting across the
+  slopes with the wind, the riders shaded under them too. Fainter under a
+  grey sky (the sun's already dimmed). Needs the sun's shadows.
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and
