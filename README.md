@@ -443,7 +443,10 @@ that rule against a save that has the pass.
   The wind moves the trees (Time of Day: Wind in the Trees,
   `native_wind_sway`): their foliage sways with it and flutters, whole trees
   (the clustered and distant ones) bend from their foot, each its own way,
-  gusts sweeping across; gently when calm, hard in a blizzard. Banners
+  gusts sweeping across; gently when calm, hard in a blizzard. Snow that
+  falls settles (Snow Settles, `native_snow_cover`): on tree boughs, roofs,
+  rocks and props, wherever they face up, patchy at first, building over a
+  few minutes of snowfall and melting slowly after. Banners
   billow and ripple too (those known by their texture: Northstar's so far;
   more can be added by their texture hashes in `native_wind_cloth`). Their
   shadows move with them, and the motion blur and upscaler see the

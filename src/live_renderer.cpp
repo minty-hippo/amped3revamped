@@ -195,6 +195,9 @@ REXCVAR_DEFINE_STRING(native_wind_cloth, "", "GPU",
                       "Time of day: more banners and flags for the wind to move, beyond the "
                       "known ones: their textures' hashes (16 hex digits each, as the texture "
                       "pack names them), separated by commas");
+REXCVAR_DEFINE_BOOL(native_snow_cover, true, "GPU",
+                    "Time of day: snow that falls settles on things (tree boughs, roofs, rocks, "
+                    "props), building over a few minutes of snowfall and melting after");
 REXCVAR_DEFINE_BOOL(native_wind_sway, true, "GPU",
                     "Time of day: the wind moves the trees and their foliage (gently when "
                     "calm, hard in a blizzard)");
@@ -722,6 +725,7 @@ struct WeatherNow {
   int kind = 0;
   double next_change = 0.0;  // the clock (seconds) it changes at
   float overcast = 0, snow = 0, wind = 1.5f, mist = 0;
+  float cover = 0;  // fresh snow lying (builds as it snows, melts in sun)
   double wind_angle = 0.7;   // radians, drifting
   uint32_t rng = 0x2545F491u;
   bool started = false;
@@ -821,6 +825,13 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
     ease(w.snow, k.snow, 25.0);
     ease(w.wind, k.wind, 20.0);
     ease(w.mist, k.mist, 30.0);
+    // Fresh snow: building over a few minutes of snowfall (faster in a
+    // blizzard), melting slowly once it stops (quicker in sunshine).
+    if (w.snow > 0.15f) {
+      w.cover = std::min(1.0f, w.cover + float(dt / 240.0 * w.snow));
+    } else {
+      w.cover = std::max(0.0f, w.cover - float(dt / (w.overcast > 0.5f ? 1500.0 : 600.0)));
+    }
     w.wind_angle += (Rand(&w.rng) - 0.5) * 0.15 * dt;
   }
   if (setting != 1) {
@@ -2343,6 +2354,7 @@ void WorkerMain() {
             if (tod.on) {
               tod.overcast = g_weather.overcast;
               tod.snow = g_weather.snow;
+              tod.snow_cover = REXCVAR_GET(native_snow_cover) ? g_weather.cover : 0.0f;
               tod.wind[0] = float(std::cos(g_weather.wind_angle) * g_weather.wind);
               tod.wind[1] = float(std::sin(g_weather.wind_angle) * g_weather.wind);
               tod.sway = REXCVAR_GET(native_wind_sway);

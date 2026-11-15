@@ -1530,6 +1530,11 @@ struct Renderer::Impl {
   // own inputs (its albedo tf3 and normals tf4, kept at the lighting pass).
   std::vector<Renderer::NightLight> lights_;
   Image* tod_albedo_ = nullptr;
+  // Fresh snow on what the lighting lights (tod_.snow_cover): its albedo
+  // (tf3) whitened where it faces up, given to it instead.
+  Image snow_albedo_;
+  Image* snow_albedo_src_ = nullptr;
+  bool snow_cover_ok_ = false;
   Image* tod_normal_ = nullptr;
   Image lights_img_, lights_out_, lights_albedo_, lights_wdepth_;
   bool lights_wdepth_ok_ = false;
@@ -1854,7 +1859,7 @@ struct Renderer::Impl {
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
-    kSnow = 39
+    kSnow = 39, kSnowCover = 40
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1895,7 +1900,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[40] = {};  // by CopyKind
+  VkShaderModule copy_fs_[41] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -5775,6 +5780,46 @@ void main() {
   o = vec4(c.rgb * (1.0 - cover) + acc_col * (cover / max(acc, 1e-4)), c.a);
 }
 )", true);
+  // Fresh snow: the lighting's albedo whitened where its surface faces up
+  // (its normals), patchy where little has fallen (noise by where it is).
+  copy_fs_[40] = CompileBuiltin("builtin_snow_cover", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D albedo;
+layout(set = 0, binding = 1) uniform sampler2D normals;
+layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(push_constant) uniform Cover {
+  mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
+  vec4 a;   // how much (0..1), 1 / width, 1 / height, -
+} pc;
+layout(location = 0) out vec4 o;
+float H(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float N(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(H(i), H(i + vec2(1, 0)), f.x), mix(H(i + vec2(0, 1)), H(i + vec2(1, 1)), f.x), f.y);
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(albedo, ip, 0);
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) {
+    o = c;
+    return;
+  }
+  vec3 n = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
+  vec2 uv = gl_FragCoord.xy * pc.a.yz;
+  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  vec3 P = w.xyz / w.w;
+  float k = pc.a.x;
+  // Patchy: two scales of noise on the ground plan.
+  float noise = 0.65 * N(P.xz * 1.3) + 0.35 * N(P.xz * 5.1 + P.y);
+  // Where it lies: up-facing surfaces first, steeper ones as it deepens.
+  float lie = smoothstep(0.8 - 0.3 * k, 1.0 - 0.22 * k, n.y + 0.25 * (noise - 0.5));
+  float amount = lie * smoothstep(0.0, 0.35, k + 0.3 * (noise - 0.5)) * min(0.85, k * 1.4);
+  vec3 snow = vec3(0.86, 0.89, 0.93) * (0.94 + 0.08 * noise);
+  // (Already white: left as it is.)
+  o = vec4(mix(c.rgb, max(c.rgb, snow), clamp(amount, 0.0, 1.0)), c.a);
+}
+)", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(push_constant) uniform Tiles { vec4 a; } pc;  // a.x: block size (8: from the map; 1: spread)
@@ -8748,6 +8793,39 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   {
     std::string n0;
     tod_game_map_ = TodOn() ? TextureFor(d, 0, st, &n0) : nullptr;
+    // Fresh snow: on what faces up (the albedo whitened, by its normals),
+    // patchy at first, given to the lighting instead of its own.
+    snow_cover_ok_ = false;
+    snow_albedo_src_ = nullptr;
+    if (TodOn() && tod_.snow_cover > 0.01f && !Diag("nosnowcover")) {
+      Image* a3 = TextureFor(d, 3, st, &n0);
+      Image* n4 = TextureFor(d, 4, st, &n0);
+      auto dit = resolved_.find(depth_base_);
+      if (a3 && n4 && !a3->depth && a3->samples == 1 && n4 != &dummy_ && dit != resolved_.end() &&
+          dit->second.format == VK_FORMAT_R32_SFLOAT && dit->second.width == a3->width &&
+          dit->second.height == a3->height) {
+        EndRendering();
+        if (!snow_albedo_.image || snow_albedo_.width != a3->width || snow_albedo_.height != a3->height ||
+            snow_albedo_.format != a3->format) {
+          if (snow_albedo_.image) Retire(snow_albedo_);
+          snow_albedo_ = gpu_.CreateImage(a3->width, a3->height, a3->format, false, "snow_cover_albedo");
+          ToGeneral(cb_, snow_albedo_);
+        }
+        float pc[24] = {};
+        for (int c = 0; c < 4; ++c) {
+          for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+        }
+        pc[16] = std::clamp(tod_.snow_cover, 0.0f, 1.0f);
+        pc[17] = 1.0f / float(a3->width);
+        pc[18] = 1.0f / float(a3->height);
+        Barrier();
+        FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 20);
+        Barrier();
+        dyn_ = DynState{};
+        snow_albedo_src_ = a3;
+        snow_cover_ok_ = true;
+      }
+    }
     // (The albedo is the scene's own image, lit over by this pass: a copy.)
     tod_albedo_ = nullptr;
     bool preview = false;
@@ -8768,7 +8846,8 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
       }
       Barrier();
       const float one[4] = {1, 1, 1, 0};
-      FullscreenPass(CopyKind::kTodTint, &lights_albedo_, alb, nullptr, nullptr, false, one, 4);
+      FullscreenPass(CopyKind::kTodTint, &lights_albedo_, snow_cover_ok_ && alb == snow_albedo_src_ ? &snow_albedo_ : alb,
+                     nullptr, nullptr, false, one, 4);
       Barrier();
       tod_albedo_ = &lights_albedo_;
       // The world's depth as the lighting has it (riders, drawn after, told
@@ -10214,6 +10293,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
       if (stage == 1 && LightModOn() && ps->info.ucode_hash == kLightingPixelShader) {
         if (b.fetch_constant == 1 && tod_lut_ok_ && hit->second.image == tod_lut_src_) im = &tod_lut_;
+        // (Fresh snow on its albedo.)
+        if (b.fetch_constant == 3 && snow_cover_ok_ && hit->second.image == snow_albedo_src_) im = &snow_albedo_;
         // (World shadows: the slopes' map baked for the hour's sun, kept.)
         if (b.fetch_constant == 0 && tod_mask_ok_) {
           im = &tod_mask_;
@@ -12172,7 +12253,7 @@ Renderer::Impl::~Impl() {
   if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_}) {
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);

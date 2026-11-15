@@ -540,6 +540,8 @@ int main(int argc, char** argv) {
       tod.night_light = std::stof(argv[++i]);
     } else if (a == "--tod-overcast" && i + 1 < argc) {
       tod.overcast = std::stof(argv[++i]);
+    } else if (a == "--tod-cover" && i + 1 < argc) {
+      tod.snow_cover = std::stof(argv[++i]);
     } else if (a == "--tod-snow" && i + 1 < argc) {
       tod.snow = std::stof(argv[++i]);
     } else if (a == "--tod-wind" && i + 1 < argc) {

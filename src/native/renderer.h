@@ -316,6 +316,7 @@ class Renderer {
     float wind[2] = {0.0f, 0.0f};
     bool sway = true;  // the wind moving trees and foliage
     float cloud_clock = 0.0f;  // the clouds' drift (faster in wind); 0: seconds
+    float snow_cover = 0.0f;   // fresh snow lying on things (0..1: builds as it snows, melts)
   };
   void SetTimeOfDay(const TimeOfDay& tod);
   // The hour the mountain is made for (its own sun), -1 before a lit frame.
