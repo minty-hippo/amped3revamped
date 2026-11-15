@@ -50,6 +50,7 @@
 #include "live_renderer.h"
 #include "night_lights.h"
 #include "night_pass.h"
+#include "xm_radio.h"
 #include "options_graphics.h"
 #include "options_menu.h"
 #include "pad_bridge.h"
@@ -598,6 +599,7 @@ void Amped3App::StartControllerHotkeyWatcher() {
       amped3::replay::OnPad(pad);
       amped3::night_lights::Tick();
       amped3::night_pass::Tick();
+      amped3::xm_radio::Tick();
       if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ &&
           !graphics_panel_open_ && !amped3::freecam::Active() && !amped3::replay::Active()) {
         unblock_when_released_ = false;
