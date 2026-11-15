@@ -864,12 +864,43 @@ int main(int argc, char** argv) {
         const float ahead = 8.0f + 9.0f * float(k / 2), side = (k % 2 ? 7.0f : -7.0f);
         for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * ahead + g[6 + i] * side;
         l.pos[1] = g[1] - 1.5f - 0.45f * ahead;  // (the slope falls away ahead)
+        l.kind = k % 4 == 2 ? 3 : k % 4;  // (a lamp, a floodlight, a campfire, ...)
+        if (l.kind == 1) {
+          for (int i = 0; i < 3; ++i) l.dir[i] = g[3 + i];
+          l.radius = 34.0f;
+          l.intensity = 1.6f;
+        }
+        if (l.kind == 3) {
+          l.pos[1] -= 1.6f;  // (on the ground, its light over the logs)
+          l.color[0] = 1.0f; l.color[1] = 0.52f; l.color[2] = 0.2f;
+        }
         if (k == 5) {
           l.color[0] = 0.75f;
           l.color[1] = 0.85f;
           l.color[2] = 1.0f;
         }
         lights.push_back(l);
+      }
+      if (std::getenv("A3_TEST_CLOSE")) {
+        // Each kind close in front (the fittings up close).
+        lights.clear();
+        const float side[3] = {-2.2f, 0.0f, 2.2f};
+        const int kinds[3] = {0, 1, 3};
+        for (int k = 0; k < 3; ++k) {
+          amped3::native::Renderer::NightLight l;
+          for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * 5.0f + g[6 + i] * side[k];
+          l.pos[1] = g[1] - 1.4f;
+          l.kind = kinds[k];
+          if (l.kind == 1) {
+            for (int i = 0; i < 3; ++i) l.dir[i] = g[3 + i];
+            l.dir[1] -= 0.4f;
+          }
+          if (l.kind == 3) {
+            l.pos[1] = g[1] - 2.9f;
+            l.color[0] = 1.0f; l.color[1] = 0.52f; l.color[2] = 0.2f;
+          }
+          lights.push_back(l);
+        }
       }
       if (const char* mk = std::getenv("A3_TEST_MESH")) {
         // Lights on every copy of a mesh (8 m up its own y): the copies found.

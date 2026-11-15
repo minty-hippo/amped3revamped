@@ -447,7 +447,10 @@ worked out from that, so it fits each mountain's own look.
   Each mountain's shadows come from somewhat higher than its light (the
   game's choice): kept, easing to true long shadows toward sunrise and
   sunset, so at the mountain's own hour they match the game's.
-- Night lights: lamps, floodlights, lit windows and fires that come on as it
+- Night lights: lamps (a hanging bulb), floodlights (a housing shining a cone
+  the way the camera looked when placed), lit windows (the wall's own texture
+  lit up and tinted where it was placed, facing the camera) and campfires
+  (stones, logs and flickering flames) that come on as it
   gets dark, lighting the snow and slopes around them (as the game's own
   lighting does: its colors and surface directions) with a glow round each
   in the air. Placed from the freecam with time of day on: aim the cross at

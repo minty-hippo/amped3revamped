@@ -4988,14 +4988,17 @@ void main() {
   copy_fs_[37] = CompileBuiltin("builtin_tod_shadow", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D depth;   // the scene's (0: nothing)
 layout(set = 0, binding = 1) uniform sampler2D casters; // from the sun: depth, 1 = nothing
+layout(set = 0, binding = 2) uniform sampler2D world;   // the world map (trees, props): the same
+layout(set = 0, binding = 3) uniform sampler2D normals; // the lighting's (xyz * 2 - 1)
 layout(push_constant) uniform Mask {
   mat4 m;  // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
-  vec4 o0; vec4 o1; vec4 o2;  // the map's rows
-  vec4 a;  // 1 / width, 1 / height, bias (depth), texels a side
+  vec4 o0; vec4 o1; vec4 o2;  // the casters' map's rows
+  vec4 a;  // the world map's ndc from the casters' (x k + a.z, y k + a.w... ): offset x, y, k, on
 } pc;
 layout(location = 0) out vec4 o;
 void main() {
-  vec2 uv = gl_FragCoord.xy * pc.a.xy;
+  ivec2 sz = textureSize(depth, 0);
+  vec2 uv = (gl_FragCoord.xy) / vec2(sz);
   float d = textureLod(depth, uv, 0.0).r;
   if (d <= 0.0) {
     o = vec4(1.0);
@@ -5007,22 +5010,48 @@ void main() {
     return;
   }
   vec4 P = vec4(wp.xyz / wp.w, 1.0);
-  vec2 st = vec2(dot(pc.o0, P), dot(pc.o1, P));
-  float zr = dot(pc.o2, P);
-  float n = pc.a.w;
-  vec2 tc = (0.5 + 0.5 * st) * n;
-  if (any(lessThan(tc, vec2(2.0))) || any(greaterThan(tc, vec2(n - 2.0)))) {
-    o = vec4(1.0);
-    return;
-  }
-  float lit = 0.0;
-  for (int y = -1; y <= 2; ++y) {
-    for (int x = -1; x <= 2; ++x) {
-      float z = texelFetch(casters, ivec2(tc + vec2(x, y) - 0.5), 0).r;
-      lit += (z >= 1.0 || z >= zr - pc.a.z) ? 1.0 : 0.0;
+  float dpm = length(pc.o2.xyz);  // depth per metre along the sun
+  vec3 fd = pc.o2.xyz / dpm;      // the sun's direction (travelling)
+  float lit = 1.0;
+  // Riders, rails, objects (fine).
+  {
+    vec2 st = vec2(dot(pc.o0, P), dot(pc.o1, P));
+    float zr = dot(pc.o2, P);
+    float n = float(textureSize(casters, 0).x);
+    vec2 tc = (0.5 + 0.5 * st) * n;
+    if (all(greaterThan(tc, vec2(2.0))) && all(lessThan(tc, vec2(n - 2.0)))) {
+      float l = 0.0;
+      for (int y = -1; y <= 2; ++y) {
+        for (int x = -1; x <= 2; ++x) {
+          float z = texelFetch(casters, ivec2(tc + vec2(x, y) - 0.5), 0).r;
+          l += (z >= 1.0 || z >= zr - 0.06 * dpm) ? 1.0 : 0.0;
+        }
+      }
+      lit = l / 16.0;
     }
   }
-  o = vec4(lit / 16.0);
+  // Trees and props (the world map: their trunks and the stumps under them,
+  // which the lighting shades by this map, not the slopes' one), looked up
+  // off the surface along its normal (the surface itself is in the map too).
+  if (pc.a.w > 0.5) {
+    vec3 N = normalize(textureLod(normals, uv, 0.0).xyz * 2.0 - 1.0);
+    vec4 Q = vec4(P.xyz + N * 0.3 - fd * 0.15, 1.0);
+    vec2 st = vec2(dot(pc.o0, Q), dot(pc.o1, Q)) * pc.a.z + pc.a.xy;
+    float zr = dot(pc.o2, Q);
+    float n = float(textureSize(world, 0).x);
+    vec2 tc = (0.5 + 0.5 * st) * n;
+    if (all(greaterThan(tc, vec2(2.0))) && all(lessThan(tc, vec2(n - 2.0)))) {
+      float l = 0.0;
+      for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+          float z = texelFetch(world, ivec2(tc + vec2(x, y)), 0).r;
+          l += (z >= 1.0 || z >= zr - 0.25 * dpm) ? 1.0 : 0.0;
+        }
+      }
+      lit = min(lit, l / 9.0);
+    }
+  }
+  o = vec4(lit);
 }
 )", true);
   // Night lights: each lamp's light on the world (the lighting's albedo and
@@ -5031,7 +5060,7 @@ void main() {
   copy_fs_[38] = CompileBuiltin("builtin_night_lights", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D world_depth;  // at the lighting (0: nothing)
-layout(set = 0, binding = 2) uniform sampler2D lights;       // n x 2: pos, radius; color, intensity
+layout(set = 0, binding = 2) uniform sampler2D lights;       // n x 3: pos, radius; color, intensity; dir, kind
 layout(set = 0, binding = 3) uniform sampler2D albedo;
 layout(set = 0, binding = 4) uniform sampler2D normals;      // xyz * 2 - 1
 layout(set = 0, binding = 5) uniform sampler2D depth;        // now (with the riders)
@@ -5039,21 +5068,74 @@ layout(push_constant) uniform Lights {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
   vec4 cam;  // camera position, count
   vec4 a;    // 1 / width, 1 / height, how dark it is (0..1), riders told apart (0/1)
+  vec4 b;    // seconds, the scene's light on the fittings (0..1), -, -
 } pc;
 layout(location = 0) out vec4 o;
+
+// The fittings, in each light's own frame (origin at the light; z along its
+// direction for a floodlight): x distance, y material (0 dark metal, 1 lit
+// glass / lens, 2 wood, 3 stone, 4 glowing embers).
+float sdBox(vec3 p, vec3 b) {
+  vec3 q = abs(p) - b;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+float sdCapsule(vec3 p, vec3 a, vec3 b, float r) {
+  vec3 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+float sdCylY(vec3 p, float y0, float y1, float r) {
+  vec2 d = vec2(length(p.xz) - r, max(y0 - p.y, p.y - y1));
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+vec2 opU(vec2 a, vec2 b) { return a.x < b.x ? a : b; }
+vec2 Model(int kind, vec3 p) {
+  if (kind == 0) {  // a bulb hanging from its cap and cable
+    vec2 d = vec2(length(p) - 0.09, 1.0);
+    d = opU(d, vec2(sdCylY(p, 0.06, 0.16, 0.05), 0.0));
+    d = opU(d, vec2(sdCylY(p, 0.16, 0.9, 0.008), 0.0));
+    return d;
+  }
+  if (kind == 1) {  // a floodlight: a housing, its lens forward, a yoke behind
+    vec2 d = vec2(sdBox(p, vec3(0.22, 0.16, 0.12)) - 0.02, 0.0);
+    if (p.z > 0.115 && abs(p.x) < 0.19 && abs(p.y) < 0.13) d.y = 1.0;
+    d = opU(d, vec2(sdCapsule(p, vec3(0.0, 0.0, -0.12), vec3(0.0, 0.0, -0.32), 0.035), 0.0));
+    return d;
+  }
+  // A campfire: stones in a ring, logs leaning in (the light 0.4 m up).
+  vec3 q = p + vec3(0.0, 0.4, 0.0);
+  vec2 d = vec2(1e9, 3.0);
+  for (int i = 0; i < 7; ++i) {
+    float t = float(i) * 0.8976;
+    d = opU(d, vec2(length(q - vec3(0.38 * cos(t), 0.04, 0.38 * sin(t))) - 0.085, 3.0));
+  }
+  for (int i = 0; i < 3; ++i) {
+    float t = float(i) * 2.094 + 0.4;
+    d = opU(d, vec2(sdCapsule(q, vec3(0.3 * cos(t), 0.04, 0.3 * sin(t)), vec3(0.0, 0.32, 0.0), 0.045), 2.0));
+  }
+  d = opU(d, vec2(sdCylY(q, 0.0, 0.05, 0.2), 4.0));
+  return d;
+}
+vec3 ModelNormal(int kind, vec3 p) {
+  const vec2 e = vec2(0.003, 0.0);
+  return normalize(vec3(Model(kind, p + e.xyy).x - Model(kind, p - e.xyy).x,
+                        Model(kind, p + e.yxy).x - Model(kind, p - e.yxy).x,
+                        Model(kind, p + e.yyx).x - Model(kind, p - e.yyx).x));
+}
+float Hash(float n) { return fract(sin(n) * 43758.5453); }
+
 void main() {
   vec2 uv = gl_FragCoord.xy * pc.a.xy;
   vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
   float k = pc.a.z;
   int count = int(pc.cam.w);
-  if (k <= 0.001 || count == 0) {
+  if (count == 0) {
     o = c;
     return;
   }
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
   float dw = textureLod(world_depth, uv, 0.0).r;
   float dn = textureLod(depth, uv, 0.0).r;
-  // (Inverted depth: what's drawn after the lighting in front is larger.)
   bool rider = pc.a.w > 0.5 && dn > dw * 1.01 + 1e-7;  // (not the snow trails, just above)
   float d = pc.a.w > 0.5 ? dn : dw;
   vec4 mid = pc.m * vec4(ndc, 0.5, 1.0);
@@ -5068,30 +5150,118 @@ void main() {
   vec3 N = normalize(textureLod(normals, uv, 0.0).xyz * 2.0 - 1.0);
   vec3 alb = textureLod(albedo, uv, 0.0).rgb;
   vec3 add = vec3(0.0);
+  // The nearest fitting in front of what's drawn: its color (solid).
+  float hit_t = pix_dist;
+  vec3 hit_col = vec3(0.0);
+  bool hit = false;
   for (int i = 0; i < count; ++i) {
     vec4 lp = texelFetch(lights, ivec2(i, 0), 0);
     vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
-    vec3 col = lc.rgb * lc.w;
+    vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
+    int kind = int(ld.w + 0.5);
+    vec3 axis = normalize(ld.xyz);
+    float flick = 1.0;
+    if (kind == 3) {  // a fire flickers
+      float t = pc.b.x * 9.0 + float(i) * 3.1;
+      flick = 0.82 + 0.1 * sin(t) + 0.08 * sin(t * 2.7 + 1.3) + 0.05 * Hash(floor(t * 1.5));
+    }
+    vec3 col = lc.rgb * lc.w * flick;
     // On the world.
-    if (d > 0.0 && !rider) {
+    if (d > 0.0 && !rider && k > 0.001) {
       vec3 dl = lp.xyz - P;
       float dist = length(dl);
+      if (kind == 2) {
+        // A window: the wall's own texture lit up within it (its color
+        // tinted, glowing), facing the way it was placed.
+        vec3 nrm = normalize(vec3(axis.x, 0.0, axis.z) + vec3(0.0, 1e-4, 0.0));
+        vec3 rt = normalize(cross(vec3(0.0, 1.0, 0.0), nrm));
+        vec3 rel = P - lp.xyz;
+        vec3 l3 = vec3(dot(rel, rt), rel.y, dot(rel, nrm));
+        if (abs(l3.x) < 0.65 && abs(l3.y) < 0.55 && abs(l3.z) < 0.4) {
+          float edge = smoothstep(0.65, 0.58, abs(l3.x)) * smoothstep(0.55, 0.48, abs(l3.y));
+          add += (alb * col * 2.4 + col * 0.18) * edge;
+        }
+      }
       if (dist < lp.w) {
         float x = dist / lp.w;
         float fall = (1.0 - x * x) * (1.0 - x * x) / (1.0 + dist * dist * 0.06);
         float ndl = max(dot(N, dl / max(dist, 1e-3)), 0.0) * 0.8 + 0.2;
+        if (kind == 1) {  // a floodlight: a cone along its direction
+          fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), axis)) * 1.4 + 0.04;
+        }
         add += alb * col * fall * ndl * 1.6;
       }
     }
-    // The glow in the air: nearest the view ray comes to the lamp (in front
-    // of what's drawn there).
+    // The glow in the air round the bulb, the lens, the flames.
     vec3 to = lp.xyz - pc.cam.xyz;
     float t = dot(to, dir);
-    if (t > 0.3 && t < pix_dist + 0.5) {
+    if (k > 0.001 && t > 0.3 && t < min(pix_dist, hit_t) + 0.5 && kind != 2) {
       float perp = length(to - dir * t);
-      float size = 0.12 + 0.004 * t;  // a little bigger far away (still seen)
+      float size = (kind == 1 ? 0.18 : 0.12) + 0.004 * t;
       float g = size * size / (perp * perp + size * size);
-      add += col * (0.55 * g * g + 0.12 * g) * smoothstep(400.0, 150.0, t);
+      float facing = kind == 1 ? 0.25 + 0.75 * smoothstep(0.2, 0.9, dot(-dir, axis)) : 1.0;
+      add += col * (0.55 * g * g + 0.12 * g) * facing * smoothstep(400.0, 150.0, t);
+    }
+    // The fitting itself (by day too), when the ray passes near it.
+    if (kind != 2 && t > 0.2 && t < 150.0) {
+      float perp = length(to - dir * t);
+      if (perp < 1.0) {
+        // Its frame: z along the axis for a floodlight.
+        vec3 fz = kind == 1 ? axis : vec3(0.0, 0.0, 1.0);
+        vec3 fx = normalize(cross(abs(fz.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), fz));
+        vec3 fy = cross(fz, fx);
+        if (kind != 1) {
+          fx = vec3(1.0, 0.0, 0.0);
+          fy = vec3(0.0, 1.0, 0.0);
+          fz = vec3(0.0, 0.0, 1.0);
+        }
+        float s = max(t - 1.2, 0.0);
+        for (int j = 0; j < 48; ++j) {
+          vec3 wpos = pc.cam.xyz + dir * s;
+          vec3 lpos = wpos - lp.xyz;
+          vec3 q = vec3(dot(lpos, fx), dot(lpos, fy), dot(lpos, fz));
+          vec2 md = Model(kind, q);
+          if (md.x < 0.002) {
+            if (s < hit_t) {
+              vec3 nl = ModelNormal(kind, q);
+              vec3 nw = nl.x * fx + nl.y * fy + nl.z * fz;
+              int mat = int(md.y + 0.5);
+              vec3 base = mat == 0 ? vec3(0.12, 0.12, 0.13)
+                        : mat == 1 ? vec3(0.85, 0.85, 0.8)
+                        : mat == 2 ? vec3(0.32, 0.2, 0.11)
+                        : mat == 3 ? vec3(0.38, 0.37, 0.36) : vec3(0.15, 0.06, 0.02);
+              float amb = pc.b.y * (0.55 + 0.45 * max(nw.y, 0.0));
+              vec3 cc = base * amb;
+              // Lit by its own light (the fire's logs and stones), glowing
+              // where it's the light (the bulb, the lens, the embers).
+              if (kind == 3 && mat != 4) cc += base * col * 0.8 * k * clamp(1.0 - length(q + vec3(0.0, 0.2, 0.0)) * 1.5, 0.0, 1.0);
+              if (mat == 1 || mat == 4) cc = mix(cc, col * (mat == 4 ? 1.2 : 1.6), k);
+              hit_col = cc;
+              hit_t = s;
+              hit = true;
+            }
+            break;
+          }
+          s += max(md.x, 0.004);
+          if (s > t + 1.2 || s > hit_t) break;
+        }
+      }
+      // The flames (a fire, after dark): glowing over the logs, flickering.
+      if (kind == 3 && k > 0.001 && perp < 0.8) {
+        float glow = 0.0;
+        for (int j = 0; j < 16; ++j) {
+          float s = t - 0.6 + float(j) * 0.075;
+          if (s > min(pix_dist, hit_t)) break;
+          vec3 q = pc.cam.xyz + dir * s - lp.xyz + vec3(0.0, 0.4, 0.0);
+          float h = q.y;
+          if (h < 0.02 || h > 0.75) continue;
+          float wob = 0.03 * sin(pc.b.x * 11.0 + h * 14.0 + float(i));
+          float r = 0.2 * (1.0 - h / 0.75) * (0.85 + 0.15 * sin(pc.b.x * 7.0 + h * 9.0));
+          float dd = length(q.xz + vec2(wob, 0.0));
+          glow += smoothstep(r, r * 0.3, dd) * 0.09;
+        }
+        add += vec3(1.0, 0.55, 0.18) * glow * 2.2 * flick;
+      }
     }
   }
   if (pc.a.w > 1.5) {  // (diagnostics: riders, depth, albedo, normal)
@@ -5099,7 +5269,8 @@ void main() {
     if (uv.x > 0.5) o = vec4(N * 0.5 + 0.5, 1.0);
     return;
   }
-  o = vec4(c.rgb + add * k, c.a);
+  vec3 base = hit ? hit_col : c.rgb;
+  o = vec4(base + add * k, c.a);
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -8119,11 +8290,18 @@ void Renderer::Impl::TodShadows() {
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 4; ++c) pc[16 + r * 4 + c] = float(Om[r * 4 + c]);
   }
-  pc[28] = 1.0f / float(depth->width);
-  pc[29] = 1.0f / float(depth->height);
-  pc[30] = float(0.06 / kSunDepth);
-  pc[31] = float(n);
-  FullscreenPass(CopyKind::kTodShadow, &tod_mask_, depth, &tod_movers_map_, nullptr, false, pc, 32);
+  // The world map's frame from the casters' (same axes, its own centre and
+  // size): x_w = x_m Rm / R + (a1 - c1) / R.
+  const bool world = world_detail_ > 0 && sun_map_ok_ && sun_r_ > 0.0 && tod_normal_;
+  if (world) {
+    const double k = Rm / sun_r_;
+    pc[28] = float(-Om[0 * 4 + 3] * k + sun_O_[0 * 4 + 3]);
+    pc[29] = float(-Om[1 * 4 + 3] * k + sun_O_[1 * 4 + 3]);
+    pc[30] = float(k);
+    pc[31] = 1.0f;
+  }
+  FullscreenPass(CopyKind::kTodShadow, &tod_mask_, depth, &tod_movers_map_, world ? &sun_env_ : nullptr,
+                 false, pc, 32, nullptr, world ? tod_normal_ : nullptr);
   Barrier();
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
   for (int i = 0; i < 4; ++i) {
@@ -8213,8 +8391,9 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   if (lights_done_) return lights_result_;
   lights_done_ = true;
   lights_result_ = nullptr;
+  // (By day too: the fittings show; their light only after dark.)
   const double dark = TodOn() ? tod::SmoothStep(0.25, 0.85, tod_state_.night) : 0.0;
-  if (lights_.empty() || dark <= 0.001 || !tod_albedo_ || !tod_normal_ ||
+  if (lights_.empty() || !TodOn() || !tod_normal_ ||
       depth->width != scene->width || depth->height != scene->height || scene->samples > 1) {
     return nullptr;
   }
@@ -8236,14 +8415,14 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     im = gpu_.CreateImage(iw, ih, f, false, name);
     ToGeneral(cb_, im);
   };
-  ensure(lights_img_, 128, 2, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
+  ensure(lights_img_, 128, 3, VK_FORMAT_R32G32B32A32_SFLOAT, "night_lights");
   ensure(lights_out_, scene->width, scene->height, scene->format, "night_lit");
   lights_out_.scaled = scene->scaled;
   lights_out_.scale = scene->scale;
   {
-    Buffer staging = gpu_.CreateBuffer(128 * 2 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Buffer staging = gpu_.CreateBuffer(128 * 3 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     float* f = reinterpret_cast<float*>(staging.mapped);
-    std::memset(f, 0, 128 * 2 * 16);
+    std::memset(f, 0, 128 * 3 * 16);
     const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
     for (size_t j = 0; j < nearby.size(); ++j) {
       const Renderer::NightLight& l = lights_[nearby[j].second];
@@ -8257,10 +8436,15 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
       b[1] = l.color[1];
       b[2] = l.color[2];
       b[3] = float(l.intensity * e);
+      float* c = f + (256 + j) * 4;
+      c[0] = l.dir[0];
+      c[1] = l.dir[1];
+      c[2] = l.dir[2];
+      c[3] = float(l.kind);
     }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {128, 2, 1};
+    region.imageExtent = {128, 3, 1};
     Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, lights_img_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
                                &region);
@@ -8270,9 +8454,17 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   // The world's depth as the lighting had it (riders told apart), when kept.
   const bool have_world = ao_depth_ok_ && ao_depth_.width == depth->width &&
                           ao_depth_.height == depth->height;
-  float pc[24] = {};
+  float pc[28] = {};
   for (int c = 0; c < 4; ++c) {
     for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // column-major
+  }
+  {
+    // The light on the fittings: the sky's and the sun's (or moon's), as the
+    // hour has them; the exposure.
+    auto lum = [](const tod::Vec3& v) { return 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z; };
+    const double amb = std::clamp(0.6 * lum(lm_ambient_scale_) + 0.35 * lum(lm_light_scale_), 0.03, 1.2);
+    pc[24] = tod_.seconds;
+    pc[25] = float(amb);
   }
   pc[16] = cam_pos_[0];
   pc[17] = cam_pos_[1];
@@ -8283,7 +8475,8 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   pc[22] = float(dark);
   pc[23] = Diag("lightsdbg") ? 2.0f : have_world ? 1.0f : 0.0f;
   FullscreenPass(CopyKind::kTodLights, &lights_out_, scene, have_world ? &ao_depth_ : depth,
-                 &lights_img_, false, pc, 24, nullptr, tod_albedo_, tod_normal_, depth);
+                 &lights_img_, false, pc, 28, nullptr, tod_albedo_ ? tod_albedo_ : &dummy_,
+                 tod_normal_, depth);
   Barrier();
   dyn_ = DynState{};
   lights_result_ = &lights_out_;

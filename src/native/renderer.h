@@ -318,6 +318,10 @@ class Renderer {
     float color[3] = {1.0f, 0.8f, 0.55f};
     float radius = 12.0f;     // metres it reaches
     float intensity = 1.0f;
+    // 0 a lamp (a hanging bulb), 1 a floodlight (shining along dir), 2 a
+    // window (the wall's own texture lit up, facing dir), 3 a campfire.
+    int kind = 0;
+    float dir[3] = {0.0f, -1.0f, 0.0f};
   };
   void SetNightLights(const std::vector<NightLight>& lights);
   // The mountain (0 before a lit frame): an id for its lights' file.
