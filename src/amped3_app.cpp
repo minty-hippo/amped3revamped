@@ -49,6 +49,7 @@
 #include "guest_waits.h"
 #include "live_renderer.h"
 #include "night_lights.h"
+#include "night_pass.h"
 #include "options_graphics.h"
 #include "options_menu.h"
 #include "pad_bridge.h"
@@ -301,6 +302,7 @@ void Amped3App::OnPostInitLogging() {
   amped3::capture::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::camera_scan::Install(rex::filesystem::GetExecutableFolder() / "logs");
   amped3::night_lights::Install(rex::filesystem::GetExecutableFolder() / "lights");
+  amped3::night_pass::Install(rex::filesystem::GetExecutableFolder() / "lights");
 
   // Paths are resolved before the log file opens, so report them here.
   if (game_dir_.empty()) {
@@ -360,6 +362,9 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                             char b[32];
                             std::snprintf(b, sizeof(b), " (%02d:%02d)", int(h), int(std::fmod(h, 1.0f) * 60.0f));
                             text += b;
+                          }
+                          if (on && amped3::night_pass::Locked()) {
+                            text = "Time of day: on (Northstar keeps its own hour until you earn the Night Pass)";
                           }
                           amped3::notice::Show(text);
                         });
@@ -589,6 +594,7 @@ void Amped3App::StartControllerHotkeyWatcher() {
       amped3::freecam::OnPad(pad);
       amped3::replay::OnPad(pad);
       amped3::night_lights::Tick();
+      amped3::night_pass::Tick();
       if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ &&
           !graphics_panel_open_ && !amped3::freecam::Active() && !amped3::replay::Active()) {
         unblock_when_released_ = false;

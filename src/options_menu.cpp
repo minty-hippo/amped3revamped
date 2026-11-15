@@ -404,6 +404,10 @@ const std::vector<Tab>& Tabs() {
                        "hour it was made for and looks as the game has it then. Shadows follow "
                        "the sun and moon (riders and objects always; the world's with World "
                        "shadows baked). Native renderer only."),
+                Toggle("native_tod_night_pass_lock", "Northstar waits for the Night Pass",
+                       "Northstar stays at its own hour, as the game has it, until you've earned "
+                       "the Night Pass; then the day and night run there too. Off: from the "
+                       "start."),
                 SliderF("native_tod_start_hour", "Set the hour",
                         "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
                         -1.0, 24.0),

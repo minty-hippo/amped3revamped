@@ -86,6 +86,7 @@ const std::vector<Tab>& Tabs() {
       {"Time of Day",
        {
            {"native_time_of_day", "Dynamic Time of Day"},
+           {"native_tod_night_pass_lock", "Northstar Waits for the Night Pass"},
            {"native_tod_start_hour", "Set the Hour", Kind::kSlider, -1.0, 24.0, 0.25},
            {"native_tod_day_minutes", "Minutes per Day", Kind::kStops, 0, 0, 0,
             {{"0", "Stopped"}, {"12", "12 min"}, {"24", "24 min"}, {"48", "48 min"},

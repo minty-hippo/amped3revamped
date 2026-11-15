@@ -42,6 +42,7 @@
 #include <rex/ui/presenter.h>
 
 #include "live_present.h"
+#include "night_pass.h"
 #include "perf_overlay.h"
 #include "perf_trace.h"
 #include "thread_qos.h"
@@ -2169,7 +2170,10 @@ void WorkerMain() {
             tod_hour = start >= 0.0 ? start : -1.0;
           }
           if (tod_hour < 0.0 && renderer->MountainHour() >= 0.0f) tod_hour = renderer->MountainHour();
-          const bool running = REXCVAR_GET(native_time_of_day) && !f->replay &&
+          // (Northstar before the Night Pass: its own hour, as the game has it.)
+          const bool locked = night_pass::Locked();
+          if (locked) tod_hour = renderer->MountainHour() >= 0.0f ? renderer->MountainHour() : tod_hour;
+          const bool running = REXCVAR_GET(native_time_of_day) && !locked && !f->replay &&
                                GameState() != 15 && dt > 0.0 && dt < 0.25;
           const double minutes = REXCVAR_GET(native_tod_day_minutes);
           if (running) {
@@ -2179,7 +2183,7 @@ void WorkerMain() {
             }
           }
           native::Renderer::TimeOfDay tod;
-          tod.on = REXCVAR_GET(native_time_of_day) && tod_hour >= 0.0;
+          tod.on = REXCVAR_GET(native_time_of_day) && !locked && tod_hour >= 0.0;
           tod.hour = float(std::max(tod_hour, 0.0));
           tod.moon_phase = float(REXCVAR_GET(native_tod_moon_phase));
           tod.clouds = float(REXCVAR_GET(native_tod_clouds));

@@ -526,6 +526,22 @@ bool DrawTab() {
   return close;
 }
 
+std::vector<Info> List() {
+  std::vector<Info> out;
+  uint8_t* base = GuestBase();
+  if (!base) return out;
+  for (Entry& e : ReadRegistry(base)) out.push_back(Info{std::move(e.name), std::move(e.level), e.state});
+  return out;
+}
+
+std::string LoadedLevel() {
+  uint8_t* base = GuestBase();
+  if (!base) return {};
+  constexpr uint32_t kWorldPtr = 0x8288FB64;  // the game's world object (+48: its level name)
+  const uint32_t world = Load32(base, kWorldPtr);
+  return world ? Lower(GuestText(base, world + 48, 32)) : std::string();
+}
+
 }  // namespace amped3::challenges
 
 // Midasm hook at the game's fade command (sub_82203470: r3 = the fader, r4 =

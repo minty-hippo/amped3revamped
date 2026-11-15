@@ -24,6 +24,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace amped3::challenges {
 
@@ -33,5 +35,17 @@ bool DrawTab();
 // Game thread, every frame (the game state machine's tick; r1 / r13 of that
 // code, for calling the game's functions).
 void GameTick(uint8_t* base, uint32_t r1, uint32_t r13);
+
+// Any thread: every challenge the game knows, with its initiator's state
+// while its mountain is loaded (-1 otherwise: 0 init, 1 locked, 2 idle, ...,
+// 11 done, 12 done (improve)).
+struct Info {
+  std::string name;
+  std::string level;  // lower case ("northstar", ...)
+  int state = -1;
+};
+std::vector<Info> List();
+// The loaded mountain's level name, lower case ("" when none or unreadable).
+std::string LoadedLevel();
 
 }  // namespace amped3::challenges

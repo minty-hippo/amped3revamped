@@ -412,6 +412,14 @@ night with stars, and clouds drifting overhead. Each mountain starts at the
 hour it was made for, where it looks as the game has it; every other hour is
 worked out from that, so it fits each mountain's own look.
 
+Northstar keeps its own hour until the Night Pass is earned (Time of Day:
+Northstar Waits for the Night Pass, `native_tod_night_pass_lock`, on by
+default). Earned is read from the game's challenges (a Northstar challenge
+named for the night pass done, or one named for the night unlocked) and
+remembered in `lights\night_pass.txt`; deleting that file forgets it. Each
+time Northstar loads, its challenges and their states go to the log, to check
+that rule against a save that has the pass.
+
 - The terrain (the game's deferred lighting pass), and riders, characters
   and props (their own lighting constants, found by their values) all take
   the hour's sun or moon direction, its color and the sky's light.
