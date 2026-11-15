@@ -115,7 +115,8 @@ void ScanRefs(rex::memory::Memory* memory) {
 // following their pointers to UTF-16 text.
 constexpr uint32_t kVtable = 0x82883830u;
 uint32_t g_object = 0;
-double g_next_look = 0.0;
+std::vector<uint32_t> g_objects;  // every object with its vtable (one shows)
+double g_next_look = 0.0, g_next_find = 0.0;
 bool g_text_logged = false;
 
 uint32_t Be32(uint8_t* base, uint32_t a) {
@@ -156,26 +157,29 @@ std::string Utf16At(rex::memory::Memory* memory, uint8_t* base, uint32_t a) {
   return s.size() >= 2 ? "u:" + s : std::string();
 }
 
-void LookAtObject(rex::memory::Memory* memory) {
+void LookAtObject(rex::memory::Memory* memory, double now) {
   uint8_t* base = memory->virtual_membase();
-  if (!g_object) {
-    // Find it: an object whose first word is the class's vtable.
-    for (uint32_t page = 0x40000000u; page < 0x60000000u && !g_object; page += 0x1000u) {
+  if (g_objects.empty() || now >= g_next_find) {
+    // Find them: objects whose first word is the class's vtable (every
+    // 20 s: made and freed with the mountain).
+    g_next_find = now + 20.0;
+    g_objects.clear();
+    for (uint32_t page = 0x40000000u; page < 0x60000000u && g_objects.size() < 16; page += 0x1000u) {
       if (!Readable(memory, page, 0x1000u)) continue;
       for (uint32_t i = 0; i < 0x1000u; i += 4) {
-        if (Be32(base, page + i) == kVtable) {
-          g_object = page + i;
-          break;
-        }
+        if (Be32(base, page + i) == kVtable) g_objects.push_back(page + i);
       }
     }
-    if (!g_object) return;
-    REXLOG_INFO("XM Radio popup: its object at {:08X}", g_object);
+    std::string list;
+    for (uint32_t o : g_objects) list += fmt::format(" {:08X} (state {})", o, Readable(memory, o, 0x100) ? Be32(base, o + 140) : 0);
+    REXLOG_INFO("XM Radio popup: objects:{}", list);
   }
-  if (!Readable(memory, g_object, 0x100)) {
-    g_object = 0;
-    return;
+  // The one showing (state 2).
+  g_object = 0;
+  for (uint32_t o : g_objects) {
+    if (Readable(memory, o, 0x100) && Be32(base, o) == kVtable && Be32(base, o + 140) == 2) g_object = o;
   }
+  if (!g_object) return;
   // Each text node: its words, and any that lead to UTF-16 text (directly,
   // or one pointer further).
   bool any = false;
@@ -243,8 +247,8 @@ void Tick() {
                                     .count()) /
                          1000.0;
       if (now >= g_next_look) {
-        g_next_look = now + 2.0;
-        LookAtObject(memory);
+        g_next_look = now + 0.5;
+        LookAtObject(memory, now);
       }
     }
   }
