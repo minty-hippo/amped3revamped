@@ -8219,16 +8219,16 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     return nullptr;
   }
   // The nearest 128 to the camera (within 400 m).
-  std::vector<std::pair<float, size_t>> near;
+  std::vector<std::pair<float, size_t>> nearby;
   for (size_t i = 0; i < lights_.size(); ++i) {
     const float* p = lights_[i].pos;
     const float dx = p[0] - cam_pos_[0], dy = p[1] - cam_pos_[1], dz = p[2] - cam_pos_[2];
     const float d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 < 400.0f * 400.0f) near.push_back({d2, i});
+    if (d2 < 400.0f * 400.0f) nearby.push_back({d2, i});
   }
-  if (near.empty()) return nullptr;
-  std::sort(near.begin(), near.end());
-  if (near.size() > 128) near.resize(128);
+  if (nearby.empty()) return nullptr;
+  std::sort(nearby.begin(), nearby.end());
+  if (nearby.size() > 128) nearby.resize(128);
   EndRendering();
   auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
     if (im.image && im.width == iw && im.height == ih && im.format == f) return;
@@ -8245,8 +8245,8 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     float* f = reinterpret_cast<float*>(staging.mapped);
     std::memset(f, 0, 128 * 2 * 16);
     const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
-    for (size_t j = 0; j < near.size(); ++j) {
-      const Renderer::NightLight& l = lights_[near[j].second];
+    for (size_t j = 0; j < nearby.size(); ++j) {
+      const Renderer::NightLight& l = lights_[nearby[j].second];
       float* a = f + j * 4;
       float* b = f + (128 + j) * 4;
       a[0] = l.pos[0];
@@ -8277,7 +8277,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   pc[16] = cam_pos_[0];
   pc[17] = cam_pos_[1];
   pc[18] = cam_pos_[2];
-  pc[19] = float(near.size());
+  pc[19] = float(nearby.size());
   pc[20] = 1.0f / float(scene->width);
   pc[21] = 1.0f / float(scene->height);
   pc[22] = float(dark);
