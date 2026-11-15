@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
@@ -17,6 +19,8 @@ namespace {
 
 bool g_scanned = false;
 bool g_scanned_refs = false;
+// The strings found (address, text): pointers to them searched for too.
+std::vector<std::pair<uint32_t, std::string>> g_found;
 
 rex::memory::Memory* GuestMemory() {
   auto* kernel = rex::system::kernel_state();
@@ -91,6 +95,11 @@ void ScanRefs(rex::memory::Memory* memory) {
           REXLOG_INFO("XM Radio popup: {} pointed to from {:08X}", w.what, uint32_t(page) + i);
           ++logged;
         }
+        for (const auto& [a, text] : g_found) {
+          if (v != a) continue;
+          REXLOG_INFO("XM Radio popup: '{}' pointed to from {:08X}", text, uint32_t(page) + i);
+          ++logged;
+        }
       }
     }
   }
@@ -115,7 +124,8 @@ void Tick() {
   constexpr uint32_t kStart = 0x82000000u, kEnd = 0x83000000u, kPage = 0x10000u;
   if (!Readable(memory, kStart, 4)) return;
   g_scanned = true;
-  const char* keys[] = {"XMRadio", "SongTitle", "BandName", "MusicType", "XMRADIO"};
+  // (The song popup is the "Chiron": ARTIST: / SONG: in the string table.)
+  const char* keys[] = {"XMRadio", "SongTitle", "BandName", "MusicType", "XMRADIO", "Chiron", "chiron", "CHIRON"};
   int found = 0;
   for (uint32_t page = kStart; page < kEnd; page += kPage) {
     if (!Readable(memory, page, kPage)) continue;
@@ -128,6 +138,7 @@ void Tick() {
       if (s.size() < 6) continue;
       for (const char* k : keys) {
         if (s.find(k) == std::string::npos) continue;
+        g_found.push_back({page + i, s});
         REXLOG_INFO("XM Radio popup: string '{}' at {:08X} (lis {}, addi {})", s, page + i,
                     int16_t(((page + i) + 0x8000) >> 16), int16_t((page + i) & 0xFFFF));
         ++found;
