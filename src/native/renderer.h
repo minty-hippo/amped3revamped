@@ -363,6 +363,9 @@ class Renderer {
   // through the depth on screen (the world, riders, objects: anything drawn,
   // moving or not). 0 off, 1 on, 2 finer.
   void SetLightShadows(int quality);
+  // Time of day: bloom (0 off .. 2): the lamps, fires and the sun on snow
+  // glowing out over what's round them (stronger at night).
+  void SetBloom(float strength);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

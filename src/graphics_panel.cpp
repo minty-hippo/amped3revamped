@@ -103,6 +103,7 @@ const std::vector<Tab>& Tabs() {
             {{"2", "2 min"}, {"6", "6 min"}, {"15", "15 min"}, {"40", "40 min"}}},
            {"native_night_light_shadows", "Night Light Shadows", Kind::kStops, 0, 0, 0,
             {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}},
+           {"native_bloom", "Light Glow", Kind::kSlider, 0.0, 2.0, 0.1},
        }},
       {"Display",
        {

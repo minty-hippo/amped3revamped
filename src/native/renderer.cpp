@@ -1859,7 +1859,7 @@ struct Renderer::Impl {
     kSunPrep = 23, kSunPcss = 24, kBakeInit = 25, kBake = 26, kMoverPos = 27,
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
-    kSnow = 39, kSnowCover = 40
+    kSnow = 39, kSnowCover = 40, kBloom = 41
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1900,7 +1900,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[41] = {};  // by CopyKind
+  VkShaderModule copy_fs_[42] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2115,6 +2115,11 @@ struct Renderer::Impl {
     const double gloom = 0.55 * tod::SmoothStep(0.6, 1.0, tod_.overcast) * (0.4 + 0.6 * std::clamp(double(tod_.snow), 0.0, 1.0));
     return std::max(night, gloom);
   }
+  // Bloom (SetBloom): the bright parts (lamps, fires, the sun on snow)
+  // glowing out over what's round them; quarter-size, blurred twice.
+  float bloom_ = 0.0f;
+  Image bloom_a_, bloom_b_, bloom_out_;
+  Image* BloomScene(Image* scene);
   bool snow_done_ = false;
   Image* snow_result_ = nullptr;
   Image snow_img_;
@@ -3102,6 +3107,10 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (tod_sky && tod_.snow > 0.002f) {
         if (Image* snowy = SnowScene(scene)) scene = snowy;
         MarkPart("effect: snow");
+      }
+      if (tod_sky && bloom_ > 0.0f) {
+        if (Image* bloomed = BloomScene(scene)) scene = bloomed;
+        MarkPart("effect: bloom");
       }
       if (blur) {
         if (Image* blurred = BlurredScene(scene)) scene = blurred;
@@ -5818,6 +5827,59 @@ void main() {
   vec3 snow = vec3(0.86, 0.89, 0.93) * (0.94 + 0.08 * noise);
   // (Already white: left as it is.)
   o = vec4(mix(c.rgb, max(c.rgb, snow), clamp(amount, 0.0, 1.0)), c.a);
+}
+)", true);
+  // Bloom: 0 the bright parts (soft threshold), 1 a 9-tap blur along a
+  // direction, 2 added over the scene.
+  copy_fs_[41] = CompileBuiltin("builtin_bloom", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;    // (linear)
+layout(set = 0, binding = 1) uniform sampler2D scene;
+layout(push_constant) uniform Bloom {
+  vec4 a;  // mode, threshold or strength, step x, step y
+  vec4 b;
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  int mode = int(pc.a.x + 0.5);
+  if (mode == 0) {
+    // A quarter-size pixel: its 4x4 as 4 linear taps; what's over the
+    // threshold, softly.
+    vec2 uv = (floor(gl_FragCoord.xy) * 4.0 + 2.0) * pc.a.zw;
+    vec3 c = vec3(0.0);
+    c += textureLod(src, uv + vec2(-1.0, -1.0) * pc.a.zw, 0.0).rgb;
+    c += textureLod(src, uv + vec2(1.0, -1.0) * pc.a.zw, 0.0).rgb;
+    c += textureLod(src, uv + vec2(-1.0, 1.0) * pc.a.zw, 0.0).rgb;
+    c += textureLod(src, uv + vec2(1.0, 1.0) * pc.a.zw, 0.0).rgb;
+    c *= 0.25;
+    // (Small bright things glow, broad lit ground not: what's over the
+    // wider surroundings.)
+    vec3 wide = vec3(0.0);
+    for (int i = 0; i < 8; ++i) {
+      float a = float(i) * 0.785398;
+      wide += textureLod(src, uv + vec2(cos(a), sin(a)) * 40.0 * pc.a.zw, 0.0).rgb;
+    }
+    wide *= 0.125;
+    c = max(c - wide * 0.7, vec3(0.0)) / 0.3 * pc.b.x + c * (1.0 - pc.b.x);
+    float l = max(c.r, max(c.g, c.b));
+    float knee = 0.12;
+    float x = clamp(l - pc.a.y + knee, 0.0, 2.0 * knee);
+    float over = max(l - pc.a.y, x * x / (4.0 * knee));
+    o = vec4(c * over / max(l, 1e-4), 1.0);
+  } else if (mode == 1) {
+    vec2 uv = gl_FragCoord.xy / vec2(textureSize(src, 0));
+    const float w[5] = float[](0.227, 0.195, 0.122, 0.054, 0.016);
+    vec3 c = textureLod(src, uv, 0.0).rgb * w[0];
+    for (int i = 1; i < 5; ++i) {
+      c += textureLod(src, uv + pc.a.zw * float(i), 0.0).rgb * w[i];
+      c += textureLod(src, uv - pc.a.zw * float(i), 0.0).rgb * w[i];
+    }
+    o = vec4(c, 1.0);
+  } else {
+    vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+    vec2 uv = gl_FragCoord.xy * pc.a.zw;
+    vec3 b = textureLod(src, uv, 0.0).rgb;
+    o = vec4(c.rgb + b * pc.a.y * (1.0 - 0.6 * clamp(c.rgb, 0.0, 1.0)), c.a);
+  }
 }
 )", true);
   copy_fs_[32] = CompileBuiltin("builtin_sun_tiles", R"(#version 450
@@ -8587,6 +8649,62 @@ void Renderer::Impl::SetWind(SystemConstants& sys, const GpuState& st, int mode)
   sys.wind2[1] = float(units);
   sys.wind2[2] = float(seed);
   sys.wind2[3] = float(std::clamp(wind_t_ - wind_prev_t_, 0.0, 0.25));
+}
+
+Image* Renderer::Impl::BloomScene(Image* scene) {
+  if (scene->samples > 1 || Diag("nobloom")) return nullptr;
+  const uint32_t w = scene->width, h = scene->height;
+  const uint32_t qw = std::max(1u, w / 4), qh = std::max(1u, h / 4);
+  EndRendering();
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
+    ToGeneral(cb_, im);
+  };
+  ensure(bloom_a_, qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, "bloom_a");
+  ensure(bloom_b_, qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, "bloom_b");
+  ensure(bloom_out_, w, h, scene->format, "bloom_out");
+  bloom_out_.scaled = scene->scaled;
+  bloom_out_.scale = scene->scale;
+  // At night the lamps and fires glow; by day only what's near white (the
+  // sun on fresh snow, a little).
+  const float dark = float(LightsDark());
+  const float thr = 0.9f - 0.3f * dark;
+  const float strength = bloom_ * (0.25f + 0.75f * dark);
+  float pc[8] = {};
+  // Bright parts, a quarter the size (4 linear taps a pixel).
+  pc[0] = 0.0f;
+  pc[1] = thr;
+  pc[2] = 1.0f / float(w);
+  pc[3] = 1.0f / float(h);
+  pc[4] = 0.85f;  // how much the surroundings are taken off
+  Barrier();
+  FullscreenPass(CopyKind::kBloom, &bloom_a_, scene, nullptr, nullptr, true, pc, 8);
+  // Blurred: across, then down, twice (wider the second time).
+  for (int pass = 0; pass < 2; ++pass) {
+    const float spread = pass == 0 ? 1.0f : 2.5f;
+    pc[0] = 1.0f;
+    pc[1] = 0.0f;
+    pc[2] = spread / float(qw);
+    pc[3] = 0.0f;
+    Barrier();
+    FullscreenPass(CopyKind::kBloom, &bloom_b_, &bloom_a_, nullptr, nullptr, true, pc, 8);
+    pc[2] = 0.0f;
+    pc[3] = spread / float(qh);
+    Barrier();
+    FullscreenPass(CopyKind::kBloom, &bloom_a_, &bloom_b_, nullptr, nullptr, true, pc, 8);
+  }
+  // Over the scene.
+  pc[0] = 2.0f;
+  pc[1] = strength;
+  pc[2] = 1.0f / float(w);
+  pc[3] = 1.0f / float(h);
+  Barrier();
+  FullscreenPass(CopyKind::kBloom, &bloom_out_, &bloom_a_, scene, nullptr, true, pc, 8);
+  Barrier();
+  dyn_ = DynState{};
+  return &bloom_out_;
 }
 
 Image* Renderer::Impl::SnowScene(Image* scene) {
@@ -12253,7 +12371,7 @@ Renderer::Impl::~Impl() {
   if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_}) {
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -12712,6 +12830,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   }
   return true;
 }
+void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetClothTextures(const std::vector<uint64_t>& hashes) { impl_->cloth_extra_ = hashes; }
 void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }

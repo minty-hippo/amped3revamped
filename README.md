@@ -451,6 +451,10 @@ that rule against a save that has the pass.
   more can be added by their texture hashes in `native_wind_cloth`). Their
   shadows move with them, and the motion blur and upscaler see the
   movement.
+  Lamps, fires and other small bright things glow (Time of Day: Light Glow,
+  `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
+  Only what's brighter than its surroundings glows, so broad lit snow and
+  sunny slopes don't wash out.
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,

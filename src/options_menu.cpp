@@ -440,6 +440,10 @@ const std::vector<Tab>& Tabs() {
                         "and buildings each cast one from every light near them. Traced "
                         "through what's on screen (something out of view casts none).",
                         {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}),
+                SliderF("native_bloom", "Light glow",
+                        "With time of day on: a soft glow around lamps, fires and other small "
+                        "bright things, strongest at night (broad lit snow doesn't glow). 0: off.",
+                        "%.1f", 0.0, 2.0),
                 Choices("native_shadow_resolution", "Shadow resolution",
                         "The sun's shadow map (riders, rails, jumps and objects, and the trees "
                         "with Tree shadows; the mountains' shadows are painted into the slopes), "
