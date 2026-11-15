@@ -123,9 +123,28 @@ uint32_t Be32(uint8_t* base, uint32_t a) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
 
-// UTF-16BE text at a (printable, 2..64 characters), or "".
+// UTF-16BE text at a (printable, 2..64 characters, shown with a "u:"), or
+// 8-bit text (3..64), or "".
 std::string Utf16At(rex::memory::Memory* memory, uint8_t* base, uint32_t a) {
   if (!Readable(memory, a, 2)) return {};
+  {
+    std::string s;
+    bool ok = true;
+    for (int i = 0; i < 64; ++i) {
+      if (!Readable(memory, a + i, 1)) {
+        ok = false;
+        break;
+      }
+      const uint8_t c = base[a + i];
+      if (c == 0) break;
+      if (c < 32 || c > 126) {
+        ok = false;
+        break;
+      }
+      s += char(c);
+    }
+    if (ok && s.size() >= 3) return s;
+  }
   std::string s;
   for (int i = 0; i < 64; ++i) {
     if (!Readable(memory, a + i * 2, 2)) return {};
@@ -134,7 +153,7 @@ std::string Utf16At(rex::memory::Memory* memory, uint8_t* base, uint32_t a) {
     if (c < 32 || c > 126) return {};
     s += char(c);
   }
-  return s.size() >= 2 ? s : std::string();
+  return s.size() >= 2 ? "u:" + s : std::string();
 }
 
 void LookAtObject(rex::memory::Memory* memory) {
@@ -187,7 +206,8 @@ void LookAtObject(rex::memory::Memory* memory) {
     }
   }
   const uint32_t state = Be32(base, g_object + 140);
-  if (any && !g_text_logged) {
+  // (Logged while it shows, text found or not.)
+  if ((any || state == 2) && !g_text_logged) {
     g_text_logged = true;
     std::string words;
     for (uint32_t i = 0; i < 64; ++i) words += fmt::format("{:08X} ", Be32(base, g_object + i * 4));
@@ -200,6 +220,14 @@ void LookAtObject(rex::memory::Memory* memory) {
       std::string nw;
       for (uint32_t i = 0; i < 64; ++i) nw += fmt::format("{:08X} ", Be32(base, node + i * 4));
       REXLOG_INFO("XM Radio popup: node +{} {:08X}: {}", field, node, nw);
+      // What its pointers lead to (16 words each).
+      for (uint32_t i = 0; i < 64; ++i) {
+        const uint32_t v = Be32(base, node + i * 4);
+        if (v < 0x40000000u || v >= 0xC0000000u || !Readable(memory, v, 64)) continue;
+        std::string tw;
+        for (uint32_t k = 0; k < 16; ++k) tw += fmt::format("{:08X} ", Be32(base, v + k * 4));
+        REXLOG_INFO("XM Radio popup:   node +{} word +{} -> {:08X}: {}", field, i * 4, v, tw);
+      }
     }
   }
 }
