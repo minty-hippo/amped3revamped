@@ -5168,15 +5168,15 @@ void main() {
   float cov = Cov(t);
   float pushed = 0.0;
   if (cov < 1.0) {
-    for (int i = 0; i < 24; ++i) {
-      float r = sqrt((float(i) + 0.5) / 24.0) * 7.0;
+    for (int i = 0; i < 32; ++i) {
+      float r = sqrt((float(i) + 0.5) / 32.0) * 10.0;
       float th = float(i) * 2.39996323;
       ivec2 off = ivec2(round(vec2(cos(th), sin(th)) * r));
       if (off == ivec2(0)) continue;
       float c = Cov(t + off);
       if (c <= 0.0) continue;
       vec2 on = Old(m + off);
-      pushed += (max(c - on.r, 0.0) + on.g * 0.8) * (1.0 - r / 8.0);
+      pushed += (max(c - on.r, 0.0) + on.g * 2.2) * (1.0 - r / 11.0);
     }
   }
   float groove = max(old.r, cov);
@@ -9218,7 +9218,7 @@ void Renderer::Impl::TracksUpdate() {
   const double jx = cam_pos_[0] - tracks_last_cam_[0], jy = cam_pos_[1] - tracks_last_cam_[1],
                jz = cam_pos_[2] - tracks_last_cam_[2];
   const bool jump = jx * jx + jy * jy + jz * jz > 150.0 * 150.0;
-  std::memcpy(tracks_last_cam_, cam_pos_, sizeof(tracks_last_cam_));
+  for (int i = 0; i < 3; ++i) tracks_last_cam_[i] = double(cam_pos_[i]);
   const int64_t N = kTracksN, W = kTracksW;
   if (fresh || !tracks_valid_ || jump) {
     // (A new place: another mountain, a restart.)
@@ -9289,18 +9289,17 @@ void Renderer::Impl::TracksUpdate() {
     }
     const double rgt[2] = {f[1], -f[0]};
     const int k = test_frame++;
-    // 0..59 a curve away (0.2 m a frame), then 20 frames skidding sideways
+    // 0..34 a curve away (0.4 m a frame), then 12 frames skidding sideways
     // to a stop.
-    const int kc = std::min(k, 59);
-    double along = 4.0 + 0.2 * kc, side = 2.5 * std::sin(kc * 0.09);
-    double heading = std::atan2(0.2, 2.5 * 0.09 * std::cos(kc * 0.09));  // vs the side axis
+    const int kturn = std::getenv("A3_TEST_TRACKS")[0] == 's' ? 16 : 34;
+    const int kc = std::min(k, kturn);
+    double along = 3.0 + 0.4 * kc, side = 3.0 * std::sin(kc * 0.18) + (std::getenv("A3_TEST_TRACKS")[0] == 's' ? -4.5 : 0.0);
+    const double heading = std::atan2(0.4, 3.0 * 0.18 * std::cos(kc * 0.18));  // from the side axis
     double board = heading;  // along its run
-    if (k >= 60) {
-      const int ks = std::min(k - 60, 20);
-      const double v = 0.2 * (1.0 - ks / 20.0);
-      along += 0.2 * ks * (1.0 - ks / 40.0);
-      side += 0.0;
-      (void)v;
+    if (k > kturn) {
+      const int ks = std::min(k - kturn, 12);
+      along += 0.35 * ks * (1.0 - ks / 24.0);
+      side += 0.35 * ks * (1.0 - ks / 24.0) / std::tan(heading);
       board = heading + 1.45;  // across its run
     }
     // The board's middle and direction in the world, then the window's texels.
@@ -9313,7 +9312,7 @@ void Renderer::Impl::TracksUpdate() {
     tb[2] = float(dx);
     tb[3] = float(dz);
     tb[4] = 0.75f / float(kTracksTexel);
-    tb[5] = 0.14f / float(kTracksTexel);
+    tb[5] = (k > kturn ? 0.2f : 0.14f) / float(kTracksTexel);
     tb[6] = 1.0f;
   }
   const double O[16] = {2.0 / span, 0, 0, -1.0 - 2.0 * x0 / span,
@@ -9322,7 +9321,7 @@ void Renderer::Impl::TracksUpdate() {
                         0, 0, 0, 1};
   DrawIntoSunMap(draws, &tracks_stamp_, O, nullptr);
   // (How much each cut pushes up beside it.)
-  float pc[12] = {float(ox), float(oz), 0.0f, 0.09f};
+  float pc[12] = {float(ox), float(oz), 0.0f, 0.045f};
   std::memcpy(pc + 4, tb, sizeof(tb));
   Barrier();
   FullscreenPass(CopyKind::kTracksMerge, &tracks_tmp_, &tracks_stamp_, &tracks_map_, nullptr, false, pc, 12);
@@ -9378,7 +9377,7 @@ void Renderer::Impl::TracksInputs(const Draw& d, const GpuState& st, Image* albe
   pc[17] = float(double(tracks_cz_ - N / 2) * kTracksTexel);
   pc[18] = float(1.0 / kTracksTexel);
   pc[20] = 0.06f * tracks_;  // a groove's depth (m)
-  pc[21] = 0.1f * tracks_;   // a heap's height
+  pc[21] = 0.22f * tracks_;  // a heap's height (all piled up)
   pc[22] = 1.0f / float(a3->width);
   pc[23] = 1.0f / float(a3->height);
   Barrier();
