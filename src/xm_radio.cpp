@@ -4,6 +4,7 @@
 
 #include "challenges.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -106,9 +107,119 @@ void ScanRefs(rex::memory::Memory* memory) {
   REXLOG_INFO("XM Radio popup: {} pointers found", logged);
 }
 
+// ---- the popup's object, at run time --------------------------------------
+// Its class (sub_8253D970 makes one): vtable 0x82883830; +136, +137 flags,
+// +140 state (2: showing), +144 timer, +148 its animations, +152 / +156 /
+// +160 its text nodes (band, genre, song: sub_8253DC28 looks them up by
+// name). Found by its vtable in the game's heap; its nodes' text found by
+// following their pointers to UTF-16 text.
+constexpr uint32_t kVtable = 0x82883830u;
+uint32_t g_object = 0;
+double g_next_look = 0.0;
+bool g_text_logged = false;
+
+uint32_t Be32(uint8_t* base, uint32_t a) {
+  const uint8_t* p = base + a;
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+
+// UTF-16BE text at a (printable, 2..64 characters), or "".
+std::string Utf16At(rex::memory::Memory* memory, uint8_t* base, uint32_t a) {
+  if (!Readable(memory, a, 2)) return {};
+  std::string s;
+  for (int i = 0; i < 64; ++i) {
+    if (!Readable(memory, a + i * 2, 2)) return {};
+    const uint16_t c = uint16_t(base[a + i * 2] << 8 | base[a + i * 2 + 1]);
+    if (c == 0) break;
+    if (c < 32 || c > 126) return {};
+    s += char(c);
+  }
+  return s.size() >= 2 ? s : std::string();
+}
+
+void LookAtObject(rex::memory::Memory* memory) {
+  uint8_t* base = memory->virtual_membase();
+  if (!g_object) {
+    // Find it: an object whose first word is the class's vtable.
+    for (uint32_t page = 0x40000000u; page < 0x60000000u && !g_object; page += 0x1000u) {
+      if (!Readable(memory, page, 0x1000u)) continue;
+      for (uint32_t i = 0; i < 0x1000u; i += 4) {
+        if (Be32(base, page + i) == kVtable) {
+          g_object = page + i;
+          break;
+        }
+      }
+    }
+    if (!g_object) return;
+    REXLOG_INFO("XM Radio popup: its object at {:08X}", g_object);
+  }
+  if (!Readable(memory, g_object, 0x100)) {
+    g_object = 0;
+    return;
+  }
+  // Each text node: its words, and any that lead to UTF-16 text (directly,
+  // or one pointer further).
+  bool any = false;
+  std::string report;
+  for (uint32_t field : {152u, 156u, 160u}) {
+    const uint32_t node = Be32(base, g_object + field);
+    report += fmt::format(" | +{} node {:08X}:", field, node);
+    if (!node || !Readable(memory, node, 0x100)) continue;
+    for (uint32_t off = 0; off < 0x100; off += 4) {
+      const uint32_t v = Be32(base, node + off);
+      if (v < 0x40000000u || v >= 0xC0000000u) continue;
+      std::string t = Utf16At(memory, base, v);
+      if (!t.empty()) {
+        report += fmt::format(" [+{} -> '{}']", off, t);
+        any = true;
+        continue;
+      }
+      if (!Readable(memory, v, 0x40)) continue;
+      for (uint32_t o2 = 0; o2 < 0x40; o2 += 4) {
+        const uint32_t w = Be32(base, v + o2);
+        if (w < 0x40000000u || w >= 0xC0000000u) continue;
+        t = Utf16At(memory, base, w);
+        if (!t.empty()) {
+          report += fmt::format(" [+{} -> +{} -> '{}']", off, o2, t);
+          any = true;
+        }
+      }
+    }
+  }
+  const uint32_t state = Be32(base, g_object + 140);
+  if (any && !g_text_logged) {
+    g_text_logged = true;
+    std::string words;
+    for (uint32_t i = 0; i < 64; ++i) words += fmt::format("{:08X} ", Be32(base, g_object + i * 4));
+    REXLOG_INFO("XM Radio popup: object {:08X} (state {}): {}", g_object, state, words);
+    REXLOG_INFO("XM Radio popup: text{}", report);
+    // The nodes themselves.
+    for (uint32_t field : {152u, 156u, 160u}) {
+      const uint32_t node = Be32(base, g_object + field);
+      if (!node || !Readable(memory, node, 0x100)) continue;
+      std::string nw;
+      for (uint32_t i = 0; i < 64; ++i) nw += fmt::format("{:08X} ", Be32(base, node + i * 4));
+      REXLOG_INFO("XM Radio popup: node +{} {:08X}: {}", field, node, nw);
+    }
+  }
+}
+
 }  // namespace
 
 void Tick() {
+  // On a mountain, every couple of seconds: the popup's object and its text.
+  if (g_scanned && !g_text_logged) {
+    if (auto* memory = GuestMemory(); memory && !challenges::LoadedLevel().empty()) {
+      const double now = double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count()) /
+                         1000.0;
+      if (now >= g_next_look) {
+        g_next_look = now + 2.0;
+        LookAtObject(memory);
+      }
+    }
+  }
   if (g_scanned && !g_scanned_refs) {
     if (auto* memory = GuestMemory(); memory && !challenges::LoadedLevel().empty()) {
       g_scanned_refs = true;
