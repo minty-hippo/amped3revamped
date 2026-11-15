@@ -3089,7 +3089,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   if (light_seen_ && !tiling_.width && tex_base == scene_base_) {
     composite_seen_ = true;
     // (This frame's trails into the kept tracks, once.)
-    if (!tracks_draws_.empty()) TracksUpdate();
+    if (!tracks_draws_.empty() || (tracks_ > 0.0f && std::getenv("A3_TEST_TRACKS"))) TracksUpdate();
   }
   if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky || eye) && light_seen_ &&
       !tiling_.width &&
@@ -5139,9 +5139,18 @@ void main() {
   copy_fs_[43] = CompileBuiltin("builtin_tracks_merge", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D stamp;   // 1: nothing
 layout(set = 0, binding = 1) uniform sampler2D tracks;  // r groove, g pushed up
-layout(push_constant) uniform Merge { vec4 a; } pc;     // the window's corner in the map, filled, push
+layout(push_constant) uniform Merge {
+  vec4 a;  // the window's corner in the map, filled, push
+  vec4 b;  // (test, A3_TEST_TRACKS: a board instead of the stamp) its middle (window texels), along it
+  vec4 c;  // half its length and width (texels), on
+} pc;
 layout(location = 0) out vec4 o;
 float Cov(ivec2 t) {
+  if (pc.c.z > 0.5) {
+    vec2 r = vec2(t) + 0.5 - pc.b.xy;
+    vec2 l = vec2(dot(r, pc.b.zw), dot(r, vec2(-pc.b.w, pc.b.z)));
+    return all(lessThan(abs(l), pc.c.xy)) ? 1.0 : 0.0;
+  }
   ivec2 n = textureSize(stamp, 0);
   if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, n))) return 0.0;
   return texelFetch(stamp, t, 0).r < 1.0 ? 1.0 : 0.0;
@@ -9234,10 +9243,10 @@ void Renderer::Impl::TracksUpdate() {
     last = now;
     if (TodOn()) pending += std::clamp(tod_.snow, 0.0f, 1.0f) * dt / 90.0f;
     if (pending > 0.03f) {
-      float pc[4] = {0.0f, -1.0f, std::min(pending, 1.0f), 0.0f};
+      float pc[12] = {0.0f, -1.0f, std::min(pending, 1.0f), 0.0f};
       Barrier();
       FullscreenPass(CopyKind::kTracksMerge, &tracks_scratch_, &tracks_stamp_, &tracks_map_, nullptr,
-                     false, pc, 4);
+                     false, pc, 12);
       Barrier();
       VkImageCopy all{};
       all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -9249,7 +9258,11 @@ void Renderer::Impl::TracksUpdate() {
       pending = 0.0f;
     }
   }
-  if (draws.empty()) {
+  // (Test: a board ridden ahead of the camera, curving, then skidding to a
+  // stop: A3_TEST_TRACKS, the frames counted.)
+  static int test_frame = 0;
+  const bool test = std::getenv("A3_TEST_TRACKS") != nullptr;
+  if (draws.empty() && !test) {
     dyn_ = DynState{};
     return;
   }
@@ -9262,15 +9275,57 @@ void Renderer::Impl::TracksUpdate() {
   const float far_depth[4] = {0, 0, 0, 0};
   ClearImage(&tracks_stamp_, far_depth, 1.0f, 0, false, true, true);
   FlushPendingClears();
+  float tb[8] = {};
+  if (test) {
+    // The camera's forward on the ground, and right.
+    double f[2] = {0, 1};
+    {
+      double v[4] = {};
+      const double n[4] = {0, 0, 0.5, 1};
+      for (int r = 0; r < 4; ++r) for (int k = 0; k < 4; ++k) v[r] += inv_vp_[r * 4 + k] * n[k];
+      const double fx = v[0] / v[3] - cam_pos_[0], fz = v[2] / v[3] - cam_pos_[2];
+      const double fl = std::sqrt(fx * fx + fz * fz);
+      if (fl > 1e-6) f[0] = fx / fl, f[1] = fz / fl;
+    }
+    const double rgt[2] = {f[1], -f[0]};
+    const int k = test_frame++;
+    // 0..59 a curve away (0.2 m a frame), then 20 frames skidding sideways
+    // to a stop.
+    const int kc = std::min(k, 59);
+    double along = 4.0 + 0.2 * kc, side = 2.5 * std::sin(kc * 0.09);
+    double heading = std::atan2(0.2, 2.5 * 0.09 * std::cos(kc * 0.09));  // vs the side axis
+    double board = heading;  // along its run
+    if (k >= 60) {
+      const int ks = std::min(k - 60, 20);
+      const double v = 0.2 * (1.0 - ks / 20.0);
+      along += 0.2 * ks * (1.0 - ks / 40.0);
+      side += 0.0;
+      (void)v;
+      board = heading + 1.45;  // across its run
+    }
+    // The board's middle and direction in the world, then the window's texels.
+    const double wx = cam_pos_[0] + f[0] * along + rgt[0] * side;
+    const double wz = cam_pos_[2] + f[1] * along + rgt[1] * side;
+    const double dside = std::cos(board), dalong = std::sin(board);
+    double dx = f[0] * dalong + rgt[0] * dside, dz = f[1] * dalong + rgt[1] * dside;
+    tb[0] = float((wx - x0) / kTracksTexel);
+    tb[1] = float((wz - z0) / kTracksTexel);
+    tb[2] = float(dx);
+    tb[3] = float(dz);
+    tb[4] = 0.75f / float(kTracksTexel);
+    tb[5] = 0.14f / float(kTracksTexel);
+    tb[6] = 1.0f;
+  }
   const double O[16] = {2.0 / span, 0, 0, -1.0 - 2.0 * x0 / span,
                         0, 0, 2.0 / span, -1.0 - 2.0 * z0 / span,
                         0, -1.0 / 1000.0, 0, 0.5 + cam_pos_[1] / 1000.0,
                         0, 0, 0, 1};
   DrawIntoSunMap(draws, &tracks_stamp_, O, nullptr);
   // (How much each cut pushes up beside it.)
-  float pc[4] = {float(ox), float(oz), 0.0f, 0.09f};
+  float pc[12] = {float(ox), float(oz), 0.0f, 0.09f};
+  std::memcpy(pc + 4, tb, sizeof(tb));
   Barrier();
-  FullscreenPass(CopyKind::kTracksMerge, &tracks_tmp_, &tracks_stamp_, &tracks_map_, nullptr, false, pc, 4);
+  FullscreenPass(CopyKind::kTracksMerge, &tracks_tmp_, &tracks_stamp_, &tracks_map_, nullptr, false, pc, 12);
   Barrier();
   VkImageCopy r{};
   r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
