@@ -523,6 +523,11 @@ bool Translator::Run(TranslateResult& out) {
        "  vec2 rt_inv_size;     // 1 / render target size in pixels\n"
        "  vec4 tex_scale[8];    // per binding (VS 0..15, PS 16..31): its image's scale\n"
        "  mat4 reproject;       // VS, XE_FLAG_REPROJECT: applied to the clip position\n"
+       "  mat4 wind_m;          // VS, wind (wind2.x > 0): the draw's c0..c3 (its space -> clip)\n"
+       "  mat4 wind_minv;       // and back (clip -> where the vertex was placed from)\n"
+       "  vec4 wind;            // its direction there (x, z), how hard (m), the clock (s)\n"
+       "  vec4 wind2;           // how it moves (1 leaves, 2 a tree, 3 cloth), units a metre,\n"
+       "                        // a seed, last frame's clock offset (s)\n"
        "} xe_sys;\n";
   g += "const uint XE_FLAG_XY_DIVIDED = 1u;      // position.xy already divided by w\n"
        "const uint XE_FLAG_Z_DIVIDED = 2u;       // position.z already divided by w\n"
@@ -738,6 +743,50 @@ uint xe_vertex_index() {
   g += "void xe_program() {\n";
   g += body_;
   g += "}\n\n";
+  if (vs()) {
+    // Wind (docs/native-shaders.md): the vertex moved in the space the draw's
+    // c0..c3 take it from (the world, or the object's own), so it moves with
+    // whatever placed it.
+    g += R"(vec4 xe_wind(vec4 p, float t) {
+  if (xe_sys.wind2.x <= 0.0) return p;
+  vec4 q = xe_sys.wind_minv * p;
+  if (abs(q.w) < 1e-6) return p;
+  vec3 v = q.xyz / q.w;
+  float u = max(xe_sys.wind2.y, 1e-4);  // units a metre
+  vec3 m = v / u;                        // metres
+  vec2 dir = xe_sys.wind.xy;
+  float k = xe_sys.wind.z;
+  float seed = xe_sys.wind2.z;
+  vec3 off = vec3(0.0);
+  int mode = int(xe_sys.wind2.x + 0.5);
+  float ph = dot(m, vec3(0.31, 0.19, 0.27)) + seed;
+  // Gusts: slow swells, the same over a stretch of the mountain.
+  float gust = 0.6 + 0.4 * sin(t * 0.83 + dot(m.xz, vec2(0.021, 0.017)) + seed * 0.1) *
+                     sin(t * 0.37 + 1.3);
+  if (mode == 1) {
+    // Leaves and needles: a sway with the wind and a quick flutter.
+    off.xz = dir * k * 0.05 * gust + k * 0.02 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
+    off.y = k * 0.012 * sin(t * 2.9 + ph * 4.3);
+  } else if (mode == 2) {
+    // A tree: bending with the wind from its foot (more the higher), its
+    // branches fluttering.
+    float h = max(m.y, 0.0);
+    float bend = h * h * 0.0016 * k * gust;
+    off.xz = dir * bend + bend * 0.25 * vec2(sin(t * 1.4 + seed), cos(t * 1.1 + seed));
+    off.y = -0.15 * bend * bend / max(h, 0.5);
+    off.xz += k * 0.012 * min(h, 6.0) / 6.0 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
+  } else {
+    // Cloth (a banner, a flag): blown out with the wind, rippling across.
+    float wave = sin(t * (4.5 + 0.3 * k) - dot(m, vec3(2.1, 1.3, 2.1)) + seed);
+    vec3 side = vec3(-dir.y, 0.0, dir.x);
+    off = (vec3(dir.x, 0.0, dir.y) * (0.04 * k * gust) + side * 0.03 * k * wave);
+    off.y = 0.01 * k * wave;
+  }
+  return p + xe_sys.wind_m * vec4(off * u, 0.0);
+}
+
+)";
+  }
   if (options_.velocity && vs()) {
     // The same program reading last frame's constants.
     std::string prev = body_;
@@ -752,11 +801,13 @@ uint xe_vertex_index() {
     g += "void xe_program_prev() {\n";
     g += prev;
     g += "}\n\n";
-    g += "vec4 xe_clip() {\n"
+    g += "float xe_wind_t;\n"
+         "vec4 xe_clip() {\n"
          "  precise vec4 p = xe_pos;\n"
          "  if ((xe_sys.flags & XE_FLAG_W_RECIPROCAL) != 0u) p.w = 1.0 / p.w;\n"
          "  if ((xe_sys.flags & XE_FLAG_XY_DIVIDED) != 0u) p.xy *= p.w;\n"
          "  if ((xe_sys.flags & XE_FLAG_Z_DIVIDED) != 0u) p.z *= p.w;\n"
+         "  p = xe_wind(p, xe_wind_t);\n"
          "  if ((xe_sys.flags & XE_FLAG_REPROJECT) != 0u) p = xe_sys.reproject * p;\n"
          "  p.xyz = p.xyz * xe_sys.ndc_scale.xyz + xe_sys.ndc_offset.xyz * p.w;\n"
          "  return p;\n"
@@ -772,11 +823,13 @@ uint xe_vertex_index() {
     g += "void main() {\n"
          "  xe_reset();\n"
          "  xe_program();\n"
+         "  xe_wind_t = xe_sys.wind.w;\n"
          "  precise vec4 p = xe_clip();\n"
          "  gl_Position = p;\n"
          "  xe_vcur = p;\n"
          "  xe_reset();\n"
          "  xe_program_prev();\n"
+         "  xe_wind_t = xe_sys.wind.w - xe_sys.wind2.w;\n"
          "  xe_vprev = xe_clip();\n"
          "  gl_PointSize = xe_sys.point_size * xe_sys.res_scale;\n"
          "}\n";
@@ -797,6 +850,7 @@ uint xe_vertex_index() {
   if ((xe_sys.flags & XE_FLAG_W_RECIPROCAL) != 0u) p.w = 1.0 / p.w;
   if ((xe_sys.flags & XE_FLAG_XY_DIVIDED) != 0u) p.xy *= p.w;
   if ((xe_sys.flags & XE_FLAG_Z_DIVIDED) != 0u) p.z *= p.w;
+  p = xe_wind(p, xe_sys.wind.w);
   if ((xe_sys.flags & XE_FLAG_REPROJECT) != 0u) p = xe_sys.reproject * p;
   p.xyz = p.xyz * xe_sys.ndc_scale.xyz + xe_sys.ndc_offset.xyz * p.w;
   gl_Position = p;

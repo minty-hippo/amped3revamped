@@ -428,6 +428,10 @@ const std::vector<Tab>& Tabs() {
                         "Changing: each spell lasts a few minutes and eases into the next.",
                         {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"},
                          {"5", "Blizzard"}}),
+                Toggle("native_wind_sway", "Wind in the trees",
+                       "With time of day on: the trees and their foliage sway in the wind, gently "
+                       "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "
+                       "across)."),
                 Choices("native_night_light_shadows", "Night light shadows",
                         "Shadows from the lamps, floodlights and fires: riders, trees, posts "
                         "and buildings each cast one from every light near them. Traced "

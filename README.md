@@ -435,6 +435,12 @@ that rule against a save that has the pass.
   behind what's in front of them, lit by the sky and by the night lights
   near them); and now and then a blizzard (strong wind streaking the snow
   sideways, the fog closing in to a few dozen metres). Or one of them fixed.
+  The wind moves the trees (Time of Day: Wind in the Trees,
+  `native_wind_sway`): their foliage sways with it and flutters, whole trees
+  (the clustered and distant ones) bend from their foot, each its own way,
+  gusts sweeping across; gently when calm, hard in a blizzard. Their
+  shadows move with them, and the motion blur and upscaler see the
+  movement.
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,

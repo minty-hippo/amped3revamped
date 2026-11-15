@@ -189,6 +189,9 @@ REXCVAR_DEFINE_INT32(native_weather, 1, "GPU",
                      "grey skies, snow showers, now and then a blizzard); 2: clear; 3: overcast; "
                      "4: snowing; 5: blizzard")
     .range(0, 5);
+REXCVAR_DEFINE_BOOL(native_wind_sway, true, "GPU",
+                    "Time of day: the wind moves the trees and their foliage (gently when "
+                    "calm, hard in a blizzard)");
 REXCVAR_DEFINE_DOUBLE(native_weather_minutes, 6.0, "GPU",
                       "Time of day, changing weather: about how many minutes each spell lasts")
     .range(1.0, 120.0);
@@ -2294,6 +2297,7 @@ void WorkerMain() {
               tod.snow = g_weather.snow;
               tod.wind[0] = float(std::cos(g_weather.wind_angle) * g_weather.wind);
               tod.wind[1] = float(std::sin(g_weather.wind_angle) * g_weather.wind);
+              tod.sway = REXCVAR_GET(native_wind_sway);
               // The fog closing in: heavy snow a few hundred metres, a
               // blizzard a few dozen.
               if (g_weather.mist > 0.002f) {

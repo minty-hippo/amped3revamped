@@ -97,6 +97,7 @@ const std::vector<Tab>& Tabs() {
            {"native_tod_night_light", "Night Brightness", Kind::kSlider, 0.2, 3.0, 0.1},
            {"native_weather", "Weather", Kind::kStops, 0, 0, 0,
             {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"}, {"5", "Blizzard"}}},
+           {"native_wind_sway", "Wind in the Trees"},
            {"native_weather_minutes", "Weather Spells", Kind::kStops, 0, 0, 0,
             {{"2", "2 min"}, {"6", "6 min"}, {"15", "15 min"}, {"40", "40 min"}}},
            {"native_night_light_shadows", "Night Light Shadows", Kind::kStops, 0, 0, 0,

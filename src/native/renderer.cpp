@@ -1020,6 +1020,10 @@ struct SystemConstants {  // std140 layout of XeSystem
   float rt_inv_size[2];      // 1 / render target size (std140: the array starts at 80)
   float tex_scale[32];       // per binding (VS 0..15, PS 16..31): 1, or the image's scale
   float reproject[16];       // VS, XE_FLAG_REPROJECT (16384): column-major mat4
+  float wind_m[16];          // VS, wind (wind2[0] > 0): c0..c3 (column-major)
+  float wind_minv[16];       // its inverse
+  float wind[4];             // direction (x, z) in its space, strength (m), clock (s)
+  float wind2[4];            // mode (1 leaves, 2 tree, 3 cloth), units a metre, seed, dt
 };
 static_assert(offsetof(SystemConstants, tex_scale) == 80, "XeSystem std140 layout");
 
@@ -1035,6 +1039,16 @@ constexpr uint64_t kLightingPixelShader = 0xC17CD159D811B298ull;
 bool IsShadowCaster(uint64_t vs_hash) {
   return vs_hash == 0x5919B6B651142594ull || vs_hash == 0x9BAF953BF548C874ull ||
          vs_hash == 0xBEF747C713765676ull || vs_hash == 0x8D6CC76801E89D1Aull;
+}
+// Wind (time of day): how a draw's vertices move, by its vertex shader.
+// 1: leaves and needles in world space (c0..c3 the view-projection: the
+// trees' foliage cards; their trunks stay); 2: a whole tree placed by
+// c0..c3 (object -> clip: the clustered and distant trees), bending from its
+// foot. 0: not moved.
+int WindMode(uint64_t vs_hash) {
+  if (vs_hash == 0x9BAF953BF548C874ull) return 1;
+  if (vs_hash == 0x8D6CC76801E89D1Aull) return 2;
+  return 0;
 }
 // The snow trails' vertex shader (it projects into the shadow map, c9-c12).
 constexpr uint64_t kTrailVertexShader = 0xCBEB0B975321F043ull;
@@ -2034,6 +2048,12 @@ struct Renderer::Impl {
   Image* FoggedScene(Image* scene);
   // Weather: falling snow over the scene (tod_.snow), hidden behind what's
   // in front of each flake.
+  // Wind on the trees (SetWind per draw): on with the time of day; its
+  // velocity (m/s, world x / z) and clock, last frame's clock.
+  bool wind_on_ = false;
+  float wind_vel_[2] = {};
+  double wind_t_ = 0.0, wind_prev_t_ = 0.0;
+  void SetWind(SystemConstants& sys, const GpuState& st, int mode);
   bool snow_done_ = false;
   Image* snow_result_ = nullptr;
   Image snow_img_;
@@ -8370,6 +8390,65 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
   return ao_result_;
 }
 
+void Renderer::Impl::SetWind(SystemConstants& sys, const GpuState& st, int mode) {
+  // c0..c3: rows of the draw's own space -> clip.
+  double M[16], Mi[16];
+  for (int i = 0; i < 16; ++i) {
+    float f;
+    std::memcpy(&f, &st.vs_consts[i], 4);
+    M[i] = f;
+  }
+  if (!Invert4(M, Mi)) return;
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      sys.wind_m[c * 4 + r] = float(M[r * 4 + c]);  // column-major
+      sys.wind_minv[c * 4 + r] = float(Mi[r * 4 + c]);
+    }
+  }
+  const double speed = std::sqrt(double(wind_vel_[0]) * wind_vel_[0] + double(wind_vel_[1]) * wind_vel_[1]);
+  if (speed < 0.05) return;
+  double dir[2] = {wind_vel_[0] / speed, wind_vel_[1] / speed};
+  double units = 1.0, seed = 0.0;
+  if (mode != 1) {
+    // Placed by c0..c3: its space -> the world (last frame's view; only its
+    // axes and scale are wanted), the wind into its axes.
+    const double zs = sys.ndc_scale[2], zo = sys.ndc_offset[2];
+    const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -zs, 1.0 - zo, 0, 0, 0, 1};
+    double KM[16], W[16];
+    Mul4(K, M, KM);
+    Mul4(game_inv_vp_, KM, W);
+    const double w = W[15];
+    if (std::fabs(w) < 1e-9) return;
+    double ax[3][3];  // the object's axes in the world (columns)
+    for (int j = 0; j < 3; ++j) {
+      for (int r = 0; r < 3; ++r) ax[j][r] = (W[r * 4 + j] - W[r * 4 + 3] * W[12 + j] / w) / w;
+    }
+    const double len_y = std::sqrt(ax[1][0] * ax[1][0] + ax[1][1] * ax[1][1] + ax[1][2] * ax[1][2]);
+    if (!(len_y > 1e-6)) return;
+    units = 1.0 / len_y;  // its units a metre
+    // The wind along its own x and z (as a direction).
+    double dx = (ax[0][0] * dir[0] + ax[0][2] * dir[1]), dz = (ax[2][0] * dir[0] + ax[2][2] * dir[1]);
+    const double lx = ax[0][0] * ax[0][0] + ax[0][1] * ax[0][1] + ax[0][2] * ax[0][2];
+    const double lz = ax[2][0] * ax[2][0] + ax[2][1] * ax[2][1] + ax[2][2] * ax[2][2];
+    dx /= std::max(lx, 1e-12);
+    dz /= std::max(lz, 1e-12);
+    const double l = std::sqrt(dx * dx + dz * dz);
+    if (l < 1e-9) return;
+    dir[0] = dx / l;
+    dir[1] = dz / l;
+    // (Each tree its own phase: by where it stands.)
+    seed = std::fmod(std::fabs(W[3] / w * 0.37 + W[11] / w * 0.53), 6.2832);
+  }
+  sys.wind[0] = float(dir[0]);
+  sys.wind[1] = float(dir[1]);
+  sys.wind[2] = float(std::min(speed, 16.0) * 0.25);  // how hard
+  sys.wind[3] = float(std::fmod(wind_t_, 1000.0));
+  sys.wind2[0] = float(mode);
+  sys.wind2[1] = float(units);
+  sys.wind2[2] = float(seed);
+  sys.wind2[3] = float(std::clamp(wind_t_ - wind_prev_t_, 0.0, 0.25));
+}
+
 Image* Renderer::Impl::SnowScene(Image* scene) {
   if (snow_done_) return snow_result_;
   snow_done_ = true;
@@ -9896,6 +9975,12 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     return;
   }
   if (ps->info.ucode_hash == kLightingPixelShader && !light_seen_) NoteLightingPass(d, st);
+  // Diagnostics: A3_SKIP_VS=<hash>[,<hash>...] not drawn (which draws are what).
+  if (static const char* skip = std::getenv("A3_SKIP_VS"); skip) {
+    char hx[24];
+    std::snprintf(hx, sizeof(hx), "%016llx", (unsigned long long)vs->info.ucode_hash);
+    if (std::strstr(skip, hx)) return;
+  }
   mark(0);
 
   // Render targets.
@@ -10165,6 +10250,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       sys.flags |= 16384u;  // XE_FLAG_REPROJECT
     }
   }
+  // Wind: trees, foliage and cloth swaying (WindMode).
+  if (const int wm = wind_on_ ? WindMode(vs->info.ucode_hash) : 0) SetWind(sys, st, wm);
   sys.rt_inv_size[0] = 1.0f / float(rt_w);
   sys.rt_inv_size[1] = 1.0f / float(rt_h);
   sys.param_gen_register = (st.reg(0x2180) & (1u << 18)) ? ((st.reg(0x2181) >> 8) & 0xFF) : 255;
@@ -10723,6 +10810,14 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
         }
       }
     }
+  }
+  if (Diag("winddiag") && !light_seen_ && tiling_.width && depth && (st.reg(0x2200) & 6) == 6) {
+    float c[16];
+    std::memcpy(c, st.vs_consts.data(), 64);
+    std::fprintf(stderr, "wind: vs %016llx ps %016llx a2c %d at %d count %u caster %d c0 %.3f %.3f %.3f %.3f c3 %.3f %.3f %.3f %.3f\n",
+                 (unsigned long long)vs->info.ucode_hash, (unsigned long long)ps->info.ucode_hash,
+                 int((st.reg(0x2202) >> 4) & 1), int((st.reg(0x2202) >> 3) & 1), d.count,
+                 int(IsShadowCaster(vs->info.ucode_hash)), c[0], c[1], c[2], c[3], c[12], c[13], c[14], c[15]);
   }
   // Night lights on every copy of an object (SetCollectInstances): the scene
   // pass's draws with an object -> clip matrix in c0..c3, kept to be turned
@@ -12382,7 +12477,18 @@ Renderer::~Renderer() = default;
 const std::string& Renderer::device_name() const { return impl_->gpu_.device_name; }
 
 void Renderer::SetMapClouds(bool on) { impl_->map_clouds_ = on; }
-void Renderer::SetTimeOfDay(const TimeOfDay& tod) { impl_->tod_ = tod; }
+void Renderer::SetTimeOfDay(const TimeOfDay& tod) {
+  auto& im = *impl_;
+  im.tod_ = tod;
+  // The wind on the trees: its clock (this frame's and last's, for the
+  // motion vectors).
+  im.wind_on_ = tod.on && tod.sway && !im.Diag("nowind");
+  im.wind_vel_[0] = tod.wind[0];
+  im.wind_vel_[1] = tod.wind[1];
+  im.wind_prev_t_ = im.wind_t_;
+  im.wind_t_ = tod.seconds;
+  if (im.wind_t_ < im.wind_prev_t_ || im.wind_t_ - im.wind_prev_t_ > 0.25) im.wind_prev_t_ = im.wind_t_;
+}
 void Renderer::SetNightLights(const std::vector<NightLight>& lights) { impl_->lights_ = lights; }
 uint64_t Renderer::MountainKey() const {
   if (!impl_->tod_layout_.valid) return 0;
