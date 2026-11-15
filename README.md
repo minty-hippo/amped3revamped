@@ -435,6 +435,10 @@ worked out from that, so it fits each mountain's own look.
     the hour's sun into a fine map around the camera (a couple of cm a texel),
     as a screen mask the lighting and the snow trails read in place of the
     game's shadow map;
+  - riders and characters in the shade: of the world (trees, slopes,
+    buildings), of other riders and objects (a lift chair overhead, a rail),
+    and of themselves (an arm on the body), all from the hour's sun (with
+    World Shadows baked);
   - the world (terrain, trees, props): the World Shadows maps drawn from the
     hour's sun and baked into the slopes around the camera as it goes (not
     saved; the saved bakes are for the mountain's own sun). Needs World

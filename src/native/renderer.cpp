@@ -1487,6 +1487,7 @@ struct Renderer::Impl {
   void CenterProbe(Image* depth);
   void CenterRead();
   double tod_mask_rows_[12] = {};  // c6, c7, c9
+  double tod_Om_[16] = {};         // the casters' map's rows (world -> its ndc, depth)
   bool baked_ok_ = false;
   void BakeWorldShadows(const Draw& d, const GpuState& st, const double H[16], bool bake);
   void ShiftMap(Image* map, Image* scratch, int64_t dx, int64_t dy);
@@ -5361,7 +5362,10 @@ void main() {
   }
   // Themselves (and the riders, rails, objects the game casts): its map.
   float self_sh = 0.0;
-  if (pc.p.y > 0.0) {
+  // (p.y < 0: the map's depth grows away from the sun, 1 = nothing.)
+  bool away_up = pc.p.y < 0.0;
+  float dpm = abs(pc.p.y);
+  if (dpm > 0.0) {
     // Looked up a little off the surface, along its normal (and towards
     // the sun): a surface steep to the sun crosses several of the map's
     // depths within a texel, and compared at the surface itself it shades
@@ -5370,11 +5374,15 @@ void main() {
     vec4 m0 = pc.l * P;
     vec4 m1 = pc.l * vec4(P.xyz + vec3(1.0, 0.0, 0.0), 1.0);
     float texel_m = 1.0 / max(length((m1.xy / m1.w - m0.xy / m0.w) * vec2(zn)), 1e-3);  // metres per texel
-    vec3 off = (n * 0.75 - fd * 0.25) * texel_m;
+    // (The time of day's map: texels of a few cm, finer than the
+    // surface's normal from the depth is sure: a few cm off at least.)
+    vec3 off = away_up ? (n * 1.0 - fd * 0.5) * max(texel_m, 0.05) : (n * 0.75 - fd * 0.25) * texel_m;
     vec4 m = pc.l * vec4(P.xyz + off, 1.0);
     vec3 s = m.xyz / m.w;  // texel u, v (0..1) and depth
     if (all(greaterThan(s.xy, vec2(0.0))) && all(lessThan(s.xy, vec2(1.0)))) {
-      float bias = (0.08 + 0.25 * (1.0 - clamp(ndl, 0.0, 1.0))) * pc.p.y;
+      // (The time of day's map is finer: a little more, against stripes.)
+      float bias = (away_up ? 0.12 + 0.3 * (1.0 - clamp(ndl, 0.0, 1.0))
+                            : 0.08 + 0.25 * (1.0 - clamp(ndl, 0.0, 1.0))) * dpm;
       // Each tap the four texels around it, weighted by how near it is to
       // each (as a comparison sampler filters): one texel's yes or no per tap
       // flipped from pixel to pixel as the rider moved, and showed as
@@ -5387,7 +5395,7 @@ void main() {
                        texelFetch(zo, clamp(t + ivec2(1, 0), ivec2(0), zn - 1), 0).r,
                        texelFetch(zo, clamp(t + ivec2(0, 1), ivec2(0), zn - 1), 0).r,
                        texelFetch(zo, clamp(t + ivec2(1, 1), ivec2(0), zn - 1), 0).r);
-        vec4 hit = step(vec4(s.z + bias), z4);
+        vec4 hit = away_up ? step(z4, vec4(s.z - bias)) : step(vec4(s.z + bias), z4);
         self_sh += mix(mix(hit.x, hit.y, fr.x), mix(hit.z, hit.w, fr.x), fr.y) / 16.0;
       }
     }
@@ -7567,16 +7575,35 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
     for (int i = 0; i < 4; ++i) sp[i] = bake_c5_[i];
     for (int i = 0; i < 3; ++i) sp[4 + i] = float(sun_f_[i]);
   }
-  const bool self = sun_depth_per_m_ > 0.0 && sun_depth_ok_ && !Diag("noselfshadow");
+  // Themselves, and in the shade of other riders and objects: the game's
+  // shadow map; with the time of day, the casters' map from the hour's sun
+  // (its depth the other way: nearer the sun, less; told by a negative
+  // depth per metre).
+  const bool tod_self = TodOn() && tod_mask_ok_ && !Diag("noselfshadow");
+  const bool self = tod_self || (sun_depth_per_m_ > 0.0 && sun_depth_ok_ && !Diag("noselfshadow"));
+  double L[16] = {};
+  if (tod_self) {
+    for (int c = 0; c < 4; ++c) {
+      L[0 * 4 + c] = 0.5 * tod_Om_[0 * 4 + c];
+      L[1 * 4 + c] = 0.5 * tod_Om_[1 * 4 + c];
+      L[2 * 4 + c] = tod_Om_[2 * 4 + c];
+    }
+    L[0 * 4 + 3] += 0.5;
+    L[1 * 4 + 3] += 0.5;
+    L[15] = 1.0;
+  } else if (self) {
+    std::memcpy(L, sun_tex_from_world_, sizeof(L));
+  }
   for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) sp[12 + c * 4 + r] = float(self ? sun_tex_from_world_[r * 4 + c] : 0.0);
+    for (int c = 0; c < 4; ++c) sp[12 + c * 4 + r] = float(L[r * 4 + c]);
   }
   sp[28] = 0.04f * std::max(shadow_softness_, 0.25f);
-  sp[29] = self ? float(sun_depth_per_m_) : 0.0f;
+  sp[29] = tod_self ? float(-1.0 / kSunDepth) : self ? float(sun_depth_per_m_) : 0.0f;
   sp[30] = 0.5f;  // how much of their light the shade takes
   sp[31] = from_baked ? 2.0f : Diag("moverdbg") ? 1.0f : 0.0f;
   FullscreenPass(CopyKind::kMoverShade, &movers_shade_, &movers_pos_, &sun_env_,
-                 self ? &sun_zo_ : nullptr, false, sp, 32, nullptr, from_baked ? &baked_ : nullptr);
+                 tod_self ? &tod_movers_map_ : self ? &sun_zo_ : nullptr, false, sp, 32, nullptr,
+                 from_baked ? &baked_ : nullptr);
   // Evened out across each surface (both ways), then applied.
   const float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
   FullscreenPass(CopyKind::kMoverBlur, &movers_blur_, &movers_shade_, &movers_pos_, nullptr, false, bx, 4);
@@ -8051,6 +8078,7 @@ void Renderer::Impl::TodShadows() {
     for (int i = 0; i < 4; ++i) Om[2 * 4 + i] = sun_O_[2 * 4 + i];
     Om[15] = 1.0;
   }
+  std::memcpy(tod_Om_, Om, sizeof(Om));
   if (sun_light_ok_ && Invert4(sun_light_vp_, Vinv)) {
     DrawIntoSunMap(draws, &tod_movers_map_, Om, Vinv);
     EndRendering();
@@ -11502,7 +11530,7 @@ std::vector<RenderedImage> Renderer::AllImages() const {
   if (impl_->baked_.image && impl_->Diag("dumpbake")) out.push_back(Describe(&impl_->baked_));
   if (impl_->Diag("dumptod")) {
     out.clear();
-    for (auto* im : {&impl_->tod_mask_, &impl_->tod_movers_map_, &impl_->sun_env_}) {
+    for (auto* im : {&impl_->tod_mask_, &impl_->tod_movers_map_, &impl_->movers_shade_}) {
       if (im->image) out.push_back(Describe(im));
     }
   }
