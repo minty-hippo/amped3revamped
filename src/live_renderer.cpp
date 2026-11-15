@@ -191,6 +191,10 @@ REXCVAR_DEFINE_INT32(native_weather, 1, "GPU",
                      "grey skies, snow showers, now and then a blizzard); 2: clear; 3: overcast; "
                      "4: snowing; 5: blizzard")
     .range(0, 5);
+REXCVAR_DEFINE_STRING(native_wind_cloth, "", "GPU",
+                      "Time of day: more banners and flags for the wind to move, beyond the "
+                      "known ones: their textures' hashes (16 hex digits each, as the texture "
+                      "pack names them), separated by commas");
 REXCVAR_DEFINE_BOOL(native_wind_sway, true, "GPU",
                     "Time of day: the wind moves the trees and their foliage (gently when "
                     "calm, hard in a blizzard)");
@@ -2345,6 +2349,24 @@ void WorkerMain() {
             }
           }
           renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)));
+          {
+            // (Read again only when it changes.)
+            static std::string cloth_text = "\x01";
+            const std::string now = REXCVAR_GET(native_wind_cloth);
+            if (now != cloth_text) {
+              cloth_text = now;
+              std::vector<uint64_t> hashes;
+              size_t at = 0;
+              while (at < now.size()) {
+                size_t end = now.find_first_of(", ;", at);
+                if (end == std::string::npos) end = now.size();
+                const std::string tok = now.substr(at, end - at);
+                if (tok.size() >= 16) hashes.push_back(std::strtoull(tok.substr(tok.size() - 16).c_str(), nullptr, 16));
+                at = end + 1;
+              }
+              renderer->SetClothTextures(hashes);
+            }
+          }
           renderer->SetEyeAdaptation(revamped ? float(REXCVAR_GET(native_eye_adaptation)) : 0.0f);
           g_tod_hour = tod.on ? float(tod_hour) : -1.0f;
         }

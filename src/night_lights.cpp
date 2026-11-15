@@ -35,6 +35,7 @@ constexpr Kind kKinds[] = {
     {"Floodlight", {0.86f, 0.92f, 1.0f}, 34.0f, 1.6f},
     {"Window", {1.0f, 0.66f, 0.32f}, 5.0f, 0.6f},
     {"Campfire", {1.0f, 0.52f, 0.2f}, 10.0f, 1.2f},
+    {"Street light", {1.0f, 0.84f, 0.62f}, 22.0f, 1.7f},
 };
 constexpr int kKindCount = int(sizeof(kKinds) / sizeof(kKinds[0]));
 
@@ -116,7 +117,7 @@ bool ReadLight(std::istringstream& ss, Light* l) {
   int kind;
   float d[3];
   if (ss >> kind >> d[0] >> d[1] >> d[2]) {
-    l->kind = std::clamp(kind, 0, 3);
+    l->kind = std::clamp(kind, 0, kKindCount - 1);
     std::memcpy(l->dir, d, sizeof(d));
   }
   return true;
@@ -139,7 +140,7 @@ void Load(uint64_t key) {
         t.mesh = std::stoull(mesh, nullptr, 16);
         int kind;
         if (ss >> kind >> t.local_dir[0] >> t.local_dir[1] >> t.local_dir[2]) {
-          t.light.kind = std::clamp(kind, 0, 3);
+          t.light.kind = std::clamp(kind, 0, kKindCount - 1);
         }
         g_s.templates.push_back(t);
       }
@@ -387,6 +388,16 @@ bool AimedLight(Light* l) {
       l->dir[2] = out[2];
       Tilt(l->dir, g_pitch);  // (a sloping wall, a roof light)
       break;
+    case 4: {
+      // A street light: a 7.5 m pole standing where aimed, its head on an
+      // arm 1.3 m out over the way (toward the camera, turned), lighting
+      // down. Its dir: from the pole's foot up to the head.
+      l->dir[0] = out[0] * 1.3f;
+      l->dir[1] = 7.5f;
+      l->dir[2] = out[2] * 1.3f;
+      for (int i = 0; i < 3; ++i) l->pos[i] = p[i] + l->dir[i];
+      break;
+    }
     default:
       // A campfire: on the ground (its light over the logs).
       std::memcpy(l->pos, p, sizeof(p));
@@ -508,7 +519,7 @@ std::string Describe() {
   if (!g_pick.on) return "";
   const Light* l = Picked();
   if (!l) return "";
-  std::string s = kKinds[std::clamp(l->kind, 0, 3)].name;
+  std::string s = kKinds[std::clamp(l->kind, 0, kKindCount - 1)].name;
   if (g_pick.every) {
     int n = 0;
     for (const Found& f : g_s.found) n += f.tmpl == g_pick.index ? 1 : 0;
@@ -642,8 +653,9 @@ std::string Rotate(float degrees) {
   Remember();
   if (!g_pick.every) {
     Light& l = g_s.lights[g_pick.index];
-    if (l.kind == 0) {
-      // A bulb: its arm swings round where it's mounted.
+    if (l.kind == 0 || l.kind == 4) {
+      // A bulb: its arm swings round where it's mounted (a street light's
+      // head round its pole).
       float base[3];
       for (int i = 0; i < 3; ++i) base[i] = l.pos[i] - l.dir[i];
       TurnY(l.dir, degrees);
@@ -655,7 +667,7 @@ std::string Rotate(float degrees) {
   } else {
     // Every copy: turned in the object's own space (about its up).
     Template& t = g_s.templates[g_pick.index];
-    if (t.light.kind == 0) {
+    if (t.light.kind == 0 || t.light.kind == 4) {
       float base[3];
       for (int i = 0; i < 3; ++i) base[i] = t.local[i] - t.local_dir[i];
       TurnY(t.local_dir, degrees);

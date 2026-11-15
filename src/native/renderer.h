@@ -328,7 +328,8 @@ class Renderer {
     float radius = 12.0f;     // metres it reaches
     float intensity = 1.0f;
     // 0 a lamp (a hanging bulb), 1 a floodlight (shining along dir), 2 a
-    // window (the wall's own texture lit up, facing dir), 3 a campfire.
+    // window (the wall's own texture lit up, facing dir), 3 a campfire, 4 a
+    // street light (a pole: dir from its foot up to the head, lighting down).
     int kind = 0;
     float dir[3] = {0.0f, -1.0f, 0.0f};
     bool preview = false;   // where one would go (the light editor): ghostly, lit by day too
@@ -361,6 +362,9 @@ class Renderer {
   // through the depth on screen (the world, riders, objects: anything drawn,
   // moving or not). 0 off, 1 on, 2 finer.
   void SetLightShadows(int quality);
+  // More cloth for the wind (banners, flags) beyond those known: their
+  // textures' ContentHash (as replacement files are named).
+  void SetClothTextures(const std::vector<uint64_t>& hashes);
   float Exposure() const;  // the exposure in use (1: none)
   // Whether the game has its trail map open (game state 7), each frame: the
   // map clouds play only for cuts to or from it (not, say, the camera cut of a

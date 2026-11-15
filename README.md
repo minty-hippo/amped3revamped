@@ -442,7 +442,9 @@ that rule against a save that has the pass.
   The wind moves the trees (Time of Day: Wind in the Trees,
   `native_wind_sway`): their foliage sways with it and flutters, whole trees
   (the clustered and distant ones) bend from their foot, each its own way,
-  gusts sweeping across; gently when calm, hard in a blizzard. Their
+  gusts sweeping across; gently when calm, hard in a blizzard. Banners
+  billow and ripple too (those known by their texture: Northstar's so far;
+  more can be added by their texture hashes in `native_wind_cloth`). Their
   shadows move with them, and the motion blur and upscaler see the
   movement.
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
@@ -496,7 +498,7 @@ that rule against a save that has the pass.
   |---|---|---|
   | Place one | A | Enter |
   | On every copy of the object (each lift tower, post, chair, building: copies light up as they come into view and follow objects that move) | Y | O |
-  | Kind (lamp, floodlight, window, campfire) | X | J |
+  | Kind (lamp, floodlight, window, campfire, street light: a 7.5 m pole standing where aimed) | X | J |
   | Turn (the preview or the picked light) | D-pad left / right | , . |
   | Tilt up / down (a floodlight's aim, a lamp's arm, a window's slope) | D-pad up / down | [ ] |
   | Color (warm, daylight, cool, amber, red, green, blue, purple, pink) | R3 | K |

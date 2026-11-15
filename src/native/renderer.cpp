@@ -1050,6 +1050,21 @@ int WindMode(uint64_t vs_hash) {
   if (vs_hash == 0x8D6CC76801E89D1Aull) return 2;
   return 0;
 }
+// Cloth: banners and flags, told by their texture (ContentHash), among the
+// world's static meshes (vertex shader 5919...: c0..c3 the view-projection)
+// and its placed props (bef7...: c0..c3 their world matrix). 3 / 4.
+constexpr uint64_t kWorldMeshVs = 0x5919B6B651142594ull, kPropVs = 0xBEF747C713765676ull;
+bool IsCloth(uint64_t content, const std::vector<uint64_t>& extra) {
+  static constexpr uint64_t kCloth[] = {
+      0x3744FCC1E61D318Eull,  // Northstar: the Method banners
+      0x62E4858827629B7Dull,  // the 2K Sports banners
+      0x95241613D9084EE7ull,  // the red banner
+  };
+  for (uint64_t c : kCloth) {
+    if (c == content) return true;
+  }
+  return std::find(extra.begin(), extra.end(), content) != extra.end();
+}
 // The snow trails' vertex shader (it projects into the shadow map, c9-c12).
 constexpr uint64_t kTrailVertexShader = 0xCBEB0B975321F043ull;
 // The shadow map's blur (two passes over the map read as 8_8_8_8).
@@ -1262,6 +1277,34 @@ struct Renderer::Impl {
   // The scale_id each surface (TargetKey without scale) was last drawn or
   // cleared at.
   std::map<TargetKey, uint32_t> target_last_scale_;
+  // A draw's texture (fetch constant fc) by its contents' hash (TextureHash,
+  // as replacements are named): 0 if it has none.
+  uint64_t DrawTextureHash(const Draw& draw, const GpuState& st, uint32_t fc) {
+    amped3::native::TextureFetch tf;
+    std::memcpy(tf.words, FetchWords(draw, fc, st), sizeof(tf.words));
+    for (const auto& t : draw.textures) {
+      if (t.slot == fc) return TextureHash(t.data, tf);
+    }
+    return 0;
+  }
+  // A draw's texture by its content (ContentHash: stable across sessions),
+  // once it's been loaded (0 before, or not block-compressed).
+  uint64_t DrawContentHash(const Draw& draw, const GpuState& st, uint32_t fc) {
+    amped3::native::TextureFetch tf;
+    std::memcpy(tf.words, FetchWords(draw, fc, st), sizeof(tf.words));
+    for (const auto& t : draw.textures) {
+      if (t.slot != fc || t.data.empty()) continue;
+      auto it = textures_.find(TextureKey(t.data, tf));
+      if (it == textures_.end()) return 0;
+      if (!it->second.content_known) {
+        it->second.content_known = true;
+        auto bytes = res_->Read(t.data + ".base");
+        it->second.content = amped3::native::TextureReplacer::ContentHash(tf, bytes.data(), bytes.size());
+      }
+      return it->second.content;
+    }
+    return 0;
+  }
   Image* TextureFor(const Draw& draw, uint32_t fetch_constant, const GpuState& st,
                     std::string* note);
   // `lod_bias`: added to the mip level (sharper textures for a scene drawn
@@ -1671,6 +1714,10 @@ struct Renderer::Impl {
     std::string note;
     size_t bytes = 0;
     uint64_t hash = 0;  // TextureHash
+    // Its base level's ContentHash (as replacements are named; the same
+    // in every session), worked out when first asked (DrawContentHash).
+    uint64_t content = 0;
+    bool content_known = false;
   };
   std::map<std::string, CachedTexture> textures_;
   // Textures first used this frame, read and decoded in parallel by Prepass
@@ -2051,6 +2098,7 @@ struct Renderer::Impl {
   // Wind on the trees (SetWind per draw): on with the time of day; its
   // velocity (m/s, world x / z) and clock, last frame's clock.
   bool wind_on_ = false;
+  std::vector<uint64_t> cloth_extra_;  // SetClothTextures
   float wind_vel_[2] = {};
   double wind_t_ = 0.0, wind_prev_t_ = 0.0;
   void SetWind(SystemConstants& sys, const GpuState& st, int mode);
@@ -5247,6 +5295,23 @@ vec2 Model(int kind, vec3 p) {
     }
     return d;
   }
+  if (kind == 4) {
+    // A street light: a tapered pole on a concrete footing, an arm out at
+    // the top to a long flat head with its lens underneath.
+    vec3 foot = g_arm;
+    vec3 back = normalize(vec3(foot.x, 0.0, foot.z) + vec3(1e-5, 0.0, 0.0));
+    vec3 side = normalize(cross(vec3(0.0, 1.0, 0.0), back));
+    vec3 top = vec3(foot.x, 0.3, foot.z);
+    vec3 q = p - back * 0.1;
+    vec3 hq = vec3(dot(q, side), q.y - 0.06, dot(q, back));
+    vec2 d = vec2(sdRoundBox(hq, vec3(0.15, 0.05, 0.3), 0.05), 6.0);
+    d = opU(d, vec2(sdRoundBox(hq - vec3(0.0, -0.06, -0.02), vec3(0.11, 0.012, 0.22), 0.01), 1.0));
+    d = opU(d, vec2(sdCapsule(p, back * 0.38 + vec3(0.0, 0.08, 0.0), top + back * 0.05, 0.035), 6.0));
+    d = opU(d, vec2(sdTaper(p, foot + vec3(0.0, 0.35, 0.0), top + vec3(0.0, 0.1, 0.0), 0.1, 0.06), 6.0));
+    d = opU(d, vec2(length(p - top - vec3(0.0, 0.1, 0.0)) - 0.07, 0.0));
+    d = opU(d, vec2(sdCylY(p - foot, -0.1, 0.35, 0.22), 3.0));
+    return d;
+  }
   if (kind == 1) {
     // A floodlight: a rounded housing, a bright bezel round the lens, fins
     // behind, a yoke with its pivots, a stem back to the mount.
@@ -5369,6 +5434,7 @@ void main() {
   float hit_t = pix_dist;
   vec3 hit_col = vec3(0.0);
   bool hit = false;
+  vec3 surf = vec3(0.0);  // the lights on the surface drawn (hidden by a fitting)
   for (int e = 0; e < tile_n; ++e) {
     int slot = e + 1;
     vec4 tv = texelFetch(lights, tile_base + ivec2(0, slot / 4), 0);
@@ -5399,8 +5465,8 @@ void main() {
     vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
     vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
     int code = int(ld.w + 0.5);
-    int kind = code & 3;
-    bool preview = (code & 4) != 0, selected = (code & 8) != 0;
+    int kind = code & 7;
+    bool preview = (code & 8) != 0, selected = (code & 16) != 0;
     // How lit: after dark; a preview shows its light by day too.
     float kk = preview ? max(k, 0.6) : k;
     vec3 axis = normalize(ld.xyz);
@@ -5426,11 +5492,11 @@ void main() {
         vec3 l3 = vec3(dot(rel, rt), rel.y, dot(rel, nrm));
         if (abs(l3.x) < 0.65 && abs(l3.y) < 0.55 && abs(l3.z) < 0.4) {
           float edge = smoothstep(0.65, 0.58, abs(l3.x)) * smoothstep(0.55, 0.48, abs(l3.y));
-          add += (alb * col * 2.4 + col * 0.18) * edge;
+          surf += (alb * col * 2.4 + col * 0.18) * edge;
           // (The panel's outline while previewed or picked.)
           if (preview || selected) {
             float rim = max(smoothstep(0.55, 0.65, abs(l3.x)), smoothstep(0.45, 0.55, abs(l3.y)));
-            add += (preview ? vec3(0.3, 0.8, 1.0) : vec3(1.0, 0.85, 0.2)) * rim *
+            surf += (preview ? vec3(0.3, 0.8, 1.0) : vec3(1.0, 0.85, 0.2)) * rim *
                    (0.35 + 0.2 * sin(pc.b.x * 6.0));
           }
         }
@@ -5439,6 +5505,9 @@ void main() {
         float x = dist / lp.w;
         float fall = (1.0 - x * x) * (1.0 - x * x) / (1.0 + dist * dist * 0.06);
         float ndl = max(dot(N, dl / max(dist, 1e-3)), 0.0) * 0.8 + 0.2;
+        if (kind == 4) {  // a street light: down and round from its head
+          fall *= smoothstep(-0.35, 0.25, dot(-dl / max(dist, 1e-3), vec3(0.0, -1.0, 0.0))) * 1.25 + 0.04;
+        }
         if (kind == 1) {  // a floodlight: a cone along its direction
           fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), axis)) * 1.4 + 0.04;
         }
@@ -5463,7 +5532,7 @@ void main() {
           if (pc.b.w > 0.5) g_dbg = vec4(sv, rider ? 1.0 : 0.0, fall, 1.0);
           lit *= mix(0.08, 1.0, sv);
         }
-        add += lit;
+        surf += lit;
       }
     }
     // The glow in the air round the bulb, the lens, the flames.
@@ -5502,7 +5571,7 @@ void main() {
     }
     // The fitting itself (by day too), when the ray passes near it.
     // (How far the fitting reaches from its light: a lamp post down to the ground.)
-    float reach = kind == 0 ? max(0.5, length(g_arm) + 0.3) : (kind == 3 ? 0.8 : 0.6);
+    float reach = kind == 0 || kind == 4 ? max(0.5, length(g_arm) + 0.3) : (kind == 3 ? 0.8 : 0.6);
     if (kind != 2 && t > 0.2 && t < 150.0) {
       float perp = length(to - dir * t);
       if (perp < reach) {
@@ -5580,8 +5649,9 @@ void main() {
     if (uv.x > 0.5) o = vec4(N * 0.5 + 0.5, 1.0);
     return;
   }
-  vec3 base = hit ? hit_col : c.rgb;
-  o = vec4(base + add, c.a);
+  // A fitting in front: solid (the light on what's behind it hidden), the
+  // glows in the air still over it.
+  o = vec4(hit ? hit_col + add : c.rgb + surf + add, c.a);
   if (pc.b.w > 0.5) o = g_dbg;  // (diagnostics: shadow, rider, falloff)
 }
 )", true);
@@ -5687,7 +5757,9 @@ void main() {
         vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
         float x = dist / lp.w;
         float fall = (1.0 - x * x) * (1.0 - x * x) / (1.0 + dist * dist * 0.06);
-        if ((int(ld.w + 0.5) & 3) == 1) fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), normalize(ld.xyz))) * 1.4 + 0.04;
+        const int lk = int(ld.w + 0.5) & 7;
+        if (lk == 4) fall *= smoothstep(-0.35, 0.25, dot(-dl / max(dist, 1e-3), vec3(0.0, -1.0, 0.0))) * 1.25 + 0.04;
+        if (lk == 1) fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), normalize(ld.xyz))) * 1.4 + 0.04;
         fc += lc.rgb * lc.w * dark * fall * 1.2;
       }
     }
@@ -8400,14 +8472,23 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
 }
 
 void Renderer::Impl::SetWind(SystemConstants& sys, const GpuState& st, int mode) {
-  // c0..c3: rows of the draw's own space -> clip.
+  // c0..c3: rows of the draw's own space -> clip. (4: a prop, its c0..c3
+  // its world matrix: the world -> clip from the game's view instead.)
   double M[16], Mi[16];
-  for (int i = 0; i < 16; ++i) {
-    float f;
-    std::memcpy(&f, &st.vs_consts[i], 4);
-    M[i] = f;
+  if (mode == 4) {
+    const double zs = sys.ndc_scale[2], zo = sys.ndc_offset[2];
+    const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -zs, 1.0 - zo, 0, 0, 0, 1};
+    Mul4(game_inv_vp_, K, Mi);
+    if (!Invert4(Mi, M)) return;
+    mode = 3;
+  } else {
+    for (int i = 0; i < 16; ++i) {
+      float f;
+      std::memcpy(&f, &st.vs_consts[i], 4);
+      M[i] = f;
+    }
+    if (!Invert4(M, Mi)) return;
   }
-  if (!Invert4(M, Mi)) return;
   for (int r = 0; r < 4; ++r) {
     for (int c = 0; c < 4; ++c) {
       sys.wind_m[c * 4 + r] = float(M[r * 4 + c]);  // column-major
@@ -8418,7 +8499,7 @@ void Renderer::Impl::SetWind(SystemConstants& sys, const GpuState& st, int mode)
   if (speed < 0.05) return;
   double dir[2] = {wind_vel_[0] / speed, wind_vel_[1] / speed};
   double units = 1.0, seed = 0.0;
-  if (mode != 1) {
+  if (mode == 2) {
     // Placed by c0..c3: its space -> the world (last frame's view; only its
     // axes and scale are wanted), the wind into its axes.
     const double zs = sys.ndc_scale[2], zo = sys.ndc_offset[2];
@@ -9255,7 +9336,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
       c[0] = l.dir[0];
       c[1] = l.dir[1];
       c[2] = l.dir[2];
-      c[3] = float((l.kind & 3) | (l.preview ? 4 : 0) | (l.selected ? 8 : 0));
+      c[3] = float((l.kind & 7) | (l.preview ? 8 : 0) | (l.selected ? 16 : 0));
     }
     // Rows 4, 5: the points afar (ndc x, y, depth, radius in pixels; color).
     for (size_t n = 0; n < sprites.size(); ++n) {
@@ -9989,10 +10070,16 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     return;
   }
   if (ps->info.ucode_hash == kLightingPixelShader && !light_seen_) NoteLightingPass(d, st);
-  // Diagnostics: A3_SKIP_VS=<hash>[,<hash>...] not drawn (which draws are what).
+  // Diagnostics: A3_SKIP_VS=<hash>[,<hash>...] not drawn (which draws are
+  // what); A3_SKIP_TEX the same by the first texture's hash.
   if (static const char* skip = std::getenv("A3_SKIP_VS"); skip) {
     char hx[24];
     std::snprintf(hx, sizeof(hx), "%016llx", (unsigned long long)vs->info.ucode_hash);
+    if (std::strstr(skip, hx)) return;
+  }
+  if (static const char* skip = std::getenv("A3_SKIP_TEX"); skip) {
+    char hx[24];
+    std::snprintf(hx, sizeof(hx), "%016llx", (unsigned long long)DrawTextureHash(d, st, 0));
     if (std::strstr(skip, hx)) return;
   }
   mark(0);
@@ -10265,7 +10352,14 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     }
   }
   // Wind: trees, foliage and cloth swaying (WindMode).
-  if (const int wm = wind_on_ ? WindMode(vs->info.ucode_hash) : 0) SetWind(sys, st, wm);
+  if (wind_on_) {
+    int wm = WindMode(vs->info.ucode_hash);
+    const uint64_t vh = vs->info.ucode_hash;
+    if (!wm && (vh == kWorldMeshVs || vh == kPropVs) && IsCloth(DrawContentHash(d, st, 0), cloth_extra_)) {
+      wm = vh == kWorldMeshVs ? 3 : 4;
+    }
+    if (wm) SetWind(sys, st, wm);
+  }
   sys.rt_inv_size[0] = 1.0f / float(rt_w);
   sys.rt_inv_size[1] = 1.0f / float(rt_h);
   sys.param_gen_register = (st.reg(0x2180) & (1u << 18)) ? ((st.reg(0x2181) >> 8) & 0xFF) : 255;
@@ -10828,8 +10922,10 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   if (Diag("winddiag") && !light_seen_ && tiling_.width && depth && (st.reg(0x2200) & 6) == 6) {
     float c[16];
     std::memcpy(c, st.vs_consts.data(), 64);
-    std::fprintf(stderr, "wind: vs %016llx ps %016llx a2c %d at %d count %u caster %d c0 %.3f %.3f %.3f %.3f c3 %.3f %.3f %.3f %.3f\n",
+    std::fprintf(stderr, "wind: content %016llx vs %016llx ps %016llx tex %016llx a2c %d at %d count %u caster %d c0 %.3f %.3f %.3f %.3f c3 %.3f %.3f %.3f %.3f\n",
+                 (unsigned long long)DrawContentHash(d, st, 0),
                  (unsigned long long)vs->info.ucode_hash, (unsigned long long)ps->info.ucode_hash,
+                 (unsigned long long)DrawTextureHash(d, st, 0),
                  int((st.reg(0x2202) >> 4) & 1), int((st.reg(0x2202) >> 3) & 1), d.count,
                  int(IsShadowCaster(vs->info.ucode_hash)), c[0], c[1], c[2], c[3], c[12], c[13], c[14], c[15]);
   }
@@ -12530,6 +12626,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   }
   return true;
 }
+void Renderer::SetClothTextures(const std::vector<uint64_t>& hashes) { impl_->cloth_extra_ = hashes; }
 void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }
 float Renderer::Exposure() const { return float(impl_->eye_strength_ > 0.0f ? impl_->exposure_ : 1.0); }

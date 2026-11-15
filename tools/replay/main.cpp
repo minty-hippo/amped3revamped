@@ -937,10 +937,10 @@ int main(int argc, char** argv) {
       if (std::getenv("A3_TEST_CLOSE")) {
         // Each kind close in front (the fittings up close).
         lights.clear();
-        const float side[3] = {-2.6f, 1.6f, 3.4f};
-        const int kinds[3] = {0, 1, 3};
+        const float side[4] = {-2.6f, 1.6f, 3.4f, -6.5f};
+        const int kinds[4] = {0, 1, 3, 4};
         const char* only = std::getenv("A3_TEST_ONLY");  // (one kind: its digit)
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 4; ++k) {
           amped3::native::Renderer::NightLight l;
           for (int i = 0; i < 3; ++i) l.pos[i] = g[i] + g[3 + i] * 5.0f + g[6 + i] * side[k];
           l.pos[1] = g[1] - 1.4f;
@@ -954,6 +954,16 @@ int main(int argc, char** argv) {
             l.dir[1] = -0.3f;
             l.pos[1] = g[1] - 0.8f;
             for (int i = 0; i < 3; ++i) l.pos[i] -= g[3 + i] * 1.8f;
+          }
+          if (l.kind == 4) {  // a street light (7.5 m), its head toward the middle
+            const float foot_y = g[1] - 3.3f;
+            for (int i = 0; i < 3; ++i) l.dir[i] = g[6 + i] * 1.3f;
+            l.dir[1] = 7.5f;
+            for (int i = 0; i < 3; ++i) l.pos[i] += g[3 + i] * 16.0f;
+            l.pos[1] = foot_y + 7.5f;
+            for (int i = 0; i < 3; ++i) l.pos[i] += l.dir[i] * (i == 1 ? 0.0f : 1.0f);
+            l.radius = 22.0f;
+            l.intensity = 1.7f;
           }
           if (l.kind == 3) {
             l.pos[1] = g[1] - 2.9f;
