@@ -363,6 +363,9 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                             std::snprintf(b, sizeof(b), " (%02d:%02d)", int(h), int(std::fmod(h, 1.0f) * 60.0f));
                             text += b;
                           }
+                          if (on && *amped3::live::WeatherName()) {
+                            text += std::string(", ") + amped3::live::WeatherName();
+                          }
                           if (on && amped3::night_pass::Locked()) {
                             text = "Time of day: on (Northstar keeps its own hour until you earn the Night Pass)";
                           }

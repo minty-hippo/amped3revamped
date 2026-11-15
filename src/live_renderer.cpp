@@ -43,6 +43,7 @@
 
 #include "live_present.h"
 #include "night_pass.h"
+#include "notice.h"
 #include "perf_overlay.h"
 #include "perf_trace.h"
 #include "thread_qos.h"
@@ -742,6 +743,7 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
   } else if (setting == 0) {
     w.kind = 0;
   } else if (t >= w.next_change) {
+    const int prev_kind = w.kind;
     // What follows what (a blizzard only out of snow or grey skies).
     static constexpr float kNext[4][4] = {
         {0.0f, 0.7f, 0.3f, 0.0f},
@@ -763,6 +765,12 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
     const double len = minutes * 60.0 * (0.5 + Rand(&w.rng)) * (next == 3 ? 0.5 : 1.0);
     w.next_change = t + len;
     REXLOG_INFO("Weather: {}", kWeather[next].name);
+    if (next != prev_kind) {
+      // (What's coming, as it starts to ease in.)
+      static constexpr const char* kComing[4] = {"The sky is clearing", "Clouds are rolling in",
+                                                 "It's starting to snow", "A blizzard is blowing in"};
+      notice::Show(kComing[next]);
+    }
   }
   // Easing toward it: the sky over a minute or so, snow and mist a little
   // quicker, the wind's direction wandering.
@@ -2298,6 +2306,10 @@ void WorkerMain() {
               tod.wind[0] = float(std::cos(g_weather.wind_angle) * g_weather.wind);
               tod.wind[1] = float(std::sin(g_weather.wind_angle) * g_weather.wind);
               tod.sway = REXCVAR_GET(native_wind_sway);
+              // The clouds' clock: faster in the wind.
+              static double cloud_clock = 1.0;
+              if (running) cloud_clock += dt * (0.5 + g_weather.wind / 3.0);
+              tod.cloud_clock = float(std::fmod(cloud_clock, 100000.0) + 1.0);
               // The fog closing in: heavy snow a few hundred metres, a
               // blizzard a few dozen.
               if (g_weather.mist > 0.002f) {

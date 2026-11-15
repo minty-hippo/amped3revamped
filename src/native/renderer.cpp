@@ -2054,6 +2054,14 @@ struct Renderer::Impl {
   float wind_vel_[2] = {};
   double wind_t_ = 0.0, wind_prev_t_ = 0.0;
   void SetWind(SystemConstants& sys, const GpuState& st, int mode);
+  // How far the night lights are on (0..1): after dark, and part way in a
+  // gloomy snowstorm by day (lamps on in a blizzard).
+  double LightsDark() const {
+    if (!TodOn()) return 0.0;
+    const double night = tod::SmoothStep(0.25, 0.85, tod_state_.night);
+    const double gloom = 0.55 * tod::SmoothStep(0.6, 1.0, tod_.overcast) * (0.4 + 0.6 * std::clamp(double(tod_.snow), 0.0, 1.0));
+    return std::max(night, gloom);
+  }
   bool snow_done_ = false;
   Image* snow_result_ = nullptr;
   Image snow_img_;
@@ -5634,7 +5642,8 @@ void main() {
     vec3 pm = cam + dir * r - vel * tt;
     vec3 ci = floor(pm / cell);
     vec3 h = Hash3(ci + float(k) * 31.7);
-    if (h.x > amount * 0.9) continue;
+    // (Fewer up close: a few big flakes, not a curtain.)
+    if (h.x > amount * (0.3 + 0.6 * smoothstep(1.0, 6.0, float(k)))) continue;
     vec3 h2 = Hash3(ci.yzx * 1.7 + 11.3 + float(k));
     vec3 cm = (ci + 0.2 + 0.6 * h2) * cell;
     // (Fluttering as it falls.)
@@ -5658,7 +5667,7 @@ void main() {
     float rad = max(size, tc * pc.t.z * 0.7);
     float f = smoothstep(rad, rad * 0.25, perp) * min(1.0, (size * size) / (rad * rad) * 1.5);
     f /= 1.0 + sqrt(uu) / (12.0 * size);  // (a streak: its light spread along it)
-    f *= smoothstep(0.45, 1.0, tc) * (1.0 - smoothstep(10.0, 14.0, tc));
+    f *= smoothstep(0.6, 1.4, tc) * (1.0 - smoothstep(10.0, 14.0, tc));
     if (f <= 0.0) continue;
     // Lit by the sky, and the lamps near it (each flake bright in a lamp's
     // light).
@@ -8502,12 +8511,16 @@ Image* Renderer::Impl::SnowScene(Image* scene) {
   pc[16] = float(std::fmod(double(tod_.seconds), 600.0));
   pc[17] = amount;
   pc[18] = float(pix);
-  pc[19] = 1.0f + 0.4f * std::clamp(tod_.snow - 0.6f, 0.0f, 0.4f) / 0.4f;  // (big flakes in a heavy fall)
+  pc[19] = 1.0f + 0.2f * std::clamp(tod_.snow - 0.6f, 0.0f, 0.4f) / 0.4f;  // (bigger flakes in a heavy fall)
   // Falling about 1 m/s, carried by the wind; streaked over 1/30 s.
   pc[20] = tod_.wind[0];
   pc[21] = -1.1f - 0.3f * tod_.snow;
   pc[22] = tod_.wind[1];
-  pc[23] = 1.0f / 90.0f;
+  // Streaked over a short exposure (shorter in strong wind: thin lines, not dashes).
+  {
+    const float ws = std::sqrt(tod_.wind[0] * tod_.wind[0] + tod_.wind[1] * tod_.wind[1]);
+    pc[23] = 1.0f / (90.0f + 12.0f * ws);
+  }
   {
     // Lit by the sky (and a little the sun or moon), as the snow on the
     // ground: about its brightness by day, dim at night.
@@ -8654,7 +8667,7 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
     bool preview = false;
     for (const auto& l : lights_) preview |= l.preview || l.selected;
     // (Copies only with a light in view to use them.)
-    Image* alb = TodOn() && !lights_.empty() && (tod_state_.night > 0.25 || preview) &&
+    Image* alb = TodOn() && !lights_.empty() && (LightsDark() > 0.001 || preview) &&
                          !VisibleLights().empty()
                      ? TextureFor(d, 3, st, &n0)
                      : nullptr;
@@ -9092,7 +9105,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   lights_done_ = true;
   lights_result_ = nullptr;
   // (By day too: the fittings show; their light only after dark.)
-  const double dark = TodOn() ? tod::SmoothStep(0.25, 0.85, tod_state_.night) : 0.0;
+  const double dark = LightsDark();
   if (lights_.empty() || !TodOn() || !tod_normal_ ||
       depth->width != scene->width || depth->height != scene->height || scene->samples > 1) {
     return nullptr;
@@ -9383,7 +9396,8 @@ Image* Renderer::Impl::TodSky(Image* scene) {
     pc[16 + i] = float(t.moon.x * (i == 0) + t.moon.y * (i == 1) + t.moon.z * (i == 2));
     pc[20 + i] = sun_dir_painted_[i];
   }
-  pc[3] = tod_.seconds;
+  // (The clouds drift with the wind: their own clock.)
+  pc[3] = tod_.cloud_clock > 0.0f ? tod_.cloud_clock : tod_.seconds;
   pc[7] = float(t.night);
   pc[11] = float(t.stars);
   pc[15] = float(t.sun_disc);
