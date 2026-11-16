@@ -5111,10 +5111,13 @@ void main() {
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D depth;
 layout(set = 0, binding = 2) uniform sampler2D ao;
+layout(set = 0, binding = 3) uniform sampler2D sunlit;   // the sun's shadows (1: lit)
+layout(set = 0, binding = 4) uniform sampler2D normals;  // the scene's (the lighting's)
 layout(push_constant) uniform Apply {
   mat4 m;   // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
   vec4 cam; // camera position, -
   vec4 a;   // 1 / width, 1 / height, debug view (1), -
+  vec4 l;   // toward the sun (or moon), its light over the sky's (0: no split)
 } pc;
 layout(location = 0) out vec4 o;
 void main() {
@@ -5146,6 +5149,15 @@ void main() {
   // None of the four at this pixel's distance: something drawn in front
   // after the occlusion's depth (a rider, snow spray) - left as it is.
   float a = mix(1.0, sum / max(wsum, 1e-6), clamp(wsum * 4.0, 0.0, 1.0));
+  // Occlusion hides the sky's light, not the sun's: where the sun reaches
+  // (lit, facing it) its share of the light is left as it is - sunlit snow
+  // beside a tree isn't dimmed by it, the shaded side is.
+  if (pc.l.w > 0.0) {
+    float lit = texelFetch(sunlit, px, 0).r;
+    vec3 n = normalize(texelFetch(normals, px, 0).xyz * 2.0 - 1.0);
+    float s = lit * max(dot(n, pc.l.xyz), 0.0) * pc.l.w;
+    a = mix(a, 1.0, s / (1.0 + s));
+  }
   o = pc.a.z > 0.5 ? vec4(vec3(a), 1.0) : vec4(c.rgb * a, c.a);
 }
 )", true);
@@ -10346,12 +10358,33 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
   float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
   FullscreenPass(CopyKind::kAoBlur, &ao_img_[1], &ao_img_[0], nullptr, nullptr, false, bx, 4);
   FullscreenPass(CopyKind::kAoBlur, &ao_img_[0], &ao_img_[1], nullptr, nullptr, false, by, 4);
-  float ap[24] = {};
+  float ap[28] = {};
   std::memcpy(ap, pc, sizeof(float) * 20);
   ap[20] = 1.0f / float(w);
   ap[21] = 1.0f / float(h);
   ap[22] = ao_debug_ ? 1.0f : 0.0f;
-  FullscreenPass(CopyKind::kAoApply, &ao_out_img_, scene, depth, &ao_img_[0], false, ap, 24);
+  // (With the time of day: the sun's share left unoccluded.)
+  Image* sunlit = nullptr;
+  Image* normals = nullptr;
+  if (TodOn() && tod_mask_ok_ && tod_normal_ && tod_mask_.width == w && tod_mask_.height == h &&
+      tod_normal_->width == w && tod_normal_->height == h && tod_normal_->samples == 1 && !tod_normal_->depth &&
+      !Diag("aoall")) {
+    const tod::State& t = tod_state_;
+    const double day = tod::SmoothStep(-2.0 * tod::kDeg, 3.0 * tod::kDeg, t.sun_elevation);
+    const double cover = std::clamp(double(tod_.clouds) + (1.0 - tod_.clouds) * tod_.overcast, 0.0, 1.0);
+    const double ratio = 2.2 * day * (1.0 - 0.85 * cover) + 0.6 * (1.0 - day) * t.moon_bright;
+    ap[24] = float(t.light.x);
+    ap[25] = float(t.light.y);
+    ap[26] = float(t.light.z);
+    ap[27] = float(ratio);
+    if (ratio > 0.01) {
+      sunlit = &tod_mask_;
+      normals = tod_normal_;
+    }
+  }
+  if (!sunlit) ap[27] = 0.0f;
+  FullscreenPass(CopyKind::kAoApply, &ao_out_img_, scene, depth, &ao_img_[0], false, ap, 28, nullptr,
+                 sunlit ? sunlit : &dummy_, normals ? normals : &dummy_);
   dyn_ = DynState{};
   ++stats_.ambient_occlusion;
   ao_result_ = &ao_out_img_;
