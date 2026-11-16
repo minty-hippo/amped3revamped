@@ -5501,8 +5501,13 @@ void main() {
   vec2 tc = (P.xz - pc.g.xy) * pc.g.z;
   vec2 n2 = vec2(textureSize(tracks, 0));
   if (any(lessThan(tc, vec2(2.0))) || any(greaterThan(tc, n2 - 2.0))) return;
-  vec3 N = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
+  vec4 nw = texelFetch(normals, ip, 0);
+  vec3 N = normalize(nw.xyz * 2.0 - 1.0);
   if (N.y < 0.4) return;  // the ground (snow), not walls
+  // (Not on what's tagged as something else: rock, wood, metal, paint,
+  // cloth - the surface class in the material byte's top bits.)
+  int cls = (int(nw.w * 255.0 + 0.5) >> 5) & 7;
+  if (cls > 1) return;
   // Parallax: where the view ray meets the tracks' surface (down in a
   // groove, up on a heap or a clump) rather than the flat slope: marched
   // down from above the highest heap to the groove's floor, the first step
