@@ -468,9 +468,8 @@ const std::vector<Tab>& Tabs() {
                 SliderF("native_ice_halo", "Ice halo",
                         "With time of day on: a ring round the sun (22 degrees out) and the sun "
                         "dogs either side of it, when thin high cloud drifts over an otherwise "
-                        "clear sky with the sun low to middling. Also the pillars: a sun pillar "
-                        "with the sun at the horizon in still air, and light pillars over the "
-                        "lamps at night in light snow or frost. 0: never.",
+                        "clear sky with the sun low to middling. Also a sun pillar with the sun "
+                        "at the horizon in still air. 0: never.",
                         "%.1f", 0.0, 2.0),
                 SliderF("native_contact_shadows", "Contact shadows",
                         "With time of day and the sun's shadows on: the shadows of small things "

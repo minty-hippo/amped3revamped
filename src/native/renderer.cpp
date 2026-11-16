@@ -1933,7 +1933,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1974,7 +1974,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[58] = {};  // by CopyKind
+  VkShaderModule copy_fs_[59] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2274,6 +2274,7 @@ struct Renderer::Impl {
   // Time of day turned on or off: the picture eased from the last one shown
   // before to the new over most of a second (TodFade), rather than cut.
   Image fade_img_, fade_out_;
+  Image icons_out_;  // the scene with the event icons kept clear of the effects
   uint64_t fade_copy_frame_ = ~0ull;
   bool fade_last_on_ = false, fade_active_ = false;
   float fade_t_ = 0.0f;
@@ -3379,6 +3380,28 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (radial) {
         if (Image* streaked = RadialScene(scene)) scene = streaked;
         MarkPart("effect: speed blur");
+      }
+      // The event icons kept clear of the lighting effects.
+      if (scene != &sit->second && vel_mask_ && !Diag("noiconkeep")) {
+        Image* vel = Velocities();
+        if (vel && vel->width == scene->width && vel->height == scene->height && scene->samples == 1 &&
+            sit->second.width == scene->width && sit->second.height == scene->height && sit->second.samples == 1) {
+          EndRendering();
+          if (!icons_out_.image || icons_out_.width != scene->width || icons_out_.height != scene->height ||
+              icons_out_.format != scene->format) {
+            if (icons_out_.image) Retire(icons_out_);
+            icons_out_ = gpu_.CreateImage(scene->width, scene->height, scene->format, false, "icons_kept");
+            ToGeneral(cb_, icons_out_);
+          }
+          icons_out_.scaled = scene->scaled;
+          icons_out_.scale = scene->scale;
+          Barrier();
+          float none[4] = {};
+          FullscreenPass(CopyKind::kKeepIcons, &icons_out_, scene, &sit->second, vel, false, none, 4);
+          Barrier();
+          dyn_ = DynState{};
+          scene = &icons_out_;
+        }
       }
       if (Image* faded = TodFade(scene)) scene = faded;
       if (upscaler_) {
@@ -6424,6 +6447,21 @@ void main() {
   o = mix(texelFetch(before, p, 0), texelFetch(now, p, 0), pc.a.x);
 }
 )", true);
+  // The event icons over the events, kept as the game drew them: where the
+  // velocity image's w says an icon is the visible surface (2), the scene
+  // from before the effects.
+  copy_fs_[58] = CompileBuiltin("builtin_keep_icons", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D now;
+layout(set = 0, binding = 1) uniform sampler2D before;
+layout(set = 0, binding = 2) uniform sampler2D motion;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(now, p, 0);
+  float icon = clamp(texelFetch(motion, p, 0).w - 1.0, 0.0, 1.0);
+  o = icon > 0.0 ? mix(c, texelFetch(before, p, 0), icon) : c;
+}
+)", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
   // in low wisps (stretched along the wind, moving with it), a pale veil
   // over the snowy ground, thicker in a gale.
@@ -8039,7 +8077,7 @@ void main() {
   // on other characters (drawn after the lighting pass), 0 on the scenery.
   exempt_ps_.module = CompileBuiltin("builtin_exempt", R"(#version 450
 layout(location = 0) out vec4 o;
-void main() { o = vec4(0.0, 0.0, 0.0, 1.0); }
+void main() { o = vec4(0.0, 0.0, 0.0, 2.0); }  // (2: an event icon; the player's is 1)
 )", true);
   vel_ps_.module = CompileBuiltin("builtin_velocity", R"(#version 450
 layout(set = 0, binding = 0, std140) uniform XeSystem {
@@ -10361,8 +10399,9 @@ Image* Renderer::Impl::BloomScene(Image* scene) {
   if (ghosts) FlareGhosts(&bloom_a_, scene);
   // Light pillars: at night in still air with ice crystals about (light
   // snow, or a clear frost), the lamps' light in columns above them.
+  // (Off: the lamps' columns aren't wanted; diagnostic "lamppillar" for them.)
   float pillar = 0.0f;
-  if (bloom_ > 0.0f && !Diag("nopillar")) {
+  if (bloom_ > 0.0f && Diag("lamppillar")) {
     const double wind = std::hypot(tod_.wind[0], tod_.wind[1]), snow = std::clamp(double(tod_.snow), 0.0, 1.0);
     pillar = float(halo_ * tod::SmoothStep(0.3, 0.8, dark) * (1.0 - tod::SmoothStep(3.0, 7.0, wind)) *
                    (0.35 + 0.65 * tod::SmoothStep(0.02, 0.2, snow)) * (1.0 - tod::SmoothStep(0.5, 0.8, snow)));
@@ -14366,7 +14405,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
                     index_count, sc, bias, rt_w, rt_h);
     }
   }
-  if (blur_scale_ > 0.0f && depth && tiling_.width && max_draws_ == UINT32_MAX &&
+  // (Also with the time of day: where they are, kept clear of its lighting
+  // effects (KeepIcons).)
+  if ((blur_scale_ > 0.0f || TodOn()) && depth && tiling_.width && max_draws_ == UINT32_MAX &&
       (icon_mesh || label) && (depth_ctl & 6) == 6 && !ps->info.writes_depth) {
     MaskExempt(d, st, *vs, *ps, depth, tex_sets, offsets, indexed, index_type, first_index,
                index_count, sc, bias, rt_w, rt_h);
@@ -15326,7 +15367,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &icons_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }

@@ -522,9 +522,7 @@ that rule against a save that has the pass.
   either side at its height.
   The same setting covers the pillars: with the sun just up or just set in
   still air, a sun pillar, its light thrown up in a narrow column that widens
-  and fades upward (a short stub below); and at night, in still air with
-  light snow or a clear frost, light pillars, columns of the lamps' and
-  fires' light above them (with Light Glow on).
+  and fades upward (a short stub below). (The lamps get no pillars.)
   Diamond dust (Diamond Dust, `native_diamond_dust`, 1): on a clear, calm
   day without falling snow, tiny ice crystals adrift in the air near the
   camera, each flashing now and then as it tumbles and catches the sun,
@@ -548,7 +546,7 @@ that rule against a save that has the pass.
   (hills, trees, riders and cloud over it dim it or cut it off, easing over
   a few frames), and fades as the sun leaves the screen. At night the moon
   makes a fainter one (as bright as its phase). Only the sun and moon flare:
-  the lamps and fires don't (their light pillars stay, with the ice halo).
+  the lamps and fires don't.
   Works with Light Glow off too.
   Lens dirt (Lens Dirt, `native_lens_dirt`, 0.4; with the lens flare on):
   dust and smudges on the lens, out of focus (soft discs, a little brighter
