@@ -1933,7 +1933,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1974,7 +1974,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[57] = {};  // by CopyKind
+  VkShaderModule copy_fs_[58] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2271,6 +2271,13 @@ struct Renderer::Impl {
   float contact_ = 0.0f;  // SetContactShadows
   Image dust_out_;
   Image* DustScene(Image* scene);
+  // Time of day turned on or off: the picture eased from the last one shown
+  // before to the new over most of a second (TodFade), rather than cut.
+  Image fade_img_, fade_out_;
+  uint64_t fade_copy_frame_ = ~0ull;
+  bool fade_last_on_ = false, fade_active_ = false;
+  float fade_t_ = 0.0f;
+  Image* TodFade(Image* scene);
   double PixelAngle(uint32_t h) const;  // a pixel's angle at the screen's middle (radians)
   // The sun's (or moon's) sheen (SetSpecular): what the game's lighting
   // leaves out (it has no specular): a glossy highlight by surface (snow:
@@ -3281,7 +3288,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
     // (This frame's trails into the kept tracks, once.)
     if (!tracks_draws_.empty() || (tracks_ > 0.0f && std::getenv("A3_TEST_TRACKS"))) TracksUpdate();
   }
-  if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky || eye) && light_seen_ &&
+  if ((blur || upscaler_ || radial || fog || ao || movers || tod_sky || eye || fade_active_ || fade_last_on_) && light_seen_ &&
       !tiling_.width &&
       tex_base == scene_base_) {
     auto sit = resolved_.find(tex_base);
@@ -3358,6 +3365,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
         if (Image* streaked = RadialScene(scene)) scene = streaked;
         MarkPart("effect: speed blur");
       }
+      if (Image* faded = TodFade(scene)) scene = faded;
       if (upscaler_) {
         if (Image* up = UpscaledScene(scene)) scene = up;
         MarkPart("effect: upscaler");
@@ -6382,6 +6390,18 @@ void main() {
   vec2 puv = vec2(q.x / q.w * 0.5 + 0.5, 0.5 - q.y / q.w * 0.5);
   if (any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) return;
   o = vec4(mix(textureLod(prev, puv, 0.0).r, c, pc.p.x));
+}
+)", true);
+  // Time of day turned on or off: the last picture before eased into the new
+  // (a.x: how far along).
+  copy_fs_[57] = CompileBuiltin("builtin_tod_fade", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D before;
+layout(set = 0, binding = 1) uniform sampler2D now;
+layout(push_constant) uniform Fade { vec4 a; } pc;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  o = mix(texelFetch(before, p, 0), texelFetch(now, p, 0), pc.a.x);
 }
 )", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
@@ -10856,6 +10876,63 @@ double Renderer::Impl::PixelAngle(uint32_t h) const {
   return pix;
 }
 
+// Time of day turned on or off (builtin_tod_fade): the last picture shown
+// before eased into the new over 0.7 s (the camera moves a little meanwhile:
+// too short to tell). Each frame's kept for that.
+Image* Renderer::Impl::TodFade(Image* scene) {
+  if (scene->samples > 1 || scene->depth) return nullptr;
+  const bool on = TodOn();
+  const bool kept = fade_copy_frame_ + 1 == frame_number_ && fade_img_.image &&
+                    fade_img_.width == scene->width && fade_img_.height == scene->height &&
+                    fade_img_.format == scene->format;
+  if (on != fade_last_on_) {
+    fade_last_on_ = on;
+    if (kept && !Diag("nofade")) {
+      fade_active_ = true;
+      fade_t_ = 0.0f;
+    }
+  }
+  EndRendering();
+  auto ensure = [&](Image& im, const char* name) {
+    if (im.image && im.width == scene->width && im.height == scene->height && im.format == scene->format) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(scene->width, scene->height, scene->format, false, name);
+    ToGeneral(cb_, im);
+  };
+  Image* out = nullptr;
+  if (fade_active_ && kept) {
+    fade_t_ += std::clamp(speed_dt_, 0.001f, 0.1f) / 0.7f;
+    if (fade_t_ >= 1.0f) {
+      fade_active_ = false;
+    } else {
+      ensure(fade_out_, "tod_fade");
+      fade_out_.scaled = scene->scaled;
+      fade_out_.scale = scene->scale;
+      const float t = fade_t_ * fade_t_ * (3.0f - 2.0f * fade_t_);
+      float pc[4] = {t, 0, 0, 0};
+      Barrier();
+      FullscreenPass(CopyKind::kTodFade, &fade_out_, &fade_img_, scene, nullptr, false, pc, 4);
+      Barrier();
+      out = &fade_out_;
+    }
+  } else {
+    fade_active_ = false;
+  }
+  // (What's shown kept for the next frame.)
+  ensure(fade_img_, "tod_fade_before");
+  Image* shown = out ? out : scene;
+  VkImageCopy all{};
+  all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  all.extent = {scene->width, scene->height, 1};
+  Barrier();
+  vk::vkCmdCopyImage(cb_, shown->image, VK_IMAGE_LAYOUT_GENERAL, fade_img_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+  Barrier();
+  fade_copy_frame_ = frame_number_;
+  dyn_ = DynState{};
+  return out;
+}
+
 // Diamond dust (builtin_dust): on a clear, calm day, ice crystals in the air
 // glinting in the sun, the most with it low (mornings and evenings).
 Image* Renderer::Impl::DustScene(Image* scene) {
@@ -15105,7 +15182,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }

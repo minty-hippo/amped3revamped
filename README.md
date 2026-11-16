@@ -596,6 +596,8 @@ that rule against a save that has the pass.
   Cover, Night Brightness.
   Setting a new hour while the clock is going winds round to it over a few
   seconds (the sun sweeps across) rather than jumping.
+  Turning time of day on or off (F5 or the menus) eases the picture from the
+  old lighting to the new over most of a second instead of cutting.
 - Smooth as the sun moves: the world's shadows are drawn again for the sun
   every degree and a half or so, and each time the part around the camera
   eases from the old shadows to the new over about a second (the riders'

@@ -1076,6 +1076,12 @@ int main(int argc, char** argv) {
           renderer.SetTimeOfDay(tod);
         }
       }
+      // A3_TOD_TOGGLE=at: the time of day turned off (or on) before repeat
+      // 'at': the change to watch eased over.
+      if (const char* tg = std::getenv("A3_TOD_TOGGLE"); tg && i == std::atoi(tg)) {
+        tod.on = !tod.on;
+        renderer.SetTimeOfDay(tod);
+      }
       stats = renderer.Render(cap, files, max_draws);
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
       if (std::getenv("A3_PICK_SURFACE")) {
