@@ -388,6 +388,9 @@ class Renderer {
   // Lens flare: the sun's (ghosts, a starburst, glare, as much as the sun is
   // seen) and the night lights' (0 off .. 2; 1 natural).
   void SetLensFlare(float strength);
+  // Diamond dust: ice crystals adrift near the camera glinting in the sun,
+  // on clear calm days, the most with the sun low (0 off .. 2).
+  void SetDiamondDust(float strength);
   // Dust and smudges on the lens, lit up with the sun in view (with the
   // lens flare; 0 off .. 2).
   void SetLensDirt(float strength);

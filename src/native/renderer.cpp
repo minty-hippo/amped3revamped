@@ -1926,7 +1926,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1967,7 +1967,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[54] = {};  // by CopyKind
+  VkShaderModule copy_fs_[55] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2250,6 +2250,12 @@ struct Renderer::Impl {
   bool drift_ = false;  // SetDriftingSnow
   float halo_ = 1.0f;     // SetIceHalo
   Image* DriftScene(Image* scene);
+  // Diamond dust (SetDiamondDust): glinting ice crystals adrift near the
+  // camera on clear, calm days, the most with the sun low.
+  float dust_ = 0.0f;
+  Image dust_out_;
+  Image* DustScene(Image* scene);
+  double PixelAngle(uint32_t h) const;  // a pixel's angle at the screen's middle (radians)
   // The sun's (or moon's) sheen (SetSpecular): what the game's lighting
   // leaves out (it has no specular): a glossy highlight by surface (snow:
   // a broad sheen and glints; packed snow and ice a glare toward a low sun;
@@ -3288,6 +3294,10 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (tod_sky && drift_ && std::hypot(tod_.wind[0], tod_.wind[1]) > 5.0f && !Diag("nodrift")) {
         if (Image* drifting = DriftScene(scene)) scene = drifting;
         MarkPart("effect: drifting snow");
+      }
+      if (tod_sky && dust_ > 0.0f) {
+        if (Image* dusty = DustScene(scene)) scene = dusty;
+        MarkPart("effect: diamond dust");
       }
       if (tod_sky && (bloom_ > 0.0f || flare_ > 0.0f)) {
         if (Image* bloomed = BloomScene(scene)) scene = bloomed;
@@ -6088,6 +6098,73 @@ void main() {
     }
     o = vec4(c.rgb + add, c.a);
   }
+}
+)", true);
+  // Diamond dust: on a clear, calm, cold day, tiny ice crystals adrift in
+  // the air near the camera, each a point that flashes as it tumbles and
+  // catches the sun (brightest looking toward it: they scatter forward),
+  // in a grid of cells drifting with the breeze, hidden behind what's drawn.
+  copy_fs_[54] = CompileBuiltin("builtin_dust", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(push_constant) uniform Dust {
+  mat4 m;     // ndc (x, y, 1 - depth, 1) -> world, from the camera
+  vec4 t;     // seconds, how many (0..1), a pixel's angle (radians), -
+  vec4 vel;   // their drift (m/s), camera x
+  vec4 col;   // the sun's light on them, camera y
+  vec4 sun;   // toward the sun, camera z
+} pc;
+layout(location = 0) out vec4 o;
+vec3 Hash3(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(scene, 0));
+  vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec4 mid = pc.m * vec4(ndc, 0.5, 1.0);
+  vec3 dir = normalize(mid.xyz / mid.w);
+  float d = textureLod(depth, uv, 0.0).r;
+  float scene_dist = 1e9;
+  if (d > 0.0) {
+    vec4 wp = pc.m * vec4(ndc, 1.0 - d, 1.0);
+    scene_dist = length(wp.xyz / wp.w);
+  }
+  float tt = pc.t.x;
+  vec3 vel = pc.vel.xyz;
+  vec3 cam = vec3(pc.vel.w, pc.col.w, pc.sun.w);
+  // Plates and columns: mostly forward toward the sun, a little all round.
+  float mu = max(dot(dir, pc.sun.xyz), 0.0);
+  float phase = 0.2 + 2.5 * pow(mu, 6.0) + 6.0 * pow(mu, 60.0);
+  vec3 acc = vec3(0.0);
+  for (int k = 0; k < 14; ++k) {
+    float r = 0.4 * pow(1.28, float(k));  // 0.4 m .. about 10 m
+    float cell = r * 0.12;
+    if (r - cell > scene_dist) break;
+    vec3 pm = cam + dir * r - vel * tt;
+    vec3 ci = floor(pm / cell);
+    vec3 h = Hash3(ci + float(k) * 17.1);
+    if (h.x > pc.t.y * 0.65) continue;
+    vec3 h2 = Hash3(ci.zxy * 1.3 + 5.7 + float(k));
+    vec3 cm = (ci + 0.15 + 0.7 * h2) * cell;
+    // (Wandering as they drift.)
+    cm.x += 0.2 * cell * sin(tt * 0.6 + h.y * 30.0);
+    cm.z += 0.2 * cell * cos(tt * 0.5 + h.z * 30.0);
+    vec3 B = cm + vel * tt - cam;
+    float tc = dot(B, dir);
+    if (tc < 0.3 || abs(tc - r) > cell * 0.5 || tc > scene_dist) continue;
+    float perp = length(B - dir * tc);
+    float rad = max(0.0006, tc * pc.t.z * 0.75);
+    float f = smoothstep(rad, rad * 0.3, perp);
+    if (f <= 0.0) continue;
+    // A flash as a face turns to the sun (each its own tumble).
+    float g = pow(0.5 + 0.5 * sin(tt * (1.5 + 3.0 * h2.x) + h2.y * 40.0), 24.0);
+    float fade = smoothstep(0.3, 0.8, tc) * (1.0 - smoothstep(7.0, 10.0, tc));
+    acc += pc.col.rgb * f * (0.06 + 1.6 * g) * phase * fade;
+  }
+  o = vec4(c.rgb + min(acc, vec3(4.0)), c.a);
 }
 )", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
@@ -10073,25 +10150,7 @@ Image* Renderer::Impl::SnowScene(Image* scene) {
       pc[c * 4 + r] = float(v);
     }
   }
-  // A pixel's angle: the view's height in ndc over the screen's pixels.
-  double pix = 0.0015;
-  {
-    auto ray = [&](double y, double out[3]) {
-      double v[4] = {};
-      const double n[4] = {0.0, y, 0.5, 1.0};
-      for (int r = 0; r < 4; ++r) {
-        for (int k = 0; k < 4; ++k) v[r] += inv_vp_[r * 4 + k] * n[k];
-      }
-      for (int r = 0; r < 3; ++r) out[r] = v[r] / v[3] - cam_pos_[r];
-    };
-    double a[3], b[3];
-    ray(0.0, a);
-    ray(1.0, b);
-    const double la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-    const double d = std::sqrt((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]) +
-                               (b[2] - a[2]) * (b[2] - a[2]));
-    if (la > 1e-9 && d > 0) pix = d / la / (h * 0.5);
-  }
+  const double pix = PixelAngle(h);
   pc[16] = float(std::fmod(double(tod_.seconds), 600.0));
   pc[17] = amount;
   pc[18] = float(pix);
@@ -10431,6 +10490,87 @@ bool Renderer::Impl::VolumeReady(const Image* scene, const Image* depth) const {
   return vol_shadow_ok_ && tod_movers_map_.image && depth && depth->format == VK_FORMAT_R32_SFLOAT &&
          depth->samples == 1 && depth->width == scene->width && depth->height == scene->height &&
          scene->samples == 1;
+}
+
+// A pixel's angle: the view's height in ndc over the screen's pixels.
+double Renderer::Impl::PixelAngle(uint32_t h) const {
+  double pix = 0.0015;
+  auto ray = [&](double y, double out[3]) {
+    double v[4] = {};
+    const double n[4] = {0.0, y, 0.5, 1.0};
+    for (int r = 0; r < 4; ++r) {
+      for (int k = 0; k < 4; ++k) v[r] += inv_vp_[r * 4 + k] * n[k];
+    }
+    for (int r = 0; r < 3; ++r) out[r] = v[r] / v[3] - cam_pos_[r];
+  };
+  double a[3], b[3];
+  ray(0.0, a);
+  ray(1.0, b);
+  const double la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  const double d = std::sqrt((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]) +
+                             (b[2] - a[2]) * (b[2] - a[2]));
+  if (la > 1e-9 && d > 0) pix = d / la / (h * 0.5);
+  return pix;
+}
+
+// Diamond dust (builtin_dust): on a clear, calm day, ice crystals in the air
+// glinting in the sun, the most with it low (mornings and evenings).
+Image* Renderer::Impl::DustScene(Image* scene) {
+  if (!TodOn() || dust_ <= 0.0f || scene->samples > 1 || Diag("nodust")) return nullptr;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples != 1 ||
+      dit->second.width != scene->width || dit->second.height != scene->height) {
+    return nullptr;
+  }
+  const tod::State& t = tod_state_;
+  const double el = t.sun_elevation;
+  const double day = tod::SmoothStep(0.0, 3.0 * tod::kDeg, el);
+  const double low = 0.35 + 0.65 * (1.0 - tod::SmoothStep(15.0 * tod::kDeg, 40.0 * tod::kDeg, el));
+  const double cover = std::clamp(double(tod_.clouds) + (1.0 - tod_.clouds) * tod_.overcast, 0.0, 1.0);
+  const double clear = 1.0 - tod::SmoothStep(0.25, 0.6, cover);
+  const double dry = 1.0 - tod::SmoothStep(0.02, 0.15, double(tod_.snow));
+  const double speed = std::hypot(tod_.wind[0], tod_.wind[1]);
+  const double calm = 1.0 - tod::SmoothStep(4.0, 9.0, speed);
+  const float amount = float(std::min(1.0, dust_ * day * low * clear * dry * calm));
+  if (amount < 0.01f) return nullptr;
+  const uint32_t w = scene->width, h = scene->height;
+  EndRendering();
+  if (!dust_out_.image || dust_out_.width != w || dust_out_.height != h || dust_out_.format != scene->format) {
+    if (dust_out_.image) Retire(dust_out_);
+    dust_out_ = gpu_.CreateImage(w, h, scene->format, false, "dust");
+    ToGeneral(cb_, dust_out_);
+  }
+  dust_out_.scaled = scene->scaled;
+  dust_out_.scale = scene->scale;
+  float pc[32] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) {
+      double v = inv_vp_[r * 4 + c];
+      if (r < 3) v -= cam_pos_[r] * inv_vp_[12 + c];
+      pc[c * 4 + r] = float(v);
+    }
+  }
+  pc[16] = float(std::fmod(double(tod_.seconds), 600.0));
+  pc[17] = amount;
+  pc[18] = float(PixelAngle(h));
+  pc[20] = tod_.wind[0] * 0.6f;
+  pc[21] = -0.12f;
+  pc[22] = tod_.wind[1] * 0.6f;
+  pc[23] = cam_pos_[0];
+  const double e = eye_strength_ > 0.0f ? std::min(exposure_, 2.0) : 1.0;
+  pc[24] = float(t.sun_color.x * e);
+  pc[25] = float(t.sun_color.y * e);
+  pc[26] = float(t.sun_color.z * e);
+  pc[27] = cam_pos_[1];
+  pc[28] = float(t.sun.x);
+  pc[29] = float(t.sun.y);
+  pc[30] = float(t.sun.z);
+  pc[31] = cam_pos_[2];
+  Barrier();
+  FullscreenPass(CopyKind::kDust, &dust_out_, scene, &dit->second, nullptr, false, pc, 32);
+  Barrier();
+  dyn_ = DynState{};
+  return &dust_out_;
 }
 
 // Drifting snow over the ground in a strong wind (builtin_drift).
@@ -14502,7 +14642,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &flare_img_, &flare_tmp_, &flare_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }
@@ -14969,6 +15109,7 @@ void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::cl
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetDriftingSnow(bool on) { impl_->drift_ = on; }
 void Renderer::SetLensFlare(float strength) { impl_->flare_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetDiamondDust(float strength) { impl_->dust_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetLensDirt(float strength) { impl_->lens_dirt_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }

@@ -465,6 +465,7 @@ int main(int argc, char** argv) {
   float bloom = 0.0f;
   float flare = 0.0f;  // --lens-flare strength
   float dirt = 0.0f;   // --lens-dirt strength
+  float dust = 0.0f;   // --diamond-dust strength
   float cloud_shadows = 0.0f;  // --cloud-shadows
   float tracks = 0.0f;  // --tracks
   float volumetric = 0.0f;  // --volumetric
@@ -564,6 +565,8 @@ int main(int argc, char** argv) {
       flare = std::stof(argv[++i]);
     } else if (a == "--lens-dirt" && i + 1 < argc) {
       dirt = std::stof(argv[++i]);
+    } else if (a == "--diamond-dust" && i + 1 < argc) {
+      dust = std::stof(argv[++i]);
     } else if (a == "--tod-cover" && i + 1 < argc) {
       tod.snow_cover = std::stof(argv[++i]);
     } else if (a == "--tod-snow" && i + 1 < argc) {
@@ -884,6 +887,7 @@ int main(int argc, char** argv) {
     renderer.SetBloom(bloom);
     renderer.SetLensFlare(flare);
     renderer.SetLensDirt(dirt);
+    renderer.SetDiamondDust(dust);
   renderer.SetCloudShadows(cloud_shadows);
   renderer.SetSnowTracks(tracks);
   renderer.SetVolumetric(volumetric, volumetric_quality);

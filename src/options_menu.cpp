@@ -469,6 +469,11 @@ const std::vector<Tab>& Tabs() {
                         "dogs either side of it, when thin high cloud drifts over an otherwise "
                         "clear sky with the sun low to middling. 0: never.",
                         "%.1f", 0.0, 2.0),
+                SliderF("native_diamond_dust", "Diamond dust",
+                        "With time of day on: tiny ice crystals adrift in the air that glint as "
+                        "they catch the sun (brightest looking toward it), on clear, calm days "
+                        "without falling snow, the most with the sun low. 0: never.",
+                        "%.1f", 0.0, 2.0),
                 Toggle("native_drifting_snow", "Drifting snow",
                        "With time of day on: in a strong wind (a blizzard), loose snow streams "
                        "along the slopes in low wisps, moving with the wind."),

@@ -520,6 +520,12 @@ that rule against a save that has the pass.
   otherwise clear sky and the sun low to middling, a ring round it 22 degrees
   out (reddish inside, the sky a shade darker within it) and the sun dogs
   either side at its height.
+  Diamond dust (Diamond Dust, `native_diamond_dust`, 1): on a clear, calm
+  day without falling snow, tiny ice crystals adrift in the air near the
+  camera, each flashing now and then as it tumbles and catches the sun,
+  brightest looking toward it (they scatter forward), the most with the sun
+  low in the morning and evening. They drift with the breeze and hide behind
+  what's in front of them.
   Drifting snow (Drifting Snow, `native_drifting_snow`): in a strong wind
   (from about 5 m/s, a blizzard's gale at its thickest) loose snow streams
   along the slopes in low wisps, stretched along the wind and moving with it,
