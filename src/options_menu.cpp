@@ -467,6 +467,9 @@ const std::vector<Tab>& Tabs() {
                 Toggle("native_snow_cover", "Snow settles",
                        "With time of day on: falling snow settles on tree boughs, roofs, rocks and "
                        "props, patchy at first, building over a few minutes, melting once it stops."),
+                Toggle("native_drifting_snow", "Drifting snow",
+                       "With time of day on: in a strong wind (a blizzard), loose snow streams "
+                       "along the slopes in low wisps, moving with the wind."),
                 Toggle("native_wind_sway", "Wind in the trees",
                        "With time of day on: the trees and their foliage sway in the wind, gently "
                        "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "

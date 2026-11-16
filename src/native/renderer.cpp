@@ -1926,7 +1926,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1967,7 +1967,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[52] = {};  // by CopyKind
+  VkShaderModule copy_fs_[53] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2236,6 +2236,9 @@ struct Renderer::Impl {
   float VolumeDensity() const;  // the air's (per metre, at the camera's height)
   bool VolumeOn() const { return volumetric_ > 0.0f && TodOn() && !Diag("novolume"); }
   Image* VolumeScene(Image* scene);
+  Image drift_out_;
+  bool drift_ = false;  // SetDriftingSnow
+  Image* DriftScene(Image* scene);
   // The sun's (or moon's) sheen (SetSpecular): what the game's lighting
   // leaves out (it has no specular): a glossy highlight by surface (snow:
   // a broad sheen and glints; packed snow and ice a glare toward a low sun;
@@ -3270,6 +3273,10 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (tod_sky && tod_.snow > 0.002f) {
         if (Image* snowy = SnowScene(scene)) scene = snowy;
         MarkPart("effect: snow");
+      }
+      if (tod_sky && drift_ && std::hypot(tod_.wind[0], tod_.wind[1]) > 5.0f && !Diag("nodrift")) {
+        if (Image* drifting = DriftScene(scene)) scene = drifting;
+        MarkPart("effect: drifting snow");
       }
       if (tod_sky && bloom_ > 0.0f) {
         if (Image* bloomed = BloomScene(scene)) scene = bloomed;
@@ -5897,6 +5904,62 @@ void main() {
     occ = max(occ, smoothstep(0.0, 0.025, Hs(q) - ray));
   }
   o = vec4(lit * (1.0 - 0.75 * occ));
+}
+)", true);
+  // Drifting snow: in a strong wind the loose snow streams along the slopes
+  // in low wisps (stretched along the wind, moving with it), a pale veil
+  // over the snowy ground, thicker in a gale.
+  copy_fs_[52] = CompileBuiltin("builtin_drift", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(push_constant) uniform Drift {
+  mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
+  vec4 cam;  // camera, seconds
+  vec4 w;    // the wind's direction (x, z), speed (m/s), how much (0..1)
+} pc;
+layout(location = 0) out vec4 o;
+float hash(vec2 p) {
+  p = fract(p * vec2(443.897, 441.423));
+  p += dot(p, p.yx + 19.19);
+  return fract((p.x + p.y) * p.x);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(scene, ip, 0);
+  o = c;
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) return;
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(depth, 0));
+  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  vec3 P = wp.xyz / wp.w;
+  float dist = length(P - pc.cam.xyz);
+  float lum = dot(c.rgb, vec3(0.3, 0.59, 0.11));
+  // (On the snow: light, grey ground; not too near or far.)
+  float snowy = smoothstep(0.25, 0.45, lum) * smoothstep(0.25, 0.1, max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)));
+  float fade = smoothstep(2.0, 6.0, dist) * smoothstep(90.0, 40.0, dist);
+  if (snowy * fade <= 0.0) return;
+  vec2 wd = pc.w.xy;
+  vec2 wn = vec2(-wd.y, wd.x);
+  float t = pc.cam.w;
+  // Along the wind (moving with it, a little slower than the air) and
+  // across it (narrow streaks), two scales.
+  float u = dot(P.xz, wd), v = dot(P.xz, wn);
+  float sp = pc.w.z * 0.7;
+  float n = noise(vec2((u - t * sp) * 0.35, v * 2.2)) * 0.6 +
+            noise(vec2((u - t * sp * 1.3) * 0.9, v * 5.5 + 7.0)) * 0.4;
+  // Gusts: patches that come and go.
+  float g = noise(vec2((u - t * sp * 0.5) * 0.04, v * 0.04));
+  float wisp = smoothstep(0.55 - 0.25 * pc.w.w, 0.85, n) * mix(0.4, 1.0, g);
+  float a = wisp * snowy * fade * pc.w.w * 0.8;
+  // (The streaming snow hides the slope's texture under it: its own even,
+  // light color, a little brighter than the ground's.)
+  vec3 veil = vec3(0.97, 0.98, 1.0) * (lum * 1.12 + 0.04);
+  o = vec4(mix(c.rgb, veil, a), c.a);
 }
 )", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
@@ -10086,6 +10149,45 @@ bool Renderer::Impl::VolumeReady(const Image* scene, const Image* depth) const {
          scene->samples == 1;
 }
 
+// Drifting snow over the ground in a strong wind (builtin_drift).
+Image* Renderer::Impl::DriftScene(Image* scene) {
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples != 1 ||
+      dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1) {
+    return nullptr;
+  }
+  const float speed = std::hypot(tod_.wind[0], tod_.wind[1]);
+  // (From a stiff breeze to a gale: 5 .. 18 m/s.)
+  const float amount = std::clamp((speed - 5.0f) / 13.0f, 0.0f, 1.0f);
+  if (amount <= 0.0f) return nullptr;
+  EndRendering();
+  if (!drift_out_.image || drift_out_.width != scene->width || drift_out_.height != scene->height ||
+      drift_out_.format != scene->format) {
+    if (drift_out_.image) Retire(drift_out_);
+    drift_out_ = gpu_.CreateImage(scene->width, scene->height, scene->format, false, "drift");
+    ToGeneral(cb_, drift_out_);
+  }
+  drift_out_.scaled = scene->scaled;
+  drift_out_.scale = scene->scale;
+  float pc[24] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+  }
+  pc[16] = cam_pos_[0];
+  pc[17] = cam_pos_[1];
+  pc[18] = cam_pos_[2];
+  pc[19] = float(std::fmod(double(tod_.seconds), 3600.0));
+  pc[20] = tod_.wind[0] / speed;
+  pc[21] = tod_.wind[1] / speed;
+  pc[22] = speed;
+  pc[23] = amount;
+  Barrier();
+  FullscreenPass(CopyKind::kDrift, &drift_out_, scene, &dit->second, nullptr, false, pc, 24);
+  Barrier();
+  dyn_ = DynState{};
+  return &drift_out_;
+}
+
 // Volumetric light: the sun's (or moon's) in the air, marched at half size
 // through the shadow maps, then added (builtin_volume / builtin_volume_add;
 // with the fog when it was left to this pass: builtin_fog_volume).
@@ -12739,8 +12841,10 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // pass's terrain, to be drawn again alone (the ground under the casters).
   // Snow tracks: the trails' draws (each trail once: the game draws it in
   // several passes), kept to be drawn again from above.
+  // (Only its colored pass: the game's earlier ones mark the stencil and
+  // alpha with the same strip; RB_COLOR_MASK's RGB on.)
   if (tracks_ > 0.0f && light_seen_ && max_draws_ == UINT32_MAX && vs->info.ucode_hash == kTrailVertexShader &&
-      (d.prim == 4 || d.prim == 5 || d.prim == 6) && tracks_draws_.size() < 64) {
+      (d.prim == 4 || d.prim == 5 || d.prim == 6) && tracks_draws_.size() < 64 && (st.reg(0x2104) & 7u) != 0) {
     uint64_t key = uint64_t(d.count) << 40;
     if (!d.up_vertices.empty()) {
       key ^= std::hash<std::string>{}(d.up_vertices);
@@ -14104,7 +14208,7 @@ Renderer::Impl::~Impl() {
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
-                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_}) {
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -14568,6 +14672,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
 void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
+void Renderer::SetDriftingSnow(bool on) { impl_->drift_ = on; }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::StartSurfacePick() {
   impl_->pick_state_ = 1;

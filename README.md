@@ -339,7 +339,7 @@ lighting, each setting the detailed options under it:
 | Lamp shadows | Off / Low (two nearest lamps) / Medium (every lamp) / High (every lamp, finer) |
 | Atmosphere | Fog / God rays / Volumetric low (quarter size) / high (half) / ultra (finer steps) |
 | Ambient occlusion | Off / On |
-| Surface detail | Low / High (settling snow, snow tracks, cloud shadows, sun sheen) |
+| Surface detail | Low / High (settling snow, snow tracks, cloud shadows, sun sheen, drifting snow) |
 
 The detailed options stay adjustable; a part whose options match none of
 its levels shows Custom, and so does the preset. High is the default.
@@ -514,6 +514,10 @@ that rule against a save that has the pass.
   picker finds the texture through the same tags: a frame listing the
   textures drawn, then one frame per digit of its place in that list, read
   back from the middle of the screen; the sheen pauses for those frames.)
+  Drifting snow (Drifting Snow, `native_drifting_snow`): in a strong wind
+  (from about 5 m/s, a blizzard's gale at its thickest) loose snow streams
+  along the slopes in low wisps, stretched along the wind and moving with it,
+  gusts coming and going, veiling the slope's texture under them.
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and

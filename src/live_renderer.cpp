@@ -261,6 +261,9 @@ REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
                     "Native renderer: light shafts from the sun (or moon) while it's in or near "
                     "view, broken up by clouds, trees and terrain in front of it");
+REXCVAR_DEFINE_BOOL(native_drifting_snow, true, "GPU",
+                    "Time of day: in a strong wind (a blizzard), loose snow streaming along the "
+                    "slopes in low wisps, moving with the wind");
 REXCVAR_DEFINE_DOUBLE(native_sun_sheen, 1.0, "GPU",
                       "Time of day: the sun's (and moon's) sheen on the world, which the game's "
                       "lighting leaves out: a glossy highlight by surface (snow glinting in the "
@@ -2444,6 +2447,7 @@ void WorkerMain() {
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(float(REXCVAR_GET(native_sun_sheen)));
+          renderer->SetDriftingSnow(REXCVAR_GET(native_drifting_snow));
           // The surface picker.
           if (g_pick_request.exchange(false)) {
             renderer->StartSurfacePick();

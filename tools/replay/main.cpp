@@ -880,6 +880,7 @@ int main(int argc, char** argv) {
   renderer.SetSnowTracks(tracks);
   renderer.SetVolumetric(volumetric, volumetric_quality);
   renderer.SetSpecular(specular);
+  renderer.SetDriftingSnow(true);
     renderer.SetCollectInstances(test_lights);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
     if (ao > 0.0f) renderer.SetAmbientOcclusion(ao, ao_debug);

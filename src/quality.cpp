@@ -140,7 +140,9 @@ void SetSurface(int l) {
     SetNum("native_snow_tracks", 0.0);
     SetNum("native_cloud_shadows", 0.0);
     SetNum("native_sun_sheen", 0.0);
+    SetBool("native_drifting_snow", false);
   } else {
+    SetBool("native_drifting_snow", true);
     if (Num("native_snow_tracks") <= 0.0) SetNum("native_snow_tracks", 1.0);
     if (Num("native_cloud_shadows") <= 0.0) SetNum("native_cloud_shadows", 0.5);
     if (Num("native_sun_sheen") <= 0.0) SetNum("native_sun_sheen", 1.0);
@@ -148,9 +150,10 @@ void SetSurface(int l) {
 }
 int MatchSurface() {
   const bool cover = Num("native_snow_cover") > 0.5, tracks = Num("native_snow_tracks") > 0.0,
-             clouds = Num("native_cloud_shadows") > 0.0, sheen = Num("native_sun_sheen") > 0.0;
-  if (!cover && !tracks && !clouds && !sheen) return 0;
-  if (cover && tracks && clouds && sheen) return 1;
+             clouds = Num("native_cloud_shadows") > 0.0, sheen = Num("native_sun_sheen") > 0.0,
+             drift = Num("native_drifting_snow") > 0.5;
+  if (!cover && !tracks && !clouds && !sheen && !drift) return 0;
+  if (cover && tracks && clouds && sheen && drift) return 1;
   return -1;
 }
 
