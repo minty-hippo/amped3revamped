@@ -7110,7 +7110,12 @@ void main() {
         if (shadow_steps > 0 && dot(lit, vec3(1.0)) > 0.004 &&
             (pc.c.y < 0.5 || float(shadowed) < pc.c.y)) {
           ++shadowed;
-          float sv = ShadowTo(P, N, lp.xyz, shadow_steps, pc.a.w > 0.5);
+          // (Fewer steps where the shadow can't show much: a faint light, or
+          // far off where a step covers few pixels.)
+          int steps = shadow_steps;
+          if (dot(lit, vec3(1.0)) < 0.06) steps = max(3, steps / 2);
+          if (pix_dist > 40.0) steps = max(3, (steps * 2) / 3);
+          float sv = ShadowTo(P, N, lp.xyz, steps, pc.a.w > 0.5);
           if (pc.b.w > 0.5) g_dbg = vec4(sv, rider ? 1.0 : 0.0, fall, 1.0);
           lit *= mix(0.08, 1.0, sv);
         }

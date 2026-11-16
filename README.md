@@ -552,6 +552,13 @@ that rule against a save that has the pass.
   dust and smudges on the lens, out of focus (soft discs, a little brighter
   at the rim, and faint smears), that light up when the sun is in view,
   most near it.
+- Ambient occlusion: its far taps read smaller copies of the depth (half to
+  an eighth size), one read each and kept in the cache (it was the dearest
+  effect up close, 6-9 ms a frame on an Arc). With time of day on it dims
+  only the sky's light: where the sun reaches a surface facing it, the sun's
+  share is left as it is, so sunlit snow beside a tree isn't greyed, only
+  the shaded side. Lamp shadows take fewer steps where they can't show much
+  (a faint light, or far off).
 - Contact shadows (Contact Shadows, `native_contact_shadows`, 1; part of Sun
   shadows Medium and High): with time of day and the sun's shadows on, the
   shadows the maps are too coarse for, where a rock, a rail, a jump's lip or
