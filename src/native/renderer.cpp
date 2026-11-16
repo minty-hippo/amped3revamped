@@ -5329,6 +5329,7 @@ layout(push_constant) uniform Apply {
   mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
   vec4 g;   // the map's texel 0 (world x, z), texels per metre, mode
   vec4 s;   // groove depth (m), heap height (m), 1 / width, 1 / height
+  vec4 cam; // the camera (parallax), -
 } pc;
 layout(location = 0) out vec4 o;
 float H(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -5362,6 +5363,18 @@ void main() {
   if (any(lessThan(tc, vec2(2.0))) || any(greaterThan(tc, n2 - 2.0))) return;
   vec3 N = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
   if (N.y < 0.4) return;  // the ground (snow), not walls
+  // Parallax: where the view ray meets the tracks' surface (down in a
+  // groove, up on a heap) rather than the flat slope: a few steps along it,
+  // the heaps hiding the groove's far side at a glancing angle.
+  {
+    vec3 D = normalize(P - pc.cam.xyz);
+    if (D.y < -0.05) {
+      vec2 k = D.xz / max(-D.y, 0.12) * pc.g.z;  // texels a metre down
+      vec2 tp = tc;
+      for (int i = 0; i < 4; ++i) tp = tc - k * Ht(tp);
+      tc = tp;
+    }
+  }
   if (pc.g.w > 2.5) {
     // (Diagnostics: the normals' w, the game's material.)
     float w = texelFetch(normals, ip, 0).w;
@@ -10308,7 +10321,7 @@ void Renderer::Impl::TracksInputs(const Draw& d, const GpuState& st, Image* albe
   tracks_albedo_.scale = a3->scale;
   tracks_normal_.scaled = n4->scaled;
   tracks_normal_.scale = n4->scale;
-  float pc[24] = {};
+  float pc[28] = {};
   for (int c = 0; c < 4; ++c) {
     for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
   }
@@ -10320,12 +10333,15 @@ void Renderer::Impl::TracksInputs(const Draw& d, const GpuState& st, Image* albe
   pc[21] = 0.22f * tracks_;  // a heap's height (all piled up)
   pc[22] = 1.0f / float(a3->width);
   pc[23] = 1.0f / float(a3->height);
+  pc[24] = cam_pos_[0];
+  pc[25] = cam_pos_[1];
+  pc[26] = cam_pos_[2];
   Barrier();
   pc[19] = Diag("matid") ? 3.0f : Diag("tracksshow") ? 2.0f : 0.0f;
-  FullscreenPass(CopyKind::kTracksApply, &tracks_albedo_, albedo_in, n4, &dit->second, false, pc, 24,
+  FullscreenPass(CopyKind::kTracksApply, &tracks_albedo_, albedo_in, n4, &dit->second, false, pc, 28,
                  nullptr, &tracks_map_);
   pc[19] = 1.0f;
-  FullscreenPass(CopyKind::kTracksApply, &tracks_normal_, n4, n4, &dit->second, false, pc, 24, nullptr,
+  FullscreenPass(CopyKind::kTracksApply, &tracks_normal_, n4, n4, &dit->second, false, pc, 28, nullptr,
                  &tracks_map_);
   Barrier();
   dyn_ = DynState{};
