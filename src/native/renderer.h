@@ -388,6 +388,9 @@ class Renderer {
   // Lens flare: the sun's (ghosts, a starburst, glare, as much as the sun is
   // seen) and the night lights' (0 off .. 2; 1 natural).
   void SetLensFlare(float strength);
+  // Dust and smudges on the lens, lit up with the sun in view (with the
+  // lens flare; 0 off .. 2).
+  void SetLensDirt(float strength);
   // The ice halo round the sun (22 degrees) and the sun dogs, in thin high
   // cloud (some cover, a clear sky otherwise). 0: none.
   void SetIceHalo(float strength);

@@ -504,6 +504,10 @@ const std::vector<Tab>& Tabs() {
                         "starburst and the lens's ghosts, cut by hills, trees and cloud), and the "
                         "lamps' and fires' ghosts at night. 0: off, 1: natural.",
                         "%.1f", 0.0, 2.0),
+                SliderF("native_lens_dirt", "Lens dirt",
+                        "With the lens flare on: dust and smudges on the lens that catch the "
+                        "light when the sun is in view. 0: a clean lens.",
+                        "%.1f", 0.0, 2.0),
                 Choices("native_shadow_resolution", "Shadow resolution",
                         "The sun's shadow map (riders, rails, jumps and objects, and the trees "
                         "with Tree shadows; the mountains' shadows are painted into the slopes), "

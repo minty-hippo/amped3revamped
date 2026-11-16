@@ -127,6 +127,7 @@ const std::vector<Tab>& Tabs() {
             {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}},
            {"native_bloom", "Light Glow", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_lens_flare", "Lens Flare", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_lens_dirt", "Lens Dirt", Kind::kSlider, 0.0, 2.0, 0.1},
        }},
       {"Display",
        {

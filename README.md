@@ -536,6 +536,10 @@ that rule against a save that has the pass.
   a few frames), and fades as the sun leaves the screen. At night the lamps
   and fires leave their own faint ghosts, mirrored through the middle from
   the same bright parts the glow uses. Works with Light Glow off too.
+  Lens dirt (Lens Dirt, `native_lens_dirt`, 0.4; with the lens flare on):
+  dust and smudges on the lens, out of focus (soft discs, a little brighter
+  at the rim, and faint smears), that light up when the sun is in view,
+  most near it.
 - Snow tracks (Effects: Snow Tracks, `native_snow_tracks`, 1; works with
   time of day off too): every board's trail (the game's own, which fades
   after a few metres) is pressed into the snow and kept, for a couple of

@@ -2218,6 +2218,7 @@ struct Renderer::Impl {
   // seen (flare_vis_: the sky's share of the sun's disc, eased); and the
   // lamps' and fires' at night, mirrored from the bright parts.
   float flare_ = 0.0f;
+  float lens_dirt_ = 0.0f;  // SetLensDirt: dust on the lens lit by the sun
   Image flare_img_, flare_tmp_, flare_out_, flare_vis_[2];
   uint32_t flare_vis_cur_ = 0;
   Image* FlareScene(Image* scene, bool ghosts_ready);
@@ -5955,7 +5956,7 @@ layout(set = 0, binding = 2) uniform sampler2D aux;    // 0: last frame's; 2: th
 layout(push_constant) uniform Flare {
   vec4 a;  // mode, sun u, sun v, aspect (w / h)
   vec4 b;  // 0: ease, disc radius, near-white from, to; 1: strength, sun masked (0/1); 2: sun color, sun strength
-  vec4 c;  // 2: lights' strength, aperture turn, lights' on (0/1), -
+  vec4 c;  // 2: lights' strength, aperture turn, lights' on (0/1), dirt on the lens
 } pc;
 layout(location = 0) out vec4 o;
 const int kGhosts = 8;
@@ -5977,6 +5978,28 @@ float Noise(vec2 p) {
   vec2 i = floor(p), f = fract(p);
   f = f * f * (3.0 - 2.0 * f);
   return mix(mix(Hash(i), Hash(i + vec2(1, 0)), f.x), mix(Hash(i + vec2(0, 1)), Hash(i + vec2(1, 1)), f.x), f.y);
+}
+// Dust and smudges on the front of the lens (out of focus: soft discs,
+// a little brighter at the rim, and broad faint smears), in screen space.
+float Dirt(vec2 uv, float aspect) {
+  vec2 p = uv * vec2(aspect, 1.0) * 9.0;
+  float d = 0.0;
+  for (int l = 0; l < 2; ++l) {
+    vec2 q = p * (l == 0 ? 1.0 : 2.3) + float(l) * 17.0;
+    vec2 i = floor(q), f = fract(q);
+    for (int y = -1; y <= 1; ++y) {
+      for (int x = -1; x <= 1; ++x) {
+        vec2 o = vec2(x, y), c = i + o;
+        if (Hash(c) < 0.6) continue;
+        vec2 at = o + vec2(Hash(c + 31.0), Hash(c + 71.0));
+        float rad = 0.15 + 0.3 * Hash(c + 5.0);
+        float dd = length(f - at);
+        d += (1.0 - smoothstep(rad * 0.8, rad, dd)) * (0.55 + 0.45 * smoothstep(rad * 0.4, rad, dd)) *
+             (0.3 + 0.7 * Hash(c + 9.0)) * (l == 0 ? 1.0 : 0.5);
+      }
+    }
+  }
+  return d + 0.6 * smoothstep(0.55, 0.85, Noise(p * 0.3 + 3.0));
 }
 // The aperture (six blades): 1 on its edge.
 float Hex(vec2 q) {
@@ -6060,6 +6083,8 @@ void main() {
       float rc = length((uv - 0.5 + off * 0.1) * vec2(aspect, 1.0));
       vec3 ring = exp(-pow((rc - vec3(0.37, 0.355, 0.34)) / 0.012, vec3(2.0)));
       add += ring * col * 0.035 * (1.0 - smoothstep(0.1, 0.5, length(off * vec2(aspect, 1.0))));
+      // The dirt on the lens catching the light: most near the sun.
+      if (pc.c.w > 0.0) add += Dirt(uv, aspect) * col * pc.c.w * (0.04 + 0.4 * exp(-r / 0.25));
     }
     o = vec4(c.rgb + add, c.a);
   }
@@ -10009,7 +10034,7 @@ Image* Renderer::Impl::FlareScene(Image* scene, bool ghosts_ready) {
   }
   float pc[12] = {2.0f, sun_uv[0], sun_uv[1], aspect,
                   float(col.x), float(col.y), float(col.z), sun ? sun_strength * edge : 0.0f,
-                  flare_ * dark, 0.26f, ghosts_ready ? 1.0f : 0.0f, 0.0f};
+                  flare_ * dark, 0.26f, ghosts_ready ? 1.0f : 0.0f, lens_dirt_};
   Barrier();
   FullscreenPass(CopyKind::kFlare, &flare_out_, ghosts_ready ? &flare_img_ : nullptr, scene,
                  sun ? &flare_vis_[flare_vis_cur_] : nullptr, true, pc, 12);
@@ -14944,6 +14969,7 @@ void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::cl
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetDriftingSnow(bool on) { impl_->drift_ = on; }
 void Renderer::SetLensFlare(float strength) { impl_->flare_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetLensDirt(float strength) { impl_->lens_dirt_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::StartSurfacePick() {
