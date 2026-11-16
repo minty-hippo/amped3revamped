@@ -1066,6 +1066,16 @@ int main(int argc, char** argv) {
     PROFILE_ZERO();
     if (std::getenv("A3_PICK_SURFACE")) renderer.StartSurfacePick();
     for (int i = 1; i < repeat; ++i) {
+      // A3_TOD_STEP=hours[,at]: the time of day's hour moved on that much
+      // before repeat 'at' (default 1): a step of the sun to watch eased over.
+      if (const char* st = std::getenv("A3_TOD_STEP")) {
+        int at = 1;
+        if (const char* comma = std::strchr(st, ',')) at = std::atoi(comma + 1);
+        if (i == at) {
+          tod.hour = std::fmod(tod.hour + float(std::atof(st)), 24.0f);
+          renderer.SetTimeOfDay(tod);
+        }
+      }
       stats = renderer.Render(cap, files, max_draws);
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
       if (std::getenv("A3_PICK_SURFACE")) {

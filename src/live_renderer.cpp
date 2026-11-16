@@ -2402,11 +2402,30 @@ void WorkerMain() {
         {
           // Time of day: the clock runs while the game does (not paused, not
           // in a replay); it starts at the setting's hour, or the mountain's.
-          static double tod_hour = -1.0, tod_seconds = 0.0, tod_start_seen = -2.0;
+          static double tod_hour = -1.0, tod_seconds = 0.0, tod_start_seen = -2.0, tod_target = -1.0;
           const double start = REXCVAR_GET(native_tod_start_hour);
           if (start != tod_start_seen) {
+            // A new hour while the clock's already going: wound round to it
+            // over a few seconds (the sun swept across, the shadows with it)
+            // rather than jumped to.
+            if (tod_start_seen > -2.0 && start >= 0.0 && tod_hour >= 0.0 && REXCVAR_GET(native_time_of_day)) {
+              tod_target = start;
+            } else {
+              tod_hour = start >= 0.0 ? start : -1.0;
+              tod_target = -1.0;
+            }
             tod_start_seen = start;
-            tod_hour = start >= 0.0 ? start : -1.0;
+          }
+          if (tod_target >= 0.0 && tod_hour >= 0.0) {
+            double delta = std::fmod(tod_target - tod_hour + 36.0, 24.0) - 12.0;  // (-12, 12]
+            const double step = std::clamp(dt, 0.0, 0.1) *
+                                std::max(std::fabs(delta) / 0.9, 0.25);  // eased, at least 15 minutes a second
+            if (std::fabs(delta) <= step) {
+              tod_hour = tod_target;
+              tod_target = -1.0;
+            } else {
+              tod_hour = std::fmod(tod_hour + (delta > 0.0 ? step : -step) + 24.0, 24.0);
+            }
           }
           if (tod_hour < 0.0 && renderer->MountainHour() >= 0.0f) tod_hour = renderer->MountainHour();
           // (Northstar before the Night Pass: its own hour, as the game has it.)

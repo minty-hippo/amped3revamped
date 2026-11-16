@@ -1582,6 +1582,13 @@ struct Renderer::Impl {
   // World shadows: the slopes' shadow map baked again (BakeWorldShadows), a
   // copy the lighting reads instead of its tf2.
   Image baked_;
+  // Over a step of the time of day's sun: the part of the world's shadows
+  // around the camera as it was (bake_old_) and as baked for the new sun
+  // (bake_new_), eased from one to the other over a second or so.
+  Image bake_old_, bake_new_;
+  VkRect2D bake_ease_rect_{};
+  uint64_t bake_ease_frame_ = 0;
+  bool bake_ease_pending_ = false, bake_ease_on_ = false;
   Image* baked_src_ = nullptr;
   bool baked_tod_ = false;  // baked for the time of day's sun (not saved, not loaded)
   // The time of day's shadows of riders, rails and objects (the game's
@@ -1926,7 +1933,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1967,7 +1974,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[56] = {};  // by CopyKind
+  VkShaderModule copy_fs_[57] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2210,6 +2217,14 @@ struct Renderer::Impl {
   void SceneInputs(const Draw& d, const GpuState& st);
   uint32_t lighting_aa_ = 0;  // the lighting pass's sample mask (its inputs made for it)
   Image tod_mask_raw_;  // the sun's shadows before the clouds'
+  // Over a step of the time of day's sun (the sun maps started over for it):
+  // the frame it went, last frame's mask and view (eased from, TodShadows).
+  uint64_t sun_turn_frame_ = 0;
+  bool sun_turned_ = false;
+  Image tod_mask_prev_;
+  bool tod_mask_prev_ok_ = false;
+  double tod_mask_prev_inv_vp_[16] = {};
+  double tod_mask_prev_cam_[3] = {};
   float cloud_here_ = 0.0f;  // the clouds' shade at the camera (for the riders: 0..1)
   Image bloom_a_, bloom_b_, bloom_out_, pillar_img_;
   Image* BloomScene(Image* scene);
@@ -6261,6 +6276,40 @@ void main() {
   o = vec4(lit * (1.0 - occ * fade * pc.L.w));
 }
 )", true);
+  // The sun's shadows eased over a step of the time of day's sun: when the
+  // sun maps start over for a sun that's moved on (every degree and a half
+  // or so), last frame's shadows, carried to where they are now on screen,
+  // held while the maps are drawn again and then eased into the new.
+  copy_fs_[56] = CompileBuiltin("builtin_mask_ease", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D prev;  // (linear) last frame's
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2) uniform sampler2D cur;
+layout(push_constant) uniform Ease {
+  mat4 m;   // ndc (x, y, 1 - depth, 1) now -> last frame's clip
+  vec4 p;   // how much of now's (0: last frame's held), 1: the world's shadows', offset x, y
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  // (The world's shadows baked for the sun: the old (prev) eased into the new
+  // (cur) over the part baked, from its corner.)
+  if (pc.p.y > 0.5) {
+    ivec2 at = ip - ivec2(pc.p.zw);
+    o = vec4(mix(texelFetch(prev, at, 0).r, texelFetch(cur, at, 0).r, pc.p.x));
+    return;
+  }
+  float c = texelFetch(cur, ip, 0).r;
+  o = vec4(c);
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) return;
+  vec2 uv = (gl_FragCoord.xy) / vec2(textureSize(depth, 0));
+  vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  if (q.w <= 1e-4) return;
+  vec2 puv = vec2(q.x / q.w * 0.5 + 0.5, 0.5 - q.y / q.w * 0.5);
+  if (any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) return;
+  o = vec4(mix(textureLod(prev, puv, 0.0).r, c, pc.p.x));
+}
+)", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
   // in low wisps (stretched along the wind, moving with it), a pale veil
   // over the snowy ground, thicker in a gale.
@@ -9173,6 +9222,13 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
                        std::fabs(cam[1] - sun_href_) > 0.3 * kSunDepth;
     const float far_depth[4] = {0, 0, 0, 0};
     if (reset) {
+      // (The time of day's sun moved on, the camera where it was: eased over.)
+      if (sun_map_ok_ && TodOn() && dot3(f, sun_f_) < 0.9997 && R == sun_r_ && moved <= 0.5 * R) {
+        sun_turn_frame_ = frame_number_;
+        sun_turned_ = true;
+        bake_ease_pending_ = true;
+        if (Diag("sun")) std::fprintf(stderr, "sun: the time of day's sun moved on: eased over\n");
+      }
       const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
       double e1[3], e2[3];
       cross(std::fabs(f[1]) < 0.9 ? up : side, f, e1);
@@ -9722,10 +9778,53 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     pc[29] = float(h);
     if (baked_tod_) {
       // The time of day: every ray baked outright (the sun moves on: what
-      // was dark before mustn't stay dark), nothing saved.
+      // was dark before mustn't stay dark), nothing saved. After a step of
+      // the sun: what was there kept first, to ease from.
+      const bool start_ease = bake_ease_pending_ && !Diag("noease");
+      if (start_ease) {
+        bake_ease_pending_ = false;
+        bake_ease_rect_ = rect;
+        bake_ease_frame_ = frame_number_;
+        bake_ease_on_ = true;
+        if (Diag("sun")) std::fprintf(stderr, "sun: world shadows eased over %ux%u texels\n", rect.extent.width, rect.extent.height);
+        for (Image* im : {&bake_old_, &bake_new_}) {
+          if (!im->image || im->width < rect.extent.width || im->height < rect.extent.height) {
+            if (im->image) Retire(*im);
+            const uint32_t ew = std::max(rect.extent.width, im->width), eh = std::max(rect.extent.height, im->height);
+            *im = gpu_.CreateImage(ew, eh, VK_FORMAT_R8_UNORM, false, im == &bake_old_ ? "world_shadows_old" : "world_shadows_new");
+            ToGeneral(cb_, *im);
+          }
+        }
+        VkImageCopy part{};
+        part.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        part.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        part.srcOffset = {rect.offset.x, rect.offset.y, 0};
+        part.extent = {rect.extent.width, rect.extent.height, 1};
+        Barrier();
+        vk::vkCmdCopyImage(cb_, baked_.image, VK_IMAGE_LAYOUT_GENERAL, bake_old_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &part);
+        Barrier();
+      }
       pc[27] = 2.0f;
       FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
                      &rect);
+      // (While easing: what's newly baked over the eased part, kept as the new.)
+      if (bake_ease_on_) {
+        const VkRect2D& er = bake_ease_rect_;
+        const int32_t ix0 = std::max(er.offset.x, rect.offset.x), iy0 = std::max(er.offset.y, rect.offset.y);
+        const int32_t ix1 = std::min(er.offset.x + int32_t(er.extent.width), rect.offset.x + int32_t(rect.extent.width));
+        const int32_t iy1 = std::min(er.offset.y + int32_t(er.extent.height), rect.offset.y + int32_t(rect.extent.height));
+        if (ix1 > ix0 && iy1 > iy0) {
+          VkImageCopy part{};
+          part.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+          part.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+          part.srcOffset = {ix0, iy0, 0};
+          part.dstOffset = {ix0 - er.offset.x, iy0 - er.offset.y, 0};
+          part.extent = {uint32_t(ix1 - ix0), uint32_t(iy1 - iy0), 1};
+          Barrier();
+          vk::vkCmdCopyImage(cb_, baked_.image, VK_IMAGE_LAYOUT_GENERAL, bake_new_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &part);
+          Barrier();
+        }
+      }
     } else {
       pc[27] = 0.0f;
       FullscreenPass(CopyKind::kBake, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc, 32,
@@ -9734,6 +9833,36 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
       FullscreenPass(CopyKind::kBakeMin, &baked_, &sun_height_, &sun_env_, &sun_seen_, false, pc,
                      32, &rect);
       bake_dirty_ = true;
+    }
+  }
+  // Eased over a step of the sun (about a second): the part around the
+  // camera, from what it was to what's baked for the new sun.
+  if (bake_ease_on_) {
+    const uint64_t since = frame_number_ - bake_ease_frame_;
+    if (!baked_tod_ || since > 60) {
+      bake_ease_on_ = false;
+      // (The new, whole.)
+      if (baked_tod_) {
+        const VkRect2D& er = bake_ease_rect_;
+        VkImageCopy part{};
+        part.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        part.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        part.dstOffset = {er.offset.x, er.offset.y, 0};
+        part.extent = {er.extent.width, er.extent.height, 1};
+        Barrier();
+        vk::vkCmdCopyImage(cb_, bake_new_.image, VK_IMAGE_LAYOUT_GENERAL, baked_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &part);
+        Barrier();
+      }
+    } else {
+      const double t = double(since) / 60.0;
+      float ep[20] = {};
+      ep[16] = float(t * t * (3.0 - 2.0 * t));
+      ep[17] = 1.0f;
+      ep[18] = float(bake_ease_rect_.offset.x);
+      ep[19] = float(bake_ease_rect_.offset.y);
+      Barrier();
+      FullscreenPass(CopyKind::kMaskEase, &baked_, &bake_old_, nullptr, &bake_new_, false, ep, 20, &bake_ease_rect_);
+      Barrier();
     }
   }
   // Saved every half a minute or so while there's something new.
@@ -11528,6 +11657,57 @@ void Renderer::Impl::TodShadows() {
     sp[31] = contact_;
     FullscreenPass(CopyKind::kContactShadow, &tod_mask_, depth, &tod_mask_raw_, nullptr, false, sp, 32);
     Barrier();
+  }
+  // Eased over a step of the sun: last frame's held while the maps are drawn
+  // again (three frames), then eased into the new over about two thirds of
+  // a second.
+  {
+    auto copy_mask = [&](Image& from, Image& to) {
+      VkImageCopy all{};
+      all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      all.extent = {from.width, from.height, 1};
+      Barrier();
+      vk::vkCmdCopyImage(cb_, from.image, VK_IMAGE_LAYOUT_GENERAL, to.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+      Barrier();
+    };
+    const uint64_t since = frame_number_ - sun_turn_frame_;
+    const double jump = std::hypot(cam_pos_[0] - tod_mask_prev_cam_[0], cam_pos_[1] - tod_mask_prev_cam_[1],
+                                   cam_pos_[2] - tod_mask_prev_cam_[2]);
+    if (sun_turned_ && since > 45) sun_turned_ = false;
+    const bool prev_ok = tod_mask_prev_ok_ && tod_mask_prev_.image && tod_mask_prev_.width == tod_mask_.width &&
+                         tod_mask_prev_.height == tod_mask_.height && jump < 5.0;
+    double prev_vp[16];
+    if (sun_turned_ && prev_ok && !Diag("noease") && Invert4(tod_mask_prev_inv_vp_, prev_vp)) {
+      if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
+        if (tod_mask_raw_.image) Retire(tod_mask_raw_);
+        tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
+        ToGeneral(cb_, tod_mask_raw_);
+      }
+      copy_mask(tod_mask_, tod_mask_raw_);
+      float ep[20] = {};
+      for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+          double v = 0.0;
+          for (int k = 0; k < 4; ++k) v += prev_vp[r * 4 + k] * inv_vp_[k * 4 + c];
+          ep[c * 4 + r] = float(v);
+        }
+      }
+      ep[16] = since < 3 ? 0.0f : 0.12f;
+      if (Diag("sun")) std::fprintf(stderr, "sun: shadows eased (%llu frames on)\n", (unsigned long long)since);
+      FullscreenPass(CopyKind::kMaskEase, &tod_mask_, &tod_mask_prev_, depth, &tod_mask_raw_, true, ep, 20);
+      Barrier();
+    }
+    // (Kept for the next frame.)
+    if (!tod_mask_prev_.image || tod_mask_prev_.width != tod_mask_.width || tod_mask_prev_.height != tod_mask_.height) {
+      if (tod_mask_prev_.image) Retire(tod_mask_prev_);
+      tod_mask_prev_ = gpu_.CreateImage(tod_mask_.width, tod_mask_.height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_prev");
+      ToGeneral(cb_, tod_mask_prev_);
+    }
+    copy_mask(tod_mask_, tod_mask_prev_);
+    tod_mask_prev_ok_ = true;
+    std::memcpy(tod_mask_prev_inv_vp_, inv_vp_, sizeof(tod_mask_prev_inv_vp_));
+    for (int i = 0; i < 3; ++i) tod_mask_prev_cam_[i] = cam_pos_[i];
   }
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
   for (int i = 0; i < 4; ++i) {
@@ -14822,7 +15002,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }
@@ -14837,7 +15017,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
   for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_,
-                    &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &baked_,
+                    &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &baked_, &bake_old_, &bake_new_,
                     &sun_tiles_, &sun_tiles2_, &movers_pos_, &movers_shade_, &movers_blur_,
                     &movers_out_}) {
     gpu_.DestroyImage(*im);

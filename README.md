@@ -585,6 +585,14 @@ that rule against a save that has the pass.
   Settings: Minutes per Day (`native_tod_day_minutes`, 24; 0 stops it), Set the
   Hour (`native_tod_start_hour`, -1 = the mountain's own), Moon Phase, Cloud
   Cover, Night Brightness.
+  Setting a new hour while the clock is going winds round to it over a few
+  seconds (the sun sweeps across) rather than jumping.
+- Smooth as the sun moves: the world's shadows are drawn again for the sun
+  every degree and a half or so, and each time the part around the camera
+  eases from the old shadows to the new over about a second (the riders'
+  and objects' shadow mask likewise: last frame's held while the maps are
+  redrawn, then eased in), so the shadows creep with the sun instead of
+  stepping.
 - Shadows follow the sun (and the moon at night):
   - riders, rails and objects: the game's own shadow casters drawn again from
     the hour's sun into a fine map around the camera (a couple of cm a texel),
