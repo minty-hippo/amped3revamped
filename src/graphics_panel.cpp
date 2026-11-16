@@ -344,7 +344,7 @@ void GraphicsPanel::HandleInput(ImGuiIO& io) {
 
   const std::vector<const Row*> rows = VisibleRows(tab_);
   const int count = int(rows.size());
-  int& cursor = cursor_[tab_];
+  int& cursor = cursor_[std::min(tab_, 7)];
   if (count == 0) cursor = 0;
   else cursor = std::clamp(cursor, 0, count - 1);
 
@@ -476,12 +476,14 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
   ImFont* hint_font = PanelFont(hint_px);
   const float row_h = text_px * 1.6f;
   const float pad = 16.0f * unit;
-  // As tall as the longest tab, so switching doesn't move the panel.
+  // As tall as the longest tab, so switching doesn't move the panel; but no
+  // taller than the screen (a long tab then scrolls with the cursor).
   size_t max_rows = 0;
   for (const Tab& t : Tabs()) max_rows = std::max(max_rows, t.rows.size());
-  const ImVec2 size(std::min(display.x * 0.45f, 380.0f * unit),
-                    pad * 2 + title_px * 1.25f + tab_px * 2.4f + row_h * float(max_rows) +
-                        hint_px * 3.0f + text_px * 1.6f);
+  const float fixed_h = pad * 2 + title_px * 1.25f + tab_px * 2.4f + hint_px * 3.0f + text_px * 1.6f;
+  const int fit_rows = std::max(4, int((display.y * 0.94f - fixed_h) / row_h));
+  const int shown_rows = std::min(int(max_rows), fit_rows);
+  const ImVec2 size(std::min(display.x * 0.45f, 380.0f * unit), fixed_h + row_h * float(shown_rows));
   const ImVec2 at(std::round(display.x * 0.03f), std::round(display.y * 0.5f - size.y * 0.5f));
 
   ImGui::SetNextWindowPos(at, ImGuiCond_Always);
@@ -534,14 +536,16 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
   }
 
   const std::vector<const Row*> rows = VisibleRows(tab_);
-  const int cursor = rows.empty() ? -1 : std::clamp(cursor_[tab_], 0, int(rows.size()) - 1);
+  const int cursor = rows.empty() ? -1 : std::clamp(cursor_[std::min(tab_, 7)], 0, int(rows.size()) - 1);
   const bool revamped = GetBool("revamped_graphics");
   const bool native = NativeRendererOn();
   const std::string upscaler = GetString("native_upscaler");
   const float value_right = end.x - pad;
   const float value_w = 70.0f * unit;
   const float arrow_s = 4.5f * unit;
-  for (int i = 0; i < int(rows.size()); ++i) {
+  // (Scrolled to keep the cursor in view, a row of the next shown below it.)
+  const int first_row = std::clamp(cursor - shown_rows + 2, 0, std::max(0, int(rows.size()) - shown_rows));
+  for (int i = first_row; i < int(rows.size()) && i < first_row + shown_rows; ++i) {
     const Row& r = *rows[i];
     const std::string_view name = r.cvar;
     const bool selected = i == cursor;

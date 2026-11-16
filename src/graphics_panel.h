@@ -60,7 +60,9 @@ class GraphicsPanel final : public rex::ui::ImGuiDialog {
   std::filesystem::path config_path_;
   std::function<void()> on_closed_;
   int tab_ = 0;
-  int cursor_[2] = {0, 0};  // per tab
+  // Per tab (room for more than there are: a fourth tab once wrote past a
+  // two-tab array into the button state, so RB skipped the Time of Day tab).
+  int cursor_[8] = {};
   bool dirty_ = false;
   bool first_frame_ = true;
   uint16_t prev_buttons_ = 0;
