@@ -2677,6 +2677,37 @@ uint32_t Renderer::Impl::WriteUniform(const void* data, size_t size) {
   return offset;
 }
 
+// The snow tracks' clumps (builtin_tracks_apply, _shadow): broken-off lumps
+// of snow lying on the heaps a board pushed up, round and a few to a dozen
+// cm across, in cells of 3 texels (15 cm); their height over the heap (m,
+// times the heap's full height), as much as there's heap.
+static const std::string kTracksClumps = R"(
+float ClumpHash(vec2 c) {
+  uvec2 q = uvec2(ivec2(c) + 65536);
+  uint h = q.x * 1597334677u ^ q.y * 3812015801u;
+  h = (h ^ (h >> 15)) * 2246822519u;
+  return float(h ^ (h >> 13)) * (1.0 / 4294967296.0);
+}
+float Clumps(vec2 tc, float heap) {
+  if (heap < 0.04) return 0.0;
+  vec2 p = tc / 3.0;
+  vec2 i = floor(p), f = p - i;
+  float h = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      vec2 c = i + vec2(x, y);
+      if (ClumpHash(c) > 0.5) continue;
+      vec2 at = vec2(x, y) + 0.2 + 0.6 * vec2(ClumpHash(c + vec2(7.0, 1.0)), ClumpHash(c + vec2(3.0, 11.0)));
+      float rad = 0.22 + 0.35 * ClumpHash(c + vec2(5.0, 17.0));
+      float dd = length(f - at) / rad;
+      if (dd < 1.0) h = max(h, sqrt(1.0 - dd * dd) * rad);
+    }
+  }
+  // (Up to about a third of a heap's height, on a full heap.)
+  return h * 0.55 * smoothstep(0.04, 0.4, heap);
+}
+)";
+
 VkShaderModule Renderer::Impl::CompileBuiltin(const std::string& name, const std::string& source,
                                               bool frag) {
   std::vector<uint32_t> spirv;
@@ -5377,6 +5408,21 @@ void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
   if (pc.a.y < -0.5) {
     vec2 old = Old(t);
+    // The wind (b.xy: how far the loose snow moved, texels; b.z the heaps
+    // scoured, b.w the grooves drifted in): the surface carried downwind
+    // (mixed with what's upwind of it: the shapes soften and creep along),
+    // the loose heaps blown away first, the grooves filling with what blows
+    // into them.
+    if (pc.b.z > 0.0 || pc.b.w > 0.0) {
+      vec2 from = vec2(t) + 0.5 - pc.b.xy;
+      vec2 f = from - 0.5;
+      ivec2 i = ivec2(floor(f));
+      vec2 w = f - floor(f);
+      vec2 up = mix(mix(Old(i), Old(i + ivec2(1, 0)), w.x), mix(Old(i + ivec2(0, 1)), Old(i + ivec2(1, 1)), w.x), w.y);
+      old = mix(old, up, 0.6);
+      old.g *= 1.0 - pc.b.z;
+      old.r *= 1.0 - pc.b.w;
+    }
     o = vec4(old.r * (1.0 - pc.a.z), old.g * (1.0 - 0.6 * pc.a.z), 0.0, 1.0);
     return;
   }
@@ -5428,10 +5474,12 @@ vec2 T(vec2 tc) {
   vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
   return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
-// Height (m): soft over a texel or so.
+)" + kTracksClumps + R"(
+// Height (m): soft over a texel or so; the clumps on the heaps on top.
 float Ht(vec2 tc) {
   vec2 t = (T(tc + vec2(0.6, 0.6)) + T(tc + vec2(-0.6, 0.6)) + T(tc + vec2(0.6, -0.6)) + T(tc - vec2(0.6))) * 0.25;
-  return -pc.s.x * t.r + pc.s.y * t.g * (1.0 - t.r);
+  float heap = t.g * (1.0 - t.r);
+  return -pc.s.x * t.r + pc.s.y * heap + Clumps(tc, heap) * pc.s.y;
 }
 void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
@@ -5448,15 +5496,37 @@ void main() {
   vec3 N = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
   if (N.y < 0.4) return;  // the ground (snow), not walls
   // Parallax: where the view ray meets the tracks' surface (down in a
-  // groove, up on a heap) rather than the flat slope: a few steps along it,
-  // the heaps hiding the groove's far side at a glancing angle.
+  // groove, up on a heap or a clump) rather than the flat slope: marched
+  // down from above the highest heap to the groove's floor, the first step
+  // under the surface narrowed in on, so heaps and clumps stand up and hide
+  // what's behind them at a glancing angle. (Nothing near: left be.)
   {
     vec3 D = normalize(P - pc.cam.xyz);
     if (D.y < -0.05) {
       vec2 k = D.xz / max(-D.y, 0.12) * pc.g.z;  // texels a metre down
-      vec2 tp = tc;
-      for (int i = 0; i < 4; ++i) tp = tc - k * Ht(tp);
-      tc = tp;
+      float top = pc.s.y * 1.4, bot = -pc.s.x;
+      vec2 near_t = T(tc) + T(tc - k * top) + T(tc - k * bot) + T(tc - k * 0.5 * top);
+      if (near_t.r + near_t.g > 0.002) {
+        float h_prev = top, h = top;
+        bool hit = false;
+        for (int i = 1; i <= 12; ++i) {
+          h = mix(top, bot, float(i) / 12.0);
+          if (Ht(tc - k * h) >= h) {
+            hit = true;
+            break;
+          }
+          h_prev = h;
+        }
+        if (hit) {
+          float a = h_prev, b = h;  // above, below
+          for (int i = 0; i < 4; ++i) {
+            float m = 0.5 * (a + b);
+            if (Ht(tc - k * m) >= m) b = m; else a = m;
+          }
+          h = 0.5 * (a + b);
+        }
+        tc = tc - k * h;
+      }
     }
   }
   if (pc.g.w > 2.5) {
@@ -5472,10 +5542,12 @@ void main() {
   }
   if (t.r + t.g < 0.003) return;
   if (pc.g.w < 0.5) {
-    // Packed in the groove (a little greyer, bluer); the heaps grainy.
+    // Packed in the groove (a little greyer, bluer); the heaps grainy, the
+    // clumps' tops a touch brighter (loose, fresh-broken).
     float grain = H(floor(P.xz * 30.0));
     vec3 col = c.rgb * mix(vec3(1.0), vec3(0.92, 0.95, 1.0), t.r * (1.0 - 0.5 * t.g));
     col *= 1.0 + t.g * (1.0 - t.r) * (0.03 + 0.08 * (grain - 0.5));
+    col *= 1.0 + 0.6 * Clumps(tc, t.g * (1.0 - t.r));
     o = vec4(col, c.a);
   } else {
     float e = 1.0;
@@ -5941,6 +6013,7 @@ layout(push_constant) uniform Sh {
   vec4 b;  // groove depth (m), heap height (m)
 } pc;
 layout(location = 0) out vec4 o;
+)" + kTracksClumps + R"(
 float Ht(vec2 tc) {
   vec2 f = tc - 0.5;
   ivec2 i = ivec2(floor(f));
@@ -5951,7 +6024,8 @@ float Ht(vec2 tc) {
   vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
   vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
   vec2 t = mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
-  return -pc.b.x * t.r + pc.b.y * t.g * (1.0 - t.r);
+  float heap = t.g * (1.0 - t.r);
+  return -pc.b.x * t.r + pc.b.y * heap + Clumps(tc, heap) * pc.b.y;
 }
 // (Soft over a texel or so, as the tracks are shaded.)
 float Hs(vec2 tc) {
@@ -11037,17 +11111,46 @@ void Renderer::Impl::TracksUpdate() {
     tracks_cx_ = tx;
     tracks_cz_ = tz;
   }
-  // Falling snow fills them in (a heavy fall: in a couple of minutes), the
-  // whole map every so often.
+  // Falling snow fills them in (a heavy fall: in a couple of minutes), and
+  // the wind wears them away: the loose heaps blown off (a gale: in a minute
+  // or so), the grooves drifting in more slowly (a few minutes), the shapes
+  // softening and creeping downwind as the loose snow moves. The whole map
+  // every so often.
   {
     static auto last = std::chrono::steady_clock::now();
-    static float pending = 0.0f;
+    static float pending = 0.0f, scour = 0.0f, drift = 0.0f, waited = 0.0f;
+    static double carried[2] = {0.0, 0.0};
     const auto now = std::chrono::steady_clock::now();
     const float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.25f);
     last = now;
-    if (TodOn()) pending += std::clamp(tod_.snow, 0.0f, 1.0f) * dt / 90.0f;
-    if (pending > 0.03f) {
-      float pc[12] = {0.0f, -1.0f, std::min(pending, 1.0f), 0.0f};
+    const bool test_wind = std::getenv("A3_TEST_WIND") != nullptr;
+    if (TodOn() || test_wind) {
+      pending += std::clamp(tod_.snow, 0.0f, 1.0f) * dt / 90.0f;
+      double wx = tod_.wind[0], wz = tod_.wind[1];
+      if (test_wind) {
+        wx = std::atof(std::getenv("A3_TEST_WIND"));  // (m/s, along x)
+        wz = 0.0;
+      }
+      const double speed = std::hypot(wx, wz);
+      if (speed > 0.1) {
+        scour += float(tod::SmoothStep(3.0, 15.0, speed)) * dt / 50.0f;
+        drift += float(tod::SmoothStep(4.0, 16.0, speed)) * dt / 200.0f;
+        // (The loose snow at the surface: about a hundredth of the wind's
+        // speed, in texels.)
+        const double moved = tod::SmoothStep(3.0, 12.0, speed) * 0.012 * speed * dt / kTracksTexel;
+        carried[0] += wx / speed * moved;
+        carried[1] += wz / speed * moved;
+      }
+      waited += dt;
+    }
+    if (pending > 0.03f || ((scour > 0.02f || drift > 0.02f) && waited > 0.5f)) {
+      // (Carried at most two texels a pass: the rest next time.)
+      const float cx = float(std::clamp(carried[0], -2.0, 2.0)), cz = float(std::clamp(carried[1], -2.0, 2.0));
+      carried[0] -= cx;
+      carried[1] -= cz;
+      float pc[12] = {0.0f, -1.0f, std::min(pending, 1.0f), 0.0f,
+                      cx, cz, std::min(scour, 0.5f), std::min(drift, 0.5f)};
+      scour = drift = waited = 0.0f;
       Barrier();
       FullscreenPass(CopyKind::kTracksMerge, &tracks_scratch_, &tracks_stamp_, &tracks_map_, nullptr,
                      false, pc, 12);

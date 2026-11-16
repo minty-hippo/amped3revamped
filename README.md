@@ -568,11 +568,20 @@ that rule against a save that has the pass.
   skid ploughs that snow ahead of the board into a pile where it stops.
   The lighting shades them (they're in its normals), riders' and lamps'
   light included.
-  They're drawn with parallax: the view ray meets the grooves' floor and
-  the heaps' tops (a few steps along it), so at a glancing angle a heap hides
-  the groove's far side.
-  Toward a low sun a groove's wall and a heap shade the snow beside them
-  (marched over the tracks' height toward the sun, into the sun's shadows). Falling snow fills them in over a couple of minutes.
+  They're drawn in relief (parallax occlusion): the view ray is marched
+  down from above the highest heap to the groove's floor and narrowed in on
+  where it meets the surface, so the heaps stand up and at a glancing angle
+  hide the groove's far side. Broken-off clumps of snow (round lumps a few to
+  a dozen cm across) lie on the heaps, as much as there's heap, standing up
+  and shaded like the rest, their tops a touch brighter.
+  Toward a low sun a groove's wall, a heap and a clump shade the snow beside
+  them (marched over the tracks' height toward the sun, into the sun's
+  shadows).
+  They don't stay forever: falling snow fills them in over a couple of
+  minutes, and the wind wears them away (with time of day on): the loose
+  heaps and clumps blown off first (a gale: in a minute or so), the grooves
+  drifting in more slowly, the shapes softening and creeping downwind as the
+  loose snow moves.
   (From the game's trail draws, drawn again from above each frame.)
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
