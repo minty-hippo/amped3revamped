@@ -35,6 +35,7 @@
 #include "cutscenes.h"
 #include "live_renderer.h"
 #include "pad_bridge.h"
+#include "version.h"
 
 namespace amped3 {
 
@@ -1194,6 +1195,9 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
                        list.c_str());
   } else {
     ImGui::TextDisabled("Changes are saved to %s.", config_path_.filename().string().c_str());
+    // (Which sources this build is from: to tell an old build from a new one.)
+    ImGui::SameLine();
+    ImGui::TextDisabled("  Build: %s", amped3::version::Text().c_str());
   }
 
   if (ImGui::Button("Reset this tab")) {
