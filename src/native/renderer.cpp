@@ -2550,6 +2550,21 @@ struct Renderer::Impl {
   // Constants by draw key (shader, buffers, range), every draw with that key
   // in drawing order (the same mesh drawn many times: trees, rocks).
   std::unordered_map<uint64_t, std::vector<std::vector<uint32_t>>> vel_prev_, vel_cur_;
+  // For a mesh drawn many times last frame: the constants that differ between
+  // its copies (where each one is placed), worked out once a frame, to match
+  // each copy to last frame's by those alone. (Comparing every copy's
+  // constants in full with every other's cost a carving challenge's 200-odd
+  // markers some 25 ms a frame.)
+  std::unordered_map<uint64_t, std::vector<uint32_t>> vel_prev_differ_;
+  // ... and for many copies, them sorted by the constant that differs most
+  // (with the next two), to find the nearest by looking either side.
+  struct VelSorted {
+    uint32_t dims[3] = {};
+    uint32_t n_dims = 0;
+    std::vector<std::pair<float, uint32_t>> order;
+  };
+  std::unordered_map<uint64_t, VelSorted> vel_prev_sorted_;
+  double vel_match_ms_ = 0.0;  // (diagnostic velstat)
   std::vector<std::vector<uint32_t>> words_pool_;  // vel_prev_'s vectors, reused
   std::unordered_map<const Shader*, Shader*> vel_by_vs_;    // draw shader -> velocity shader
   std::unordered_map<VkPipeline, VkPipeline> vel_pipelines_;  // draw pipeline -> velocity one
@@ -10340,7 +10355,9 @@ Image* Renderer::Impl::BloomScene(Image* scene) {
   FullscreenPass(CopyKind::kBloom, &bloom_a_, scene, nullptr, nullptr, true, pc, 8);
   // The lights' ghosts (from the bright parts before they're blurred).
   const bool flare = flare_ > 0.0f && !Diag("noflare");
-  const bool ghosts = flare && dark > 0.02f;
+  // (The lamps' ghosts: off; the night's flare is the moon's. Diagnostic
+  // "lampflare" brings them back.)
+  const bool ghosts = flare && dark > 0.02f && Diag("lampflare");
   if (ghosts) FlareGhosts(&bloom_a_, scene);
   // Light pillars: at night in still air with ice crystals about (light
   // snow, or a clear frost), the lamps' light in columns above them.
@@ -10435,18 +10452,46 @@ Image* Renderer::Impl::FlareScene(Image* scene, bool ghosts_ready) {
                      ? &dit->second
                      : nullptr;
   float sun_uv[2], edge = 0.0f;
-  const bool on = SunOnScreen(sun_uv, &edge);
-  // The sun (not the moon): up, and how bright (through the eye's exposure).
+  bool on = SunOnScreen(sun_uv, &edge);
+  // The sun, up; or at night the moon (fainter: as bright as its phase,
+  // up), through the eye's exposure.
   const tod::State& t = tod_state_;
-  double day = 1.0;
+  double day = 1.0, moon = 0.0;
   tod::Vec3 col{1.0, 0.97, 0.9};
+  float seen_from = 0.8f, seen_to = 0.97f;  // how near white its disc is, seen
   if (TodOn()) {
     day = tod::SmoothStep(-1.0 * tod::kDeg, 4.0 * tod::kDeg, t.sun_elevation);
     col = t.sun_color;
+    if (day < 0.01) {
+      moon = 0.35 * t.moon_bright * tod::SmoothStep(0.0, 4.0 * tod::kDeg, t.moon_elevation);
+      col = t.moon_color;
+      seen_from = 0.45f;
+      seen_to = 0.8f;
+      // (Where the moon is on screen.)
+      on = false;
+      edge = 0.0f;
+      double vp[16];
+      if (moon > 0.001 && Invert4(inv_vp_, vp)) {
+        const double p[4] = {cam_pos_[0] + t.moon.x * 1000.0, cam_pos_[1] + t.moon.y * 1000.0,
+                             cam_pos_[2] + t.moon.z * 1000.0, 1.0};
+        double c[4];
+        for (int r = 0; r < 4; ++r) {
+          c[r] = 0.0;
+          for (int k = 0; k < 4; ++k) c[r] += vp[r * 4 + k] * p[k];
+        }
+        if (c[3] > 1e-6) {
+          const double x = c[0] / c[3], y = c[1] / c[3];
+          sun_uv[0] = float(x * 0.5 + 0.5);
+          sun_uv[1] = float(0.5 - y * 0.5);
+          edge = float(std::clamp(1.0 - (std::max(std::fabs(x), std::fabs(y)) - 1.0) / 0.6, 0.0, 1.0));
+          on = edge > 0.0f;
+        }
+      }
+    }
   }
   const double e = eye_strength_ > 0.0f ? std::min(exposure_, 2.0) : 1.0;
-  const float sun_strength = float(flare_ * day * e);
-  const bool sun = depth && sun_strength > 0.001f && sun_valid_;
+  const float sun_strength = float(flare_ * std::max(day, moon) * e);
+  const bool sun = depth && sun_strength > 0.001f && (sun_valid_ || moon > 0.0);
   const float dark = float(LightsDark());
   if (!sun && !ghosts_ready) return nullptr;
   EndRendering();
@@ -10472,7 +10517,7 @@ Image* Renderer::Impl::FlareScene(Image* scene, bool ghosts_ready) {
     const uint32_t prev = flare_vis_cur_, cur = prev ^ 1;
     const float ease = 1.0f - std::exp(-std::clamp(speed_dt_, 0.001f, 0.25f) / 0.06f);
     float pc[12] = {0.0f, on ? sun_uv[0] : -9.0f, on ? sun_uv[1] : -9.0f, aspect,
-                    ease, 0.012f, 0.8f, 0.97f, 0, 0, 0, 0};
+                    ease, 0.012f, seen_from, seen_to, 0, 0, 0, 0};
     Barrier();
     FullscreenPass(CopyKind::kFlare, &flare_vis_[cur], scene, depth, &flare_vis_[prev], true, pc, 12);
     flare_vis_cur_ = cur;
@@ -14070,6 +14115,15 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
         }
       }
     }
+    // (Diagnostic: as if everything had moved a little since last frame.)
+    if (Diag("veljitter")) {
+      for (auto& w : words) {
+        float f;
+        std::memcpy(&f, &w, 4);
+        if (std::isfinite(f) && f != 0.0f) f *= 1.0f + 1e-5f * float(frame_number_ & 1);
+        std::memcpy(&w, &f, 4);
+      }
+    }
     auto& cur_list = vel_cur_[key];
     Shader* vvs = nullptr;
     if (prev_valid_) {
@@ -14101,6 +14155,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
         // constants. Drawing order isn't stable (culling, sorting), so the
         // n-th copy last frame may be another tree.
         const std::vector<uint32_t>* prevw = nullptr;
+        const auto match_t0 = std::chrono::steady_clock::now();
         if (auto pit = vel_prev_.find(key); pit != vel_prev_.end()) {
           const auto& cands = pit->second;
           size_t nth = cur_list.size();
@@ -14121,19 +14176,100 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
           // come into and out of view): a first guess from the leading
           // constants (the transform, which differs most between copies), so
           // the full comparisons below stop early.
-          const bool nth_exact = nth < cands.size() && cands[nth] == words;
+          const bool nth_exact = !Diag("velnoexact") && nth < cands.size() && cands[nth] == words;
+          // (Where the copies differ: worked out once a frame for the mesh,
+          // from a few of them, at most 48 constants' words.)
+          const std::vector<uint32_t>* differ = nullptr;
           if (!nth_exact && cands.size() > 4) {
-            const size_t probe = std::min<size_t>(words.size(), 16);
+            auto dit = vel_prev_differ_.find(key);
+            if (dit == vel_prev_differ_.end()) {
+              std::vector<uint32_t> idx;
+              const auto& c0 = cands[0];
+              for (size_t k = 0; k < c0.size() && idx.size() < 48; ++k) {
+                for (size_t i = 1; i < cands.size() && i < 12; ++i) {
+                  if (cands[i].size() == c0.size() && cands[i][k] != c0[k]) {
+                    idx.push_back(uint32_t(k));
+                    break;
+                  }
+                }
+              }
+              dit = vel_prev_differ_.emplace(key, std::move(idx)).first;
+            }
+            differ = &dit->second;
+          }
+          auto word_f = [](const std::vector<uint32_t>& c, uint32_t k) {
+            float f;
+            std::memcpy(&f, &c[k], 4);
+            return std::isfinite(f) ? f : 0.0f;
+          };
+          if (!nth_exact && cands.size() > 16 && differ && !differ->empty()) {
+            // Many copies: sorted by the constant that differs most among
+            // them; the nearest found by looking either side of this one's
+            // place, until that constant alone is further than the best.
+            auto sit = vel_prev_sorted_.find(key);
+            if (sit == vel_prev_sorted_.end()) {
+              VelSorted vs_sorted;
+              std::vector<std::pair<float, uint32_t>> spread;
+              for (uint32_t k : *differ) {
+                float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+                for (const auto& c : cands) {
+                  if (k >= c.size()) continue;
+                  const float f = word_f(c, k);
+                  lo = std::min(lo, f);
+                  hi = std::max(hi, f);
+                }
+                if (hi > lo) spread.emplace_back(hi - lo, k);
+              }
+              std::sort(spread.begin(), spread.end(), [](auto& a, auto& b) { return a.first > b.first; });
+              for (size_t i = 0; i < spread.size() && i < 3; ++i) vs_sorted.dims[vs_sorted.n_dims++] = spread[i].second;
+              if (vs_sorted.n_dims) {
+                for (uint32_t i = 0; i < cands.size(); ++i) {
+                  if (cands[i].size() == words.size()) vs_sorted.order.emplace_back(word_f(cands[i], vs_sorted.dims[0]), i);
+                }
+                std::sort(vs_sorted.order.begin(), vs_sorted.order.end());
+              }
+              sit = vel_prev_sorted_.emplace(key, std::move(vs_sorted)).first;
+            }
+            const VelSorted& so = sit->second;
+            if (so.n_dims && !so.order.empty()) {
+              float q[3];
+              for (uint32_t d = 0; d < so.n_dims; ++d) q[d] = word_f(words, so.dims[d]);
+              const auto at = std::lower_bound(so.order.begin(), so.order.end(), std::make_pair(q[0], 0u));
+              float guess = std::numeric_limits<float>::infinity();
+              auto consider = [&](const std::pair<float, uint32_t>& e) {
+                float sum = 0.0f;
+                for (uint32_t d = 0; d < so.n_dims; ++d) sum += std::fabs(word_f(cands[e.second], so.dims[d]) - q[d]);
+                if (sum < guess) {
+                  guess = sum;
+                  nth = e.second;
+                }
+              };
+              for (auto it = at; it != so.order.end() && std::fabs(it->first - q[0]) < guess; ++it) consider(*it);
+              for (auto it = at; it != so.order.begin();) {
+                --it;
+                if (std::fabs(it->first - q[0]) >= guess) break;
+                consider(*it);
+              }
+            }
+          } else if (!nth_exact && cands.size() > 4) {
             float guess = std::numeric_limits<float>::infinity();
+            auto probe_sum = [&](const std::vector<uint32_t>& c, size_t k) {
+              float a, b;
+              std::memcpy(&a, &words[k], 4);
+              std::memcpy(&b, &c[k], 4);
+              const float dd = std::fabs(a - b);
+              return dd == dd && dd < 1e30f ? dd : 0.0f;
+            };
             for (size_t i = 0; i < cands.size(); ++i) {
               if (cands[i].size() != words.size()) continue;
               float sum = 0.0f;
-              for (size_t k = 0; k < probe; ++k) {
-                float a, b;
-                std::memcpy(&a, &words[k], 4);
-                std::memcpy(&b, &cands[i][k], 4);
-                const float dd = std::fabs(a - b);
-                sum += dd == dd && dd < 1e30f ? dd : 0.0f;
+              if (differ && !differ->empty()) {
+                for (uint32_t k : *differ) {
+                  if (k < words.size()) sum += probe_sum(cands[i], k);
+                }
+              } else {
+                const size_t probe = std::min<size_t>(words.size(), 16);
+                for (size_t k = 0; k < probe; ++k) sum += probe_sum(cands[i], k);
               }
               if (sum < guess) {
                 guess = sum;
@@ -14147,7 +14283,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
             best = distance(cands[nth], best);
             prevw = &cands[nth];
           }
-          for (size_t i = 0; i < cands.size() && best > 0.0f; ++i) {
+          // (Many copies: the guess from where they differ stands; the full
+          // comparison only among a few.)
+          for (size_t i = 0; i < cands.size() && best > 0.0f && (cands.size() <= 16 || !differ || differ->empty() || Diag("velfull")); ++i) {
             if (i == nth || cands[i].size() != words.size()) continue;
             const float dd = distance(cands[i], best);
             if (dd < best) {
@@ -14156,6 +14294,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
             }
           }
         }
+        vel_match_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - match_t0).count();
         const bool matched = prevw != nullptr;
         VelDraw v{};
         v.pipeline = vp;
@@ -15523,7 +15662,19 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   if (prev_valid_) std::memcpy(prev_inv_vp_, inv_vp_, sizeof(inv_vp_));
   // Object motion: this frame's constants are the next one's previous.
   if (max_draws == UINT32_MAX) {
+    if (Diag("velstat")) {
+      size_t total = 0, most = 0, meshes = 0;
+      for (auto& [k, list] : vel_cur_) {
+        total += list.size();
+        most = std::max(most, list.size());
+        ++meshes;
+      }
+      std::fprintf(stderr, "velstat: %zu meshes, %zu draws, most copies of one %zu; matching %.2f ms\n", meshes, total, most, vel_match_ms_);
+    }
     vel_prev_.swap(vel_cur_);
+    vel_prev_differ_.clear();
+    vel_prev_sorted_.clear();
+    vel_match_ms_ = 0.0;
     if (!prev_valid_) vel_prev_.clear();
     // Two frames back: its vectors are reused for the next frame's constants.
     if (words_pool_.size() < 16384) {

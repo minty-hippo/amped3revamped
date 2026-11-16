@@ -513,7 +513,7 @@ const std::vector<Tab>& Tabs() {
                 SliderF("native_lens_flare", "Lens flare",
                         "With time of day on: the sun's flare when it's in view (glare, a "
                         "starburst and the lens's ghosts, cut by hills, trees and cloud), and the "
-                        "lamps' and fires' ghosts at night. 0: off, 1: natural.",
+                        "moon's, fainter, at night. 0: off, 1: natural.",
                         "%.1f", 0.0, 2.0),
                 SliderF("native_lens_dirt", "Lens dirt",
                         "With the lens flare on: dust and smudges on the lens that catch the "

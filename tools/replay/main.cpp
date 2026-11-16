@@ -889,6 +889,9 @@ int main(int argc, char** argv) {
     renderer.SetEyeAdaptation(eye);
     renderer.SetBloom(bloom);
     renderer.SetLensFlare(flare);
+    // A3_COLLECT_INSTANCES: the scene's object placements kept, as the game
+    // does for the night lights (to time it).
+    if (std::getenv("A3_COLLECT_INSTANCES")) renderer.SetCollectInstances(true);
     renderer.SetLensDirt(dirt);
     renderer.SetDiamondDust(dust);
     renderer.SetContactShadows(contact);

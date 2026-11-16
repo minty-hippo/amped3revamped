@@ -171,7 +171,7 @@ REXCVAR_DEFINE_DOUBLE(native_bloom, 0.5, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_lens_flare, 0.6, "GPU",
                       "Time of day: lens flare. The sun's when it's in view (glare, a six-bladed "
                       "starburst and the aperture's ghosts, as much as the sun is seen: hills, "
-                      "trees and cloud cut it), and ghosts of the lamps and fires at night. 0: "
+                      "trees and cloud cut it), and the moon's, fainter, at night. 0: "
                       "off, 1: natural, up to 2")
     .range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(native_contact_shadows, 1.0, "GPU",

@@ -546,9 +546,10 @@ that rule against a save that has the pass.
   coating and a little apart in its colors, plus a faint rainbow ring when
   the sun is near the middle. It follows how much of the sun's disc is seen
   (hills, trees, riders and cloud over it dim it or cut it off, easing over
-  a few frames), and fades as the sun leaves the screen. At night the lamps
-  and fires leave their own faint ghosts, mirrored through the middle from
-  the same bright parts the glow uses. Works with Light Glow off too.
+  a few frames), and fades as the sun leaves the screen. At night the moon
+  makes a fainter one (as bright as its phase). Only the sun and moon flare:
+  the lamps and fires don't (their light pillars stay, with the ice halo).
+  Works with Light Glow off too.
   Lens dirt (Lens Dirt, `native_lens_dirt`, 0.4; with the lens flare on):
   dust and smudges on the lens, out of focus (soft discs, a little brighter
   at the rim, and faint smears), that light up when the sun is in view,
