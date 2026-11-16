@@ -86,6 +86,7 @@ const std::vector<Tab>& Tabs() {
            {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_god_rays", "God Rays"},
            {"native_volumetric", "Volumetric Light", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_sun_sheen", "Sun Sheen", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_eye_adaptation", "Eye Adaptation", Kind::kSlider, 0.0, 1.0, 0.1},
            {"native_snow_tracks", "Snow Tracks", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_shadow_resolution", "Shadow Resolution", Kind::kStops, 0, 0, 0,

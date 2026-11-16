@@ -339,7 +339,7 @@ lighting, each setting the detailed options under it:
 | Lamp shadows | Off / Low (two nearest lamps) / Medium (every lamp) / High (every lamp, finer) |
 | Atmosphere | Fog / God rays / Volumetric low (quarter size) / high (half) / ultra (finer steps) |
 | Ambient occlusion | Off / On |
-| Surface detail | Low / High (settling snow, snow tracks, cloud shadows) |
+| Surface detail | Low / High (settling snow, snow tracks, cloud shadows, sun sheen) |
 
 The detailed options stay adjustable; a part whose options match none of
 its levels shows Custom, and so does the preset. High is the default.
@@ -486,6 +486,15 @@ that rule against a save that has the pass.
   distance fog is drawn in the same pass (one full-screen pass for both).
   The cloud layer is worked out once a frame into a small map round the
   camera, which the cloud shadows and the volumetric light both read.
+  The sun's sheen (Sun Sheen, `native_sun_sheen`, 1): the game's lighting
+  has no specular at all, so a physically based highlight (GGX) is added
+  from the sun or moon, shadowed by the sun's shadows: snow (told by its
+  albedo) a little glossy with crystals glinting in the sun, a glare off
+  the slopes toward a low sun; other surfaces a dull gloss; foliage (the
+  game's own material mark in the normals' alpha) barely. Made at the
+  lighting pass, before riders are drawn, and added after where the depth
+  still matches. (The lamps' glints use a proper integer hash now too: the
+  old one repeated far from the world's origin.)
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and

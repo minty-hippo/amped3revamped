@@ -1860,7 +1860,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1901,7 +1901,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[49] = {};  // by CopyKind
+  VkShaderModule copy_fs_[51] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2170,6 +2170,18 @@ struct Renderer::Impl {
   float VolumeDensity() const;  // the air's (per metre, at the camera's height)
   bool VolumeOn() const { return volumetric_ > 0.0f && TodOn() && !Diag("novolume"); }
   Image* VolumeScene(Image* scene);
+  // The sun's (or moon's) sheen (SetSpecular): what the game's lighting
+  // leaves out (it has no specular): a glossy highlight by surface (snow:
+  // a broad sheen and glints; packed snow and ice a glare toward a low sun;
+  // the rest a dull dielectric; foliage little), shadowed by the sun's mask.
+  // Made at the lighting pass (the world's albedo, normals and depth, no
+  // riders yet: its depth kept in alpha) and added after (where the depth
+  // still matches: not over the riders).
+  float specular_ = 0.0f;
+  Image spec_img_, spec_out_;
+  bool spec_ok_ = false;
+  void SunSpecular(const Draw& d, const GpuState& st);
+  Image* SpecularScene(Image* scene);
   bool snow_done_ = false;
   Image* snow_result_ = nullptr;
   Image snow_img_;
@@ -3142,6 +3154,11 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
           if (Image* lit = NightLights(scene, dimg)) scene = lit;
           MarkPart("effect: night lights");
         }
+      }
+      // The sun's sheen (made at the lighting).
+      if (tod_sky && spec_ok_) {
+        if (Image* glossy = SpecularScene(scene)) scene = glossy;
+        MarkPart("effect: sun sheen");
       }
       // How bright the lit scene is (eye adaptation).
       if (eye) EyeMeasure(scene);
@@ -5257,6 +5274,12 @@ void main() {
   if (any(lessThan(tc, vec2(2.0))) || any(greaterThan(tc, n2 - 2.0))) return;
   vec3 N = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
   if (N.y < 0.4) return;  // the ground (snow), not walls
+  if (pc.g.w > 2.5) {
+    // (Diagnostics: the normals' w, the game's material.)
+    float w = texelFetch(normals, ip, 0).w;
+    o = vec4(w, fract(w * 4.0), fract(w * 16.0), 1.0);
+    return;
+  }
   vec2 t = T(tc);
   if (pc.g.w > 1.5) {
     o = vec4(t.r, t.g, 0.0, 1.0);
@@ -5570,6 +5593,121 @@ void main() {
   o = vec4(v);
 }
 )", true);
+  // The sun's sheen, 1 (at the lighting pass): GGX by surface, from the
+  // albedo (snow told by its color), the normals (their w: foliage), the
+  // sun's shadow mask. rgb the sheen, a the depth it was made at.
+  copy_fs_[49] = CompileBuiltin("builtin_sun_spec", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D albedo;
+layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the game's material (foliage > 0)
+layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(set = 0, binding = 3) uniform sampler2D mask;     // the sun's shadows (1 lit)
+layout(push_constant) uniform Spec {
+  mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
+  vec4 L;    // toward the light, -
+  vec4 col;  // its color (exposed), how low it is (0 high .. 1 at the horizon)
+  vec4 cam;  // camera, mask on (0/1)
+} pc;
+layout(location = 0) out vec4 o;
+// (An integer hash: a cell's own, far from the origin too.)
+float Hash3(ivec3 c, int k) {
+  uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u ^ uint(k) * 2654435761u;
+  h ^= h >> 16;
+  h *= 0x7feb352du;
+  h ^= h >> 15;
+  h *= 0x846ca68bu;
+  h ^= h >> 16;
+  return float(h & 0xFFFFFFu) / 16777216.0;
+}
+float D_GGX(float nh, float a) {
+  float a2 = a * a;
+  float dd = nh * nh * (a2 - 1.0) + 1.0;
+  return a2 / (3.14159 * dd * dd);
+}
+float G_Smith(float nv, float nl, float a) {
+  float k = a * 0.5;
+  return (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  ivec2 sz = textureSize(depth, 0);
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) {
+    o = vec4(0.0);
+    return;
+  }
+  vec2 uv = (gl_FragCoord.xy) / vec2(sz);
+  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  vec3 P = wp.xyz / wp.w;
+  vec3 V = normalize(pc.cam.xyz - P);
+  vec4 nw = texelFetch(normals, ip, 0);
+  vec3 N = normalize(nw.xyz * 2.0 - 1.0);
+  vec3 L = pc.L.xyz;
+  float nl = dot(N, L), nv = dot(N, V);
+  if (nl <= 0.0 || nv <= 0.0) {
+    o = vec4(0.0, 0.0, 0.0, d);
+    return;
+  }
+  float lit = pc.cam.w > 0.5 ? texelFetch(mask, ip, 0).r : 1.0;
+  if (lit <= 0.01) {
+    o = vec4(0.0, 0.0, 0.0, d);
+    return;
+  }
+  vec3 alb = texelFetch(albedo, ip, 0).rgb;
+  float lum = dot(alb, vec3(0.3, 0.59, 0.11));
+  float sat = max(alb.r, max(alb.g, alb.b)) - min(alb.r, min(alb.g, alb.b));
+  bool foliage = nw.w > 0.02;
+  float snow = foliage ? 0.0 : smoothstep(0.5, 0.7, lum) * smoothstep(0.2, 0.08, sat);
+  // Roughness and reflectance: snow (packed, the slopes) glossier toward a
+  // low sun's glare; the rest a dull dielectric; foliage waxy, faint.
+  float rough = foliage ? 0.6 : mix(0.55, 0.3, snow);
+  float f0 = foliage ? 0.03 : mix(0.04, 0.03, snow);
+  vec3 H = normalize(L + V);
+  float nh = max(dot(N, H), 0.0), vh = max(dot(V, H), 0.0);
+  float a = rough * rough;
+  float F = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+  float spec = D_GGX(nh, a) * G_Smith(nv, nl, a) * F / (4.0 * nv * nl) * nl;
+  spec = min(spec, 6.0);
+  vec3 c = pc.col.rgb * spec * lit * (foliage ? 0.35 : 1.0);
+  // Glints in the sunlit snow: crystals catching it, changing as the view
+  // moves (fewer far off: they'd shimmer).
+  if (snow > 0.0) {
+    float dist = length(pc.cam.xyz - P);
+    ivec3 cell = ivec3(floor(P * 30.0));
+    ivec3 hb = ivec3(floor(H * 7.0));
+    float g = step(0.995, Hash3(cell, hb.x * 31 + hb.y * 17 + hb.z * 7));
+    c += pc.col.rgb * g * snow * lit * nl * 2.5 * smoothstep(35.0, 8.0, dist);
+  }
+  if (pc.L.w > 0.5) c = vec4(snow, lit, nl, 0.0).rgb + vec3(0.0, 0.0, spec * 0.0);
+  o = vec4(c, d);
+}
+)", true);
+  // The sun's sheen, 2: added to the scene where the depth still matches
+  // (not over what was drawn after the lighting: riders, effects).
+  copy_fs_[50] = CompileBuiltin("builtin_spec_add", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D spec;
+layout(set = 0, binding = 1) uniform sampler2D scene;
+layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(push_constant) uniform Add { vec4 a; } pc;  // strength
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(scene, ip, 0);
+  vec4 s = texelFetch(spec, ip, 0);
+  float d = texelFetch(depth, ip, 0).r;
+  // (Within a percent or two: a rider in front differs far more.)
+  if (s.a <= 0.0 || abs(d - s.a) > 1e-6 + s.a * 0.015) {
+    o = c;
+    return;
+  }
+  vec3 add = s.rgb * pc.a.x;
+  if (pc.a.y > 0.5) {
+    o = vec4(s.rgb, 1.0);
+    return;
+  }
+  add /= 1.0 + dot(add, vec3(0.3, 0.59, 0.11));
+  o = vec4(c.rgb + add * (1.0 - 0.6 * clamp(c.rgb, 0.0, 1.0)), c.a);
+}
+)", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
   // the same way), a few hundred metres up, over each point toward the sun:
   // the sun's shadow mask darkened under them.
@@ -5806,6 +5944,16 @@ float smin(float a, float b, float k) {
 }
 vec2 opU(vec2 a, vec2 b) { return a.x < b.x ? a : b; }
 float Hash(float n) { return fract(sin(n) * 43758.5453); }
+// (An integer hash: a cell's own, far from the origin too.)
+float Hash3(ivec3 c, int k) {
+  uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u ^ uint(k) * 2654435761u;
+  h ^= h >> 16;
+  h *= 0x7feb352du;
+  h ^= h >> 15;
+  h *= 0x846ca68bu;
+  h ^= h >> 16;
+  return float(h & 0xFFFFFFu) / 16777216.0;
+}
 vec3 g_arm;  // a bulb: from it back to where it's mounted (world axes)
 vec2 Model(int kind, vec3 p) {
   if (kind == 0) {
@@ -6075,9 +6223,8 @@ void main() {
         if (facing > 0.0) {
           float snow = rider ? 0.0 : smoothstep(0.45, 0.7, dot(alb, vec3(0.333)));
           float sheen = pow(max(dot(N, hv), 0.0), 28.0) * (0.12 + 0.3 * snow);
-          vec3 cell = floor(P * 28.0);
-          float glint = step(0.993, Hash(dot(cell, vec3(1.0, 57.0, 113.0)) +
-                                         dot(floor(hv * 6.0), vec3(7.1, 11.3, 13.7)))) *
+          ivec3 hb = ivec3(floor(hv * 6.0));
+          float glint = step(0.993, Hash3(ivec3(floor(P * 28.0)), hb.x * 31 + hb.y * 17 + hb.z * 7)) *
                         snow * smoothstep(40.0, 10.0, pix_dist);
           lit += col * fall * facing * (sheen + glint * 3.0);
         }
@@ -6393,6 +6540,12 @@ void main() {
   float d = texelFetch(depth, ip, 0).r;
   if (d <= 0.0) {
     o = c;
+    return;
+  }
+  if (pc.a.w > 0.5) {
+    // (Diagnostics: the normals' w, the game's material.)
+    float mw = texelFetch(normals, ip, 0).w;
+    o = vec4(mw, fract(mw * 4.0), fract(mw * 16.0), 1.0);
     return;
   }
   vec3 n = normalize(texelFetch(normals, ip, 0).xyz * 2.0 - 1.0);
@@ -9542,6 +9695,89 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   return fog_result_;
 }
 
+// The sun's sheen, at the lighting pass (builtin_sun_spec): into spec_img_.
+void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
+  spec_ok_ = false;
+  if (specular_ <= 0.0f || !TodOn() || !tod_normal_ || Diag("nospec")) return;
+  std::string n0;
+  Image* a3 = TextureFor(d, 3, st, &n0);
+  auto dit = resolved_.find(depth_base_);
+  if (!a3 || a3->depth || a3->samples != 1 || dit == resolved_.end() ||
+      dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples != 1 ||
+      dit->second.width != a3->width || dit->second.height != a3->height ||
+      tod_normal_->width != a3->width || tod_normal_->height != a3->height) {
+    return;
+  }
+  Image* albedo = tracks_ok_ && a3 == tracks_albedo_src_ ? &tracks_albedo_
+                  : snow_cover_ok_ && a3 == snow_albedo_src_ ? &snow_albedo_ : a3;
+  const tod::State& t = tod_state_;
+  double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
+  const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
+  if (!(fl > 1e-12)) return;
+  // The light: the sun by day, the moon (faint) at night, dimmed through a
+  // grey sky (little sheen then).
+  const double day = 1.0 - t.night;
+  const double dim = 1.0 - 0.85 * std::clamp(double(tod_.overcast), 0.0, 1.0);
+  const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
+  double col[3] = {t.sun_color.x * day + t.moon_color.x * t.night * t.moon_bright * 0.12,
+                   t.sun_color.y * day + t.moon_color.y * t.night * t.moon_bright * 0.12,
+                   t.sun_color.z * day + t.moon_color.z * t.night * t.moon_bright * 0.14};
+  for (double& c : col) c *= dim * e * 0.9;
+  if (col[0] + col[1] + col[2] < 0.002) return;
+  EndRendering();
+  if (!spec_img_.image || spec_img_.width != a3->width || spec_img_.height != a3->height) {
+    if (spec_img_.image) Retire(spec_img_);
+    spec_img_ = gpu_.CreateImage(a3->width, a3->height, VK_FORMAT_R16G16B16A16_SFLOAT, false, "sun_spec");
+    ToGeneral(cb_, spec_img_);
+  }
+  float pc[28] = {};
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+  }
+  for (int i = 0; i < 3; ++i) pc[16 + i] = float(-fd[i] / fl);
+  pc[19] = Diag("specdbg") ? 1.0f : 0.0f;
+  for (int i = 0; i < 3; ++i) pc[20 + i] = float(col[i]);
+  pc[24] = cam_pos_[0];
+  pc[25] = cam_pos_[1];
+  pc[26] = cam_pos_[2];
+  pc[27] = tod_mask_ok_ ? 1.0f : 0.0f;
+  Barrier();
+  // (Its depth: a copy-sized float would lose nothing; R16F alpha keeps the
+  // match test's tolerance relative.)
+  FullscreenPass(CopyKind::kSunSpec, &spec_img_, albedo, tod_normal_, &dit->second, false, pc, 28, nullptr,
+                 tod_mask_ok_ ? &tod_mask_ : &tod_white_);
+  Barrier();
+  dyn_ = DynState{};
+  spec_ok_ = true;
+}
+
+// The sun's sheen added (builtin_spec_add), after the scene.
+Image* Renderer::Impl::SpecularScene(Image* scene) {
+  if (!spec_ok_) return nullptr;
+  spec_ok_ = false;
+  auto dit = resolved_.find(depth_base_);
+  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples != 1 ||
+      dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1 ||
+      spec_img_.width != scene->width || spec_img_.height != scene->height) {
+    return nullptr;
+  }
+  EndRendering();
+  if (!spec_out_.image || spec_out_.width != scene->width || spec_out_.height != scene->height ||
+      spec_out_.format != scene->format) {
+    if (spec_out_.image) Retire(spec_out_);
+    spec_out_ = gpu_.CreateImage(scene->width, scene->height, scene->format, false, "sun_spec_lit");
+    ToGeneral(cb_, spec_out_);
+  }
+  spec_out_.scaled = scene->scaled;
+  spec_out_.scale = scene->scale;
+  float pc[4] = {specular_, Diag("specdbg") || Diag("specshow") ? 1.0f : 0.0f, 0, 0};
+  Barrier();
+  FullscreenPass(CopyKind::kSpecAdd, &spec_out_, &spec_img_, scene, &dit->second, false, pc, 4);
+  Barrier();
+  dyn_ = DynState{};
+  return &spec_out_;
+}
+
 // The air's density for the volumetric light (per metre, at the camera's
 // height): a little haze always; more under a grey sky, in mist (the fog),
 // and in falling snow.
@@ -9862,7 +10098,7 @@ void Renderer::Impl::TracksInputs(const Draw& d, const GpuState& st, Image* albe
   pc[22] = 1.0f / float(a3->width);
   pc[23] = 1.0f / float(a3->height);
   Barrier();
-  pc[19] = Diag("tracksshow") ? 2.0f : 0.0f;
+  pc[19] = Diag("matid") ? 3.0f : Diag("tracksshow") ? 2.0f : 0.0f;
   FullscreenPass(CopyKind::kTracksApply, &tracks_albedo_, albedo_in, n4, &dit->second, false, pc, 24,
                  nullptr, &tracks_map_);
   pc[19] = 1.0f;
@@ -9905,6 +10141,7 @@ void Renderer::Impl::SceneInputs(const Draw& d, const GpuState& st) {
       pc[16] = std::clamp(tod_.snow_cover, 0.0f, 1.0f);
       pc[17] = 1.0f / float(a3->width);
       pc[18] = 1.0f / float(a3->height);
+      pc[19] = Diag("matid") ? 1.0f : 0.0f;
       pc[20] = tod_.wind[0];
       pc[21] = tod_.wind[1];
       pc[22] = float(cam_pos_[0]);
@@ -9993,6 +10230,7 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
     vk::vkCmdClearColorImage(cb_, tod_white_.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
   }
   TodShadows();
+  SunSpecular(d, st);
   std::string note;
   Image* src = TextureFor(d, 1, st, &note);
   if (!src || src->depth || src->samples > 1 || src->width > 4096 || src->height > 4096) {
@@ -13509,7 +13747,7 @@ Renderer::Impl::~Impl() {
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
-                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_}) {
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
@@ -13971,6 +14209,7 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
 void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
+void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetVolumetric(float strength, int quality) {
   impl_->volumetric_ = std::clamp(strength, 0.0f, 2.0f);
   impl_->volumetric_quality_ = std::clamp(quality, 0, 2);

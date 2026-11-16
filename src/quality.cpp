@@ -32,8 +32,8 @@ REXCVAR_DEFINE_INT32(native_quality_ambient_occlusion, 1, "GPU",
                      "Ambient occlusion: 0 off, 1 on. -1: custom")
     .range(-1, 1);
 REXCVAR_DEFINE_INT32(native_quality_surface, 1, "GPU",
-                     "Surface detail: 0 low (no settling snow, snow tracks or cloud shadows); "
-                     "1 high (all three). -1: custom")
+                     "Surface detail: 0 low (no settling snow, snow tracks, cloud shadows or sun "
+                     "sheen); 1 high (all four). -1: custom")
     .range(-1, 1);
 
 namespace amped3::quality {
@@ -139,16 +139,18 @@ void SetSurface(int l) {
   if (l == 0) {
     SetNum("native_snow_tracks", 0.0);
     SetNum("native_cloud_shadows", 0.0);
+    SetNum("native_sun_sheen", 0.0);
   } else {
     if (Num("native_snow_tracks") <= 0.0) SetNum("native_snow_tracks", 1.0);
     if (Num("native_cloud_shadows") <= 0.0) SetNum("native_cloud_shadows", 0.5);
+    if (Num("native_sun_sheen") <= 0.0) SetNum("native_sun_sheen", 1.0);
   }
 }
 int MatchSurface() {
   const bool cover = Num("native_snow_cover") > 0.5, tracks = Num("native_snow_tracks") > 0.0,
-             clouds = Num("native_cloud_shadows") > 0.0;
-  if (!cover && !tracks && !clouds) return 0;
-  if (cover && tracks && clouds) return 1;
+             clouds = Num("native_cloud_shadows") > 0.0, sheen = Num("native_sun_sheen") > 0.0;
+  if (!cover && !tracks && !clouds && !sheen) return 0;
+  if (cover && tracks && clouds && sheen) return 1;
   return -1;
 }
 

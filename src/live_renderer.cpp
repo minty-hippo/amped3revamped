@@ -256,6 +256,12 @@ REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
                     "Native renderer: light shafts from the sun (or moon) while it's in or near "
                     "view, broken up by clouds, trees and terrain in front of it");
+REXCVAR_DEFINE_DOUBLE(native_sun_sheen, 1.0, "GPU",
+                      "Time of day: the sun's (and moon's) sheen on the world, which the game's "
+                      "lighting leaves out: a glossy highlight by surface (snow glinting in the "
+                      "sun, a glare off it toward a low sun), shadowed by the sun's shadows. "
+                      "0: off, up to 2")
+    .range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(native_volumetric, 1.0, "GPU",
                       "Time of day: volumetric light: the air lit by the sun or moon where it "
                       "reaches (shafts through the trees, past ridges and under clouds; strongest "
@@ -2425,6 +2431,7 @@ void WorkerMain() {
           renderer->SetBloom(float(REXCVAR_GET(native_bloom)));
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
+          renderer->SetSpecular(float(REXCVAR_GET(native_sun_sheen)));
           renderer->SetVolumetric(float(REXCVAR_GET(native_volumetric)),
                                   int(REXCVAR_GET(native_volumetric_quality)));
           {

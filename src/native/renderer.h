@@ -380,6 +380,9 @@ class Renderer {
   // while on. 0: off, 1, up to 2.
   // (quality: 0 quarter size, 1 half, 2 half with finer steps.)
   void SetVolumetric(float strength, int quality = 1);
+  // The sun's (or moon's) sheen on the world (the game's lighting has none):
+  // glossy by surface, snow glinting; shadowed by the sun's. 0: off .. 2.
+  void SetSpecular(float strength);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

@@ -278,8 +278,8 @@ const std::vector<Tab>& Tabs() {
                         "Creases, corners and the snow round trees and jumps shaded.",
                         {{"-1", "Custom"}, {"0", "Off"}, {"1", "On"}}),
                 Choices("native_quality_surface", "Surface detail",
-                        "Snow settling on the world, the boards' tracks kept in the snow, and "
-                        "the clouds' shadows.",
+                        "Snow settling on the world, the boards' tracks kept in the snow, the "
+                        "clouds' shadows, and the sun's sheen (snow glinting).",
                         {{"-1", "Custom"}, {"0", "Low"}, {"1", "High"}}),
             }},
            {"Renderer",
@@ -554,6 +554,11 @@ const std::vector<Tab>& Tabs() {
                        "Native renderer only."),
                 SliderF("native_god_rays_strength", "God ray strength",
                         "How bright the light shafts are (0 = none).", "%.2f", 0.0, 2.0),
+                SliderF("native_sun_sheen", "Sun sheen",
+                        "With time of day on: the sun's (and moon's) sheen, which the game's "
+                        "lighting leaves out: snow glinting in the sun, a glare off it toward a "
+                        "low sun, a dull gloss on the rest. 0: off.",
+                        "%.1f", 0.0, 2.0),
                 SliderF("native_volumetric", "Volumetric light",
                         "With time of day on: the air itself lit by the sun or moon where it "
                         "reaches: real shafts through the trees, past ridges and under the "
