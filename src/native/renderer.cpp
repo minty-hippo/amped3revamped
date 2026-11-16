@@ -1926,7 +1926,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1967,7 +1967,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[53] = {};  // by CopyKind
+  VkShaderModule copy_fs_[54] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2213,6 +2213,15 @@ struct Renderer::Impl {
   float cloud_here_ = 0.0f;  // the clouds' shade at the camera (for the riders: 0..1)
   Image bloom_a_, bloom_b_, bloom_out_;
   Image* BloomScene(Image* scene);
+  // Lens flare (SetLensFlare): the sun's, drawn (ghosts of the aperture along
+  // the line through the middle, a starburst, glare), as much as the sun is
+  // seen (flare_vis_: the sky's share of the sun's disc, eased); and the
+  // lamps' and fires' at night, mirrored from the bright parts.
+  float flare_ = 0.0f;
+  Image flare_img_, flare_tmp_, flare_out_, flare_vis_[2];
+  uint32_t flare_vis_cur_ = 0;
+  Image* FlareScene(Image* scene, bool ghosts_ready);
+  void FlareGhosts(Image* bright, Image* scene);
   // Volumetric light (SetVolumetric): the air lit by the sun (or moon) where
   // it reaches, shadowed by the world's maps and the clouds: shafts through
   // trees, past ridges, under clouds; thicker in mist, overcast and falling
@@ -3279,9 +3288,9 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
         if (Image* drifting = DriftScene(scene)) scene = drifting;
         MarkPart("effect: drifting snow");
       }
-      if (tod_sky && bloom_ > 0.0f) {
+      if (tod_sky && (bloom_ > 0.0f || flare_ > 0.0f)) {
         if (Image* bloomed = BloomScene(scene)) scene = bloomed;
-        MarkPart("effect: bloom");
+        MarkPart("effect: bloom and lens flare");
       }
       if (blur) {
         if (Image* blurred = BlurredScene(scene)) scene = blurred;
@@ -5930,6 +5939,130 @@ void main() {
     occ = max(occ, smoothstep(0.0, 0.025, Hs(q) - ray));
   }
   o = vec4(lit * (1.0 - 0.75 * occ));
+}
+)", true);
+  // Lens flare. 0: how much of the sun's disc is seen (one texel, eased:
+  // the sky's share of it, and how near white it is there, so a cloud over
+  // it dims it too); 1: the night lights' ghosts, mirrored through the
+  // middle from the bright parts (quarter size); 2: over the scene, those
+  // and the sun's (glare, a six-bladed starburst with its fine rays, and
+  // the aperture's ghosts along the line through the middle, each a little
+  // apart in its colors).
+  copy_fs_[53] = CompileBuiltin("builtin_flare", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;    // (linear) 0: the scene; 1: the bright parts; 2: the lights' ghosts
+layout(set = 0, binding = 1) uniform sampler2D scene;  // 0: depth; 2: the scene
+layout(set = 0, binding = 2) uniform sampler2D aux;    // 0: last frame's; 2: the sun seen
+layout(push_constant) uniform Flare {
+  vec4 a;  // mode, sun u, sun v, aspect (w / h)
+  vec4 b;  // 0: ease, disc radius, near-white from, to; 1: strength, sun masked (0/1); 2: sun color, sun strength
+  vec4 c;  // 2: lights' strength, aperture turn, lights' on (0/1), -
+} pc;
+layout(location = 0) out vec4 o;
+const int kGhosts = 8;
+// Where each ghost is (from the middle: the sun's offset times this), its
+// size (of the screen's height), how bright and its coating's tint.
+const float kK[kGhosts] = float[](-0.28, -0.55, -0.9, 0.42, -1.35, 0.22, -1.9, 1.35);
+const float kSize[kGhosts] = float[](0.035, 0.06, 0.11, 0.025, 0.16, 0.015, 0.24, 0.05);
+const float kBright[kGhosts] = float[](0.18, 0.09, 0.06, 0.14, 0.045, 0.2, 0.03, 0.05);
+const vec3 kTint[kGhosts] = vec3[](vec3(0.9, 0.6, 1.0), vec3(0.5, 1.0, 0.6), vec3(1.0, 0.75, 0.4),
+                                   vec3(0.6, 0.8, 1.0), vec3(0.7, 1.0, 0.8), vec3(1.0, 0.9, 0.7),
+                                   vec3(0.8, 0.6, 1.0), vec3(1.0, 0.5, 0.4));
+float Hash(vec2 p) {
+  uvec2 q = uvec2(ivec2(floor(p)) + 32768);
+  uint h = q.x * 1597334677u ^ q.y * 3812015801u;
+  h = (h ^ (h >> 15)) * 2246822519u;
+  return float(h ^ (h >> 13)) * (1.0 / 4294967296.0);
+}
+float Noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(Hash(i), Hash(i + vec2(1, 0)), f.x), mix(Hash(i + vec2(0, 1)), Hash(i + vec2(1, 1)), f.x), f.y);
+}
+// The aperture (six blades): 1 on its edge.
+float Hex(vec2 q) {
+  q = abs(q);
+  return max(q.x * 0.866025 + q.y * 0.5, q.y);
+}
+void main() {
+  int mode = int(pc.a.x + 0.5);
+  vec2 s = pc.a.yz;
+  float aspect = pc.a.w;
+  if (mode == 0) {
+    float seen = 0.0, n = 0.0;
+    for (int i = 0; i < 48; ++i) {
+      float r = pc.b.y * sqrt((float(i) + 0.5) / 48.0), t = float(i) * 2.39996;
+      vec2 uv = s + vec2(cos(t), sin(t)) * r * vec2(1.0 / aspect, 1.0);
+      if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) continue;
+      n += 1.0;
+      if (textureLod(scene, uv, 0.0).r > 0.0) continue;  // something in front
+      vec3 c = textureLod(src, uv, 0.0).rgb;
+      seen += smoothstep(pc.b.z, pc.b.w, max(c.r, max(c.g, c.b)));
+    }
+    float prev = texelFetch(aux, ivec2(0), 0).r;
+    // (Off the screen: what was seen, fading.)
+    float v = n >= 4.0 ? mix(prev, seen / n, pc.b.x) : prev * (1.0 - pc.b.x * 0.5);
+    o = vec4(v, n > 0.0 ? seen / n : 0.0, n, 1.0);
+  } else if (mode == 1) {
+    vec2 size = vec2(textureSize(src, 0));
+    vec2 uv = gl_FragCoord.xy / size;
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < kGhosts; ++i) {
+      for (int ch = 0; ch < 3; ++ch) {
+        float k = kK[i] * (1.0 + float(ch - 1) * 0.03);
+        vec2 from = 0.5 + (uv - 0.5) / k;
+        if (any(lessThan(from, vec2(0.0))) || any(greaterThan(from, vec2(1.0)))) continue;
+        // (Not the sun's: drawn whole below.)
+        if (pc.b.y > 0.5 && length((from - s) * vec2(aspect, 1.0)) < 0.12) continue;
+        // Off to the side, the barrel cuts it.
+        float edge = 1.0 - smoothstep(0.35, 0.75, length(from - 0.5));
+        acc[ch] += textureLod(src, from, 0.0)[ch] * kBright[i] * kTint[i][ch] * edge * 2.0;
+      }
+    }
+    o = vec4(acc * pc.b.x, 1.0);
+  } else {
+    vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
+    vec2 uv = gl_FragCoord.xy / vec2(textureSize(scene, 0));
+    vec3 add = vec3(0.0);
+    if (pc.c.z > 0.5) add += textureLod(src, uv, 0.0).rgb * pc.c.x;
+    float sun = pc.b.w * texelFetch(aux, ivec2(0), 0).r;
+    if (sun > 1e-4) {
+      vec3 col = pc.b.rgb * sun;
+      vec2 d = (uv - s) * vec2(aspect, 1.0);
+      float r = length(d);
+      // Glare: a bright core and a wide veil.
+      vec3 glare = col * (0.35 * exp(-r * r / 0.00045) + 0.06 / (1.0 + r * r * 500.0));
+      // The starburst: six spikes (the blades' edges), the far ends
+      // reddening (longer waves spread wider), and fine rays.
+      float t = atan(d.y, d.x) + pc.c.y;
+      float spike = pow(abs(cos(3.0 * t)), 500.0);
+      vec3 reach = vec3(0.11, 0.095, 0.08);
+      vec3 burst = spike * exp(-r / reach) * 0.35;
+      float fine = Noise(vec2(cos(t), sin(t)) * 26.0);
+      burst += vec3(pow(fine, 7.0) * exp(-r / 0.05) * 0.5);
+      add += glare + burst * col;
+      // The ghosts: the aperture's shape, each a little apart in its colors
+      // (an edge of fringes), brighter at the rim.
+      vec2 off = s - 0.5;
+      float cs = cos(pc.c.y), sn = sin(pc.c.y);
+      for (int i = 0; i < kGhosts; ++i) {
+        vec3 g;
+        for (int ch = 0; ch < 3; ++ch) {
+          vec2 p = 0.5 + off * kK[i] * (1.0 + float(ch - 1) * 0.025);
+          vec2 q = (uv - p) * vec2(aspect, 1.0);
+          q = vec2(cs * q.x - sn * q.y, sn * q.x + cs * q.y);
+          float h = Hex(q) / kSize[i];
+          g[ch] = (1.0 - smoothstep(0.9, 1.0, h)) * (0.55 + 0.45 * smoothstep(0.5, 1.0, h));
+        }
+        add += g * kTint[i] * kBright[i] * col;
+      }
+      // A wide ring round the middle, in rainbow colors, when the sun is
+      // near the middle.
+      float rc = length((uv - 0.5 + off * 0.1) * vec2(aspect, 1.0));
+      vec3 ring = exp(-pow((rc - vec3(0.37, 0.355, 0.34)) / 0.012, vec3(2.0)));
+      add += ring * col * 0.035 * (1.0 - smoothstep(0.1, 0.5, length(off * vec2(aspect, 1.0))));
+    }
+    o = vec4(c.rgb + add, c.a);
+  }
 }
 )", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
@@ -9758,6 +9891,15 @@ Image* Renderer::Impl::BloomScene(Image* scene) {
   pc[4] = 0.85f;  // how much the surroundings are taken off
   Barrier();
   FullscreenPass(CopyKind::kBloom, &bloom_a_, scene, nullptr, nullptr, true, pc, 8);
+  // The lights' ghosts (from the bright parts before they're blurred).
+  const bool flare = flare_ > 0.0f && !Diag("noflare");
+  const bool ghosts = flare && dark > 0.02f;
+  if (ghosts) FlareGhosts(&bloom_a_, scene);
+  if (!(bloom_ > 0.0f)) {
+    Image* f = flare ? FlareScene(scene, ghosts) : nullptr;
+    dyn_ = DynState{};
+    return f;
+  }
   // Blurred: across, then down, twice (wider the second time).
   for (int pass = 0; pass < 2; ++pass) {
     const float spread = pass == 0 ? 1.0f : 2.5f;
@@ -9780,8 +9922,99 @@ Image* Renderer::Impl::BloomScene(Image* scene) {
   Barrier();
   FullscreenPass(CopyKind::kBloom, &bloom_out_, &bloom_a_, scene, nullptr, true, pc, 8);
   Barrier();
+  Image* out = &bloom_out_;
+  if (flare) {
+    if (Image* f = FlareScene(out, ghosts)) out = f;
+  }
   dyn_ = DynState{};
-  return &bloom_out_;
+  return out;
+}
+
+// The night lights' ghosts (builtin_flare 1): mirrored through the middle
+// from the bright parts, a quarter the size, then blurred a little.
+void Renderer::Impl::FlareGhosts(Image* bright, Image* scene) {
+  const uint32_t qw = bright->width, qh = bright->height;
+  for (Image* im : {&flare_img_, &flare_tmp_}) {
+    if (im->image && im->width == qw && im->height == qh) continue;
+    if (im->image) Retire(*im);
+    *im = gpu_.CreateImage(qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, false, im == &flare_img_ ? "flare" : "flare_tmp");
+    ToGeneral(cb_, *im);
+  }
+  float sun_uv[2], edge = 0.0f;
+  const bool sun = SunOnScreen(sun_uv, &edge);
+  float pc[12] = {1.0f, sun_uv[0], sun_uv[1], float(scene->width) / float(scene->height),
+                  1.0f, sun && tod_state_.sun_elevation > -1.0 * tod::kDeg ? 1.0f : 0.0f, 0, 0};
+  Barrier();
+  FullscreenPass(CopyKind::kFlare, &flare_img_, bright, nullptr, nullptr, true, pc, 12);
+  float bl[8] = {1.0f, 0.0f, 1.5f / float(qw), 0.0f, 0, 0, 0, 0};
+  Barrier();
+  FullscreenPass(CopyKind::kBloom, &flare_tmp_, &flare_img_, nullptr, nullptr, true, bl, 8);
+  bl[2] = 0.0f;
+  bl[3] = 1.5f / float(qh);
+  Barrier();
+  FullscreenPass(CopyKind::kBloom, &flare_img_, &flare_tmp_, nullptr, nullptr, true, bl, 8);
+}
+
+// The lens flare over the scene (builtin_flare 0 and 2): the sun's, as much
+// as its disc is seen, and the lights' ghosts (FlareGhosts).
+Image* Renderer::Impl::FlareScene(Image* scene, bool ghosts_ready) {
+  const uint32_t w = scene->width, h = scene->height;
+  auto dit = resolved_.find(depth_base_);
+  Image* depth = dit != resolved_.end() && dit->second.format == VK_FORMAT_R32_SFLOAT &&
+                         dit->second.samples == 1 && dit->second.width == w && dit->second.height == h
+                     ? &dit->second
+                     : nullptr;
+  float sun_uv[2], edge = 0.0f;
+  const bool on = SunOnScreen(sun_uv, &edge);
+  // The sun (not the moon): up, and how bright (through the eye's exposure).
+  const tod::State& t = tod_state_;
+  double day = 1.0;
+  tod::Vec3 col{1.0, 0.97, 0.9};
+  if (TodOn()) {
+    day = tod::SmoothStep(-1.0 * tod::kDeg, 4.0 * tod::kDeg, t.sun_elevation);
+    col = t.sun_color;
+  }
+  const double e = eye_strength_ > 0.0f ? std::min(exposure_, 2.0) : 1.0;
+  const float sun_strength = float(flare_ * day * e);
+  const bool sun = depth && sun_strength > 0.001f && sun_valid_;
+  const float dark = float(LightsDark());
+  if (!sun && !ghosts_ready) return nullptr;
+  EndRendering();
+  auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
+    if (im.image && im.width == iw && im.height == ih && im.format == f) return false;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(iw, ih, f, false, name);
+    ToGeneral(cb_, im);
+    return true;
+  };
+  ensure(flare_out_, w, h, scene->format, "flare_out");
+  flare_out_.scaled = scene->scaled;
+  flare_out_.scale = scene->scale;
+  const float aspect = float(w) / float(h);
+  if (sun) {
+    for (Image& v : flare_vis_) {
+      if (ensure(v, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, "flare_vis")) {
+        VkClearColorValue zero{};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vk::vkCmdClearColorImage(cb_, v.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+      }
+    }
+    const uint32_t prev = flare_vis_cur_, cur = prev ^ 1;
+    const float ease = 1.0f - std::exp(-std::clamp(speed_dt_, 0.001f, 0.25f) / 0.06f);
+    float pc[12] = {0.0f, on ? sun_uv[0] : -9.0f, on ? sun_uv[1] : -9.0f, aspect,
+                    ease, 0.012f, 0.8f, 0.97f, 0, 0, 0, 0};
+    Barrier();
+    FullscreenPass(CopyKind::kFlare, &flare_vis_[cur], scene, depth, &flare_vis_[prev], true, pc, 12);
+    flare_vis_cur_ = cur;
+  }
+  float pc[12] = {2.0f, sun_uv[0], sun_uv[1], aspect,
+                  float(col.x), float(col.y), float(col.z), sun ? sun_strength * edge : 0.0f,
+                  flare_ * dark, 0.26f, ghosts_ready ? 1.0f : 0.0f, 0.0f};
+  Barrier();
+  FullscreenPass(CopyKind::kFlare, &flare_out_, ghosts_ready ? &flare_img_ : nullptr, scene,
+                 sun ? &flare_vis_[flare_vis_cur_] : nullptr, true, pc, 12);
+  Barrier();
+  return &flare_out_;
 }
 
 Image* Renderer::Impl::SnowScene(Image* scene) {
@@ -14244,7 +14477,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &flare_img_, &flare_tmp_, &flare_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }
@@ -14710,6 +14943,7 @@ void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetDriftingSnow(bool on) { impl_->drift_ = on; }
+void Renderer::SetLensFlare(float strength) { impl_->flare_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::StartSurfacePick() {

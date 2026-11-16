@@ -499,6 +499,11 @@ const std::vector<Tab>& Tabs() {
                         "With time of day on: a soft glow around lamps, fires and other small "
                         "bright things, strongest at night (broad lit snow doesn't glow). 0: off.",
                         "%.1f", 0.0, 2.0),
+                SliderF("native_lens_flare", "Lens flare",
+                        "With time of day on: the sun's flare when it's in view (glare, a "
+                        "starburst and the lens's ghosts, cut by hills, trees and cloud), and the "
+                        "lamps' and fires' ghosts at night. 0: off, 1: natural.",
+                        "%.1f", 0.0, 2.0),
                 Choices("native_shadow_resolution", "Shadow resolution",
                         "The sun's shadow map (riders, rails, jumps and objects, and the trees "
                         "with Tree shadows; the mountains' shadows are painted into the slopes), "

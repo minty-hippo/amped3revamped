@@ -463,6 +463,7 @@ int main(int argc, char** argv) {
   amped3::native::Renderer::TimeOfDay tod;
   float eye = 0.0f;  // --eye strength (eye adaptation)
   float bloom = 0.0f;
+  float flare = 0.0f;  // --lens-flare strength
   float cloud_shadows = 0.0f;  // --cloud-shadows
   float tracks = 0.0f;  // --tracks
   float volumetric = 0.0f;  // --volumetric
@@ -558,6 +559,8 @@ int main(int argc, char** argv) {
       cloud_shadows = std::stof(argv[++i]);
     } else if (a == "--bloom" && i + 1 < argc) {
       bloom = std::stof(argv[++i]);
+    } else if (a == "--lens-flare" && i + 1 < argc) {
+      flare = std::stof(argv[++i]);
     } else if (a == "--tod-cover" && i + 1 < argc) {
       tod.snow_cover = std::stof(argv[++i]);
     } else if (a == "--tod-snow" && i + 1 < argc) {
@@ -876,6 +879,7 @@ int main(int argc, char** argv) {
     renderer.SetTimeOfDay(tod);
     renderer.SetEyeAdaptation(eye);
     renderer.SetBloom(bloom);
+    renderer.SetLensFlare(flare);
   renderer.SetCloudShadows(cloud_shadows);
   renderer.SetSnowTracks(tracks);
   renderer.SetVolumetric(volumetric, volumetric_quality);

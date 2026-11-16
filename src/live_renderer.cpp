@@ -168,6 +168,12 @@ REXCVAR_DEFINE_DOUBLE(native_bloom, 0.5, "GPU",
                       "Time of day: glow around lamps, fires and other small bright things "
                       "(strongest at night; broad lit snow doesn't glow). 0: off, up to 2")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_DOUBLE(native_lens_flare, 0.6, "GPU",
+                      "Time of day: lens flare. The sun's when it's in view (glare, a six-bladed "
+                      "starburst and the aperture's ghosts, as much as the sun is seen: hills, "
+                      "trees and cloud cut it), and ghosts of the lamps and fires at night. 0: "
+                      "off, 1: natural, up to 2")
+    .range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(native_snow_tracks, 1.0, "GPU",
                       "Native renderer: the boards' tracks pressed into the snow and kept "
                       "(a couple of hundred metres round you), the snow they push aside "
@@ -2449,6 +2455,7 @@ void WorkerMain() {
           renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)),
                                     int(REXCVAR_GET(native_night_light_shadow_lamps)));
           renderer->SetBloom(float(REXCVAR_GET(native_bloom)));
+          renderer->SetLensFlare(float(REXCVAR_GET(native_lens_flare)));
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(float(REXCVAR_GET(native_sun_sheen)));

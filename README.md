@@ -526,6 +526,16 @@ that rule against a save that has the pass.
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and
   sunny slopes don't wash out.
+  Lens flare (Time of Day: Lens Flare, `native_lens_flare`, 0.6): with the
+  sun in view, glare round it, a six-bladed starburst (fine rays, the spikes'
+  ends reddening) and the lens's ghosts: aperture-shaped hexagons along the
+  line from the sun through the middle of the screen, each tinted by its
+  coating and a little apart in its colors, plus a faint rainbow ring when
+  the sun is near the middle. It follows how much of the sun's disc is seen
+  (hills, trees, riders and cloud over it dim it or cut it off, easing over
+  a few frames), and fades as the sun leaves the screen. At night the lamps
+  and fires leave their own faint ghosts, mirrored through the middle from
+  the same bright parts the glow uses. Works with Light Glow off too.
 - Snow tracks (Effects: Snow Tracks, `native_snow_tracks`, 1; works with
   time of day off too): every board's trail (the game's own, which fades
   after a few metres) is pressed into the snow and kept, for a couple of
