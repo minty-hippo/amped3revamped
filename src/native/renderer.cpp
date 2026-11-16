@@ -1860,7 +1860,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1901,7 +1901,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[47] = {};  // by CopyKind
+  VkShaderModule copy_fs_[49] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2158,6 +2158,14 @@ struct Renderer::Impl {
   float vol_shadow_pc_[32] = {};
   bool vol_shadow_ok_ = false, vol_world_ok_ = false;
   float vol_cloud_[4] = {};
+  Image cloud_map_;           // the cloud layer round the camera (builtin_cloud_map)
+  float cloud_map_at_[4] = {};  // its corner (layer coordinates), 1 / its span
+  // The fog left to the volumetric light's pass (one pass for both): its
+  // constants and colors.
+  bool fog_merged_ = false;
+  float fog_pc_[32] = {};
+  Image* fog_colors_now_ = nullptr;
+  bool VolumeReady(const Image* scene, const Image* depth) const;
   float VolumeDensity() const;  // the air's (per metre, at the camera's height)
   bool VolumeOn() const { return volumetric_ > 0.0f && TodOn() && !Diag("novolume"); }
   Image* VolumeScene(Image* scene);
@@ -5289,6 +5297,7 @@ layout(set = 0, binding = 0) uniform sampler2D depth;    // full size (0: nothin
 layout(set = 0, binding = 1) uniform sampler2D casters;  // from the sun: depth, 1 = nothing
 layout(set = 0, binding = 2) uniform sampler2D world;    // the world map
 layout(set = 0, binding = 3) uniform sampler2D params;   // 8 x 1 (below)
+layout(set = 0, binding = 4) uniform sampler2D cmap;     // the cloud layer round about (builtin_cloud_map)
 layout(push_constant) uniform Maps {
   mat4 m;                    // ndc (x, y, 1 - depth, 1) -> world
   vec4 o0; vec4 o1; vec4 o2; // the casters' map's rows
@@ -5299,7 +5308,7 @@ layout(location = 0) out vec4 o;
 // (/m); 2 toward the light, its forward scattering (g); 3 the height it's
 // densest at, how fast it thins (/m), steps, maps (1 casters, 2 world);
 // 4 the clouds: cover, clock, height, darkness; 5 1 / size (here), the
-// depth's size.
+// depth's size; 6 the cloud map's corner, 1 / its span.
 vec4 P(int i) { return texelFetch(params, ivec2(i, 0), 0); }
 float hash(vec2 p) {
   p = fract(p * vec2(443.897, 441.423));
@@ -5311,10 +5320,14 @@ float noise(vec2 p) {
   vec2 w = f * f * (3.0 - 2.0 * f);
   return mix(mix(hash(i), hash(i + vec2(1, 0)), w.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), w.x), w.y);
 }
-float Clouds(vec3 X, vec3 L, vec4 c) {
+float Clouds(vec3 X, vec3 L, vec4 c, vec4 cm) {
   if (c.w <= 0.0) return 0.0;
   vec2 q = X.xz + L.xz * (c.z / max(L.y, 0.08));
   vec2 p = q / c.z * 0.9 + vec2(c.y * 0.006, c.y * 0.0025);
+  vec2 mu = (p - cm.xy) * cm.z;
+  if (all(greaterThan(mu, vec2(0.002))) && all(lessThan(mu, vec2(0.998)))) {
+    return c.w * smoothstep(1.0 - c.x - 0.03, 1.0 - c.x + 0.1, textureLod(cmap, mu, 0.0).r);
+  }
   float v = 0.0, a = 0.5;
   for (int i = 0; i < 3; ++i) {
     v += a * noise(p);
@@ -5348,7 +5361,7 @@ float Sun(vec3 X, int maps, float dpm) {
   return lit;
 }
 void main() {
-  vec4 p0 = P(0), p1 = P(1), p2 = P(2), p3 = P(3), p4 = P(4), p5 = P(5);
+  vec4 p0 = P(0), p1 = P(1), p2 = P(2), p3 = P(3), p4 = P(4), p5 = P(5), p6 = P(6);
   vec2 uv = gl_FragCoord.xy * p5.xy;
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
   float d = texelFetch(depth, ivec2(uv * p5.zw), 0).r;
@@ -5375,7 +5388,8 @@ void main() {
     vec3 X = cam + dir * t;
     float h = X.y - p3.x;
     float dens = p1.w * clamp(exp(-h * p3.y), 0.25, 3.0);
-    float vis = Sun(X, maps, dpm) * (1.0 - Clouds(X, L, p4));
+    float vis = Sun(X, maps, dpm);
+    if (vis > 0.0) vis *= 1.0 - Clouds(X, L, p4, p6);
     float dt = max(tn * (0.35 + 0.65 * tn / dist) - tprev, 0.0);
     tprev += dt;
     acc += dens * vis * dt;
@@ -5433,16 +5447,139 @@ void main() {
   o = vec4(c.rgb + lit * (1.0 - 0.5 * clamp(c.rgb, 0.0, 1.0)), c.a);
 }
 )", true);
+  // The fog and the volumetric light in one pass (while both are on): the
+  // fog as builtin_fog, then the air's light over it.
+  copy_fs_[47] = CompileBuiltin("builtin_fog_volume", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2) uniform sampler2D fog_color;
+layout(set = 0, binding = 3) uniform sampler2D vol;  // half size: rgb the air's light, a distance
+layout(push_constant) uniform Fog {
+  mat4 m;      // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
+  vec4 cam;    // camera position, -
+  vec4 sun;    // direction toward the sun, strength (0: none)
+  vec4 a;      // density (per world unit at the base height), start distance,
+               // height falloff (per unit), base height
+  vec4 b;      // most fog (0..1), 1 / width, 1 / height, the air's light (strength)
+} pc;
+layout(location = 0) out vec4 o;
+vec4 Fogged(out float dist_out) {
+  dist_out = 20000.0;
+  vec2 uv = gl_FragCoord.xy * pc.b.yz;
+  vec4 c = texture(scene, uv);
+  float d = texture(depth, uv).r;
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  // The view ray: through a point halfway in depth.
+  vec4 mid = pc.m * vec4(ndc, 0.5, 1.0);
+  vec3 dir = normalize(mid.xyz / mid.w - pc.cam.xyz);
+  float dist;
+  vec4 wp = pc.m * vec4(ndc, 1.0 - d, 1.0);
+  if (d <= 0.0 || abs(wp.w) < 1e-7) {
+    dist = 20000.0;  // the sky: far away
+  } else {
+    dist = length(wp.xyz / wp.w - pc.cam.xyz);
+  }
+  dist_out = dist;
+  float len = max(dist - pc.a.y, 0.0);
+  if (len <= 0.0) {
+    return c;
+  }
+  // Exponential height fog, integrated from the start distance onward.
+  vec3 s0 = pc.cam.xyz + dir * pc.a.y;
+  float k = pc.a.z;
+  // At most twice as dense below the base height (deep valleys don't fill
+  // up solid).
+  float base = pc.a.x * exp(min(-k * (s0.y - pc.a.w), 0.7));
+  float t = k * dir.y * len;
+  // Looking down, the ray goes into denser air: capped as above.
+  float amount = abs(t) > 1e-4 ? base * (1.0 - exp(-t)) / (k * dir.y) : base * len;
+  amount = min(amount, pc.a.x * 2.0 * len);
+  float f = min(1.0 - exp(-max(amount, 0.0)), pc.b.x);
+  // Lit by the sun (or moon) everywhere: the ambient sky color, blending
+  // toward the sun's color with a broad forward-scattering lobe (strongest
+  // looking toward it, never fully gone).
+  vec3 ambient = texelFetch(fog_color, ivec2(0, 0), 0).rgb;
+  vec3 fc = ambient;
+  if (pc.sun.w > 0.0) {
+    vec3 sun_color = texelFetch(fog_color, ivec2(1, 0), 0).rgb;
+    float g = 0.6;
+    float cos_t = dot(dir, pc.sun.xyz);
+    float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cos_t, 1.5);
+    float hg_max = (1.0 - g * g) / pow(1.0 - g, 3.0);
+    float lit = 0.15 + 0.85 * hg / hg_max;
+    fc = mix(ambient, sun_color, clamp(lit * pc.sun.w, 0.0, 1.0));
+  }
+  return vec4(mix(c.rgb, fc, f), c.a);
+}
+
+// Then the volumetric light added (smoothed from half size: what's at the
+// same distance, not across an outline).
+void main() {
+  float dist;
+  vec4 c = Fogged(dist);
+  dist = min(dist, 220.0);
+  vec2 uv = gl_FragCoord.xy * pc.b.yz;
+  ivec2 hs = textureSize(vol, 0);
+  vec2 hp = uv * vec2(hs) - 0.5;
+  ivec2 base = ivec2(floor(hp));
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int y = -1; y <= 2; ++y) {
+    for (int x = -1; x <= 2; ++x) {
+      ivec2 q = clamp(base + ivec2(x, y), ivec2(0), hs - 1);
+      vec4 v = texelFetch(vol, q, 0);
+      vec2 dd = vec2(q) - hp;
+      float w = exp(-dot(dd, dd) * 0.6) * exp(-abs(v.a - dist) / (0.06 * dist + 0.4));
+      sum += v.rgb * w;
+      wsum += w;
+    }
+  }
+  vec3 add = wsum > 1e-4 ? sum / wsum : texture(vol, uv).rgb;
+  vec3 lit = pc.b.w > 0.0 ? add * pc.b.w : vec3(0.0);
+  lit /= 1.0 + 0.9 * dot(lit, vec3(0.3, 0.59, 0.11));
+  o = vec4(c.rgb + lit * (1.0 - 0.5 * clamp(c.rgb, 0.0, 1.0)), c.a);
+}
+)", true);
+  // The cloud layer's thickness (its noise, five octaves) once a frame, over
+  // the part of it that shades what's round the camera (the layer's own
+  // coordinates: a.xy its corner, a.z its span): read by the clouds'
+  // shadows and the volumetric light instead of the noise each.
+  copy_fs_[48] = CompileBuiltin("builtin_cloud_map", R"(#version 450
+layout(push_constant) uniform Map { vec4 a; } pc;
+layout(location = 0) out vec4 o;
+float hash(vec2 p) {
+  p = fract(p * vec2(443.897, 441.423));
+  p += dot(p, p.yx + 19.19);
+  return fract((p.x + p.y) * p.x);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), w.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), w.x), w.y);
+}
+void main() {
+  vec2 p = pc.a.xy + gl_FragCoord.xy * pc.a.z / 512.0;
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; ++i) {
+    v += a * noise(p);
+    p = p * 2.03 + vec2(17.1, 9.7);
+    a *= 0.5;
+  }
+  o = vec4(v);
+}
+)", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
   // the same way), a few hundred metres up, over each point toward the sun:
   // the sun's shadow mask darkened under them.
   copy_fs_[42] = CompileBuiltin("builtin_cloud_shadow", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D depth;
 layout(set = 0, binding = 1) uniform sampler2D mask;  // the sun's shadows
+layout(set = 0, binding = 2) uniform sampler2D cmap;  // the layer's thickness round about (builtin_cloud_map)
 layout(push_constant) uniform Clouds {
   mat4 m;     // ndc (x, y, 1 - depth, 1) -> world
   vec4 sun;   // toward the sun, cloud cover
   vec4 c;     // seconds (the clouds' clock), height (m), darkness, -
+  vec4 map;   // the map's corner (the layer's coordinates), 1 / its span, -
 } pc;
 layout(location = 0) out vec4 o;
 float hash(vec2 p) {
@@ -5484,7 +5621,9 @@ void main() {
   // sky draws it: 0.9 a height.)
   vec2 q = P.xz + L.xz * (pc.c.y / max(L.y, 0.08));
   vec2 p = q / pc.c.y * 0.9 + vec2(pc.c.x * 0.006, pc.c.x * 0.0025);
-  float n = fbm(p);
+  // (From the map round about; past it, the noise itself.)
+  vec2 mu = (p - pc.map.xy) * pc.map.z;
+  float n = all(greaterThan(mu, vec2(0.002))) && all(lessThan(mu, vec2(0.998))) ? textureLod(cmap, mu, 0.0).r : fbm(p);
   float cover = pc.sun.w;
   // (Its shade: where it's thick enough, the edge soft over some metres.)
   float cloud = smoothstep(1.0 - cover - 0.03, 1.0 - cover + 0.1, n);
@@ -9283,6 +9422,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   if (fog_done_) return fog_result_;
   fog_done_ = true;
   fog_result_ = nullptr;
+  fog_merged_ = false;
   auto dit = resolved_.find(depth_base_);
   if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
       dit->second.width != scene->width || dit->second.height != scene->height ||
@@ -9346,9 +9486,16 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
     pc[28] = 0.75f;  // never opaque: far mountains stay visible
     pc[29] = 1.0f / float(w);
     pc[30] = 1.0f / float(h);
-    FullscreenPass(CopyKind::kFog, &fog_img_, scene, depth, &fog_color_img_[cur], true, pc, 32);
-    Barrier();
-    out = &fog_img_;
+    if (VolumeOn() && VolumeReady(scene, depth) && !Diag("nofogmerge")) {
+      // (Left to the volumetric light's pass: one pass for both.)
+      std::memcpy(fog_pc_, pc, sizeof(pc));
+      fog_colors_now_ = &fog_color_img_[cur];
+      fog_merged_ = true;
+    } else {
+      FullscreenPass(CopyKind::kFog, &fog_img_, scene, depth, &fog_color_img_[cur], true, pc, 32);
+      Barrier();
+      out = &fog_img_;
+    }
     ++stats_.fogged;
   }
   // 3: god rays, from the sky around the sun while it's in (or near) view.
@@ -9399,16 +9546,22 @@ float Renderer::Impl::VolumeDensity() const {
   return volumetric_ * (0.0004f + 0.0015f * overcast + 0.008f * snow + 0.003f * std::min(mist, 4.0f));
 }
 
+bool Renderer::Impl::VolumeReady(const Image* scene, const Image* depth) const {
+  return vol_shadow_ok_ && tod_movers_map_.image && depth && depth->format == VK_FORMAT_R32_SFLOAT &&
+         depth->samples == 1 && depth->width == scene->width && depth->height == scene->height &&
+         scene->samples == 1;
+}
+
 // Volumetric light: the sun's (or moon's) in the air, marched at half size
-// through the shadow maps, then added (builtin_volume / builtin_volume_add).
+// through the shadow maps, then added (builtin_volume / builtin_volume_add;
+// with the fog when it was left to this pass: builtin_fog_volume).
 Image* Renderer::Impl::VolumeScene(Image* scene) {
-  if (!vol_shadow_ok_ || !tod_movers_map_.image) return nullptr;
   auto dit = resolved_.find(depth_base_);
-  if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples > 1 ||
-      dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1) {
-    return nullptr;
-  }
+  if (dit == resolved_.end()) return nullptr;
   Image* depth = &dit->second;
+  const bool fog = fog_merged_;
+  fog_merged_ = false;
+  if (!VolumeReady(scene, depth)) return nullptr;
   const tod::State& t = tod_state_;
   // The light: the sun by day; the moon's, faint, at night.
   const double day = 1.0 - t.night;
@@ -9422,7 +9575,10 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
   // little at noon.)
   const double low = 1.0 - tod::SmoothStep(0.06, 0.5, t.sun_elevation);
   for (double& c : col) c *= dim * e * (0.45 + 1.5 * low);
-  if (col[0] + col[1] + col[2] < 0.002) return nullptr;
+  double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
+  const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
+  const bool lit = col[0] + col[1] + col[2] >= 0.002 && fl > 1e-12;
+  if (!lit && !fog) return nullptr;
   const uint32_t w = scene->width, h = scene->height;
   const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
   EndRendering();
@@ -9437,10 +9593,7 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
   ensure(vol_out_, w, h, scene->format, "volume_lit");
   vol_out_.scaled = scene->scaled;
   vol_out_.scale = scene->scale;
-  // Toward the light: back along the sun map's depth axis.
-  double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
-  const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
-  if (!(fl > 1e-12)) return nullptr;
+  // (Toward the light: back along the sun map's depth axis, fd.)
   const float far_m = 220.0f;
   const int steps = volumetric_ > 1.25f ? 48 : 28;
   {
@@ -9455,7 +9608,7 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
     f[5] = float(col[1]);
     f[6] = float(col[2]);
     f[7] = VolumeDensity();
-    for (int i = 0; i < 3; ++i) f[8 + i] = float(-fd[i] / fl);
+    for (int i = 0; i < 3; ++i) f[8 + i] = lit ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
     f[11] = 0.55f;
     f[12] = cam_pos_[1] - 30.0f;  // densest a little below the camera (in the valleys)
     f[13] = 1.0f / 160.0f;
@@ -9466,6 +9619,7 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
     f[21] = 1.0f / float(hh);
     f[22] = float(w);
     f[23] = float(h);
+    std::memcpy(f + 24, cloud_map_at_, sizeof(float) * 4);
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {8, 1, 1};
@@ -9474,9 +9628,23 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
     staging_.push_back(staging);
   }
   Barrier();
-  FullscreenPass(CopyKind::kVolume, &vol_img_, depth, &tod_movers_map_, vol_world_ok_ ? &sun_env_ : &tod_movers_map_,
-                 false, vol_shadow_pc_, 32, nullptr, &vol_params_);
-  Barrier();
+  if (lit) {
+    FullscreenPass(CopyKind::kVolume, &vol_img_, depth, &tod_movers_map_,
+                   vol_world_ok_ ? &sun_env_ : &tod_movers_map_, false, vol_shadow_pc_, 32, nullptr, &vol_params_,
+                   cloud_map_.image ? &cloud_map_ : &vol_params_);
+    Barrier();
+  }
+  if (fog) {
+    // The fog first, then the air's light: one pass.
+    float fp[32];
+    std::memcpy(fp, fog_pc_, sizeof(fp));
+    fp[31] = lit ? 1.0f : 0.0f;
+    FullscreenPass(CopyKind::kFogVolume, &vol_out_, scene, depth, fog_colors_now_, true, fp, 32, nullptr,
+                   &vol_img_);
+    Barrier();
+    dyn_ = DynState{};
+    return &vol_out_;
+  }
   float pc[24] = {};
   for (int c = 0; c < 4; ++c) {
     for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
@@ -10048,7 +10216,7 @@ void Renderer::Impl::TodShadows() {
   vol_cloud_[3] = clouds ? std::min(1.0f, 0.4f + cloud_dark) : 0.0f;
   Barrier();
   if (clouds) {
-    float cp[24] = {};
+    float cp[28] = {};
     for (int c = 0; c < 4; ++c) {
       for (int r = 0; r < 4; ++r) cp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
     }
@@ -10060,6 +10228,27 @@ void Renderer::Impl::TodShadows() {
     cp[20] = tod_.cloud_clock > 0.0f ? tod_.cloud_clock : tod_.seconds;
     cp[21] = 600.0f;
     cp[22] = cloud_dark;
+    // The layer round about once (512 texels over ~600 m of it: a metre or
+    // so each), for this and the volumetric light.
+    {
+      if (!cloud_map_.image) {
+        cloud_map_ = gpu_.CreateImage(512, 512, VK_FORMAT_R16_SFLOAT, false, "cloud_map");
+        ToGeneral(cb_, cloud_map_);
+      }
+      const float H = cp[21], ly = std::max(cp[17], 0.08f);
+      const float px = (float(cam_pos_[0]) + cp[16] * H / ly) / H * 0.9f + cp[20] * 0.006f;
+      const float pz = (float(cam_pos_[2]) + cp[18] * H / ly) / H * 0.9f + cp[20] * 0.0025f;
+      const float span = 600.0f / H * 0.9f;
+      float mp[4] = {px - span * 0.5f, pz - span * 0.5f, span, 0.0f};
+      FullscreenPass(CopyKind::kCloudMap, &cloud_map_, nullptr, nullptr, nullptr, false, mp, 4);
+      Barrier();
+      cloud_map_at_[0] = mp[0];
+      cloud_map_at_[1] = mp[1];
+      cloud_map_at_[2] = 1.0f / span;
+      cp[24] = mp[0];
+      cp[25] = mp[1];
+      cp[26] = 1.0f / span;
+    }
     // (At the camera, for the riders.)
     {
       const float H = cp[21], ly = std::max(cp[17], 0.08f);
@@ -10069,7 +10258,7 @@ void Renderer::Impl::TodShadows() {
       const float t = std::clamp((n - lo) / (hi - lo), 0.0f, 1.0f);
       cloud_here_ = cloud_dark * t * t * (3.0f - 2.0f * t);
     }
-    FullscreenPass(CopyKind::kCloudShadow, &tod_mask_, depth, &tod_mask_raw_, nullptr, false, cp, 24);
+    FullscreenPass(CopyKind::kCloudShadow, &tod_mask_, depth, &tod_mask_raw_, &cloud_map_, false, cp, 28);
     Barrier();
   }
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
@@ -13312,7 +13501,7 @@ Renderer::Impl::~Impl() {
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
-                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_}) {
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);

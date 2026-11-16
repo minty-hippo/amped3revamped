@@ -467,7 +467,10 @@ that rule against a save that has the pass.
   low sun, faint at noon. The night lights light the air round them too
   (worked out per light, no steps; a floodlight's beam brighter). The air
   is thicker under a grey sky, in mist and in falling snow, and in the
-  valleys. It replaces the screen-space god rays while it's on.
+  valleys. It replaces the screen-space god rays while it's on, and the
+  distance fog is drawn in the same pass (one full-screen pass for both).
+  The cloud layer is worked out once a frame into a small map round the
+  camera, which the cloud shadows and the volumetric light both read.
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and
