@@ -2154,6 +2154,7 @@ struct Renderer::Impl {
   // lights' own (their light in the air) in their pass. Replaces the god
   // rays while on.
   float volumetric_ = 0.0f;
+  int volumetric_quality_ = 1;  // 0 quarter size, 1 half, 2 half finer
   Image vol_img_, vol_params_, vol_out_;
   float vol_shadow_pc_[32] = {};
   bool vol_shadow_ok_ = false, vol_world_ok_ = false;
@@ -2249,6 +2250,7 @@ struct Renderer::Impl {
   // frames back: read back without waiting) calls for.
   float eye_strength_ = 0.0f;
   int light_shadows_ = 1;  // SetLightShadows
+  int light_shadow_lamps_ = 0;  // (how many of the nearest; 0: all)
   double exposure_ = 1.0;
   Buffer eye_rb_;                 // 4 slots of 16 bytes: the measure, by frame % 4
   double eye_rb_exposure_[4] = {};
@@ -5720,7 +5722,8 @@ layout(push_constant) uniform Lights {
   vec4 cam;  // camera position, tile size (pixels)
   vec4 a;    // 1 / width, 1 / height, how dark it is (0..1), riders told apart (0/1)
   vec4 b;    // seconds, the scene's light on the fittings (0..1), shadow steps (0: none), -
-  vec4 c;    // the air's density for their light in it (volumetric: 0 none), -
+  vec4 c;    // the air's density for their light in it (volumetric: 0 none), how many
+             // lamps cast shadows at each spot (the nearest; 0: all), -
 } pc;
 layout(location = 0) out vec4 o;
 
@@ -5981,6 +5984,7 @@ void main() {
   vec3 hit_col = vec3(0.0);
   bool hit = false;
   vec3 surf = vec3(0.0);  // the lights on the surface drawn (hidden by a fitting)
+  int shadowed = 0;       // lamps whose shadows were traced (the nearest first)
   for (int e = 0; e < tile_n; ++e) {
     int slot = e + 1;
     vec4 tv = texelFetch(lights, tile_base + ivec2(0, slot / 4), 0);
@@ -6078,7 +6082,9 @@ void main() {
           lit += col * fall * facing * (sheen + glint * 3.0);
         }
         // Its shadows (what's lit enough to show one).
-        if (shadow_steps > 0 && dot(lit, vec3(1.0)) > 0.004) {
+        if (shadow_steps > 0 && dot(lit, vec3(1.0)) > 0.004 &&
+            (pc.c.y < 0.5 || float(shadowed) < pc.c.y)) {
+          ++shadowed;
           float sv = ShadowTo(P, N, lp.xyz, shadow_steps, pc.a.w > 0.5);
           if (pc.b.w > 0.5) g_dbg = vec4(sv, rider ? 1.0 : 0.0, fall, 1.0);
           lit *= mix(0.08, 1.0, sv);
@@ -9580,7 +9586,8 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
   const bool lit = col[0] + col[1] + col[2] >= 0.002 && fl > 1e-12;
   if (!lit && !fog) return nullptr;
   const uint32_t w = scene->width, h = scene->height;
-  const uint32_t hw = std::max(w / 2, 1u), hh = std::max(h / 2, 1u);
+  const uint32_t div = volumetric_quality_ == 0 ? 4 : 2;
+  const uint32_t hw = std::max(w / div, 1u), hh = std::max(h / div, 1u);
   EndRendering();
   auto ensure = [&](Image& im, uint32_t iw, uint32_t ih, VkFormat f, const char* name) {
     if (im.image && im.width == iw && im.height == ih && im.format == f) return;
@@ -9595,7 +9602,7 @@ Image* Renderer::Impl::VolumeScene(Image* scene) {
   vol_out_.scale = scene->scale;
   // (Toward the light: back along the sun map's depth axis, fd.)
   const float far_m = 220.0f;
-  const int steps = volumetric_ > 1.25f ? 48 : 28;
+  const int steps = volumetric_quality_ == 0 ? 24 : volumetric_quality_ == 1 ? 28 : 48;
   {
     Buffer staging = gpu_.CreateBuffer(8 * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     float* f = reinterpret_cast<float*>(staging.mapped);
@@ -10657,6 +10664,7 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
   }
   // Their light in the air (volumetric).
   pc[28] = VolumeOn() && !Diag("novolumelights") ? VolumeDensity() * 3.0f : 0.0f;
+  pc[29] = float(light_shadow_lamps_);
   {
     // The light on the fittings: the sky's and the sun's (or moon's), as the
     // hour has them; the exposure.
@@ -13963,9 +13971,15 @@ bool Renderer::CenterPoint(float out[3], float normal[3]) const {
 void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
-void Renderer::SetVolumetric(float strength) { impl_->volumetric_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetVolumetric(float strength, int quality) {
+  impl_->volumetric_ = std::clamp(strength, 0.0f, 2.0f);
+  impl_->volumetric_quality_ = std::clamp(quality, 0, 2);
+}
 void Renderer::SetClothTextures(const std::vector<uint64_t>& hashes) { impl_->cloth_extra_ = hashes; }
-void Renderer::SetLightShadows(int quality) { impl_->light_shadows_ = std::clamp(quality, 0, 2); }
+void Renderer::SetLightShadows(int quality, int lamps) {
+  impl_->light_shadows_ = std::clamp(quality, 0, 2);
+  impl_->light_shadow_lamps_ = std::clamp(lamps, 0, 35);
+}
 void Renderer::SetEyeAdaptation(float strength) { impl_->eye_strength_ = std::clamp(strength, 0.0f, 1.0f); }
 float Renderer::Exposure() const { return float(impl_->eye_strength_ > 0.0f ? impl_->exposure_ : 1.0); }
 float Renderer::MountainHour() const { return impl_->tod_mountain_hour_; }

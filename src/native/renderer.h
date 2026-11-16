@@ -362,7 +362,8 @@ class Renderer {
   // Night lights' shadows: each light traced toward from what it lights,
   // through the depth on screen (the world, riders, objects: anything drawn,
   // moving or not). 0 off, 1 on, 2 finer.
-  void SetLightShadows(int quality);
+  // (lamps: how many of the nearest cast them at each spot; 0: all.)
+  void SetLightShadows(int quality, int lamps = 0);
   // Time of day: bloom (0 off .. 2): the lamps, fires and the sun on snow
   // glowing out over what's round them (stronger at night).
   void SetBloom(float strength);
@@ -377,7 +378,8 @@ class Renderer {
   // (shafts through trees, past ridges, under clouds) and by the night
   // lights; thicker in mist, overcast and snowfall. Replaces the god rays
   // while on. 0: off, 1, up to 2.
-  void SetVolumetric(float strength);
+  // (quality: 0 quarter size, 1 half, 2 half with finer steps.)
+  void SetVolumetric(float strength, int quality = 1);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

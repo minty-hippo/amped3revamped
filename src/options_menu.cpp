@@ -252,6 +252,36 @@ const std::vector<Tab>& Tabs() {
        }},
       {"Graphics",
        {
+           {"Quality",
+            {
+                Choices("native_quality", "Preset",
+                        "Sets each part below at once. Change any part (or any setting under "
+                        "it) and this shows Custom.",
+                        {{"-1", "Custom"}, {"0", "Low"}, {"1", "Medium"}, {"2", "High"}, {"3", "Ultra"}}),
+                Choices("native_quality_sun_shadows", "Sun shadows",
+                        "Game's: its own painted shadows. Low: the world's shadows baked as you "
+                        "ride, riders' and objects' at the game's resolution. Medium: twice "
+                        "that. High: the world's at four times, riders' and objects' sharper "
+                        "and reaching farther.",
+                        {{"-1", "Custom"}, {"0", "Game's"}, {"1", "Low"}, {"2", "Medium"}, {"3", "High"}}),
+                Choices("native_quality_lamp_shadows", "Lamp shadows",
+                        "Shadows from the night lights. Low: the two nearest lamps at each "
+                        "spot. Medium: every lamp. High: every lamp, finer.",
+                        {{"-1", "Custom"}, {"0", "Off"}, {"1", "Low"}, {"2", "Medium"}, {"3", "High"}}),
+                Choices("native_quality_atmosphere", "Atmosphere",
+                        "Fog: distance fog only. God rays: fog and shafts from the sun on "
+                        "screen. Volumetric: the air itself lit (real shafts, lamps glowing in "
+                        "mist): low at quarter size, high at half, ultra with finer steps.",
+                        {{"-1", "Custom"}, {"0", "Fog"}, {"1", "God rays"}, {"2", "Volumetric low"},
+                         {"3", "Volumetric high"}, {"4", "Volumetric ultra"}}),
+                Choices("native_quality_ambient_occlusion", "Ambient occlusion",
+                        "Creases, corners and the snow round trees and jumps shaded.",
+                        {{"-1", "Custom"}, {"0", "Off"}, {"1", "On"}}),
+                Choices("native_quality_surface", "Surface detail",
+                        "Snow settling on the world, the boards' tracks kept in the snow, and "
+                        "the clouds' shadows.",
+                        {{"-1", "Custom"}, {"0", "Low"}, {"1", "High"}}),
+            }},
            {"Renderer",
             {
                 Choices("gpu_backend", "Graphics API",
@@ -446,6 +476,12 @@ const std::vector<Tab>& Tabs() {
                         "and buildings each cast one from every light near them. Traced "
                         "through what's on screen (something out of view casts none).",
                         {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}),
+                Choices("native_night_light_shadow_lamps", "Lamps casting shadows",
+                        "How many lamps cast shadows at each spot (the nearest).",
+                        {{"0", "All"}, {"1", "1"}, {"2", "2"}, {"4", "4"}}),
+                Choices("native_volumetric_quality", "Volumetric detail",
+                        "Quarter size is fastest; half size sharper; fine adds steps.",
+                        {{"0", "Quarter"}, {"1", "Half"}, {"2", "Half, fine"}}),
                 SliderF("native_cloud_shadows", "Cloud shadows",
                         "With time of day on: the clouds' shadows drift across the slopes "
                         "with the wind (the sky's own clouds, where they are). Needs the sun's "
@@ -523,7 +559,7 @@ const std::vector<Tab>& Tabs() {
                         "reaches: real shafts through the trees, past ridges and under the "
                         "clouds (strongest with a low sun), and the night lights glowing in the "
                         "air round them. Thicker in mist, under a grey sky and in falling snow. "
-                        "Replaces the god rays while on. 0: off; above 1.25 finer.",
+                        "Replaces the god rays while on. 0: off.",
                         "%.1f", 0.0, 2.0),
                 Toggle("native_vertex_cache", "Reuse unchanged vertex data",
                        "Copies the game's vertex buffers only when the game has written to "

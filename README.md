@@ -329,6 +329,21 @@ at the extracted game; the installer puts a `game\` folder in the install.
 The game is drawn by the port's own Vulkan renderer (on by default; Options
 (F1) > Graphics > Native renderer switches back to the GPU emulation).
 
+Quality (Options > Graphics > Quality, or the graphics panel's Quality
+tab): a preset (Low, Medium, High, Ultra) and a level for each part of the
+lighting, each setting the detailed options under it:
+
+| Part | Levels |
+|---|---|
+| Sun shadows | Game's (its painted shadows) / Low / Medium / High (world shadows 2x-4x, sharper, farther) |
+| Lamp shadows | Off / Low (two nearest lamps) / Medium (every lamp) / High (every lamp, finer) |
+| Atmosphere | Fog / God rays / Volumetric low (quarter size) / high (half) / ultra (finer steps) |
+| Ambient occlusion | Off / On |
+| Surface detail | Low / High (settling snow, snow tracks, cloud shadows) |
+
+The detailed options stay adjustable; a part whose options match none of
+its levels shows Custom, and so does the preset. High is the default.
+
 The GPU emulation keeps running underneath (the game waits on it every
 frame) but stops drawing. When the native renderer is on at launch, the
 emulation also starts lean: it doesn't load its shader cache and ignores

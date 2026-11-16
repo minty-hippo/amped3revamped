@@ -59,6 +59,22 @@ struct Tab {
 const std::vector<Tab>& Tabs() {
   static const std::vector<Tab> tabs = {
       // Revamped Graphics first; the rest are what it turns on and off.
+      {"Quality",
+       {
+           {"native_quality", "Preset", Kind::kStops, 0, 0, 0,
+            {{"-1", "Custom"}, {"0", "Low"}, {"1", "Medium"}, {"2", "High"}, {"3", "Ultra"}}},
+           {"native_quality_sun_shadows", "Sun Shadows", Kind::kStops, 0, 0, 0,
+            {{"-1", "Custom"}, {"0", "Game's"}, {"1", "Low"}, {"2", "Medium"}, {"3", "High"}}},
+           {"native_quality_lamp_shadows", "Lamp Shadows", Kind::kStops, 0, 0, 0,
+            {{"-1", "Custom"}, {"0", "Off"}, {"1", "Low"}, {"2", "Medium"}, {"3", "High"}}},
+           {"native_quality_atmosphere", "Atmosphere", Kind::kStops, 0, 0, 0,
+            {{"-1", "Custom"}, {"0", "Fog"}, {"1", "God Rays"}, {"2", "Volumetric Low"},
+             {"3", "Volumetric High"}, {"4", "Volumetric Ultra"}}},
+           {"native_quality_ambient_occlusion", "Ambient Occlusion", Kind::kStops, 0, 0, 0,
+            {{"-1", "Custom"}, {"0", "Off"}, {"1", "On"}}},
+           {"native_quality_surface", "Surface Detail", Kind::kStops, 0, 0, 0,
+            {{"-1", "Custom"}, {"0", "Low"}, {"1", "High"}}},
+       }},
       {"Effects",
        {
            {"revamped_graphics", "Revamped Graphics"},

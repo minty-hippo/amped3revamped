@@ -43,6 +43,7 @@
 
 #include "live_present.h"
 #include "night_pass.h"
+#include "quality.h"
 #include "notice.h"
 #include "xm_radio.h"
 #include "perf_overlay.h"
@@ -182,6 +183,10 @@ REXCVAR_DEFINE_INT32(native_night_light_shadows, 1, "GPU",
                      "buildings each casting one from every lamp near them), traced through "
                      "what's on screen. 0: off, 1: on, 2: finer")
     .range(0, 2);
+REXCVAR_DEFINE_INT32(native_night_light_shadow_lamps, 0, "GPU",
+                     "Time of day: how many lamps cast night light shadows at each spot (the "
+                     "nearest; 0: every one)")
+    .range(0, 8);
 REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
                     "Native renderer: dynamic time of day (F5): the sun and moon move across "
                     "the sky, the mountain's light, sky, stars and clouds follow the hour; "
@@ -256,8 +261,12 @@ REXCVAR_DEFINE_DOUBLE(native_volumetric, 1.0, "GPU",
                       "reaches (shafts through the trees, past ridges and under clouds; strongest "
                       "with a low sun) and round the night lights; thicker in mist, under a grey "
                       "sky and in falling snow. Replaces the god rays while on (with the sun's "
-                      "shadows). 0: off, up to 2 (above 1.25: finer)")
+                      "shadows). 0: off, up to 2")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_INT32(native_volumetric_quality, 1, "GPU",
+                     "Time of day: volumetric light's detail: 0 quarter size (fastest), 1 half "
+                     "size, 2 half size with finer steps")
+    .range(0, 2);
 REXCVAR_DEFINE_DOUBLE(native_god_rays_strength, 1.0, "GPU",
                       "Native renderer: god ray strength (0..2)")
     .range(0.0, 2.0);
@@ -2322,6 +2331,11 @@ void WorkerMain() {
         const double dt = std::chrono::duration<double>(f->swap_time - last_swap_time).count();
         // Revamped Graphics (the game's Options menu) off: none of the
         // enhancements, each keeps its own setting for when it's back on.
+        // The quality preset and parts set what's under them (before it's read).
+        {
+          static int quality_tick = 0;
+          if (++quality_tick % 6 == 0) amped3::quality::Apply();
+        }
         const bool revamped = REXCVAR_GET(revamped_graphics);
         const bool camera = revamped && REXCVAR_GET(native_camera_motion_blur);
         const bool objects = revamped && REXCVAR_GET(native_object_motion_blur);
@@ -2406,11 +2420,13 @@ void WorkerMain() {
               g_lights_changed = false;
             }
           }
-          renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)));
+          renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)),
+                                    int(REXCVAR_GET(native_night_light_shadow_lamps)));
           renderer->SetBloom(float(REXCVAR_GET(native_bloom)));
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
-          renderer->SetVolumetric(float(REXCVAR_GET(native_volumetric)));
+          renderer->SetVolumetric(float(REXCVAR_GET(native_volumetric)),
+                                  int(REXCVAR_GET(native_volumetric_quality)));
           {
             // (Read again only when it changes.)
             static std::string cloth_text = "\x01";
