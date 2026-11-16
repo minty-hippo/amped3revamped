@@ -2238,6 +2238,7 @@ struct Renderer::Impl {
   Image* VolumeScene(Image* scene);
   Image drift_out_;
   bool drift_ = false;  // SetDriftingSnow
+  float halo_ = 1.0f;     // SetIceHalo
   Image* DriftScene(Image* scene);
   // The sun's (or moon's) sheen (SetSpecular): what the game's lighting
   // leaves out (it has no specular): a glossy highlight by surface (snow:
@@ -5234,6 +5235,31 @@ void main() {
       }
       c += vec3(0.55, 0.6, 0.7) * 0.12 * pc.moon.w * night * exp(-ang * 18.0) * vis;
     }
+  }
+  // Ice in thin high cloud: the 22-degree halo round the sun (reddish
+  // inside, paling out) and the sun dogs either side at its height (a little
+  // farther out the higher it is, a white tail outward); where the sky's
+  // open.
+  float halo = texelFetch(colors, ivec2(0, 0), 0).a;
+  if (halo > 0.0 && pc.sun.y > 0.0) {
+    float th = acos(clamp(dot(dir, pc.sun.xyz), -1.0, 1.0));
+    const float R22 = 0.3840;
+    float x = (th - R22) / 0.013;
+    float ring = exp(-x * x) + 0.35 * exp(-max(x, 0.0) * 0.6) * step(0.0, x) * exp(-max(x - 3.0, 0.0));
+    vec3 rc = mix(vec3(1.0, 0.55, 0.35), vec3(0.95, 0.97, 1.0), smoothstep(-1.0, 1.5, x));
+    // (Inside the ring the sky a little darker: the ice turns its light away.)
+    float inside = smoothstep(R22, R22 - 0.05, th) * smoothstep(0.05, 0.15, th);
+    vec3 hc = rc * ring * 0.12 - vec3(0.02) * inside;
+    // Sun dogs.
+    float es = asin(clamp(pc.sun.y, -1.0, 1.0)), e = asin(clamp(dir.y, -1.0, 1.0));
+    vec2 sh = normalize(pc.sun.xz + vec2(1e-6)), dh = normalize(dir.xz + vec2(1e-6));
+    float daz = acos(clamp(dot(sh, dh), -1.0, 1.0));
+    float a0 = asin(clamp(sin(R22) / max(cos(es), 0.2), 0.0, 1.0));
+    float de = (e - es) / 0.025, dz = (daz - a0) / 0.012;
+    float dog = exp(-de * de - dz * dz * (dz < 0.0 ? 1.0 : 0.15));
+    vec3 dc = mix(vec3(1.0, 0.5, 0.3), vec3(1.0), smoothstep(-1.0, 2.0, dz));
+    hc += dc * dog * 0.35;
+    c += max(hc, vec3(-0.03)) * pc.sun_col.rgb * halo * clear * open_sky;
   }
   // The sun's disc and a glow, once it isn't where the panorama paints it.
   if (pc.sun.w > 0.0) {
@@ -11395,6 +11421,17 @@ Image* Renderer::Impl::TodSky(Image* scene) {
       f[i * 4 + 2] = float(cols[i]->z);
       f[i * 4 + 3] = 1.0f;
     }
+    // (Texel 0's alpha: the ice halo's strength: thin high cloud (some
+    // cover, not a grey sky), the sun up but not high.)
+    {
+      const double cover = tod_.clouds, ov = std::clamp(double(tod_.overcast), 0.0, 1.0);
+      const double halo = tod::SmoothStep(0.08, 0.22, cover) * (1.0 - tod::SmoothStep(0.45, 0.7, cover)) *
+                          (1.0 - tod::SmoothStep(0.15, 0.45, ov)) *
+                          tod::SmoothStep(2.0 * tod::kDeg, 8.0 * tod::kDeg, t.sun_elevation) *
+                          (1.0 - tod::SmoothStep(45.0 * tod::kDeg, 60.0 * tod::kDeg, t.sun_elevation)) *
+                          (1.0 - t.night);
+      f[3] = Diag("nohalo") ? 0.0f : Diag("halo") ? 1.0f : float(halo) * halo_;
+    }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {4, 1, 1};
@@ -14673,6 +14710,7 @@ void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetDriftingSnow(bool on) { impl_->drift_ = on; }
+void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::StartSurfacePick() {
   impl_->pick_state_ = 1;

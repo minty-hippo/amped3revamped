@@ -514,6 +514,10 @@ that rule against a save that has the pass.
   picker finds the texture through the same tags: a frame listing the
   textures drawn, then one frame per digit of its place in that list, read
   back from the middle of the screen; the sheen pauses for those frames.)
+  An ice halo (Ice Halo, `native_ice_halo`, 1): with thin high cloud over an
+  otherwise clear sky and the sun low to middling, a ring round it 22 degrees
+  out (reddish inside, the sky a shade darker within it) and the sun dogs
+  either side at its height.
   Drifting snow (Drifting Snow, `native_drifting_snow`): in a strong wind
   (from about 5 m/s, a blizzard's gale at its thickest) loose snow streams
   along the slopes in low wisps, stretched along the wind and moving with it,

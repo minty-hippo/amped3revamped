@@ -385,6 +385,9 @@ class Renderer {
   void SetSpecular(float strength);
   // In a strong wind, loose snow streaming along the slopes in low wisps.
   void SetDriftingSnow(bool on);
+  // The ice halo round the sun (22 degrees) and the sun dogs, in thin high
+  // cloud (some cover, a clear sky otherwise). 0: none.
+  void SetIceHalo(float strength);
   // Surfaces for the sheen by texture (content hash, as replacements are
   // named): 1 snow, 2 metal, 3 wood, 4 rock, 5 paint, 6 cloth (0: none); over
   // what's worked out from each texture's colors.

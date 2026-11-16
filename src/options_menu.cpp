@@ -467,6 +467,11 @@ const std::vector<Tab>& Tabs() {
                 Toggle("native_snow_cover", "Snow settles",
                        "With time of day on: falling snow settles on tree boughs, roofs, rocks and "
                        "props, patchy at first, building over a few minutes, melting once it stops."),
+                SliderF("native_ice_halo", "Ice halo",
+                        "With time of day on: a ring round the sun (22 degrees out) and the sun "
+                        "dogs either side of it, when thin high cloud drifts over an otherwise "
+                        "clear sky with the sun low to middling. 0: never.",
+                        "%.1f", 0.0, 2.0),
                 Toggle("native_drifting_snow", "Drifting snow",
                        "With time of day on: in a strong wind (a blizzard), loose snow streams "
                        "along the slopes in low wisps, moving with the wind."),
