@@ -5689,11 +5689,13 @@ layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the game's material (foliage > 0)
 layout(set = 0, binding = 2) uniform sampler2D depth;
 layout(set = 0, binding = 3) uniform sampler2D mask;     // the sun's shadows (1 lit)
+layout(set = 0, binding = 4) uniform sampler2D sky;      // 4 x 1: zenith, horizon (the hour's)
 layout(push_constant) uniform Spec {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
   vec4 L;    // toward the light, -
-  vec4 col;  // its color (exposed), how low it is (0 high .. 1 at the horizon)
+  vec4 col;  // its color (exposed), -
   vec4 cam;  // camera, mask on (0/1)
+  vec4 env;  // the sky's reflection: strength (exposure; 0 none), -
 } pc;
 layout(location = 0) out vec4 o;
 // (An integer hash: a cell's own, far from the origin too.)
@@ -5731,15 +5733,13 @@ void main() {
   vec3 N = normalize(nw.xyz * 2.0 - 1.0);
   vec3 L = pc.L.xyz;
   float nl = dot(N, L), nv = dot(N, V);
-  if (nl <= 0.0 || nv <= 0.0) {
+  if (nv <= 0.0) {
     o = vec4(0.0, 0.0, 0.0, d);
     return;
   }
   float lit = pc.cam.w > 0.5 ? texelFetch(mask, ip, 0).r : 1.0;
-  if (lit <= 0.01) {
-    o = vec4(0.0, 0.0, 0.0, d);
-    return;
-  }
+  if (nl <= 0.0) lit = 0.0;  // (facing away: the sky's reflection only)
+  nl = max(nl, 1e-4);
   vec3 alb = texelFetch(albedo, ip, 0).rgb;
   float lum = dot(alb, vec3(0.3, 0.59, 0.11));
   float sat = max(alb.r, max(alb.g, alb.b)) - min(alb.r, min(alb.g, alb.b));
@@ -5771,6 +5771,19 @@ void main() {
   float spec = D_GGX(nh, a) * G_Smith(nv, nl, a) / (4.0 * nv * nl) * nl;
   spec = min(spec, 6.0);
   vec3 c = pc.col.rgb * F * spec * lit * (foliage ? 0.35 : 1.0);
+  // The sky in it (what the game's ambient leaves out: a mirror's worth of
+  // it), by how smooth: metal and paint show it, snow a faint sheen at a
+  // glancing angle, the rough rest none. Below the horizon, the snow.
+  if (pc.env.x > 0.0 && !foliage) {
+    vec3 R = reflect(-V, N);
+    vec3 zen = texelFetch(sky, ivec2(0, 0), 0).rgb, hor = texelFetch(sky, ivec2(1, 0), 0).rgb;
+    vec3 env = R.y >= 0.0 ? mix(hor, zen, smoothstep(0.0, 0.6, R.y)) : hor * 0.8;
+    float fv = pow(1.0 - nv, 5.0);
+    float gloss = (1.0 - rough) * (1.0 - rough);
+    vec3 Fe = mix(vec3(f0 + (max(1.0 - rough, f0) - f0) * fv), mix(alb, vec3(1.0), fv), metal);
+    // (Out of the sun, less of it: in a shadow, under trees, indoors.)
+    c += env * Fe * gloss * mix(0.5, 1.0, lit) * pc.env.x * mix(1.0, 0.35, snow);
+  }
   // Glints in the sunlit snow: crystals catching it, changing as the view
   // moves (fewer far off: they'd shimmer).
   if (snow > 0.0) {
@@ -6204,7 +6217,10 @@ void main() {
     P = wp.xyz / wp.w;
     pix_dist = length(P - pc.cam.xyz);
   }
-  vec3 N = normalize(textureLod(normals, uv, 0.0).xyz * 2.0 - 1.0);
+  vec4 nw4 = textureLod(normals, uv, 0.0);
+  vec3 N = normalize(nw4.xyz * 2.0 - 1.0);
+  // (The surface tagged in the normals' alpha: 2 metal, 5 paint: shinier.)
+  uint surf_tag = rider ? 0u : (uint(nw4.w * 255.0 + 0.5) >> 5u);
   vec3 alb = textureLod(albedo, uv, 0.0).rgb;
   if (rider && d > 0.0) {
     // A rider (drawn after the lighting: no albedo or normals of its own):
@@ -6332,6 +6348,12 @@ void main() {
         if (facing > 0.0) {
           float snow = rider ? 0.0 : smoothstep(0.45, 0.7, dot(alb, vec3(0.333)));
           float sheen = pow(max(dot(N, hv), 0.0), 28.0) * (0.12 + 0.3 * snow);
+          if (snow < 0.5 && surf_tag == 2u) {
+            // Metal: a tighter, brighter highlight, tinted by its color.
+            lit += col * fall * facing * pow(max(dot(N, hv), 0.0), 70.0) * 1.6 * (alb + 0.25);
+          } else if (snow < 0.5 && surf_tag == 5u) {
+            sheen += pow(max(dot(N, hv), 0.0), 50.0) * 0.5;
+          }
           ivec3 hb = ivec3(floor(hv * 6.0));
           float glint = step(0.993, Hash3(ivec3(floor(P * 28.0)), hb.x * 31 + hb.y * 17 + hb.z * 7)) *
                         snow * smoothstep(40.0, 10.0, pix_dist);
@@ -9928,12 +9950,14 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
     spec_img_ = gpu_.CreateImage(a3->width, a3->height, VK_FORMAT_R16G16B16A16_SFLOAT, false, "sun_spec");
     ToGeneral(cb_, spec_img_);
   }
-  float pc[28] = {};
+  float pc[32] = {};
   for (int c = 0; c < 4; ++c) {
     for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
   }
   for (int i = 0; i < 3; ++i) pc[16 + i] = float(-fd[i] / fl);
   pc[19] = Diag("specdbg") ? 1.0f : 0.0f;
+  // The sky's reflection (its colors as the sky was last drawn).
+  pc[28] = tod_colors_.image && !Diag("noenvspec") ? float(e) * 0.8f : 0.0f;
   for (int i = 0; i < 3; ++i) pc[20 + i] = float(col[i]);
   pc[24] = cam_pos_[0];
   pc[25] = cam_pos_[1];
@@ -9942,8 +9966,8 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   Barrier();
   // (Its depth: a copy-sized float would lose nothing; R16F alpha keeps the
   // match test's tolerance relative.)
-  FullscreenPass(CopyKind::kSunSpec, &spec_img_, albedo, tod_normal_, &dit->second, false, pc, 28, nullptr,
-                 tod_mask_ok_ ? &tod_mask_ : &tod_white_);
+  FullscreenPass(CopyKind::kSunSpec, &spec_img_, albedo, tod_normal_, &dit->second, false, pc, 32, nullptr,
+                 tod_mask_ok_ ? &tod_mask_ : &tod_white_, tod_colors_.image ? &tod_colors_ : &tod_white_);
   Barrier();
   dyn_ = DynState{};
   spec_ok_ = true;

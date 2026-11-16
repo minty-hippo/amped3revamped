@@ -503,7 +503,10 @@ that rule against a save that has the pass.
   its color, paint is glossy, wood, rock and cloth stay dull. Wrong guesses can
   be put right by texture: `native_materials = "HASH=metal, HASH=wood"`
   (content hashes, as replacements are named); the wind's cloth list counts
-  as cloth.
+  as cloth. Smooth surfaces also reflect the sky (its zenith and horizon
+  colors for the hour): metal and paint show it, snow a faint sheen at a
+  glancing angle. The night lights catch tagged metal (a tight highlight in
+  its own color) and paint too.
   To fix one in the game: in the light editor (freecam, then L), aim the cross
   at it and press M: it shows the texture and its surface (guessed or set);
   press M again (within 20 s) to step through snow, metal, wood, rock, paint,
