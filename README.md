@@ -495,6 +495,15 @@ that rule against a save that has the pass.
   lighting pass, before riders are drawn, and added after where the depth
   still matches. (The lamps' glints use a proper integer hash now too: the
   old one repeated far from the world's origin.)
+  Surfaces: each texture is sorted when it's loaded, from its colors, into
+  snow, metal, wood, rock, paint or none, and the scene's draws tag their
+  surface into the normals' alpha (the game keeps its own material number in
+  the low bits and reads them mod 4; ours sit in the top three bits, which an
+  edge's MSAA average can't push into the game's). Metal then shines tinted by
+  its color, paint is glossy, wood, rock and cloth stay dull. Wrong guesses can
+  be put right by texture: `native_materials = "HASH=metal, HASH=wood"`
+  (content hashes, as replacements are named); the wind's cloth list counts
+  as cloth.
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and

@@ -210,6 +210,11 @@ REXCVAR_DEFINE_INT32(native_weather, 1, "GPU",
                      "grey skies, snow showers, now and then a blizzard); 2: clear; 3: overcast; "
                      "4: snowing; 5: blizzard")
     .range(0, 5);
+REXCVAR_DEFINE_STRING(native_materials, "", "GPU",
+                      "Time of day: surfaces for the sun's sheen by texture, over what's worked "
+                      "out from their colors: HASH=snow / metal / wood / rock / paint / cloth / "
+                      "none, comma separated (the texture's content hash, as replacements are "
+                      "named)");
 REXCVAR_DEFINE_STRING(native_wind_cloth, "", "GPU",
                       "Time of day: more banners and flags for the wind to move, beyond the "
                       "known ones: their textures' hashes (16 hex digits each, as the texture "
@@ -2450,6 +2455,41 @@ void WorkerMain() {
                 at = end + 1;
               }
               renderer->SetClothTextures(hashes);
+            }
+          }
+          {
+            // Surfaces by texture: "HASH=metal, HASH=wood, ..." (read again
+            // only when it changes; the cloth list's textures are cloth).
+            static std::string text = "\x01";
+            const std::string now = REXCVAR_GET(native_materials) + std::string("|") +
+                                    std::string(REXCVAR_GET(native_wind_cloth));
+            if (now != text) {
+              text = now;
+              static const char* kNames[] = {"none", "snow", "metal", "wood", "rock", "paint", "cloth"};
+              std::vector<std::pair<uint64_t, int>> list;
+              auto parse = [&](const std::string& s, int fixed) {
+                size_t at = 0;
+                while (at < s.size()) {
+                  size_t end = s.find_first_of(", ;", at);
+                  if (end == std::string::npos) end = s.size();
+                  std::string tok = s.substr(at, end - at);
+                  at = end + 1;
+                  int m = fixed;
+                  if (const size_t eq = tok.find('='); eq != std::string::npos) {
+                    const std::string name = tok.substr(eq + 1);
+                    tok = tok.substr(0, eq);
+                    for (int k = 0; k < 7; ++k) {
+                      if (name == kNames[k]) m = k;
+                    }
+                  }
+                  if (tok.size() >= 16 && m >= 0) {
+                    list.emplace_back(std::strtoull(tok.substr(tok.size() - 16).c_str(), nullptr, 16), m);
+                  }
+                }
+              };
+              parse(REXCVAR_GET(native_wind_cloth), 6);
+              parse(REXCVAR_GET(native_materials), -1);
+              renderer->SetMaterials(list);
             }
           }
           renderer->SetEyeAdaptation(revamped ? float(REXCVAR_GET(native_eye_adaptation)) : 0.0f);

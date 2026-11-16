@@ -383,6 +383,10 @@ class Renderer {
   // The sun's (or moon's) sheen on the world (the game's lighting has none):
   // glossy by surface, snow glinting; shadowed by the sun's. 0: off .. 2.
   void SetSpecular(float strength);
+  // Surfaces for the sheen by texture (content hash, as replacements are
+  // named): 1 snow, 2 metal, 3 wood, 4 rock, 5 paint, 6 cloth (0: none); over
+  // what's worked out from each texture's colors.
+  void SetMaterials(const std::vector<std::pair<uint64_t, int>>& list);
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

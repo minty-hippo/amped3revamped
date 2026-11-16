@@ -122,6 +122,10 @@ struct Image {
   // A texture replacement (texture_replace.h): bigger than the guest's, with
   // its own mip chain, sampled with every level and linear filtering.
   bool replaced = false;
+  // A texture's surface (SurfaceOf: 0 unknown, 1 snow, 2 metal, 3 wood,
+  // 4 rock, 5 paint, 6 fabric), tagged into the normals' alpha when it's a
+  // draw's albedo (the lighting's sheen reads it).
+  uint8_t surface = 0;
   // A render target (GetTarget): draws never sample one directly.
   bool target = false;
   // The guest's sample count for a render target (1 sample here when MSAA is
@@ -1024,8 +1028,70 @@ struct SystemConstants {  // std140 layout of XeSystem
   float wind_minv[16];       // its inverse
   float wind[4];             // direction (x, z) in its space, strength (m), clock (s)
   float wind2[4];            // mode (1 leaves, 2 tree, 3 cloth), units a metre, seed, dt
+  uint32_t material[4];      // PS: x the surface tagged into oC1.w's high bits (0: none)
 };
 static_assert(offsetof(SystemConstants, tex_scale) == 80, "XeSystem std140 layout");
+
+// A texture's surface from its colors (the base level: RGBA texels, or BC1-3
+// blocks' end colors, through the view's swizzle): 1 snow (bright, grey),
+// 2 metal (mid grey, even), 3 wood (brown), 4 rock (grey, varied), 5 paint
+// (strong colors), 0 anything else.
+uint8_t SurfaceOf(const amped3::native::DecodedTexture& t, const VkComponentMapping& view) {
+  double sum[3] = {}, sum_l = 0, sum_l2 = 0;
+  size_t n = 0;
+  auto add = [&](double r, double g, double b) {
+    double c[3] = {r, g, b};
+    double o[3];
+    const VkComponentSwizzle sw[3] = {view.r, view.g, view.b};
+    for (int i = 0; i < 3; ++i) {
+      switch (sw[i]) {
+        case VK_COMPONENT_SWIZZLE_R: o[i] = c[0]; break;
+        case VK_COMPONENT_SWIZZLE_G: o[i] = c[1]; break;
+        case VK_COMPONENT_SWIZZLE_B: o[i] = c[2]; break;
+        case VK_COMPONENT_SWIZZLE_ONE: o[i] = 1.0; break;
+        case VK_COMPONENT_SWIZZLE_ZERO: o[i] = 0.0; break;
+        default: o[i] = c[i]; break;
+      }
+    }
+    for (int i = 0; i < 3; ++i) sum[i] += o[i];
+    const double l = 0.3 * o[0] + 0.59 * o[1] + 0.11 * o[2];
+    sum_l += l;
+    sum_l2 += l * l;
+    ++n;
+  };
+  if (t.bc == 0) {
+    const size_t px = t.rgba.size() / 4;
+    const size_t step = std::max<size_t>(1, px / 4096);
+    for (size_t i = 0; i < px; i += step) {
+      add(t.rgba[i * 4] / 255.0, t.rgba[i * 4 + 1] / 255.0, t.rgba[i * 4 + 2] / 255.0);
+    }
+  } else if (t.bc <= 3) {
+    const size_t bs = t.bc == 1 ? 8 : 16, off = t.bc == 1 ? 0 : 8;
+    const size_t blocks = t.rgba.size() / bs;
+    const size_t step = std::max<size_t>(1, blocks / 2048);
+    for (size_t i = 0; i < blocks; i += step) {
+      const uint8_t* b = t.rgba.data() + i * bs + off;
+      for (int e = 0; e < 2; ++e) {
+        const uint32_t c = uint32_t(b[e * 2]) | uint32_t(b[e * 2 + 1]) << 8;
+        add(((c >> 11) & 31) / 31.0, ((c >> 5) & 63) / 63.0, (c & 31) / 31.0);
+      }
+    }
+  } else {
+    return 0;
+  }
+  if (n < 8) return 0;
+  const double r = sum[0] / n, g = sum[1] / n, b = sum[2] / n;
+  const double l = sum_l / n;
+  const double var = std::max(sum_l2 / n - l * l, 0.0);
+  const double sd = std::sqrt(var);
+  const double mx = std::max({r, g, b}), mn = std::min({r, g, b});
+  const double sat = mx > 1e-3 ? (mx - mn) / mx : 0.0;
+  if (l > 0.62 && sat < 0.14) return 1;                             // snow
+  if (sat > 0.45 && mx > 0.35) return 5;                            // paint, signs
+  if (r > g && g > b && sat > 0.2 && sat < 0.75 && l < 0.55) return 3;  // wood
+  if (sat < 0.12 && l > 0.12 && l < 0.6) return sd < 0.07 ? 2 : 4;    // metal / rock
+  return 0;
+}
 
 // --- Replayer -------------------------------------------------------------------
 
@@ -2178,6 +2244,8 @@ struct Renderer::Impl {
   // riders yet: its depth kept in alpha) and added after (where the depth
   // still matches: not over the riders).
   float specular_ = 0.0f;
+  std::unordered_map<uint64_t, uint8_t> material_overrides_;  // content hash -> surface
+  bool surfaces_on_ = true;  // (diag nosurfaces: none tagged; read once a frame)
   Image spec_img_, spec_out_;
   bool spec_ok_ = false;
   void SunSpecular(const Draw& d, const GpuState& st);
@@ -3274,6 +3342,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   }
   Image im = gpu_.CreateTexture(decoded.width, decoded.height, format, uint32_t(levels.size()),
                                 data, components);
+  im.surface = SurfaceOf(decoded, components);
   // Upload through a staging buffer recorded into the current command buffer;
   // it is freed once the frame has finished.
   size_t total = 0;
@@ -5655,19 +5724,34 @@ void main() {
   vec3 alb = texelFetch(albedo, ip, 0).rgb;
   float lum = dot(alb, vec3(0.3, 0.59, 0.11));
   float sat = max(alb.r, max(alb.g, alb.b)) - min(alb.r, min(alb.g, alb.b));
-  bool foliage = nw.w > 0.02;
-  float snow = foliage ? 0.0 : smoothstep(0.5, 0.7, lum) * smoothstep(0.2, 0.08, sat);
-  // Roughness and reflectance: snow (packed, the slopes) glossier toward a
-  // low sun's glare; the rest a dull dielectric; foliage waxy, faint.
-  float rough = foliage ? 0.6 : mix(0.55, 0.3, snow);
-  float f0 = foliage ? 0.03 : mix(0.04, 0.03, snow);
+  // The normals' alpha: the game's material in its low bits (3: foliage;
+  // it reads them mod 4), our surface tag in the top three.
+  uint mb = uint(nw.w * 255.0 + 0.5);
+  bool foliage = (mb & 3u) == 3u;
+  uint tag = mb >> 5u;
+  // Snow: tagged, or by its color (fresh snow over anything).
+  float snow = foliage ? 0.0 : max(tag == 1u ? 1.0 : 0.0, smoothstep(0.5, 0.7, lum) * smoothstep(0.2, 0.08, sat));
+  // Roughness and reflectance by surface: snow glossier toward a low sun's
+  // glare; metal (tinted by its color) and paint shinier; wood, rock and
+  // cloth dull; foliage waxy, faint.
+  float rough = 0.55, f0 = 0.04, metal = 0.0;
+  if (foliage) { rough = 0.6; f0 = 0.03; }
+  else if (tag == 2u) { rough = 0.32; f0 = 0.5; metal = 1.0; }
+  else if (tag == 3u) { rough = 0.75; }
+  else if (tag == 4u) { rough = 0.7; }
+  else if (tag == 5u) { rough = 0.35; f0 = 0.05; }
+  else if (tag == 6u) { rough = 0.9; f0 = 0.03; }
+  rough = mix(rough, 0.3, snow);
+  f0 = mix(f0, 0.03, snow);
+  metal *= 1.0 - snow;
   vec3 H = normalize(L + V);
   float nh = max(dot(N, H), 0.0), vh = max(dot(V, H), 0.0);
   float a = rough * rough;
-  float F = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
-  float spec = D_GGX(nh, a) * G_Smith(nv, nl, a) * F / (4.0 * nv * nl) * nl;
+  float fr = pow(1.0 - vh, 5.0);
+  vec3 F = mix(vec3(f0 + (1.0 - f0) * fr), mix(alb, vec3(1.0), fr), metal);
+  float spec = D_GGX(nh, a) * G_Smith(nv, nl, a) / (4.0 * nv * nl) * nl;
   spec = min(spec, 6.0);
-  vec3 c = pc.col.rgb * spec * lit * (foliage ? 0.35 : 1.0);
+  vec3 c = pc.col.rgb * F * spec * lit * (foliage ? 0.35 : 1.0);
   // Glints in the sunlit snow: crystals catching it, changing as the view
   // moves (fewer far off: they'd shimmer).
   if (snow > 0.0) {
@@ -5677,7 +5761,13 @@ void main() {
     float g = step(0.995, Hash3(cell, hb.x * 31 + hb.y * 17 + hb.z * 7));
     c += pc.col.rgb * g * snow * lit * nl * 2.5 * smoothstep(35.0, 8.0, dist);
   }
-  if (pc.L.w > 0.5) c = vec4(snow, lit, nl, 0.0).rgb + vec3(0.0, 0.0, spec * 0.0);
+  if (pc.L.w > 0.5) {
+    // (Diagnostics: the surfaces: snow white, metal blue, wood brown, rock
+    // grey, paint magenta, cloth green, foliage dark green, unknown black.)
+    const vec3 kTag[7] = vec3[7](vec3(0.0), vec3(1.0), vec3(0.2, 0.4, 1.0), vec3(0.55, 0.3, 0.1),
+                                 vec3(0.45), vec3(1.0, 0.1, 0.8), vec3(0.1, 0.9, 0.2));
+    c = foliage ? vec3(0.0, 0.3, 0.0) : kTag[min(tag, 6u)];
+  }
   o = vec4(c, d);
 }
 )", true);
@@ -7762,6 +7852,13 @@ void Renderer::Impl::FreecamFrame() {
 }
 
 void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
+  if (Diag("lightconsts")) {
+    for (uint32_t c : {11u, 12u, 13u, 39u, 40u, 41u, 42u, 43u, 44u, 45u, 46u, 47u, 253u, 254u, 255u}) {
+      float v[4];
+      std::memcpy(v, &st.ps_consts[c * 4], 16);
+      std::fprintf(stderr, "lighting c%u = %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
+    }
+  }
   // Rows c0..c3: world (homogeneous) = rows * (ndc x, ndc y, 1 - depth, 1).
   for (uint32_t i = 0; i < 16; ++i) {
     float f;
@@ -11901,6 +11998,23 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     }
     if (wm) SetWind(sys, st, wm);
   }
+  // The surface, tagged into the normals' alpha (the scene's draws before
+  // the lighting that write normals): from its albedo texture (fetch 0), or
+  // the player's list (native_materials) by its content hash.
+  // (Only where the normals are written whole: not blended over, which
+  // would mix the tag into the game's bits.)
+  const uint32_t blend1 = st.reg(0x2209);
+  const bool rt1_opaque = ((blend1 >> 16) & 31u) == 1u && ((blend1 >> 24) & 31u) == 0u && ((blend1 >> 21) & 7u) == 0u;
+  if (specular_ > 0.0f && !light_seen_ && (ps->info.colors_written & 2u) && rt1_opaque && surfaces_on_) {
+    std::string n0;
+    uint8_t tag = 0;
+    if (Image* t0 = TextureFor(d, 0, st, &n0)) tag = t0->surface;
+    if (!material_overrides_.empty()) {
+      auto it = material_overrides_.find(DrawContentHash(d, st, 0));
+      if (it != material_overrides_.end()) tag = it->second;
+    }
+    sys.material[0] = tag;
+  }
   sys.rt_inv_size[0] = 1.0f / float(rt_w);
   sys.rt_inv_size[1] = 1.0f / float(rt_h);
   sys.param_gen_register = (st.reg(0x2180) & (1u << 18)) ? ((st.reg(0x2181) >> 8) & 0xFF) : 255;
@@ -13869,6 +13983,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   tod_sky_done_ = false;
   eye_done_ = false;
   lights_done_ = false;
+  surfaces_on_ = !Diag("nosurfaces");
   ao_done_ = false;
   ao_depth_ok_ = false;
   ao_late_ok_ = false;
@@ -14210,6 +14325,10 @@ void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetMaterials(const std::vector<std::pair<uint64_t, int>>& list) {
+  impl_->material_overrides_.clear();
+  for (const auto& [h, m] : list) impl_->material_overrides_[h] = uint8_t(std::clamp(m, 0, 7));
+}
 void Renderer::SetVolumetric(float strength, int quality) {
   impl_->volumetric_ = std::clamp(strength, 0.0f, 2.0f);
   impl_->volumetric_quality_ = std::clamp(quality, 0, 2);

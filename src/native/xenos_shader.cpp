@@ -528,6 +528,7 @@ bool Translator::Run(TranslateResult& out) {
        "  vec4 wind;            // its direction there (x, z), how hard (m), the clock (s)\n"
        "  vec4 wind2;           // how it moves (1 leaves, 2 a tree, 3 cloth), units a metre,\n"
        "                        // a seed, last frame's clock offset (s)\n"
+       "  uvec4 material;       // PS: x the surface tagged into oC1.w's high bits (0: none)\n"
        "} xe_sys;\n";
   g += "const uint XE_FLAG_XY_DIVIDED = 1u;      // position.xy already divided by w\n"
        "const uint XE_FLAG_Z_DIVIDED = 2u;       // position.z already divided by w\n"
@@ -1003,6 +1004,17 @@ uint xe_vertex_index() {
       // least half the samples would be covered.
       g += "  if ((xe_sys.flags & XE_FLAG_ALPHA_TO_COVERAGE) != 0u && xe_oC[0].a < 0.5) ";
       g += info_.kills ? "demote;\n" : "discard;\n";
+    }
+    // The surface (the normals' alpha: the game's material in the low two
+    // bits, ours in the top three: multiples of 32, so the samples' average
+    // at an edge (MSAA) leaves the game's reading mod 4 as it was).
+    if (info_.colors_written & 2u) {
+      g += "  if (xe_sys.material.x != 0u) {\n"
+           "    // (Only over the game's small material numbers: not a value of its own.)\n"
+           "    float gw = clamp(xe_oC[1].w, 0.0, 1.0) * 255.0;\n"
+           "    if (gw < 31.5 && abs(gw - floor(gw + 0.5)) < 0.01)\n"
+           "      xe_oC[1].w = float(uint(gw + 0.5) | (min(xe_sys.material.x, 7u) << 5u)) / 255.0;\n"
+           "  }\n";
     }
     for (uint32_t i = 0; i < 4; ++i) {
       if (info_.colors_written & (1u << i)) g += Fmt("  xe_color%u = xe_oC[%u];\n", i, i);
