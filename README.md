@@ -553,6 +553,13 @@ that rule against a save that has the pass.
   dust and smudges on the lens, out of focus (soft discs, a little brighter
   at the rim, and faint smears), that light up when the sun is in view,
   most near it.
+- Contact shadows (Contact Shadows, `native_contact_shadows`, 1; part of Sun
+  shadows Medium and High): with time of day and the sun's shadows on, the
+  shadows the maps are too coarse for, where a rock, a rail, a jump's lip or
+  a boot meets the snow, found by marching a short way toward the sun
+  through the depth. Steps along a slope seen edge-on don't count (how fast
+  the surface's distance changes there is allowed for), so flat snow stays
+  clean.
 - Snow tracks (Effects: Snow Tracks, `native_snow_tracks`, 1; works with
   time of day off too): every board's trail (the game's own, which fades
   after a few metres) is pressed into the snow and kept, for a couple of

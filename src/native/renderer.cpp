@@ -1926,7 +1926,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1967,7 +1967,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[55] = {};  // by CopyKind
+  VkShaderModule copy_fs_[56] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2253,6 +2253,7 @@ struct Renderer::Impl {
   // Diamond dust (SetDiamondDust): glinting ice crystals adrift near the
   // camera on clear, calm days, the most with the sun low.
   float dust_ = 0.0f;
+  float contact_ = 0.0f;  // SetContactShadows
   Image dust_out_;
   Image* DustScene(Image* scene);
   double PixelAngle(uint32_t h) const;  // a pixel's angle at the screen's middle (radians)
@@ -6180,6 +6181,84 @@ void main() {
     acc += pc.col.rgb * f * (0.06 + 1.6 * g) * phase * fade;
   }
   o = vec4(c.rgb + min(acc, vec3(4.0)), c.a);
+}
+)", true);
+  // Contact shadows: the sun's shadows of what's too small or too far for
+  // the shadow maps (a rider's boots, bumps and lips in the snow, a rail's
+  // underside), found in the depth: a short march toward the sun in screen
+  // space, shadowed where it passes behind something drawn (not too far
+  // behind: that's something else, farther off).
+  copy_fs_[55] = CompileBuiltin("builtin_contact_shadow", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D depth;
+layout(set = 0, binding = 1) uniform sampler2D mask;  // the sun's shadows so far
+layout(push_constant) uniform Sh {
+  mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
+  vec4 r0;  // world -> clip: x
+  vec4 r1;  //               y
+  vec4 r3;  //               w
+  vec4 L;   // toward the sun, strength
+} pc;
+layout(location = 0) out vec4 o;
+vec3 World(vec2 uv, float d) {
+  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  return w.xyz / w.w;
+}
+// The distance (clip w) of what's drawn at a pixel (far for the sky).
+float Wat(ivec2 p, vec2 size) {
+  float d = texelFetch(depth, clamp(p, ivec2(0), ivec2(size) - 1), 0).r;
+  if (d <= 0.0) return 1e6;
+  return dot(pc.r3, vec4(World((vec2(p) + 0.5) / size, d), 1.0));
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  float lit = texelFetch(mask, ip, 0).r;
+  o = vec4(lit);
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0 || lit <= 0.02) return;
+  vec2 size = vec2(textureSize(depth, 0));
+  vec2 uv = (gl_FragCoord.xy) / size;
+  vec3 P = World(uv, d);
+  float w0 = dot(pc.r3, vec4(P, 1.0));
+  if (w0 <= 0.0 || w0 > 120.0) return;
+  vec3 L = pc.L.xyz;
+  // (Reaching farther the farther off: about the same on screen.)
+  float reach = clamp(w0 * 0.02, 0.2, 1.2);
+  float bias = 0.03 + w0 * 0.002;
+  // How fast the surface's distance changes across the screen here (a
+  // slope seen edge-on: steps along it look 'behind' it): the smaller of
+  // each side's, so an outline doesn't count.
+  float gx = min(abs(Wat(ip + ivec2(1, 0), size) - w0), abs(Wat(ip - ivec2(1, 0), size) - w0));
+  float gy = min(abs(Wat(ip + ivec2(0, 1), size) - w0), abs(Wat(ip - ivec2(0, 1), size) - w0));
+  float grad = max(gx, gy);
+  // (A little jitter only: there's no frame blending to smooth noise out.)
+  float jit = 0.35 + 0.3 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  float occ = 0.0;
+  for (int i = 0; i < 12; ++i) {
+    float f = (float(i) + jit) / 12.0;
+    float t = reach * (0.02 + 0.98 * f * f);
+    vec3 Q = P + L * t;
+    float cw = dot(pc.r3, vec4(Q, 1.0));
+    if (cw <= 0.05) break;
+    vec2 q = vec2(dot(pc.r0, vec4(Q, 1.0)), dot(pc.r1, vec4(Q, 1.0))) / cw;
+    vec2 quv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+    if (any(lessThan(quv, vec2(0.0))) || any(greaterThan(quv, vec2(1.0)))) break;
+    ivec2 qp = ivec2(quv * size);
+    if (qp == ip) continue;
+    float ds = texelFetch(depth, qp, 0).r;
+    if (ds <= 0.0) continue;
+    float sw = dot(pc.r3, vec4(World(quv, ds), 1.0));
+    float behind = cw - sw;
+    // Behind what's drawn there, but within a thickness (more for nearer
+    // steps: a boot, a lip; not the slope far behind a rider's outline).
+    float thick = 0.3 + 0.6 * t;
+    // (Two steps behind for it all: one alone may be the depth's grain.)
+    float px = length(vec2(qp - ip));
+    if (behind > bias + t * 0.03 + grad * px * 0.6 && behind < thick) occ += 0.5 * (1.0 - f * 0.6);
+  }
+  occ = min(occ, 1.0);
+  // (Fading out with distance and at the screen's edges.)
+  float fade = 1.0 - smoothstep(60.0, 120.0, w0);
+  o = vec4(lit * (1.0 - occ * fade * pc.L.w));
 }
 )", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
@@ -11419,6 +11498,37 @@ void Renderer::Impl::TodShadows() {
     FullscreenPass(CopyKind::kTracksShadow, &tod_mask_, depth, &tod_mask_raw_, &tracks_map_, false, tp, 28);
     Barrier();
   }
+  // Contact shadows: what the maps miss, from the depth (the mask copied,
+  // then marched).
+  if (contact_ > 0.0f && !Diag("nocontact")) {
+    if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
+      if (tod_mask_raw_.image) Retire(tod_mask_raw_);
+      tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
+      ToGeneral(cb_, tod_mask_raw_);
+    }
+    VkImageCopy all{};
+    all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    all.extent = {depth->width, depth->height, 1};
+    Barrier();
+    vk::vkCmdCopyImage(cb_, tod_mask_.image, VK_IMAGE_LAYOUT_GENERAL, tod_mask_raw_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+    Barrier();
+    float sp[32] = {};
+    for (int c = 0; c < 4; ++c) {
+      for (int r = 0; r < 4; ++r) sp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+    }
+    for (int c = 0; c < 4; ++c) {
+      sp[16 + c] = float(vp[0 * 4 + c]);
+      sp[20 + c] = float(vp[1 * 4 + c]);
+      sp[24 + c] = float(vp[3 * 4 + c]);
+    }
+    double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
+    const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
+    for (int i = 0; i < 3; ++i) sp[28 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
+    sp[31] = contact_;
+    FullscreenPass(CopyKind::kContactShadow, &tod_mask_, depth, &tod_mask_raw_, nullptr, false, sp, 32);
+    Barrier();
+  }
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
   for (int i = 0; i < 4; ++i) {
     tod_mask_rows_[0 + i] = 0.5 * vp[0 * 4 + i] + 0.5 * vp[3 * 4 + i];
@@ -15179,6 +15289,7 @@ void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::cl
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetDriftingSnow(bool on) { impl_->drift_ = on; }
 void Renderer::SetLensFlare(float strength) { impl_->flare_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetContactShadows(float strength) { impl_->contact_ = std::clamp(strength, 0.0f, 1.0f); }
 void Renderer::SetDiamondDust(float strength) { impl_->dust_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetLensDirt(float strength) { impl_->lens_dirt_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }

@@ -16,8 +16,8 @@ REXCVAR_DEFINE_INT32(native_quality, 2, "GPU",
 REXCVAR_DEFINE_INT32(native_quality_sun_shadows, 2, "GPU",
                      "Sun shadows: 0 the game's own painted shadows; 1 low (the world's shadows "
                      "baked as you ride, riders' and objects' at the game's resolution); 2 "
-                     "medium (twice that); 3 high (the world's at four times, riders' and "
-                     "objects' sharper and reaching farther). -1: custom")
+                     "medium (twice that, and contact shadows); 3 high (the world's at four "
+                     "times, riders' and objects' sharper and reaching farther). -1: custom")
     .range(-1, 3);
 REXCVAR_DEFINE_INT32(native_quality_lamp_shadows, 2, "GPU",
                      "Night light shadows: 0 off; 1 low (the two nearest lamps at each spot); "
@@ -77,19 +77,22 @@ struct Part {
 
 // Sun shadows.
 struct SunLevel {
-  int world, res, soft, dist;
+  int world, res, soft, dist, contact;
 };
-constexpr SunLevel kSun[4] = {{0, 100, 0, 0}, {2, 100, 100, 0}, {2, 200, 100, 0}, {4, 300, 100, 80}};
+constexpr SunLevel kSun[4] = {
+    {0, 100, 0, 0, 0}, {2, 100, 100, 0, 0}, {2, 200, 100, 0, 1}, {4, 300, 100, 80, 1}};
 void SetSun(int l) {
   SetNum("native_world_shadows", kSun[l].world);
   SetNum("native_shadow_resolution", kSun[l].res);
   SetNum("native_shadow_softness", kSun[l].soft);
   SetNum("native_shadow_distance", kSun[l].dist);
+  SetNum("native_contact_shadows", kSun[l].contact);
 }
 int MatchSun() {
   for (int l = 0; l < 4; ++l) {
     if (Near(Num("native_world_shadows"), kSun[l].world) && Near(Num("native_shadow_resolution"), kSun[l].res) &&
-        Near(Num("native_shadow_softness"), kSun[l].soft) && Near(Num("native_shadow_distance"), kSun[l].dist)) {
+        Near(Num("native_shadow_softness"), kSun[l].soft) && Near(Num("native_shadow_distance"), kSun[l].dist) &&
+        Near(Num("native_contact_shadows"), kSun[l].contact)) {
       return l;
     }
   }

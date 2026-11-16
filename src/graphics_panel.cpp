@@ -121,6 +121,7 @@ const std::vector<Tab>& Tabs() {
            {"native_drifting_snow", "Drifting Snow"},
            {"native_ice_halo", "Ice Halo", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_diamond_dust", "Diamond Dust", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_contact_shadows", "Contact Shadows", Kind::kSlider, 0.0, 1.0, 0.1},
            {"native_weather_minutes", "Weather Spells", Kind::kStops, 0, 0, 0,
             {{"2", "2 min"}, {"6", "6 min"}, {"15", "15 min"}, {"40", "40 min"}}},
            {"native_night_light_shadows", "Night Light Shadows", Kind::kStops, 0, 0, 0,

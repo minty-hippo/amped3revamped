@@ -174,6 +174,11 @@ REXCVAR_DEFINE_DOUBLE(native_lens_flare, 0.6, "GPU",
                       "trees and cloud cut it), and ghosts of the lamps and fires at night. 0: "
                       "off, 1: natural, up to 2")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_DOUBLE(native_contact_shadows, 1.0, "GPU",
+                      "Time of day with the sun's shadows on: contact shadows, the shadows of small "
+                      "things and fine relief the shadow maps miss (where a rock or a boot meets "
+                      "the snow), found in the depth. 0: off, 1: full")
+    .range(0.0, 1.0);
 REXCVAR_DEFINE_DOUBLE(native_diamond_dust, 1.0, "GPU",
                       "Time of day: diamond dust, tiny ice crystals adrift in the air that glint "
                       "as they catch the sun (brightest looking toward it), on clear, calm days "
@@ -2468,6 +2473,7 @@ void WorkerMain() {
           renderer->SetLensFlare(float(REXCVAR_GET(native_lens_flare)));
           renderer->SetLensDirt(float(REXCVAR_GET(native_lens_dirt)));
           renderer->SetDiamondDust(float(REXCVAR_GET(native_diamond_dust)));
+          renderer->SetContactShadows(float(REXCVAR_GET(native_contact_shadows)));
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(float(REXCVAR_GET(native_sun_sheen)));

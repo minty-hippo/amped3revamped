@@ -391,6 +391,9 @@ class Renderer {
   // Diamond dust: ice crystals adrift near the camera glinting in the sun,
   // on clear calm days, the most with the sun low (0 off .. 2).
   void SetDiamondDust(float strength);
+  // Contact shadows: the sun's shadows of small things and fine relief the
+  // shadow maps miss, found in the depth (0 off .. 1).
+  void SetContactShadows(float strength);
   // Dust and smudges on the lens, lit up with the sun in view (with the
   // lens flare; 0 off .. 2).
   void SetLensDirt(float strength);

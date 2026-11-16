@@ -471,6 +471,12 @@ const std::vector<Tab>& Tabs() {
                         "with the sun at the horizon in still air, and light pillars over the "
                         "lamps at night in light snow or frost. 0: never.",
                         "%.1f", 0.0, 2.0),
+                SliderF("native_contact_shadows", "Contact shadows",
+                        "With time of day and the sun's shadows on: the shadows of small things "
+                        "and fine relief the shadow maps miss, where a rock, a rail or a boot "
+                        "meets the snow, found from the depth. Part of Sun shadows Medium and up. "
+                        "0: off.",
+                        "%.1f", 0.0, 1.0),
                 SliderF("native_diamond_dust", "Diamond dust",
                         "With time of day on: tiny ice crystals adrift in the air that glint as "
                         "they catch the sun (brightest looking toward it), on clear, calm days "
