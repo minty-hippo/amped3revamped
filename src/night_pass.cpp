@@ -25,6 +25,11 @@ namespace amped3::night_pass {
 namespace {
 
 constexpr const char* kMountain = "northstar";
+// The lock is off for now: on a save without the Night Pass it kept reading
+// the challenge registry from the controller thread and got in the way of
+// the menus (the resolution settings among them). Day and night run at
+// Northstar from the start, whatever native_tod_night_pass_lock says.
+constexpr bool kLockEnabled = false;
 
 std::mutex g_mutex;
 std::filesystem::path g_file;
@@ -75,6 +80,7 @@ void Install(const std::filesystem::path& folder) {
 }
 
 void Tick() {
+  if (!kLockEnabled) return;
   std::lock_guard lock(g_mutex);
   const auto now = std::chrono::steady_clock::now();
   if (now < g_next_read) return;
@@ -117,7 +123,7 @@ void Tick() {
 bool Earned() { return g_earned.load(); }
 
 bool Locked() {
-  return REXCVAR_GET(native_tod_night_pass_lock) && g_at_mountain.load() && !g_earned.load();
+  return kLockEnabled && REXCVAR_GET(native_tod_night_pass_lock) && g_at_mountain.load() && !g_earned.load();
 }
 
 }  // namespace amped3::night_pass

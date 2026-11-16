@@ -427,6 +427,8 @@ night with stars, and clouds drifting overhead. Each mountain starts at the
 hour it was made for, where it looks as the game has it; every other hour is
 worked out from that, so it fits each mountain's own look.
 
+(Off for now: day and night run at Northstar from the start on every save,
+and the setting below is ignored and hidden from the menus.)
 Northstar keeps its own hour until the Night Pass is earned (Time of Day:
 Northstar Waits for the Night Pass, `native_tod_night_pass_lock`, on by
 default). Earned is read from the game's challenges (a Northstar challenge
