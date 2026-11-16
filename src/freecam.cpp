@@ -14,6 +14,7 @@
 
 #include <imgui.h>
 
+#include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
@@ -103,7 +104,7 @@ struct Keys {
   // J kind, Delete delete, , . turn, Page Up / Down pick, Backspace back,
   // Ctrl+Z undo.
   bool ed_toggle = false, ed_place = false, ed_every = false, ed_kind = false, ed_delete = false,
-       ed_back = false, ed_undo = false, ed_color = false;
+       ed_back = false, ed_undo = false, ed_color = false, ed_surface = false;  // M: the surface picker
   int ed_turn = 0, ed_pick = 0, ed_tilt = 0;
 } g_keys;
 
@@ -172,6 +173,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
           "R3 / K: color",
           "LB RB / Page Up Down: pick a placed light",
           "Start / Ctrl+Z: undo",
+          "M: the surface under the cross (again: change it)",
           picked ? "B / Backspace: unpick" : "B / Backspace: done",
           "View / H: hide controls",
       };
@@ -252,6 +254,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     ed.ed_pick = g_keys.ed_pick + int(hit(ImGuiKey_PageDown)) - int(hit(ImGuiKey_PageUp));
     ed.ed_tilt = g_keys.ed_tilt + int(hit(ImGuiKey_RightBracket)) - int(hit(ImGuiKey_LeftBracket));
     ed.ed_color = g_keys.ed_color || hit(ImGuiKey_K);
+    ed.ed_surface = g_keys.ed_surface || hit(ImGuiKey_M);
     if (ImGui::IsKeyPressed(ImGuiKey_H, false)) help_bar::Toggle();
     float mouse[2] = {g_keys.mouse[0], g_keys.mouse[1]};
     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
@@ -273,6 +276,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     g_keys.ed_pick = ed.ed_pick;
     g_keys.ed_tilt = ed.ed_tilt;
     g_keys.ed_color = ed.ed_color;
+    g_keys.ed_surface = ed.ed_surface;
     g_keys.mouse[0] = mouse[0];
     g_keys.mouse[1] = mouse[1];
   }
@@ -400,6 +404,92 @@ void SetOn(bool on) {
   }
 }
 
+// The surface picker (light editor, M): the first press looks up the
+// texture under the cross (the sun's sheen's surface for it: guessed from
+// its colors, or set); pressed again while that's shown, the next surface,
+// kept in native_materials. Called every tick: the look-up's answer too.
+constexpr const char* kSurfaceNames[] = {"none", "snow", "metal", "wood", "rock", "paint", "cloth"};
+std::string SurfaceKey(bool pressed) {
+  static bool looking = false;
+  static uint64_t hash = 0;
+  static int surface = 0;  // as now (set, or the guess)
+  static bool set = false;
+  static int64_t shown_ns = 0;
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  auto hex = [](uint64_t h) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "%016llX", (unsigned long long)h);
+    return std::string(b);
+  };
+  // The list as it stands: HASH=surface entries.
+  auto entries = []() {
+    std::vector<std::pair<std::string, std::string>> out;
+    const std::string s = rex::cvar::GetFlagByName("native_materials");
+    size_t at = 0;
+    while (at < s.size()) {
+      size_t end = s.find_first_of(", ;", at);
+      if (end == std::string::npos) end = s.size();
+      const std::string tok = s.substr(at, end - at);
+      at = end + 1;
+      const size_t eq = tok.find('=');
+      if (eq != std::string::npos) out.emplace_back(tok.substr(0, eq), tok.substr(eq + 1));
+    }
+    return out;
+  };
+  if (looking) {
+    uint64_t h = 0;
+    int guess = 0;
+    const int r = live::SurfacePickResult(&h, &guess);
+    if (r == -1) return {};
+    looking = false;
+    if (r != 1) return "Nothing to sort there (the sky, or a rider)";
+    hash = h;
+    surface = guess;
+    set = false;
+    for (const auto& [k, v] : entries()) {
+      if (k.size() >= 16 && std::strtoull(k.substr(k.size() - 16).c_str(), nullptr, 16) == h) {
+        for (int i = 0; i < 7; ++i) {
+          if (v == kSurfaceNames[i]) {
+            surface = i;
+            set = true;
+          }
+        }
+      }
+    }
+    shown_ns = now;
+    return "Texture " + hex(hash) + ": " + kSurfaceNames[surface] + (set ? " (set)" : " (guessed)") +
+           "  -  M again to change";
+  }
+  if (!pressed) return {};
+  // Again, while it's shown: the next surface, kept.
+  if (hash && now - shown_ns < 20'000'000'000) {
+    surface = (surface + 1) % 7;
+    set = true;
+    shown_ns = now;
+    auto list = entries();
+    const std::string key = hex(hash);
+    bool found = false;
+    for (auto& [k, v] : list) {
+      if (k.size() >= 16 && k.substr(k.size() - 16) == key) {
+        v = kSurfaceNames[surface];
+        found = true;
+      }
+    }
+    if (!found) list.emplace_back(key, kSurfaceNames[surface]);
+    std::string text;
+    for (const auto& [k, v] : list) text += (text.empty() ? "" : ", ") + k + "=" + v;
+    rex::cvar::SetFlagByName("native_materials", text);
+    if (g_host.save_settings) g_host.save_settings();
+    return "Texture " + key + ": " + kSurfaceNames[surface] + " (set)  -  M again to change";
+  }
+  live::PickSurface();
+  looking = true;
+  hash = 0;
+  return "Looking at the surface under the cross...";
+}
+
 }  // namespace
 
 void Install(Host host) { g_host = std::move(host); }
@@ -424,7 +514,7 @@ void OnPad(const pad::Snapshot& pad) {
     g_keys.mouse[0] = g_keys.mouse[1] = 0.0f;
     g_keys.reset = g_keys.leave = g_keys.switch_mode = false;
     g_keys.ed_toggle = g_keys.ed_place = g_keys.ed_every = g_keys.ed_kind = g_keys.ed_delete =
-        g_keys.ed_back = g_keys.ed_undo = g_keys.ed_color = false;
+        g_keys.ed_back = g_keys.ed_undo = g_keys.ed_color = g_keys.ed_surface = false;
     g_keys.ed_turn = g_keys.ed_pick = g_keys.ed_tilt = 0;
   }
   // The light editor (time of day on; not in a replay: the replay's frames
@@ -471,6 +561,10 @@ void OnPad(const pad::Snapshot& pad) {
                      ((pressed & X_INPUT_GAMEPAD_LEFT_SHOULDER) ? 1 : 0);
     if (pick) say = night_lights::Select(pick);
     if ((pressed & X_INPUT_GAMEPAD_START) || keys.ed_undo) say = night_lights::Undo();
+    {
+      std::string s = SurfaceKey(keys.ed_surface);
+      if (!s.empty()) say = s;
+    }
     if ((pressed & X_INPUT_GAMEPAD_B) || keys.ed_back) {
       if (picked) {
         say = night_lights::Deselect();

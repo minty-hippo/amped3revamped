@@ -387,6 +387,11 @@ class Renderer {
   // named): 1 snow, 2 metal, 3 wood, 4 rock, 5 paint, 6 cloth (0: none); over
   // what's worked out from each texture's colors.
   void SetMaterials(const std::vector<std::pair<uint64_t, int>>& list);
+  // Which texture is at the screen's middle (its content hash, and the
+  // surface guessed for it): started here, found over a dozen frames.
+  // SurfacePick: 0 still looking (or none asked), 1 found, 2 nothing there.
+  void StartSurfacePick();
+  int SurfacePick(uint64_t* hash, int* guess) const;
   // More cloth for the wind (banners, flags) beyond those known: their
   // textures' ContentHash (as replacement files are named).
   void SetClothTextures(const std::vector<uint64_t>& hashes);

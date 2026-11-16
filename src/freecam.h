@@ -32,6 +32,8 @@ struct Host {
   // The game stops seeing the controller (true), or gets it back once every
   // button is up (false).
   std::function<void(bool)> block_game_input;
+  // The settings written to amped3.toml (the surface picker's corrections).
+  std::function<void()> save_settings;
 };
 
 void Install(Host host);

@@ -748,6 +748,13 @@ float g_freecam_pose[6] = {};  // the renderer's freecam, last frame (FreecamPos
 bool g_freecam_pose_valid = false;
 float g_center[3] = {};  // the screen's middle in the world (CenterPoint)
 std::atomic<bool> g_need_instances{false}, g_need_center{false};  // SetLightNeeds
+// The surface picker (PickSurface): asked; looking; what it found.
+std::atomic<bool> g_pick_request{false};
+bool g_pick_pending = false;  // (render thread)
+std::mutex g_pick_mutex;
+int g_pick_state = 0;  // 0 none asked, -1 looking, 1 found, 2 nothing there
+uint64_t g_pick_hash = 0;
+int g_pick_guess = 0;
 
 // ---- weather ----
 // Kinds: clear, overcast, snowing, blizzard; each a grey sky over, snow
@@ -2437,6 +2444,22 @@ void WorkerMain() {
           renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(float(REXCVAR_GET(native_sun_sheen)));
+          // The surface picker.
+          if (g_pick_request.exchange(false)) {
+            renderer->StartSurfacePick();
+            g_pick_pending = true;
+          } else if (g_pick_pending) {
+            uint64_t h = 0;
+            int g = 0;
+            const int r = renderer->SurfacePick(&h, &g);
+            if (r) {
+              g_pick_pending = false;
+              std::lock_guard lock(g_pick_mutex);
+              g_pick_state = r;
+              g_pick_hash = h;
+              g_pick_guess = g;
+            }
+          }
           renderer->SetVolumetric(float(REXCVAR_GET(native_volumetric)),
                                   int(REXCVAR_GET(native_volumetric_quality)));
           {
@@ -2727,6 +2750,21 @@ uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since)
   std::lock_guard lock(g_game_camera_mutex);
   if (g_instances_version != since) *out = g_instances;
   return g_instances_version;
+}
+void PickSurface() {
+  {
+    std::lock_guard lock(g_pick_mutex);
+    g_pick_state = -1;
+  }
+  g_pick_request = true;
+}
+int SurfacePickResult(uint64_t* hash, int* guess) {
+  std::lock_guard lock(g_pick_mutex);
+  if (g_pick_state == 1) {
+    *hash = g_pick_hash;
+    *guess = g_pick_guess;
+  }
+  return g_pick_state;
 }
 void SetLightNeeds(bool instances, bool center) {
   g_need_instances = instances;

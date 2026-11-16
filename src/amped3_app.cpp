@@ -453,6 +453,11 @@ void Amped3App::OnPostSetup() {
         unblock_when_released_ = true;  // the watcher, once every button is up
       }
     };
+    host.save_settings = [this] {
+      app_context().CallInUIThread([this] {
+        if (!config_path_.empty()) rex::cvar::SaveConfig(config_path_);
+      });
+    };
     amped3::freecam::Install(std::move(host));
   }
   // Instant replay (F7, or L3 + R3 held).

@@ -98,6 +98,13 @@ const char* WeatherName();
 // objects' placements (lights on every copy, or the editor), the screen's
 // middle read back (the editor). Off: neither is done.
 void SetLightNeeds(bool instances, bool center);
+// The surface picker: which texture is at the middle of the screen (time of
+// day on, the sun's sheen or not), found over a dozen frames. The result:
+// -1 still looking, 0 none asked, 1 found (its content hash, the surface
+// guessed for it: 0 none, 1 snow, 2 metal, 3 wood, 4 rock, 5 paint), 2
+// nothing there (the sky, or something drawn after the lighting: a rider).
+void PickSurface();
+int SurfacePickResult(uint64_t* hash, int* guess);
 // Objects placed in the world as last drawn (time of day on): copied out
 // when newer than `since`; returns the version.
 uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since);

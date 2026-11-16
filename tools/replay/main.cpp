@@ -1047,9 +1047,20 @@ int main(int argc, char** argv) {
     }
     // Profiling under callgrind: count only the repeats (caches warm).
     PROFILE_ZERO();
+    if (std::getenv("A3_PICK_SURFACE")) renderer.StartSurfacePick();
     for (int i = 1; i < repeat; ++i) {
       stats = renderer.Render(cap, files, max_draws);
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
+      if (std::getenv("A3_PICK_SURFACE")) {
+        uint64_t h = 0;
+        int g = 0;
+        const int r = renderer.SurfacePick(&h, &g);
+        if (r) {
+          std::printf("Surface pick after %d frames: %s %016llX guessed %d\n", i,
+                      r == 1 ? "found" : "nothing", (unsigned long long)h, g);
+          break;
+        }
+      }
     }
     if (stats.tree_shadow_draws)
       std::cout << "Sun shadows: " << stats.tree_shadow_draws << " filtered, " << stats.tree_casters

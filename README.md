@@ -504,6 +504,13 @@ that rule against a save that has the pass.
   be put right by texture: `native_materials = "HASH=metal, HASH=wood"`
   (content hashes, as replacements are named); the wind's cloth list counts
   as cloth.
+  To fix one in the game: in the light editor (freecam, then L), aim the cross
+  at it and press M: it shows the texture and its surface (guessed or set);
+  press M again (within 20 s) to step through snow, metal, wood, rock, paint,
+  cloth and none. Each change is kept in native_materials and saved. (The
+  picker finds the texture through the same tags: a frame listing the
+  textures drawn, then one frame per digit of its place in that list, read
+  back from the middle of the screen; the sheen pauses for those frames.)
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and

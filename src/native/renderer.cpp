@@ -2246,6 +2246,25 @@ struct Renderer::Impl {
   float specular_ = 0.0f;
   std::unordered_map<uint64_t, uint8_t> material_overrides_;  // content hash -> surface
   bool surfaces_on_ = true;  // (diag nosurfaces: none tagged; read once a frame)
+  // The surface picker (StartSurfacePick): which texture is at the screen's
+  // middle, found through the tags: a frame listing the textures drawn
+  // (fetch 0 of the draws tagged), then a frame per base-7 digit of its place
+  // in that list, each texture tagged 1 + that digit; the normals' alpha at
+  // the middle read back (4 frames later) gives each digit.
+  int pick_state_ = 0;  // 0 idle, 1 listing, 2 digits
+  std::vector<uint64_t> pick_hashes_;
+  std::vector<uint8_t> pick_guess_;
+  std::unordered_map<uint64_t, uint32_t> pick_index_;
+  int pick_digits_ = 0, pick_cur_ = 0, pick_frames_ = 0, pick_misses_ = 0;
+  int pick_have_[8] = {};
+  int pick_slot_digit_[4] = {-1, -1, -1, -1};
+  uint64_t pick_slot_frame_[4] = {};
+  Buffer pick_rb_;
+  int pick_result_ = 0;  // 0 pending, 1 found, 2 nothing there
+  uint64_t pick_hash_ = 0;
+  int pick_found_guess_ = 0;
+  void PickProbe(const Draw& d, const GpuState& st);
+  void PickRead();
   Image spec_img_, spec_out_;
   bool spec_ok_ = false;
   void SunSpecular(const Draw& d, const GpuState& st);
@@ -9792,6 +9811,88 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
   return fog_result_;
 }
 
+// The surface picker: the normals' alpha at the screen's middle (this
+// frame's digit) copied to its read-back slot.
+void Renderer::Impl::PickProbe(const Draw& d, const GpuState& st) {
+  std::string n0;
+  Image* n4 = TextureFor(d, 4, st, &n0);
+  if (!n4 || n4->depth || n4->samples != 1 || n4->format != VK_FORMAT_R8G8B8A8_UNORM || n4->width < 4) return;
+  if (!pick_rb_.buffer) pick_rb_ = gpu_.CreateBuffer(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  EndRendering();
+  Barrier();
+  const int slot = int(frame_number_ % 4);
+  VkBufferImageCopy region{};
+  region.bufferOffset = VkDeviceSize(slot) * 16;
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageOffset = {int32_t(n4->width / 2), int32_t(n4->height / 2), 0};
+  region.imageExtent = {1, 1, 1};
+  vk::vkCmdCopyImageToBuffer(cb_, n4->image, VK_IMAGE_LAYOUT_GENERAL, pick_rb_.buffer, 1, &region);
+  Barrier();
+  pick_slot_digit_[slot] = pick_cur_;
+  pick_slot_frame_[slot] = frame_number_;
+  dyn_ = DynState{};
+}
+
+// The picker, a frame on: the listing done (digits next); a digit read back.
+void Renderer::Impl::PickRead() {
+  if (pick_state_ == 1) {
+    if (++pick_frames_ < 2) return;  // (a whole frame listed)
+    if (pick_hashes_.empty()) {
+      pick_state_ = 0;
+      pick_result_ = 2;
+      return;
+    }
+    pick_digits_ = 1;
+    for (size_t n = 7; n < pick_hashes_.size() && pick_digits_ < 8; n *= 7) ++pick_digits_;
+    for (int& h : pick_have_) h = -1;
+    for (int& sd : pick_slot_digit_) sd = -1;
+    pick_state_ = 2;
+    pick_cur_ = 0;
+    pick_frames_ = 0;
+    pick_misses_ = 0;
+    return;
+  }
+  if (pick_state_ != 2) return;
+  // Each digit in turn, round again until all are read.
+  pick_cur_ = (pick_cur_ + 1) % pick_digits_;
+  if (++pick_frames_ > 120) {  // (given up: nothing tagged there)
+    pick_state_ = 0;
+    pick_result_ = 2;
+    return;
+  }
+  for (int slot = 0; slot < 4; ++slot) {
+    if (pick_slot_digit_[slot] < 0 || frame_number_ < pick_slot_frame_[slot] + 4) continue;
+    const uint8_t w = pick_rb_.mapped[slot * 16 + 3];
+    const int digit = pick_slot_digit_[slot];
+    pick_slot_digit_[slot] = -1;
+    const int tag = w >> 5;
+    if (Diag("pickdbg")) std::fprintf(stderr, "pick: slot %d digit %d byte %u (of %zu, %d digits)\n", slot, digit, w, pick_hashes_.size(), pick_digits_);
+    if (tag == 0) {
+      if (++pick_misses_ >= 6) {
+        pick_state_ = 0;
+        pick_result_ = 2;
+        return;
+      }
+      continue;
+    }
+    pick_have_[digit] = tag - 1;
+  }
+  uint64_t index = 0, place = 1;
+  for (int k = 0; k < pick_digits_; ++k) {
+    if (pick_have_[k] < 0) return;
+    index += uint64_t(pick_have_[k]) * place;
+    place *= 7;
+  }
+  pick_state_ = 0;
+  if (index < pick_hashes_.size()) {
+    pick_hash_ = pick_hashes_[index];
+    pick_found_guess_ = pick_guess_[index];
+    pick_result_ = 1;
+  } else {
+    pick_result_ = 2;
+  }
+}
+
 // The sun's sheen, at the lighting pass (builtin_sun_spec): into spec_img_.
 void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   spec_ok_ = false;
@@ -9852,6 +9953,7 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
 Image* Renderer::Impl::SpecularScene(Image* scene) {
   if (!spec_ok_) return nullptr;
   spec_ok_ = false;
+  if (pick_state_ == 2) return nullptr;  // (the tags are the picker's now)
   auto dit = resolved_.find(depth_base_);
   if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples != 1 ||
       dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1 ||
@@ -10328,6 +10430,7 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
   }
   TodShadows();
   SunSpecular(d, st);
+  if (pick_state_ == 2) PickProbe(d, st);
   std::string note;
   Image* src = TextureFor(d, 1, st, &note);
   if (!src || src->depth || src->samples > 1 || src->width > 4096 || src->height > 4096) {
@@ -12005,13 +12108,26 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // would mix the tag into the game's bits.)
   const uint32_t blend1 = st.reg(0x2209);
   const bool rt1_opaque = ((blend1 >> 16) & 31u) == 1u && ((blend1 >> 24) & 31u) == 0u && ((blend1 >> 21) & 7u) == 0u;
-  if (specular_ > 0.0f && !light_seen_ && (ps->info.colors_written & 2u) && rt1_opaque && surfaces_on_) {
+  if ((specular_ > 0.0f || pick_state_) && !light_seen_ && (ps->info.colors_written & 2u) && rt1_opaque &&
+      surfaces_on_) {
     std::string n0;
     uint8_t tag = 0;
-    if (Image* t0 = TextureFor(d, 0, st, &n0)) tag = t0->surface;
-    if (!material_overrides_.empty()) {
-      auto it = material_overrides_.find(DrawContentHash(d, st, 0));
+    Image* t0 = TextureFor(d, 0, st, &n0);
+    if (t0) tag = t0->surface;
+    if (!material_overrides_.empty() || pick_state_) {
+      const uint64_t h = DrawContentHash(d, st, 0);
+      auto it = material_overrides_.find(h);
       if (it != material_overrides_.end()) tag = it->second;
+      if (pick_state_ == 1 && h && !pick_index_.count(h)) {
+        pick_index_[h] = uint32_t(pick_hashes_.size());
+        pick_hashes_.push_back(h);
+        pick_guess_.push_back(t0 ? t0->surface : 0);
+      } else if (pick_state_ == 2) {
+        auto pi = pick_index_.find(h);
+        uint32_t v = pi != pick_index_.end() ? pi->second : 0;
+        for (int k = 0; k < pick_cur_; ++k) v /= 7;
+        tag = pi != pick_index_.end() ? uint8_t(1 + v % 7) : 0;
+      }
     }
     sys.material[0] = tag;
   }
@@ -13858,6 +13974,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(fog_img_);
   if (eye_rb_.buffer) gpu_.DestroyBuffer(eye_rb_);
   if (center_rb_.buffer) gpu_.DestroyBuffer(center_rb_);
+  if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
@@ -13984,6 +14101,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   eye_done_ = false;
   lights_done_ = false;
   surfaces_on_ = !Diag("nosurfaces");
+  PickRead();  // (before this frame's draws are tagged)
   ao_done_ = false;
   ao_depth_ok_ = false;
   ao_late_ok_ = false;
@@ -14325,6 +14443,21 @@ void Renderer::SetBloom(float strength) { impl_->bloom_ = std::clamp(strength, 0
 void Renderer::SetCloudShadows(float darkness) { impl_->cloud_shadows_ = std::clamp(darkness, 0.0f, 1.0f); }
 void Renderer::SetSnowTracks(float depth) { impl_->tracks_ = std::clamp(depth, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::StartSurfacePick() {
+  impl_->pick_state_ = 1;
+  impl_->pick_frames_ = 0;
+  impl_->pick_result_ = 0;
+  impl_->pick_hashes_.clear();
+  impl_->pick_guess_.clear();
+  impl_->pick_index_.clear();
+}
+int Renderer::SurfacePick(uint64_t* hash, int* guess) const {
+  if (impl_->pick_result_ == 1) {
+    *hash = impl_->pick_hash_;
+    *guess = impl_->pick_found_guess_;
+  }
+  return impl_->pick_result_;
+}
 void Renderer::SetMaterials(const std::vector<std::pair<uint64_t, int>>& list) {
   impl_->material_overrides_.clear();
   for (const auto& [h, m] : list) impl_->material_overrides_[h] = uint8_t(std::clamp(m, 0, 7));
