@@ -1933,7 +1933,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1974,7 +1974,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[59] = {};  // by CopyKind
+  VkShaderModule copy_fs_[60] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2331,6 +2331,7 @@ struct Renderer::Impl {
   float ao_strength_ = 0.0f;
   bool ao_debug_ = false;
   Image ao_img_[2], ao_out_img_;
+  Image ao_prep_[3];  // builtin_ao_prep: the smaller depths for the far taps
   // The scene's depth as the lighting pass reads it: the world alone. The
   // game resolves depth again at the end of the frame with the riders,
   // particles that write depth (snow spray) and 3D HUD text in it, which
@@ -4934,18 +4935,49 @@ void main() {
   // on a spiral within a world radius, projected onto the screen). R = the
   // light left (1 = none hidden), G = the point's distance (for the blur and
   // the upsampling).
+  // Ambient occlusion, 0: the depth its far taps read, smaller and smaller
+  // (half, quarter, eighth, sixteenth size: every other texel of the last),
+  // the riders' negative. A tap far from its pixel reads a smaller one: the
+  // same few texels for the pixels around it, kept in the cache, where
+  // reading the full depth all over the screen (three of them) made it the
+  // dearest effect up close (6-9 ms a frame on an Arc).
+  copy_fs_[59] = CompileBuiltin("builtin_ao_prep", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D late;    // the first: with the riders; then the last level
+layout(set = 0, binding = 1) uniform sampler2D depth;   // before the depth-only passes
+layout(set = 0, binding = 2) uniform sampler2D hidden;  // after them
+layout(push_constant) uniform Prep { vec4 a; } pc;      // a.x: the first (1) or the next (0)
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy) * 2;
+  if (pc.a.x < 0.5) {
+    t = min(t, textureSize(late, 0) - 1);
+    o = vec4(texelFetch(late, t, 0).r);
+    return;
+  }
+  t = min(t, textureSize(depth, 0) - 1);
+  float late_d = texelFetch(late, t, 0).r;
+  bool mover = late_d != texelFetch(hidden, t, 0).r;
+  float d = mover ? late_d : texelFetch(depth, t, 0).r;
+  o = vec4(mover && d > 0.0 ? -d : d);
+}
+)", true);
   copy_fs_[20] = CompileBuiltin("builtin_ao", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D late;    // with the riders
 layout(set = 0, binding = 1) uniform sampler2D depth;   // before the depth-only passes
 layout(set = 0, binding = 2) uniform sampler2D hidden;  // after them
+layout(set = 0, binding = 3) uniform sampler2D lv0;     // builtin_ao_prep: half size
+layout(set = 0, binding = 4) uniform sampler2D lv1;     // quarter
+layout(set = 0, binding = 5) uniform sampler2D lv2;     // eighth
 layout(push_constant) uniform Ao {
   mat4 m;   // ndc (x, y, 1 - depth, 1) -> world (homogeneous)
   vec4 cam; // camera position, radius (world units)
   vec4 a;   // 1 / depth width, 1 / depth height, depth pixels per world unit 1 unit away,
             // farthest distance
   vec4 b;   // 1 / output width, 1 / output height, intensity, largest radius (depth pixels)
+  vec4 e;   // e.x: the taps from the full depth (diagnostic "aofull"), -
 } pc;
 layout(location = 0) out vec4 o;
+bool Diag_full;
 // Depth texels read by their integer position and placed at their centres:
 // a half-size pixel's centre falls exactly between two depth texels, and
 // which one a sampler picks there differs between GPUs (and from row to
@@ -4964,8 +4996,23 @@ vec3 World(ivec2 t, out bool sky) {
   sky = d <= 0.0 || abs(p.w) < 1e-7;
   return sky ? vec3(0.0) : p.xyz / p.w;
 }
+// A tap: from the smaller depths, the farther off the smaller (as many
+// texels apart, about, at each).
+vec3 Tap(ivec2 t, int dist_px, out bool sky) {
+  int level = clamp(findMSB(max(dist_px, 1)) - 3, 0, 2);
+  int sh = level + 1;
+  ivec2 q = clamp(t, ivec2(0), kSize - 1) >> sh;
+  float d = level == 0 ? texelFetch(lv0, q, 0).r : level == 1 ? texelFetch(lv1, q, 0).r : texelFetch(lv2, q, 0).r;
+  kMover = d < 0.0;
+  d = abs(d);
+  vec2 uv = (vec2(q << sh) + 0.5) * pc.a.xy;
+  vec4 p = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  sky = d <= 0.0 || abs(p.w) < 1e-7;
+  return sky ? vec3(0.0) : p.xyz / p.w;
+}
 void main() {
   kSize = textureSize(depth, 0);
+  Diag_full = pc.e.x > 0.5;
   // The depth texel this half-size pixel covers (top left of its 2 x 2).
   ivec2 c = ivec2(gl_FragCoord.xy) * 2;
   bool sky;
@@ -5016,7 +5063,7 @@ void main() {
     ivec2 off = ivec2(round(vec2(cos(ang), sin(ang)) * (f * rpx)));
     if (off == ivec2(0)) continue;
     bool sk;
-    vec3 v = World(c + off, sk) - p;
+    vec3 v = (Diag_full ? World(c + off, sk) : Tap(c + off, int(f * rpx), sk)) - p;
     if (sk) continue;
     float vv = dot(v, v);
     // A rider darkens only what it touches (the snow right under the board
@@ -10253,6 +10300,22 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
     im = gpu_.CreateImage(iw, ih, f, false, name);
     ToGeneral(cb_, im);
   };
+  // The smaller depths for the far taps (builtin_ao_prep).
+  {
+    uint32_t lw = w, lh = h;
+    for (int l = 0; l < 3; ++l) {
+      lw = std::max((lw + 1) / 2, 1u);
+      lh = std::max((lh + 1) / 2, 1u);
+      ensure(ao_prep_[l], lw, lh, VK_FORMAT_R32_SFLOAT, "ao_depths");
+    }
+    Barrier();
+    float first[4] = {1, 0, 0, 0}, next[4] = {0, 0, 0, 0};
+    FullscreenPass(CopyKind::kAoPrep, &ao_prep_[0], late_depth, before_hidden, after_hidden, false, first, 4);
+    for (int l = 1; l < 3; ++l) {
+      Barrier();
+      FullscreenPass(CopyKind::kAoPrep, &ao_prep_[l], &ao_prep_[l - 1], nullptr, nullptr, false, next, 4);
+    }
+  }
   ensure(ao_img_[0], hw, hh, VK_FORMAT_R16G16_SFLOAT, "ao");
   ensure(ao_img_[1], hw, hh, VK_FORMAT_R16G16_SFLOAT, "ao_blur");
   ensure(ao_out_img_, w, h, scene->format, "ambient_occlusion");
@@ -10276,8 +10339,10 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
   pc[25] = 1.0f / float(hh);
   pc[26] = 9.0f * ao_strength_;
   pc[27] = 0.25f * float(h);  // the screen radius, at most
+  pc[28] = Diag("aofull") ? 1.0f : 0.0f;
+  Barrier();
   FullscreenPass(CopyKind::kAo, &ao_img_[0], late_depth, before_hidden, after_hidden, false, pc,
-                 28);
+                 32, nullptr, &ao_prep_[0], &ao_prep_[1], &ao_prep_[2]);
   float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
   FullscreenPass(CopyKind::kAoBlur, &ao_img_[1], &ao_img_[0], nullptr, nullptr, false, bx, 4);
   FullscreenPass(CopyKind::kAoBlur, &ao_img_[0], &ao_img_[1], nullptr, nullptr, false, by, 4);
@@ -15379,6 +15444,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_img_[0]);
   gpu_.DestroyImage(ao_img_[1]);
   gpu_.DestroyImage(ao_out_img_);
+  for (Image& im : ao_prep_) gpu_.DestroyImage(im);
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
   for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_,
