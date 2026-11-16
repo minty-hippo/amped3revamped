@@ -528,7 +528,9 @@ that rule against a save that has the pass.
   light included.
   They're drawn with parallax: the view ray meets the grooves' floor and
   the heaps' tops (a few steps along it), so at a glancing angle a heap hides
-  the groove's far side. Falling snow fills them in over a couple of minutes.
+  the groove's far side.
+  Toward a low sun a groove's wall and a heap shade the snow beside them
+  (marched over the tracks' height toward the sun, into the sun's shadows). Falling snow fills them in over a couple of minutes.
   (From the game's trail draws, drawn again from above each frame.)
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like

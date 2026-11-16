@@ -1926,7 +1926,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -1967,7 +1967,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[51] = {};  // by CopyKind
+  VkShaderModule copy_fs_[52] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -5841,6 +5841,62 @@ void main() {
   }
   add /= 1.0 + dot(add, vec3(0.3, 0.59, 0.11));
   o = vec4(c.rgb + add * (1.0 - 0.6 * clamp(c.rgb, 0.0, 1.0)), c.a);
+}
+)", true);
+  // Snow tracks, 3: their own shadows in the sun's mask: a groove's wall
+  // and a heap shading the snow beside them toward a low sun (marched over
+  // the tracks' height toward it).
+  copy_fs_[51] = CompileBuiltin("builtin_tracks_shadow", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D depth;
+layout(set = 0, binding = 1) uniform sampler2D mask;    // the sun's shadows so far
+layout(set = 0, binding = 2) uniform sampler2D tracks;  // r groove, g heap
+layout(push_constant) uniform Sh {
+  mat4 m;  // ndc (x, y, 1 - depth, 1) -> world
+  vec4 L;  // toward the sun
+  vec4 a;  // the map's texel 0 (world x, z), texels a metre
+  vec4 b;  // groove depth (m), heap height (m)
+} pc;
+layout(location = 0) out vec4 o;
+float Ht(vec2 tc) {
+  vec2 f = tc - 0.5;
+  ivec2 i = ivec2(floor(f));
+  vec2 w = f - floor(f);
+  ivec2 n = textureSize(tracks, 0) - 1;
+  vec2 a = texelFetch(tracks, clamp(i, ivec2(0), n), 0).rg;
+  vec2 b = texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0).rg;
+  vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
+  vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
+  vec2 t = mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+  return -pc.b.x * t.r + pc.b.y * t.g * (1.0 - t.r);
+}
+// (Soft over a texel or so, as the tracks are shaded.)
+float Hs(vec2 tc) {
+  return (Ht(tc + vec2(0.7, 0.7)) + Ht(tc + vec2(-0.7, 0.7)) + Ht(tc + vec2(0.7, -0.7)) + Ht(tc - vec2(0.7))) * 0.25;
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  float lit = texelFetch(mask, ip, 0).r;
+  o = vec4(lit);
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0 || lit <= 0.01) return;
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(depth, 0));
+  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  vec3 P = w.xyz / w.w;
+  vec2 tc = (P.xz - pc.a.xy) * pc.a.z;
+  vec2 n2 = vec2(textureSize(tracks, 0));
+  if (any(lessThan(tc, vec2(16.0))) || any(greaterThan(tc, n2 - 16.0))) return;
+  float h0 = Hs(tc);
+  vec3 L = pc.L.xyz;
+  float occ = 0.0;
+  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  for (int i = 0; i < 10; ++i) {
+    float f = (float(i) + jit) / 10.0;
+    float t = 0.02 + 0.9 * f * f;  // 2 cm .. ~1 m
+    vec2 q = tc + L.xz * t * pc.a.z;
+    float ray = h0 + L.y * t;
+    occ = max(occ, smoothstep(0.0, 0.025, Hs(q) - ray));
+  }
+  o = vec4(lit * (1.0 - 0.75 * occ));
 }
 )", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
@@ -10744,6 +10800,36 @@ void Renderer::Impl::TodShadows() {
       cloud_here_ = cloud_dark * t * t * (3.0f - 2.0f * t);
     }
     FullscreenPass(CopyKind::kCloudShadow, &tod_mask_, depth, &tod_mask_raw_, &cloud_map_, false, cp, 28);
+    Barrier();
+  }
+  // The boards' tracks shading the snow beside them (a low sun).
+  if (tracks_ok_ && tracks_map_.image && !Diag("notrackshadow")) {
+    if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
+      if (tod_mask_raw_.image) Retire(tod_mask_raw_);
+      tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
+      ToGeneral(cb_, tod_mask_raw_);
+    }
+    VkImageCopy all{};
+    all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    all.extent = {depth->width, depth->height, 1};
+    Barrier();
+    vk::vkCmdCopyImage(cb_, tod_mask_.image, VK_IMAGE_LAYOUT_GENERAL, tod_mask_raw_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+    Barrier();
+    float tp[28] = {};
+    for (int c = 0; c < 4; ++c) {
+      for (int r = 0; r < 4; ++r) tp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+    }
+    double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
+    const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
+    for (int i = 0; i < 3; ++i) tp[16 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
+    const int64_t N = kTracksN;
+    tp[20] = float(double(tracks_cx_ - N / 2) * kTracksTexel);
+    tp[21] = float(double(tracks_cz_ - N / 2) * kTracksTexel);
+    tp[22] = float(1.0 / kTracksTexel);
+    tp[24] = 0.06f * tracks_;
+    tp[25] = 0.22f * tracks_;
+    FullscreenPass(CopyKind::kTracksShadow, &tod_mask_, depth, &tod_mask_raw_, &tracks_map_, false, tp, 28);
     Barrier();
   }
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
