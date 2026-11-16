@@ -520,6 +520,11 @@ that rule against a save that has the pass.
   otherwise clear sky and the sun low to middling, a ring round it 22 degrees
   out (reddish inside, the sky a shade darker within it) and the sun dogs
   either side at its height.
+  The same setting covers the pillars: with the sun just up or just set in
+  still air, a sun pillar, its light thrown up in a narrow column that widens
+  and fades upward (a short stub below); and at night, in still air with
+  light snow or a clear frost, light pillars, columns of the lamps' and
+  fires' light above them (with Light Glow on).
   Diamond dust (Diamond Dust, `native_diamond_dust`, 1): on a clear, calm
   day without falling snow, tiny ice crystals adrift in the air near the
   camera, each flashing now and then as it tumbles and catches the sun,

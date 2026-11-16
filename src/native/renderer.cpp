@@ -2211,7 +2211,7 @@ struct Renderer::Impl {
   uint32_t lighting_aa_ = 0;  // the lighting pass's sample mask (its inputs made for it)
   Image tod_mask_raw_;  // the sun's shadows before the clouds'
   float cloud_here_ = 0.0f;  // the clouds' shade at the camera (for the riders: 0..1)
-  Image bloom_a_, bloom_b_, bloom_out_;
+  Image bloom_a_, bloom_b_, bloom_out_, pillar_img_;
   Image* BloomScene(Image* scene);
   // Lens flare (SetLensFlare): the sun's, drawn (ghosts of the aperture along
   // the line through the middle, a starburst, glare), as much as the sun is
@@ -5281,6 +5281,21 @@ void main() {
     hc += dc * dog * 0.35;
     c += max(hc, vec3(-0.03)) * pc.sun_col.rgb * halo * clear * open_sky;
   }
+  // A sun pillar: with the sun at the horizon (just up or just set) in still
+  // cold air, its light thrown up in a narrow column by the ice plates
+  // floating flat (texel 1's alpha: how strong), widening and fading upward;
+  // a short stub below it.
+  float pillar = texelFetch(colors, ivec2(1, 0), 0).a;
+  if (pillar > 0.0) {
+    float es = asin(clamp(pc.sun.y, -1.0, 1.0)), e = asin(clamp(dir.y, -1.0, 1.0));
+    vec2 sh = normalize(pc.sun.xz + vec2(1e-6)), dh = normalize(dir.xz + vec2(1e-6));
+    float side = acos(clamp(dot(sh, dh), -1.0, 1.0)) * cos(e);
+    float up = e - max(es, -0.01);
+    float width = 0.006 + 0.05 * max(up, 0.0);
+    float across = exp(-pow(side / width, 2.0));
+    float along = up > 0.0 ? exp(-up / 0.07) * (0.6 + 0.4 * exp(-up / 0.015)) : exp(up / 0.012) * 0.5;
+    c += pc.sun_col.rgb * across * along * pillar * 0.45 * clear * open_sky;
+  }
   // The sun's disc and a glow, once it isn't where the panorama paints it.
   if (pc.sun.w > 0.0) {
     float s = dot(dir, pc.sun.xyz);
@@ -7175,6 +7190,29 @@ void main() {
       c += textureLod(src, uv - pc.a.zw * float(i), 0.0).rgb * w[i];
     }
     o = vec4(c, 1.0);
+  } else if (mode == 3) {
+    // Light pillars: what's bright drawn up in a column above it (and a
+    // short way below), a little wider than it. (a.w: a step, of the height)
+    vec2 size = vec2(textureSize(src, 0));
+    vec2 uv = gl_FragCoord.xy / size;
+    float dx = 1.0 / size.x;
+    vec3 acc = vec3(0.0);
+    for (int k = 1; k <= 48; ++k) {
+      float f = float(k) / 48.0;
+      vec2 at = uv + vec2(0.0, pc.a.w * float(k));
+      vec3 s = textureLod(src, at, 0.0).rgb * 0.5 + textureLod(src, at - vec2(dx, 0.0), 0.0).rgb * 0.25 +
+               textureLod(src, at + vec2(dx, 0.0), 0.0).rgb * 0.25;
+      acc += s * pow(1.0 - f, 1.5);
+      if (k <= 14) {
+        at = uv - vec2(0.0, pc.a.w * float(k));
+        acc += textureLod(src, at, 0.0).rgb * pow(1.0 - float(k) / 14.0, 1.5) * 0.5;
+      }
+    }
+    o = vec4(acc * pc.a.y, 1.0);
+  } else if (mode == 4) {
+    // (Two the same size added: the glow and the pillars.)
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    o = vec4(texelFetch(src, p, 0).rgb + texelFetch(scene, p, 0).rgb * pc.a.y, 1.0);
   } else {
     vec4 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0);
     vec2 uv = gl_FragCoord.xy * pc.a.zw;
@@ -9997,6 +10035,21 @@ Image* Renderer::Impl::BloomScene(Image* scene) {
   const bool flare = flare_ > 0.0f && !Diag("noflare");
   const bool ghosts = flare && dark > 0.02f;
   if (ghosts) FlareGhosts(&bloom_a_, scene);
+  // Light pillars: at night in still air with ice crystals about (light
+  // snow, or a clear frost), the lamps' light in columns above them.
+  float pillar = 0.0f;
+  if (bloom_ > 0.0f && !Diag("nopillar")) {
+    const double wind = std::hypot(tod_.wind[0], tod_.wind[1]), snow = std::clamp(double(tod_.snow), 0.0, 1.0);
+    pillar = float(halo_ * tod::SmoothStep(0.3, 0.8, dark) * (1.0 - tod::SmoothStep(3.0, 7.0, wind)) *
+                   (0.35 + 0.65 * tod::SmoothStep(0.02, 0.2, snow)) * (1.0 - tod::SmoothStep(0.5, 0.8, snow)));
+    if (Diag("pillar")) pillar = 1.0f;
+  }
+  if (pillar > 0.01f) {
+    ensure(pillar_img_, qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, "pillars");
+    float pp[8] = {3.0f, 0.045f, 0.0f, 0.24f / 48.0f, 0, 0, 0, 0};
+    Barrier();
+    FullscreenPass(CopyKind::kBloom, &pillar_img_, &bloom_a_, nullptr, nullptr, true, pp, 8);
+  }
   if (!(bloom_ > 0.0f)) {
     Image* f = flare ? FlareScene(scene, ghosts) : nullptr;
     dyn_ = DynState{};
@@ -10016,13 +10069,21 @@ Image* Renderer::Impl::BloomScene(Image* scene) {
     Barrier();
     FullscreenPass(CopyKind::kBloom, &bloom_a_, &bloom_b_, nullptr, nullptr, true, pc, 8);
   }
+  // (The pillars with the glow, as strong whatever the glow's strength.)
+  Image* glow = &bloom_a_;
+  if (pillar > 0.01f) {
+    float pa[8] = {4.0f, pillar / std::max(strength, 0.05f), 0, 0, 0, 0, 0, 0};
+    Barrier();
+    FullscreenPass(CopyKind::kBloom, &bloom_b_, &bloom_a_, &pillar_img_, nullptr, false, pa, 8);
+    glow = &bloom_b_;
+  }
   // Over the scene.
   pc[0] = 2.0f;
   pc[1] = strength;
   pc[2] = 1.0f / float(w);
   pc[3] = 1.0f / float(h);
   Barrier();
-  FullscreenPass(CopyKind::kBloom, &bloom_out_, &bloom_a_, scene, nullptr, true, pc, 8);
+  FullscreenPass(CopyKind::kBloom, &bloom_out_, glow, scene, nullptr, true, pc, 8);
   Barrier();
   Image* out = &bloom_out_;
   if (flare) {
@@ -11829,6 +11890,15 @@ Image* Renderer::Impl::TodSky(Image* scene) {
                           (1.0 - tod::SmoothStep(45.0 * tod::kDeg, 60.0 * tod::kDeg, t.sun_elevation)) *
                           (1.0 - t.night);
       f[3] = Diag("nohalo") ? 0.0f : Diag("halo") ? 1.0f : float(halo) * halo_;
+      // (Texel 1's alpha: the sun pillar's: the sun at the horizon, the air
+      // still, the sky clear to thinly clouded, no more than light snow.)
+      const double wind = std::hypot(tod_.wind[0], tod_.wind[1]);
+      const double pillar = tod::SmoothStep(-4.0 * tod::kDeg, -0.5 * tod::kDeg, t.sun_elevation) *
+                            (1.0 - tod::SmoothStep(4.0 * tod::kDeg, 9.0 * tod::kDeg, t.sun_elevation)) *
+                            (1.0 - tod::SmoothStep(0.35, 0.65, cover)) * (1.0 - tod::SmoothStep(0.15, 0.45, ov)) *
+                            (1.0 - tod::SmoothStep(4.0, 8.0, wind)) *
+                            (1.0 - tod::SmoothStep(0.3, 0.6, double(tod_.snow)));
+      f[7] = Diag("nopillar") ? 0.0f : Diag("pillar") ? 1.0f : float(pillar) * halo_;
     }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -14642,7 +14712,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
     gpu_.DestroyImage(*im);
   }

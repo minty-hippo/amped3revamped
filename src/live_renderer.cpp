@@ -279,7 +279,8 @@ REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
 REXCVAR_DEFINE_DOUBLE(native_ice_halo, 1.0, "GPU",
                       "Time of day: the 22-degree ice halo round the sun and the sun dogs either "
                       "side of it, in thin high cloud (some cloud cover, the sky otherwise clear; "
-                      "the sun low to middling). 0: never, up to 2")
+                      "the sun low to middling); and the pillars, the sun's at the horizon and "
+                      "the lamps' at night, in still air. 0: never, up to 2")
     .range(0.0, 2.0);
 REXCVAR_DEFINE_BOOL(native_drifting_snow, true, "GPU",
                     "Time of day: in a strong wind (a blizzard), loose snow streaming along the "
