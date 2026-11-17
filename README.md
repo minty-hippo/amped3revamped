@@ -568,6 +568,18 @@ that rule against a save that has the pass.
   dust and smudges on the lens, out of focus (soft discs, a little brighter
   at the rim, and faint smears), that light up when the sun is in view,
   most near it.
+- Fewer hitches from pipeline builds: a pipeline the driver has to compile
+  (not in its cache; 150-800 ms each on an Arc) is now built in the
+  background at once, even the first one in a frame, the draw left out for
+  the frame or two it takes; one already in the cache is still made on the
+  spot. The copies drawn into the sun maps, the casters' and tracks' maps
+  can wait too. A build that still stalls a frame (over 30 ms) is named in
+  the log ("pipeline built while drawing"), the first 30 a session.
+  (After an update that changes the shaders, the pipelines are all new
+  once: expect a few more hitches in the first minutes.)
+- The instant replay's copy of each frame (1.5-2 ms a frame, plus freeing the
+  frame after) moved off the render thread onto a thread of its own.
+- The log's "draw state" now shows its vertex buffers' share.
 - Shadows while the time of day's sun moves: the sun maps follow it in
   half-degree steps (were 1.4), each eased into the next, so the shadows
   glide rather than tick. While the maps are drawn again after a step (three

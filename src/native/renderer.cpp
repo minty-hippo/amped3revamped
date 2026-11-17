@@ -178,6 +178,9 @@ class Gpu {
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t family = 0;
   uint32_t timestamp_bits = 0;  // the queue's valid timestamp bits (0: no timestamps)
+  // Pipelines can be asked for only if the driver's cache has them (built
+  // in the background otherwise): VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED.
+  bool cache_control = false;
   VkPhysicalDeviceProperties props{};
   VkPhysicalDeviceMemoryProperties mem_props{};
   VkCommandPool pool = VK_NULL_HANDLE;
@@ -307,6 +310,8 @@ class Gpu {
     VkPhysicalDeviceVulkan13Features want13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     want13.dynamicRendering = VK_TRUE;
     want13.shaderDemoteToHelperInvocation = f13.shaderDemoteToHelperInvocation;
+    want13.pipelineCreationCacheControl = f13.pipelineCreationCacheControl;
+    cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
     VkPhysicalDeviceFeatures2 want{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     want.pNext = &want13;
     want.features.independentBlend = f2.features.independentBlend;
@@ -1778,7 +1783,7 @@ struct Renderer::Impl {
   VkBuffer cur_index_buffer_ = VK_NULL_HANDLE;
   bool index_cache_ = true;
   bool profile_frame_ = false;
-  double draw_part_ms_[12] = {};  // 10, 11: parts of 'after' (the shadow maps' and tracks' copies; instances)  // off with the diagnostic "noixcache"
+  double draw_part_ms_[13] = {};  // 10, 11: parts of 'after' (the shadow maps' and tracks' copies; instances); 12: of 'draw state' (before its vertex data)  // off with the diagnostic "noixcache"
   std::unordered_map<std::string, uint64_t> mem_sizes_;
   // Vertex data kept in one GPU buffer across frames (Prepass): a resource
   // is copied only when its bytes changed (FrameResources::Version). A region
@@ -1968,6 +1973,7 @@ struct Renderer::Impl {
   // flight, the queue and the builders, and what they finished.
   static constexpr double kPipelineSyncBudgetMs = 4.0;
   double pipeline_sync_ms_ = 0;  // this frame's synchronous builds
+  uint32_t slow_pipes_told_ = 0;
   bool last_pipeline_pending_ = false;
   std::unordered_set<std::string> pipelines_pending_;
   std::mutex pq_mutex_;
@@ -3945,7 +3951,9 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   // frame has spent its budget building pipelines, the rest are built in the
   // background and the draw is left out until its pipeline is ready (a
   // frame or two), instead of the frame stalling on the driver's compiler.
-  const bool deferrable = options_.async_pipelines && (tiling_.width != 0 || velocity || mask);
+  // (So can the copies drawn again into the sun maps, the casters' and the
+  // tracks' maps: a frame without one is a shadow late by a frame.)
+  const bool deferrable = options_.async_pipelines && (tiling_.width != 0 || velocity || mask || caster);
   // Just after the renderer starts (most pipelines then come from the disk
   // cache, quickly) a longer stall beats a scene missing for a frame.
   const double budget = frame_number_ < 120 ? 100.0 : kPipelineSyncBudgetMs;
@@ -3956,11 +3964,38 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   }
   VkPipeline p = VK_NULL_HANDLE;
   const auto t_pipe = std::chrono::steady_clock::now();
-  if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p) !=
-      VK_SUCCESS) {
+  // Past the start: one the driver would have to compile (not in its cache;
+  // a few hundred ms on some) goes to the background at once, even the
+  // frame's first, rather than only once the frame's budget is spent.
+  if (deferrable && gpu_.cache_control && frame_number_ >= 120 && !Diag("nocachetry")) {
+    pci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    const VkResult r = vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p);
+    pci.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+    if (r != VK_SUCCESS || p == VK_NULL_HANDLE) {
+      if (p != VK_NULL_HANDLE) vk::vkDestroyPipeline(gpu_.device, p, nullptr);
+      p = VK_NULL_HANDLE;
+      pipeline_sync_ms_ += MsSince(t_pipe);
+      QueuePipeline(std::move(build));
+      last_pipeline_pending_ = true;
+      return VK_NULL_HANDLE;
+    }
+  } else if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p) !=
+             VK_SUCCESS) {
     p = VK_NULL_HANDLE;
   }
   const double took = MsSince(t_pipe);
+  // (Slow ones that couldn't wait, told in the log: what they were for.)
+  if (took > 30.0 && slow_pipes_told_ < 30) {
+    ++slow_pipes_told_;
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "pipeline built while drawing: %.0f ms (%s; vs %016llx ps %016llx, %zu colors, depth %d%s%s%s)", took,
+                  deferrable ? "could wait" : tiling_.width ? "scene" : "outside the scene",
+                  (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash, colors.size(),
+                  depth ? 1 : 0, caster ? ", a caster copy" : "", light_seen_ ? ", after the lighting" : "",
+                  composite_seen_ ? ", after the composite" : "");
+    pending_notices_.push_back(line);
+  }
   ++stats_.new_pipelines;
   ++pipelines_unsaved_;
   stats_.pipeline_ms += took;
@@ -13741,6 +13776,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     if (float24) units *= 8.0f;
     bias_constant = poly_offset < 0 ? -units : units;
   }
+  mark(12);
   uint32_t fetch[192];
   std::memcpy(fetch, st.fetch.data(), sizeof(fetch));
   for (const auto& [vf, vmem_name] : d.vmem) {

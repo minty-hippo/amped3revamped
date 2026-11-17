@@ -1602,8 +1602,9 @@ double ReplaySpan() {
   return g_replay_times.back() - g_replay_times.front();
 }
 
-// After a frame is drawn (worker): kept for the replay while riding.
-void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos) {
+// After a frame is drawn (worker): whether it's to be kept for the replay
+// while riding (the keeping itself on the keeper thread: ReplayKeep).
+bool ReplayWants(const RecordedFrame& f, uint64_t camera) {
   const bool still = camera != 0 && camera == g_last_camera;
   g_last_camera = camera;
   g_scene_still = still;
@@ -1618,11 +1619,16 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
       g_replay_times.clear();
       g_replay_bytes = 0;
     }
-    return;
+    return false;
   }
-  if (f.replay || g_replay_playing.load() || camera == 0 || still) return;
-  if (f.swap_time - g_replay_last_kept < std::chrono::milliseconds(15)) return;
+  if (f.replay || g_replay_playing.load() || camera == 0 || still) return false;
+  if (f.swap_time - g_replay_last_kept < std::chrono::milliseconds(15)) return false;
   g_replay_last_kept = f.swap_time;
+  return true;
+}
+
+void ReplayKeep(const RecordedFrame& f, const float* camera_pos) {
+  const int seconds = REXCVAR_GET(replay_seconds);
   const auto t0 = std::chrono::steady_clock::now();
   std::unique_ptr<RecordedFrame> spare;
   {
@@ -1695,6 +1701,61 @@ void ReplayKeep(const RecordedFrame& f, uint64_t camera, const float* camera_pos
     g_replay_spare = std::move(dropped.back());
     dropped.pop_back();
   }
+}
+
+// The keeper: frames handed over by the worker once drawn, copied into the
+// replay and let go here (the copy, and the frees of the frame, were 1.5-2
+// ms a frame on the worker, the thread the frame rate waits for).
+struct KeepJob {
+  std::unique_ptr<RecordedFrame> frame;
+  float camera_pos[3];
+};
+std::mutex g_keep_mutex;
+std::condition_variable g_keep_cv;
+std::unique_ptr<KeepJob> g_keep_job;
+bool g_keep_stop = false;
+std::thread g_keeper;
+
+void KeeperMain() {
+  qos::PreferPerformanceThread(L"amped3 replay keeper", false);
+  for (;;) {
+    std::unique_ptr<KeepJob> job;
+    {
+      std::unique_lock lock(g_keep_mutex);
+      g_keep_cv.wait(lock, [] { return g_keep_stop || g_keep_job != nullptr; });
+      if (!g_keep_job && g_keep_stop) return;
+      job = std::move(g_keep_job);
+    }
+    ReplayKeep(*job->frame, job->camera_pos);
+    RecycleBlobs(*job->frame);
+    job.reset();
+  }
+}
+
+// The worker's frame to the keeper (false: busy with the last; drawn frames
+// come faster than it keeps them only in a hitch: this one not kept).
+bool HandToKeeper(std::unique_ptr<RecordedFrame>& f, const float* camera_pos) {
+  std::lock_guard lock(g_keep_mutex);
+  if (g_keep_job || g_keep_stop) return false;
+  if (!g_keeper.joinable()) g_keeper = std::thread(KeeperMain);
+  auto job = std::make_unique<KeepJob>();
+  job->frame = std::move(f);
+  std::memcpy(job->camera_pos, camera_pos, sizeof(job->camera_pos));
+  g_keep_job = std::move(job);
+  g_keep_cv.notify_one();
+  return true;
+}
+
+void StopKeeper() {
+  {
+    std::lock_guard lock(g_keep_mutex);
+    g_keep_stop = true;
+  }
+  g_keep_cv.notify_all();
+  if (g_keeper.joinable()) g_keeper.join();
+  std::lock_guard lock(g_keep_mutex);
+  g_keep_job.reset();
+  g_keep_stop = false;
 }
 
 void ReplayFeedMain() {
@@ -1936,7 +1997,7 @@ struct Timings {
   double worst = 0;
   std::string worst_detail;
   // Sampled frames: the worker's draw recording by part (RenderStats::draw_part_ms).
-  double parts[10] = {};
+  double parts[11] = {};  // 10: the vertex data's share of 'draw state'
   uint32_t part_frames = 0;
   // Render passes and clears (RenderStats).
   uint64_t passes = 0, clear_passes = 0, clears_merged = 0, clears_in_pass = 0;
@@ -2010,10 +2071,10 @@ void LogTimings(bool shared) {
     const double k = 1.0 / t.part_frames;
     REXLOG_INFO(
         "Native renderer: draws by part (ms per frame, {} sampled): setup {:.2f}, targets {:.2f}, "
-        "textures {:.2f}, pipeline {:.2f}, draw state {:.2f}, constants {:.2f}, texture sets {:.2f}, "
-        "indices {:.2f}, Vulkan commands {:.2f}, after {:.2f}",
+        "textures {:.2f}, pipeline {:.2f}, draw state {:.2f} (vertex buffers {:.2f}), constants {:.2f}, "
+        "texture sets {:.2f}, indices {:.2f}, Vulkan commands {:.2f}, after {:.2f}",
         t.part_frames, t.parts[0] * k, t.parts[1] * k, t.parts[2] * k, t.parts[3] * k,
-        t.parts[9] * k, t.parts[4] * k, t.parts[5] * k, t.parts[6] * k, t.parts[7] * k, t.parts[8] * k);
+        t.parts[9] * k, t.parts[10] * k, t.parts[4] * k, t.parts[5] * k, t.parts[6] * k, t.parts[7] * k, t.parts[8] * k);
   }
   REXLOG_INFO(
       "Native renderer: per frame {:.1f} render passes; clears: {:.1f} as passes of their own, "
@@ -2680,6 +2741,8 @@ void WorkerMain() {
         if (stats.draw_parts_sampled) {
           for (int k = 0; k < 10; ++k) g_timings.parts[k] += stats.draw_part_ms[k];
           g_timings.parts[8] += stats.draw_part_ms[10] + stats.draw_part_ms[11];  // (all 'after')
+          g_timings.parts[10] += stats.draw_part_ms[9];
+          g_timings.parts[9] += stats.draw_part_ms[12];
           ++g_timings.part_frames;
         }
         perf::ReportRenderFrame(states_ms + stats.prepass_ms + stats.record_ms);
@@ -2704,7 +2767,9 @@ void WorkerMain() {
         }
       }
       LogTimings(shared);
-      ReplayKeep(*f, stats.camera_signature, stats.game_camera);
+      // (Kept for the instant replay on the keeper thread: the frame's its now.)
+      const bool frame_replay = f->replay;
+      if (ReplayWants(*f, stats.camera_signature)) HandToKeeper(f, stats.game_camera);
       {
         float pose[6];
         const bool have = renderer->FreecamPose(pose);
@@ -2718,7 +2783,7 @@ void WorkerMain() {
           ++g_instances_version;
         }
       }
-      if (stats.camera_signature && !f->replay) {
+      if (stats.camera_signature && !frame_replay) {
         std::lock_guard lock(g_game_camera_mutex);
         std::memcpy(g_game_camera, stats.game_camera, sizeof(g_game_camera));
         g_game_camera_valid = true;
@@ -2792,6 +2857,7 @@ void Shutdown() {
   g_work_cv.notify_all();
   if (g_prep_thread.joinable()) g_prep_thread.join();
   if (g_worker.joinable()) g_worker.join();
+  StopKeeper();
   StopRecorder();
   SetHostDrawing(true);
   if (rex::ui::Presenter* presenter = g_presenter ? g_presenter() : nullptr) {
