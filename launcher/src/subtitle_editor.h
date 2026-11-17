@@ -47,6 +47,8 @@ class SubtitleEditor {
   void Shutdown();
   // Where the movie preview's pictures are drawn (null: none).
   void SetRenderer(SDL_Renderer* renderer);
+  // The text's size, times the display's scale (A- / A+, Ctrl+= / Ctrl+-).
+  float Zoom() const { return zoom_; }
   // The window recreated or resized: the preview's picture uploaded again.
   void Refresh() { video_tex_frame_ = -1; }
 
@@ -99,6 +101,7 @@ class SubtitleEditor {
   // The selected clip's speakers' names (typed in; offered from the other
   // clips'); true when one changed.
   bool DrawNames(float px, float unit);
+  int Speakers(const amped3::subtitle_file::Clip& c) const;
   // A movie's pictures: fetched (made on a thread when they aren't yet).
   void FetchVideo(const std::string& source);
   void UpdateVideo();
@@ -135,6 +138,14 @@ class SubtitleEditor {
   SDL_Texture* video_tex_ = nullptr;
   int video_tex_frame_ = -1;
   std::vector<std::string> known_names_;  // every name typed in, for picking
+  int extra_speakers_ = 0, extra_speakers_clip_ = -1;  // speakers added with + (that clip)
+  // The layout: the text's size, the list's width and the movie preview's
+  // height (shares of the window), kept between runs.
+  float zoom_ = 1.0f, list_frac_ = 0.30f, preview_frac_ = 0.28f;
+  bool layout_dirty_ = false;
+  void LoadLayout();
+  void SaveLayout();
+  void SetZoom(float z);
   double names_scan_at_ = -1;
 
   // Output: one stream, fed a little ahead.

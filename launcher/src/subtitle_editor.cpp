@@ -39,9 +39,17 @@ namespace sf = amped3::subtitle_file;
 
 namespace {
 
-// As the game shows them: white, then the yellow, pink and green of its menus.
-const ImU32 kSpeaker[4] = {IM_COL32(255, 255, 255, 255), IM_COL32(250, 232, 74, 255),
-                           IM_COL32(246, 96, 240, 255), IM_COL32(128, 224, 40, 255)};
+// As the game shows them: white, then the yellow, pink and green of its
+// menus, then six more (subtitle_file.h).
+const struct SpeakerColors {
+  ImU32 c[sf::kSpeakers];
+  SpeakerColors() {
+    for (int i = 0; i < sf::kSpeakers; ++i) {
+      c[i] = IM_COL32(sf::kSpeakerRgb[i][0], sf::kSpeakerRgb[i][1], sf::kSpeakerRgb[i][2], 255);
+    }
+  }
+  ImU32 operator[](int i) const { return c[std::clamp(i, 0, sf::kSpeakers - 1)]; }
+} kSpeaker;
 const ImU32 kGold = IM_COL32(255, 204, 0, 255);
 const ImU32 kDim = IM_COL32(255, 255, 255, 130);
 const ImU32 kRed = IM_COL32(255, 80, 70, 255);
@@ -296,19 +304,25 @@ bool SubtitleEditor::DrawNames(float px, float unit) {
     }
     std::sort(known_names_.begin(), known_names_.end());
   }
-  // Which speakers say anything here (the others' names aren't needed).
-  int used = 1;
-  for (const auto& l : c.lines) used = std::max(used, std::clamp(l.speaker, 0, sf::kSpeakers - 1) + 1);
+  // The speakers shown: those who say anything here or are named, and any
+  // added (+, up to ten).
+  const int used = Speakers(c);
   bool changed = false;
+  const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
   ImGui::AlignTextToFramePadding();
   ImGui::TextColored(ImColor(kDim), "Speakers");
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Who each speaker is: shown before their lines (\"Name: line\") when the game's Speaker "
-                      "names setting is on. Leave one empty to show none.");
+                      "names setting is on. Leave one empty to show none. + adds a speaker (up to ten).");
   }
-  for (int i = 0; i < sf::kSpeakers; ++i) {
-    if (i >= used && c.names[i].empty()) continue;
-    ImGui::SameLine();
+  const float field_w = 130 * unit + ImGui::GetFrameHeight() + 2 * unit;
+  for (int i = 0; i < used; ++i) {
+    // (Onto the next row when this one's full.)
+    if (ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + field_w > right) {
+      ImGui::AlignTextToFramePadding();
+    } else {
+      ImGui::SameLine();
+    }
     ImGui::PushID(1000 + i);
     char hint[16];
     std::snprintf(hint, sizeof(hint), "Speaker %d", i + 1);
@@ -346,8 +360,53 @@ bool SubtitleEditor::DrawNames(float px, float unit) {
     }
     ImGui::PopID();
   }
+  if (used < sf::kSpeakers) {
+    ImGui::SameLine();
+    if (ImGui::Button("+##speaker")) {
+      extra_speakers_ = used + 1;
+      extra_speakers_clip_ = selected_;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Another speaker (up to ten)");
+  }
   (void)px;
   return changed;
+}
+
+// ---- the layout (kept in subtitles/work/editor.txt) --------------------------------
+
+void SubtitleEditor::LoadLayout() {
+  std::ifstream in(install_dir_ / "subtitles" / "work" / "editor.txt");
+  std::string k;
+  float v = 0;
+  while (in >> k >> v) {
+    if (k == "zoom") zoom_ = std::clamp(v, 0.5f, 3.0f);
+    if (k == "list") list_frac_ = std::clamp(v, 0.12f, 0.6f);
+    if (k == "preview") preview_frac_ = std::clamp(v, 0.08f, 0.75f);
+  }
+}
+
+void SubtitleEditor::SaveLayout() {
+  layout_dirty_ = false;
+  std::error_code ec;
+  fs::create_directories(install_dir_ / "subtitles" / "work", ec);
+  std::ofstream out(install_dir_ / "subtitles" / "work" / "editor.txt");
+  out << "zoom " << zoom_ << "\nlist " << list_frac_ << "\npreview " << preview_frac_ << "\n";
+}
+
+void SubtitleEditor::SetZoom(float z) {
+  zoom_ = std::clamp(z, 0.5f, 3.0f);
+  SaveLayout();
+}
+
+// The speakers a clip has room for: everyone who says a line or is named,
+// and those added with + (at least one).
+int SubtitleEditor::Speakers(const sf::Clip& c) const {
+  int n = std::max(1, extra_speakers_clip_ == selected_ ? extra_speakers_ : 0);
+  for (const auto& l : c.lines) n = std::max(n, std::clamp(l.speaker, 0, sf::kSpeakers - 1) + 1);
+  for (int i = 0; i < sf::kSpeakers; ++i) {
+    if (!c.names[i].empty()) n = std::max(n, i + 1);
+  }
+  return std::min(n, sf::kSpeakers);
 }
 
 bool SubtitleEditor::Open(const fs::path& install_dir, const fs::path& source_dir, std::string* error) {
@@ -378,6 +437,7 @@ bool SubtitleEditor::Open(const fs::path& install_dir, const fs::path& source_di
   Select(clips_.empty() ? -1 : 0);
   dirty_ = false;
   status_.clear();
+  LoadLayout();
   return true;
 }
 
@@ -963,7 +1023,7 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
     const sf::Line& l = c.lines[size_t(i)];
     const float x0 = to_x(l.start_ms), x1 = std::max(to_x(l.end_ms), x0 + 2.0f);
     if (x1 < p0.x || x0 > p0.x + w) continue;
-    const ImU32 col = kSpeaker[std::clamp(l.speaker, 0, 3)];
+    const ImU32 col = kSpeaker[std::clamp(l.speaker, 0, sf::kSpeakers - 1)];
     const bool sel = i == line_;
     const bool bad = l.end_ms <= l.start_ms ||
                      (i + 1 < int(c.lines.size()) && c.lines[size_t(i) + 1].start_ms < l.end_ms);
@@ -998,7 +1058,7 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
   for (const auto& l : c.lines) {
     const float x0 = q0.x + float(l.start_ms / total) * w, x1 = q0.x + float(l.end_ms / total) * w;
     dl->AddRectFilled(ImVec2(x0, q0.y + 3 * unit), ImVec2(std::max(x1, x0 + 1), q0.y + 1 * unit + strip_h),
-                      WithAlpha(kSpeaker[std::clamp(l.speaker, 0, 3)], 90));
+                      WithAlpha(kSpeaker[std::clamp(l.speaker, 0, sf::kSpeakers - 1)], 90));
   }
   const float v0 = q0.x + float(view_ms_ / total) * w, v1 = q0.x + float((view_ms_ + view_len_ms_) / total) * w;
   dl->AddRect(ImVec2(v0, q0.y + 1 * unit), ImVec2(std::max(v1, v0 + 4), q0.y + 3 * unit + strip_h), kGold,
@@ -1017,8 +1077,11 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
     const ImVec2 b0 = ImGui::GetCursorScreenPos();
     int vw = 0, vh = 0;
     const bool movie = c.kind == sf::Kind::kVideo && VideoFrame(&vw, &vh);
-    const float max_bh = std::max(px * 3.6f, ImGui::GetIO().DisplaySize.y * 0.34f);
-    const float bh = movie ? std::min(max_bh, w * float(vh) / float(vw)) : px * 3.6f;
+    // (A movie: as tall as dragged, the bar under it.)
+    const float want_bh = std::max(px * 4.0f, preview_frac_ * ImGui::GetIO().DisplaySize.y);
+    // (Room kept for a few of the lines under it.)
+    const float room = ImGui::GetContentRegionAvail().y - px * 10.0f;
+    const float bh = movie ? std::max(px * 4.0f, std::min({want_bh, w * float(vh) / float(vw), room})) : px * 3.6f;
     ImGui::Dummy(ImVec2(w, bh));
     dl->AddRectFilled(b0, ImVec2(b0.x + w, b0.y + bh), IM_COL32(0, 0, 0, 200), 6.0f * unit);
     float text_bottom = b0.y + bh;
@@ -1029,8 +1092,9 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
       const ImVec2 i0(b0.x + (w - iw) * 0.5f, b0.y);
       dl->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(video_tex_))), i0, ImVec2(i0.x + iw, b0.y + bh));
       text_bottom = b0.y + bh * 0.93f;
-      text_w = iw;
-      text_x0 = i0.x;
+      // (Wrapped to the picture, or the box when the picture's narrow.)
+      text_w = std::max(iw, std::min(w, bh * 16.0f / 9.0f));
+      text_x0 = b0.x + (w - text_w) * 0.5f;
     } else if (c.kind == sf::Kind::kVideo && (video_loader_ && video_loader_->source == c.source)) {
       const char* t = "Getting the movie's pictures...";
       dl->AddText(font, px * 0.8f, ImVec2(b0.x + 8 * unit, b0.y + 4 * unit), kDim, t);
@@ -1047,20 +1111,62 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
         dl->AddText(font, px, ImVec2(b0.x + (w - ts.x) * 0.5f, b0.y + (bh - ts.y) * 0.5f), kDim, t);
       }
     } else {
-      const size_t n = std::min<size_t>(now.size(), 2);
-      float y = movie ? text_bottom - tpx * 1.2f * float(n) : b0.y + (bh - tpx * 1.2f * float(n)) * 0.5f;
-      for (size_t k = 0; k < n; ++k) {
+      // Wrapped into rows as the game does (each row centred, on its own
+      // shading), the last at the bottom.
+      struct Row {
+        std::string text;
+        ImU32 col;
+      };
+      std::vector<Row> rows;
+      const float max_w = text_w * (movie ? 0.85f : 0.95f);
+      for (size_t k = 0; k < now.size() && k < 3; ++k) {
         const std::string t = Named(c, *now[k]);
-        const ImVec2 ts = font->CalcTextSizeA(tpx, text_w - 20 * unit, 0, t.c_str());
-        const float x = text_x0 + std::max(10 * unit, (text_w - ts.x) * 0.5f);
+        const ImU32 col = kSpeaker[std::clamp(now[k]->speaker, 0, sf::kSpeakers - 1)];
+        std::string row;
+        size_t pos = 0;
+        while (pos < t.size()) {
+          size_t sp = t.find(' ', pos);
+          if (sp == std::string::npos) sp = t.size();
+          const std::string word = t.substr(pos, sp - pos);
+          const std::string attempt = row.empty() ? word : row + " " + word;
+          if (!row.empty() && font->CalcTextSizeA(tpx, FLT_MAX, 0, attempt.c_str()).x > max_w) {
+            rows.push_back({row, col});
+            row = word;
+          } else {
+            row = attempt;
+          }
+          pos = sp + 1;
+        }
+        if (!row.empty()) rows.push_back({row, col});
+      }
+      const float line_h = tpx * 1.22f;
+      float y = movie ? text_bottom - line_h * float(rows.size()) : b0.y + (bh - line_h * float(rows.size())) * 0.5f;
+      y = std::max(y, b0.y + 2 * unit);
+      dl->PushClipRect(b0, ImVec2(b0.x + w, b0.y + bh), true);
+      for (const Row& r : rows) {
+        const ImVec2 ts = font->CalcTextSizeA(tpx, FLT_MAX, 0, r.text.c_str());
+        const float x = text_x0 + (text_w - ts.x) * 0.5f;
         if (movie) {
-          dl->AddRectFilled(ImVec2(x - tpx * 0.4f, y - tpx * 0.1f), ImVec2(x + ts.x + tpx * 0.4f, y + tpx * 1.15f),
+          dl->AddRectFilled(ImVec2(x - tpx * 0.4f, y - tpx * 0.08f), ImVec2(x + ts.x + tpx * 0.4f, y + line_h - tpx * 0.08f),
                             IM_COL32(0, 0, 0, 150), tpx * 0.2f);
         }
-        dl->AddText(font, tpx, ImVec2(x + 2, y + 2), IM_COL32(0, 0, 0, 255), t.c_str());
-        dl->AddText(font, tpx, ImVec2(x, y), kSpeaker[std::clamp(now[k]->speaker, 0, 3)], t.c_str());
-        y += tpx * 1.2f;
+        dl->AddText(font, tpx, ImVec2(x + 2, y + 2), IM_COL32(0, 0, 0, 255), r.text.c_str());
+        dl->AddText(font, tpx, ImVec2(x, y), r.col, r.text.c_str());
+        y += line_h;
       }
+      dl->PopClipRect();
+    }
+    if (movie) {
+      // The bar under the picture: drag to make it bigger or smaller.
+      ImGui::InvisibleButton("##preview-split", ImVec2(w, 8.0f * unit));
+      if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+      if (ImGui::IsItemActive() && io.MouseDelta.y != 0) {
+        preview_frac_ = std::clamp(bh / io.DisplaySize.y + io.MouseDelta.y / io.DisplaySize.y, 0.08f, 0.75f);
+        layout_dirty_ = true;
+      }
+      const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+      dl->AddLine(ImVec2(a.x + w * 0.45f, (a.y + b.y) * 0.5f), ImVec2(a.x + w * 0.55f, (a.y + b.y) * 0.5f),
+                  ImGui::IsItemActive() ? kGold : kDim, 2.0f * unit);
     }
   }
   return changed;
@@ -1104,6 +1210,10 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
   ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(255, 204, 0, 40));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
   ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * unit);
+  // (Sized with the display's scale and the zoom.)
+  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f * unit, 3.0f * unit));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * unit, 5.0f * unit));
+  ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 14.0f * unit);
   ImGui::Begin("##subtitle-editor", nullptr,
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
   ImGui::PushFont(font, px);
@@ -1133,14 +1243,21 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
   if (ImGui::Button("Redo")) Undo(true);
   ImGui::EndDisabled();
   ImGui::SameLine();
+  // The text's size (as well as the display's scale): Ctrl+= / Ctrl+- / Ctrl+0.
+  if (ImGui::Button("A-")) SetZoom(zoom_ / 1.1f);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Smaller (Ctrl+-)");
+  ImGui::SameLine(0, 2 * unit);
+  if (ImGui::Button("A+")) SetZoom(zoom_ * 1.1f);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bigger (Ctrl+=; Ctrl+0: as it was)");
+  ImGui::SameLine();
   if (ImGui::Button("Back")) close = Back();
   if (!status_.empty()) {
     ImGui::SameLine();
     ImGui::TextColored(ImColor(kGold), "%s", status_.c_str());
   }
 
-  // The clips.
-  const float list_w = display.x * 0.30f;
+  // The clips (as wide as dragged: the bar between).
+  const float list_w = std::clamp(list_frac_, 0.12f, 0.6f) * display.x;
   const float body_h = display.y - ImGui::GetCursorPosY() - pad;
   ImGui::BeginChild("##clips", ImVec2(list_w, body_h), ImGuiChildFlags_Borders);
   const std::string needle = Lower(search_);
@@ -1157,25 +1274,59 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       if (!hit) continue;
     }
     std::string label = std::string(c.edited ? "* " : "") + "[" + KindLabel(c.kind) + "] " +
-                        (c.lines.empty() ? std::string("(no lines)") : c.lines[0].text);
+                        (c.lines.empty() ? std::string("(no lines)") : Named(c, c.lines[0]));
     std::string src = c.source;
     if (src.size() > 60) src = "..." + src.substr(src.size() - 57);
     ImGui::PushID(i);
     visible_.push_back(i);
     if (ImGui::Selectable("##clip", selected_ == i, 0, ImVec2(0, px * 2.3f))) Select(i);
+    const bool row_hot = ImGui::IsItemHovered() || selected_ == i;
+    const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
     if (selected_ == i && scroll_to_selected_) {
       ImGui::SetScrollHereY(0.4f);
       scroll_to_selected_ = false;
     }
-    ImGui::SameLine(px * 0.4f);
-    ImGui::BeginGroup();
-    ImGui::TextUnformatted(label.c_str());
-    ImGui::TextColored(ImColor(kDim), "%s   %s", src.c_str(), Clock(c.duration_ms, false).c_str());
-    ImGui::EndGroup();
+    // Its first line: too long for the list, it scrolls by while picked or
+    // under the mouse (to and fro).
+    {
+      ImDrawList* ldl = ImGui::GetWindowDrawList();
+      const float x0 = r0.x + px * 0.4f, x1 = r1.x - px * 0.3f;
+      const float tw = ImGui::CalcTextSize(label.c_str()).x;
+      float shift = 0;
+      if (tw > x1 - x0 && row_hot) {
+        const float over = tw - (x1 - x0), speed = 45.0f * unit;
+        const double period = 2.0 * (over / speed + 1.2);
+        const double t = std::fmod(ImGui::GetTime(), period);
+        const double half = period * 0.5;
+        const double u = t < half ? t : period - t;  // there and back, a pause at each end
+        shift = float(std::clamp((u - 0.6) * speed, 0.0, double(over)));
+      }
+      ldl->PushClipRect(ImVec2(x0, r0.y), ImVec2(x1, r1.y), true);
+      ldl->AddText(ImVec2(x0 - shift, r0.y + px * 0.1f), ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
+      char sub[160];
+      std::snprintf(sub, sizeof(sub), "%s   %s", src.c_str(), Clock(c.duration_ms, false).c_str());
+      ldl->AddText(ImVec2(x0, r0.y + px * 1.2f), kDim, sub);
+      ldl->PopClipRect();
+    }
     ImGui::PopID();
   }
   ImGui::EndChild();
-  ImGui::SameLine();
+  // The bar between: drag to widen or narrow the list.
+  ImGui::SameLine(0, 0);
+  ImGui::InvisibleButton("##split", ImVec2(8.0f * unit, body_h));
+  if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+  if (ImGui::IsItemActive() && io.MouseDelta.x != 0) {
+    list_frac_ = std::clamp(list_frac_ + io.MouseDelta.x / display.x, 0.12f, 0.6f);
+    layout_dirty_ = true;
+  }
+  {
+    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddLine(ImVec2((a.x + b.x) * 0.5f, a.y + body_h * 0.45f),
+                                        ImVec2((a.x + b.x) * 0.5f, a.y + body_h * 0.55f),
+                                        ImGui::IsItemActive() ? kGold : kDim, 2.0f * unit);
+  }
+  if (layout_dirty_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) SaveLayout();
+  ImGui::SameLine(0, 0);
 
   // The selected clip: its timeline, then its lines.
   ImGui::BeginChild("##clip", ImVec2(0, body_h), ImGuiChildFlags_Borders);
@@ -1255,9 +1406,33 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
 
     // The lines.
     ImGui::BeginChild("##lines", ImVec2(0, 0));
-    ImGui::TextColored(ImColor(kDim), "     Speaker   Start s    End s     Words");
     int remove = -1, insert_after = -2;
     bool at_playhead = false;
+    // The speaker buttons all as wide as the widest (the columns line up).
+    float speaker_w = ImGui::CalcTextSize(" 10 ").x;
+    for (int k = 0; k < sf::kSpeakers; ++k) {
+      if (!c.names[k].empty()) {
+        char t[48];
+        std::snprintf(t, sizeof(t), " %d %.24s ", k + 1, c.names[k].c_str());
+        speaker_w = std::max(speaker_w, ImGui::CalcTextSize(t).x);
+      }
+    }
+    speaker_w += ImGui::GetStyle().FramePadding.x * 2;
+    {
+      // The columns' heads, over them.
+      const ImGuiStyle& st = ImGui::GetStyle();
+      const float x0 = ImGui::GetCursorPosX();
+      const float arrow_w = ImGui::CalcTextSize(">").x + st.FramePadding.x * 2 + st.ItemSpacing.x;
+      const float cols[4] = {x0 + arrow_w, x0 + arrow_w + speaker_w + st.ItemSpacing.x,
+                             x0 + arrow_w + speaker_w + st.ItemSpacing.x * 2 + 80 * unit,
+                             x0 + arrow_w + speaker_w + st.ItemSpacing.x * 3 + 160 * unit};
+      const char* heads[4] = {"Speaker", "Start s", "End s", "Words"};
+      for (int k = 0; k < 4; ++k) {
+        if (k) ImGui::SameLine();
+        ImGui::SetCursorPosX(cols[k] + st.FramePadding.x);
+        ImGui::TextColored(ImColor(kDim), "%s", heads[k]);
+      }
+    }
     for (int i = 0; i < int(c.lines.size()); ++i) {
       sf::Line& l = c.lines[size_t(i)];
       ImGui::PushID(i);
@@ -1274,7 +1449,7 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play from this line");
       ImGui::SameLine();
       // The speaker: a swatch of their colour.
-      const int sp = std::clamp(l.speaker, 0, 3);
+      const int sp = std::clamp(l.speaker, 0, sf::kSpeakers - 1);
       ImGui::PushStyleColor(ImGuiCol_Button, kSpeaker[sp]);
       ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kSpeaker[sp]);
       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 0, 0, 255));
@@ -1284,14 +1459,17 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       } else {
         std::snprintf(who, sizeof(who), " %d %.24s ", sp + 1, c.names[sp].c_str());
       }
-      if (ImGui::Button(who)) {
+      // (Through the clip's speakers and one more.)
+      const int slots = std::min(sf::kSpeakers, Speakers(c) + 1);
+      if (ImGui::Button(who, ImVec2(speaker_w, 0))) {
         Remember();
-        l.speaker = (sp + 1) % sf::kSpeakers;
+        l.speaker = (sp + 1) % slots;
         changed = true;
       }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Speaker: click for the next, right-click for the one before (keys 1 to 9, 0 for 10)");
       if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
         Remember();
-        l.speaker = (sp + sf::kSpeakers - 1) % sf::kSpeakers;
+        l.speaker = (sp + slots - 1) % slots;
         changed = true;
       }
       ImGui::PopStyleColor(3);
@@ -1336,7 +1514,14 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       }
       ImGui::PushStyleColor(ImGuiCol_Text, kSpeaker[sp]);
       ++pushed;
-      if (ImGui::InputText("##text", buf, sizeof(buf))) {
+      // Wrapped to the box (as tall as its words need); Enter is done.
+      const float box_w = ImGui::CalcItemWidth();
+      const ImVec2 fp = ImGui::GetStyle().FramePadding;
+      const float text_h = ImGui::CalcTextSize(buf, nullptr, false, std::max(10.0f, box_w - fp.x * 2 - 2 * unit)).y;
+      if (ImGui::InputTextMultiline("##text", buf, sizeof(buf),
+                                    ImVec2(box_w, std::max(ImGui::GetFrameHeight(), text_h + fp.y * 2 + 1)),
+                                    ImGuiInputTextFlags_WordWrap | ImGuiInputTextFlags_CtrlEnterForNewLine |
+                                        ImGuiInputTextFlags_NoHorizontalScroll)) {
         l.text = sf::OneLine(buf);
         changed = true;
       }
@@ -1392,8 +1577,9 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
         "pans. Space plays / pauses, Left / Right step (Shift: a second), [ and ] set the picked line's "
         "start and end at the playhead, Up / Down pick a line, / splits it at the playhead, M joins it "
         "to the next, L loops it. Dragged edges snap to other lines and the playhead (Alt: not). "
-        "Speakers: 1 white, 2 yellow, 3 pink, 4 green (click for the next, right-click for the one "
-        "before, or the keys 1 to 4); type their names in above the timeline (or pick one used before) "
+        "Speakers: 1 white, 2 yellow, 3 pink, 4 green, then sky blue, orange, lavender, coral, mint and "
+        "sand (click for the next, right-click for the one before, or the keys 1 to 9 and 0); + adds "
+        "one, up to ten; type their names in above the timeline (or pick one used before) "
         "to show them before their lines. Movies: the picture at the playhead, under the timeline. "
         "Page Up / Down: the previous / next clip. Ctrl+Z / Ctrl+Y undo and redo, Ctrl+S saves.");
     ImGui::PopStyleColor();
@@ -1405,11 +1591,18 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
 
   ImGui::PopFont();
   ImGui::End();
-  ImGui::PopStyleVar(2);
+  ImGui::PopStyleVar(5);
   ImGui::PopStyleColor(6);
 
   // Keys (not while typing).
   if (dirty_ && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) Save();
+  if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))) {
+    SetZoom(zoom_ * 1.1f);
+  }
+  if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))) {
+    SetZoom(zoom_ / 1.1f);
+  }
+  if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_0, false)) SetZoom(1.0f);
   if (!io.WantTextInput && selected_ >= 0 && selected_ < int(clips_.size())) {
     sf::Clip& c = clips_[size_t(selected_)];
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo(io.KeyShift);
@@ -1434,8 +1627,9 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
     }
     const bool have_line = line_ >= 0 && line_ < int(c.lines.size());
     // Speaker of the picked line: 1 to 4.
-    const ImGuiKey digits[4] = {ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4};
-    for (int k = 0; k < 4 && have_line; ++k) {
+    const ImGuiKey digits[sf::kSpeakers] = {ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4, ImGuiKey_5,
+                                            ImGuiKey_6, ImGuiKey_7, ImGuiKey_8, ImGuiKey_9, ImGuiKey_0};
+    for (int k = 0; k < sf::kSpeakers && have_line; ++k) {
       if (!io.KeyCtrl && ImGui::IsKeyPressed(digits[k], false) && c.lines[size_t(line_)].speaker != k) {
         Remember();
         c.lines[size_t(line_)].speaker = k;

@@ -11,7 +11,7 @@
 //   amped3-subtitles 2
 //   # comments
 //   clip <kind>[+edited] <duration ms> <bytes> <keys> <source>
-//   names <speaker 1>|<speaker 2>|<speaker 3>|<speaker 4>   (optional)
+//   names <speaker 1>|<speaker 2>|...|<speaker 10>   (optional)
 //   <start ms> <end ms> s<speaker> <text>
 //   ...
 //
@@ -55,7 +55,13 @@ namespace amped3::subtitle_file {
 inline constexpr const char* kFileName = "amped3.subtitles";
 inline constexpr const char* kMagic = "amped3-subtitles 2";
 inline constexpr const char* kMagicV1 = "amped3-subtitles 1";
-inline constexpr int kSpeakers = 4;
+inline constexpr int kSpeakers = 10;
+// Their colours (RGB): white, then the yellow, pink and green of the game's
+// menus (the four the subtitle maker tells apart), then six more for the
+// editor's: sky blue, orange, lavender, coral, mint, sand.
+inline constexpr uint8_t kSpeakerRgb[kSpeakers][3] = {
+    {255, 255, 255}, {250, 232, 74}, {246, 96, 240}, {128, 224, 40}, {96, 200, 255},
+    {255, 160, 60},  {180, 150, 255}, {255, 110, 110}, {120, 240, 190}, {225, 200, 150}};
 inline constexpr uint32_t kKeyLengths[] = {2048, 4096, 8192, 16384};
 inline constexpr uint32_t kMaxKeyLength = 16384;
 
@@ -91,7 +97,7 @@ struct Line {
   uint32_t start_ms = 0;
   uint32_t end_ms = 0;
   std::string text;
-  int speaker = 0;  // 0..3
+  int speaker = 0;  // 0..kSpeakers-1
 };
 
 enum class Kind { kSpeech, kStory, kVideo };
@@ -210,9 +216,15 @@ inline bool Parse(const std::string& text, std::vector<Clip>* clips, std::string
       l.start_ms = a;
       l.end_ms = b;
       l.text = line.substr(used);
-      if (l.text.size() >= 3 && l.text[0] == 's' && l.text[1] >= '1' && l.text[1] <= '4' && l.text[2] == ' ') {
-        l.speaker = l.text[1] - '1';
-        l.text.erase(0, 3);
+      // s1 .. s10.
+      if (l.text.size() >= 3 && l.text[0] == 's' && l.text[1] >= '1' && l.text[1] <= '9') {
+        size_t k = 1;
+        int n = 0;
+        while (k < l.text.size() && k < 3 && l.text[k] >= '0' && l.text[k] <= '9') n = n * 10 + (l.text[k++] - '0');
+        if (k < l.text.size() && l.text[k] == ' ' && n >= 1 && n <= kSpeakers) {
+          l.speaker = n - 1;
+          l.text.erase(0, k + 1);
+        }
       }
       if (!l.text.empty()) clips->back().lines.push_back(std::move(l));
     }
@@ -236,7 +248,7 @@ inline std::string OneLine(std::string s) {
 inline std::string Format(const std::vector<Clip>& clips, const std::string& comment = "") {
   std::string out = std::string(kMagic) + "\n";
   if (!comment.empty()) out += comment;
-  out += "# Lines: clip <kind>[+edited] <ms> <bytes> <keys> <source> / names <s1>|<s2>|<s3>|<s4> / <start ms> <end ms> s<speaker> <text>\n";
+  out += "# Lines: clip <kind>[+edited] <ms> <bytes> <keys> <source> / names <s1>|...|<s10> / <start ms> <end ms> s<speaker> <text>\n";
   char buf[64];
   for (const Clip& c : clips) {
     std::snprintf(buf, sizeof(buf), " %u %u ", c.duration_ms, c.bytes);
@@ -252,7 +264,7 @@ inline std::string Format(const std::vector<Clip>& clips, const std::string& com
       out += "\n";
     }
     for (const Line& l : c.lines) {
-      std::snprintf(buf, sizeof(buf), "%u %u s%d ", l.start_ms, l.end_ms, std::clamp(l.speaker, 0, 3) + 1);
+      std::snprintf(buf, sizeof(buf), "%u %u s%d ", l.start_ms, l.end_ms, std::clamp(l.speaker, 0, kSpeakers - 1) + 1);
       out += buf + OneLine(l.text) + "\n";
     }
   }

@@ -1066,7 +1066,15 @@ void App::OnWindowChanged() {
 
 void App::Draw(ImFont* font) {
   if (page_ == Page::kSubtitleEditor) {
-    const float unit = std::max(ImGui::GetIO().DisplaySize.y / 720.0f, 0.6f);
+    // Sized by the display's scale (high DPI: 150% is 1.5) and the editor's
+    // own zoom, not the window's size (a bigger window: more room).
+    float scale = 1.0f;
+    if (window_) {
+      const float ds = SDL_GetWindowDisplayScale(window_), pd = SDL_GetWindowPixelDensity(window_);
+      if (ds > 0.0f && pd > 0.0f) scale = ds / pd;
+    }
+    if (const char* z = std::getenv("AMPED3_EDITOR_SCALE")) scale = float(std::atof(z));  // (testing)
+    const float unit = std::clamp(scale * editor_.Zoom(), 0.5f, 4.0f);
     if (editor_.Draw(font, unit)) OpenPage(Page::kSubtitles);
     return;
   }

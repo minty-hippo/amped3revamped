@@ -780,7 +780,10 @@ fetches its sound (written out from your game files) and shows it on a
 timeline: the waveform, each line on it in its speaker's colour, the
 playhead, and below it the line being heard as the game shows it.
 
-**Speaker names.** Above the timeline, each speaker of the clip can be given
+**Speakers.** A clip can have up to ten speakers (+ beside the names adds
+one; keys 1 to 9 and 0 set the picked line's): white, yellow, pink and green
+(the four the subtitle maker tells apart), then sky blue, orange, lavender,
+coral, mint and sand. Above the timeline, each can be given
 a name (or one picked from the names typed in elsewhere: the arrow beside
 it). A named speaker's lines show it first, "Name: line", on the timeline,
 in the line list, the preview, and in game (**Options > Audio > Speaker
@@ -796,6 +799,15 @@ The pictures come from your movie file the first time the clip is chosen
 pictures a second, 480 wide, a few seconds and some MB a movie, kept in
 `subtitles\work\play`). The subtitle maker has to be rebuilt for it once
 (Update).
+
+**Layout.** The editor is sized by the display's scale (Windows' 125%,
+150%...), and A- / A+ (Ctrl+- / Ctrl+=, Ctrl+0 back) make its text smaller
+or bigger. Drag the bar between the clip list and the clip to widen either,
+and the bar under a movie's picture to make it bigger or smaller (kept in
+`subtitles\work\editor.txt`). The lines' words wrap in their boxes (Enter is
+done, Ctrl+Enter isn't needed: a line is one line in game), and a clip's
+first line too long for the list scrolls by while it's picked or under the
+mouse.
 
 | Subtitle editor | |
 |---|---|

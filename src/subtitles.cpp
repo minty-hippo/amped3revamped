@@ -130,10 +130,9 @@ Shown ShownLine(const sf::Clip& c, const sf::Line& l) {
 // The speakers' colours: white, then the yellow, pink and green of the
 // game's menus and HUD (sampled from its UI textures).
 ImU32 SpeakerColor(int speaker) {
-  static const ImU32 kColors[4] = {IM_COL32(255, 255, 255, 255), IM_COL32(250, 232, 74, 255),
-                                   IM_COL32(246, 96, 240, 255), IM_COL32(128, 224, 40, 255)};
-  if (!REXCVAR_GET(subtitles_speaker_colors)) return kColors[0];
-  return kColors[std::clamp(speaker, 0, 3)];
+  if (!REXCVAR_GET(subtitles_speaker_colors)) return IM_COL32(255, 255, 255, 255);
+  const auto& c = sf::kSpeakerRgb[std::clamp(speaker, 0, sf::kSpeakers - 1)];
+  return IM_COL32(c[0], c[1], c[2], 255);
 }
 
 // ---- the overlay ---------------------------------------------------------------
