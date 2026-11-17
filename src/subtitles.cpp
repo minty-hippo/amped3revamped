@@ -36,6 +36,7 @@
 #include <rex/ui/imgui_drawer.h>
 
 #include "graphics_panel.h"
+#include "subtitle_draw.h"
 #include "subtitle_file.h"
 
 REXCVAR_DEFINE_INT32(subtitles, 1, "Amped 3/Subtitles",
@@ -52,6 +53,21 @@ REXCVAR_DEFINE_BOOL(subtitles_speaker_colors, true, "Amped 3/Subtitles",
 REXCVAR_DEFINE_BOOL(subtitles_speaker_names, true, "Amped 3/Subtitles",
                     "Each line led by its speaker's name, where the subtitle editor has one for "
                     "them (\"Name: line\")");
+REXCVAR_DEFINE_INT32(subtitles_background, 60, "Amped 3/Subtitles",
+                     "The shading behind the subtitles, % opaque (0: none)")
+    .range(0, 100);
+REXCVAR_DEFINE_INT32(subtitles_box, 0, "Amped 3/Subtitles",
+                     "The shading: 0 a box behind each row, 1 one block behind them all")
+    .range(0, 1);
+REXCVAR_DEFINE_INT32(subtitles_edge, 1, "Amped 3/Subtitles",
+                     "Around the letters: 0 nothing, 1 a drop shadow, 2 an outline")
+    .range(0, 2);
+REXCVAR_DEFINE_INT32(subtitles_position, 8, "Amped 3/Subtitles",
+                     "How high the subtitles sit: the last row's bottom, % of the picture up from its bottom")
+    .range(2, 45);
+REXCVAR_DEFINE_INT32(subtitles_width, 78, "Amped 3/Subtitles",
+                     "How wide a row of the subtitles may run before it wraps, % of the picture")
+    .range(40, 100);
 REXCVAR_DEFINE_BOOL(trace_subtitles, false, "Amped 3/Diagnostics",
                     "Log which sounds the subtitles recognise as they start, and the ones "
                     "they don't (to the log file).");
@@ -120,6 +136,18 @@ struct Shown {
 };
 std::vector<Shown> g_shown;
 
+// The look (subtitle_draw.h), from the settings.
+subtitle_draw::Style CurrentStyle() {
+  subtitle_draw::Style st;
+  st.size = REXCVAR_GET(subtitles_size);
+  st.background = REXCVAR_GET(subtitles_background);
+  st.box = REXCVAR_GET(subtitles_box);
+  st.edge = REXCVAR_GET(subtitles_edge);
+  st.position = REXCVAR_GET(subtitles_position);
+  st.width = REXCVAR_GET(subtitles_width);
+  return st;
+}
+
 // A line as shown: its speaker's name first, when there is one.
 Shown ShownLine(const sf::Clip& c, const sf::Line& l) {
   const int sp = std::clamp(l.speaker, 0, sf::kSpeakers - 1);
@@ -154,47 +182,12 @@ class Overlay final : public rex::ui::ImGuiDialog {
     // The game's 16:9 picture (letterboxed in other window shapes).
     const float pic_w = std::min(w, h * 16.0f / 9.0f);
     const float pic_h = std::min(h, w * 9.0f / 16.0f);
-    const float px = std::max(12.0f, pic_h * 0.042f * float(REXCVAR_GET(subtitles_size)) / 100.0f);
-    ImFont* font = amped3::UiFont(px);
-    const float max_w = pic_w * 0.78f;
-
-    // Wrapped rows, the newest line at the bottom.
-    std::vector<Shown> rows;
-    for (const Shown& shown : lines) {
-      const std::string& line = shown.text;
-      std::string row;
-      size_t pos = 0;
-      while (pos < line.size()) {
-        size_t sp = line.find(' ', pos);
-        if (sp == std::string::npos) sp = line.size();
-        const std::string word = line.substr(pos, sp - pos);
-        const std::string attempt = row.empty() ? word : row + " " + word;
-        if (!row.empty() && font->CalcTextSizeA(px, FLT_MAX, 0, attempt.c_str()).x > max_w) {
-          rows.push_back({row, shown.speaker});
-          row = word;
-        } else {
-          row = attempt;
-        }
-        pos = sp + 1;
-      }
-      if (!row.empty()) rows.push_back({row, shown.speaker});
-    }
-    if (rows.empty()) return;
-    const float line_h = px * 1.22f;
-    const float pad_x = px * 0.45f, pad_y = px * 0.18f;
-    float y = (h + pic_h) * 0.5f - pic_h * 0.075f - line_h * float(rows.size());
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    for (const Shown& r : rows) {
-      const std::string& row = r.text;
-      const ImVec2 size = font->CalcTextSizeA(px, FLT_MAX, 0, row.c_str());
-      const float x = (w - size.x) * 0.5f;
-      dl->AddRectFilled(ImVec2(x - pad_x, y - pad_y), ImVec2(x + size.x + pad_x, y + line_h - pad_y),
-                        IM_COL32(0, 0, 0, 150), px * 0.2f);
-      const float o = std::max(1.0f, px / 22.0f);
-      dl->AddText(font, px, ImVec2(x + o, y + o), IM_COL32(0, 0, 0, 200), row.c_str());
-      dl->AddText(font, px, ImVec2(x, y), SpeakerColor(r.speaker), row.c_str());
-      y += line_h;
-    }
+    const subtitle_draw::Style st = CurrentStyle();
+    ImFont* font = amped3::UiFont(subtitle_draw::TextPx(st, pic_h, 12.0f));
+    std::vector<subtitle_draw::Line> draw;
+    for (const Shown& shown : lines) draw.push_back({shown.text, SpeakerColor(shown.speaker)});
+    subtitle_draw::Draw(ImGui::GetForegroundDrawList(), font, st, ImVec2((w - pic_w) * 0.5f, (h - pic_h) * 0.5f),
+                        pic_w, pic_h, draw);
   }
 };
 

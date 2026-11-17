@@ -21,7 +21,9 @@
 #include <thread>
 #include <vector>
 
+#include "../../src/subtitle_draw.h"
 #include "../../src/subtitle_file.h"
+#include "game_settings.h"
 
 struct ImFont;
 struct SDL_AudioStream;
@@ -144,6 +146,12 @@ class SubtitleEditor {
   float zoom_ = 1.0f, list_frac_ = 0.30f, preview_frac_ = 0.28f;
   bool layout_dirty_ = false;
   void LoadLayout();
+  // The game's settings: how the subtitles look there (the preview's too).
+  GameConfig game_;
+  amped3::subtitle_draw::Style GameStyle() const;
+  bool GameColors() const;
+  bool GameNames() const;
+  void DrawLook(float unit);
   void SaveLayout();
   void SetZoom(float z);
   double names_scan_at_ = -1;
@@ -157,7 +165,9 @@ class SubtitleEditor {
 
   // The timeline's view, and what's being dragged on it.
   double view_ms_ = 0, view_len_ms_ = 0;  // 0: the whole clip
-  int drag_ = 0;        // 0 none, 1 scrubbing, 2 a line's start, 3 its end, 4 the whole line
+  int drag_ = 0;        // 0 none, 1 scrubbing, 2 a line's start, 3 its end, 4 the whole line,
+                        // 5 where two lines meet (drag_line_'s end and the next's start)
+  int drag_joint_side_ = 2;  // dragging at a joint: -1 its left, 0 both, 1 its right (2: not)
   int drag_line_ = -1;
   double drag_grab_ms_ = 0;
   bool was_playing_ = false;

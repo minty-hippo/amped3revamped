@@ -672,6 +672,18 @@ const std::vector<Tab>& Tabs() {
                         {{"0", "Off"}, {"1", "Cutscenes and movies"}, {"2", "All speech"}}),
                 SliderI("subtitles_size", "Subtitle size", "How big the subtitle text is.", 50,
                         200, "%d%%"),
+                SliderI("subtitles_background", "Subtitle shading",
+                        "How dark the shading behind the subtitles is (0: none).", 0, 100, "%d%%"),
+                Choices("subtitles_box", "Subtitle shading shape",
+                        "A box behind each row, or one block behind them all.",
+                        {{"0", "Each row"}, {"1", "One block"}}),
+                Choices("subtitles_edge", "Subtitle letters",
+                        "Around the letters: a drop shadow, an outline, or nothing.",
+                        {{"1", "Drop shadow"}, {"2", "Outline"}, {"0", "Plain"}}),
+                SliderI("subtitles_position", "Subtitle height",
+                        "How high the subtitles sit on the picture (from its bottom).", 2, 45, "%d%%"),
+                SliderI("subtitles_width", "Subtitle width",
+                        "How wide a row may run before it wraps (of the picture).", 40, 100, "%d%%"),
                 Toggle("subtitles_speaker_colors", "Speaker colours",
                        "Each speaker of a scene in their own colour, in the order they first "
                        "speak: white, yellow, pink, green (the game's colours). Who says what "

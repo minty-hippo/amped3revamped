@@ -83,6 +83,11 @@ const std::vector<GameSetting>& SubtitleSettings() {
       {"subtitles_speaker_colors", "Speaker colours", Kind::kToggle, "true"},
       {"subtitles_speaker_names", "Speaker names", Kind::kToggle, "true"},
       {"subtitles_size", "Text size", Kind::kSlider, "100", {}, 50, 200, 10, true},
+      {"subtitles_background", "Shading", Kind::kSlider, "60", {}, 0, 100, 10, true},
+      {"subtitles_box", "Shading shape", Kind::kChoice, "0", {{"0", "Each row"}, {"1", "One block"}}},
+      {"subtitles_edge", "Letters", Kind::kChoice, "1", {{"1", "Drop shadow"}, {"2", "Outline"}, {"0", "Plain"}}},
+      {"subtitles_position", "Height", Kind::kSlider, "8", {}, 2, 45, 1, true},
+      {"subtitles_width", "Width", Kind::kSlider, "78", {}, 40, 100, 2, true},
   };
   return settings;
 }

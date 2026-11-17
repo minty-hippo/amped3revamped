@@ -819,6 +819,21 @@ pictures a second, 480 wide, a few seconds and some MB a movie, kept in
 `subtitles\work\play`). The subtitle maker has to be rebuilt for it once
 (Update).
 
+**Where lines meet.** Two lines that touch (one ends where the next starts,
+or within a few pixels) show a small diamond at the joint. Drag just left of
+it to move the left line's end, just right to move the right line's start,
+or on it to move both together (the joint stays shut); the side that will
+move lights up, with an arrow, as the mouse comes near.
+
+**How they look.** **Look...** sets how the subtitles look in game (saved to
+the game's settings; the in-game **Options > Audio** and the launcher's
+Subtitles page have the same): text size, the shading's darkness (0: none)
+and shape (a box per row, or one block), the letters' edge (drop shadow,
+outline, plain), height on the picture and how wide a row runs before it
+wraps, speaker colours and names. A movie's preview shows its subtitles
+exactly as the game draws them, scaled to the preview (the same drawing code,
+`src/subtitle_draw.h`).
+
 **Layout.** The editor is sized by the display's scale (Windows' 125%,
 150%...), and A- / A+ (Ctrl+- / Ctrl+=, Ctrl+0 back) make its text smaller
 or bigger. Drag the bar between the clip list and the clip to widen either,

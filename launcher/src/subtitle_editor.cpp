@@ -32,6 +32,7 @@
 
 #include "platform.h"
 #include "process.h"
+#include "../../src/subtitle_draw.h"
 
 namespace launcher {
 
@@ -372,6 +373,90 @@ bool SubtitleEditor::DrawNames(float px, float unit) {
   return changed;
 }
 
+// ---- the game's look for the subtitles (amped3.toml) --------------------------------
+
+namespace {
+const GameSetting* Find(const char* key) {
+  for (const GameSetting& g : SubtitleSettings()) {
+    if (std::strcmp(g.key, key) == 0) return &g;
+  }
+  return nullptr;
+}
+}  // namespace
+
+amped3::subtitle_draw::Style SubtitleEditor::GameStyle() const {
+  amped3::subtitle_draw::Style st;
+  auto get = [&](const char* key, int fallback) {
+    const GameSetting* g = Find(key);
+    return g ? std::atoi(game_.Get(*g).c_str()) : fallback;
+  };
+  st.size = get("subtitles_size", st.size);
+  st.background = get("subtitles_background", st.background);
+  st.box = get("subtitles_box", st.box);
+  st.edge = get("subtitles_edge", st.edge);
+  st.position = get("subtitles_position", st.position);
+  st.width = get("subtitles_width", st.width);
+  return st;
+}
+
+bool SubtitleEditor::GameColors() const {
+  const GameSetting* g = Find("subtitles_speaker_colors");
+  return !g || game_.Get(*g) == "true";
+}
+
+bool SubtitleEditor::GameNames() const {
+  const GameSetting* g = Find("subtitles_speaker_names");
+  return !g || game_.Get(*g) == "true";
+}
+
+// The Look popup: the game's subtitle settings, changed here (saved to the
+// game's settings at once: the game picks them up when it next starts).
+void SubtitleEditor::DrawLook(float unit) {
+  if (!ImGui::BeginPopup("##look")) return;
+  ImGui::TextColored(ImColor(kGold), "How the subtitles look in game");
+  ImGui::TextColored(ImColor(kDim), "Saved to the game's settings (it reads them when it starts).");
+  ImGui::Separator();
+  for (const GameSetting& g : SubtitleSettings()) {
+    if (std::strcmp(g.key, "subtitles") == 0) continue;
+    ImGui::PushID(g.key);
+    const std::string v = game_.Get(g);
+    ImGui::SetNextItemWidth(220 * unit);
+    switch (g.kind) {
+      case GameSetting::Kind::kToggle: {
+        bool on = v == "true";
+        if (ImGui::Checkbox(g.label, &on)) game_.Set(g, on ? "true" : "false");
+        break;
+      }
+      case GameSetting::Kind::kChoice: {
+        int cur = 0;
+        for (int k = 0; k < int(g.choices.size()); ++k) {
+          if (v == g.choices[size_t(k)].first) cur = k;
+        }
+        if (ImGui::BeginCombo(g.label, g.choices.empty() ? "" : g.choices[size_t(cur)].second)) {
+          for (int k = 0; k < int(g.choices.size()); ++k) {
+            if (ImGui::Selectable(g.choices[size_t(k)].second, k == cur)) game_.Set(g, g.choices[size_t(k)].first);
+          }
+          ImGui::EndCombo();
+        }
+        break;
+      }
+      case GameSetting::Kind::kSlider: {
+        int n = std::atoi(v.c_str());
+        if (ImGui::SliderInt(g.label, &n, int(g.min), int(g.max), "%d%%")) game_.Set(g, std::to_string(n));
+        break;
+      }
+    }
+    ImGui::PopID();
+  }
+  ImGui::Separator();
+  if (ImGui::Button("As they were")) {
+    for (const GameSetting& g : SubtitleSettings()) {
+      if (std::strcmp(g.key, "subtitles") != 0) game_.Set(g, g.fallback);
+    }
+  }
+  ImGui::EndPopup();
+}
+
 // ---- the layout (kept in subtitles/work/editor.txt) --------------------------------
 
 void SubtitleEditor::LoadLayout() {
@@ -438,6 +523,7 @@ bool SubtitleEditor::Open(const fs::path& install_dir, const fs::path& source_di
   dirty_ = false;
   status_.clear();
   LoadLayout();
+  game_.Load(install_dir_ / "amped3.toml");
   return true;
 }
 
@@ -830,9 +916,31 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
   const float edge = 6.0f * unit;
 
   // What the mouse is over in the lines' lane: a line's start (2), end (3)
-  // or body (4).
+  // or body (4), or where two lines meet (5: both, the left's end and the
+  // right's start together).
   int hit = 0, hit_line = -1;
+  // Lines that meet (one ends where the next starts, or within a few
+  // pixels): around the joint, the left part takes the left line's end,
+  // the right part the right line's start, the middle both.
+  auto joint_x = [&](int i) { return (to_x(c.lines[size_t(i)].end_ms) + to_x(c.lines[size_t(i) + 1].start_ms)) * 0.5f; };
+  auto meets = [&](int i) {
+    return i >= 0 && i + 1 < int(c.lines.size()) &&
+           std::fabs(to_x(c.lines[size_t(i) + 1].start_ms) - to_x(c.lines[size_t(i)].end_ms)) <= edge * 2.0f;
+  };
+  int joint = -1, joint_side = 0;  // the joint the mouse is at: -1 left, 0 both, 1 right
   if (my >= lane_y && my < wave_y) {
+    for (int i = 0; i + 1 < int(c.lines.size()); ++i) {
+      if (!meets(i)) continue;
+      const float xb = joint_x(i), dx = mx - xb;
+      if (std::fabs(dx) > edge * 2.0f) continue;
+      joint = i;
+      joint_side = std::fabs(dx) <= edge * 0.6f ? 0 : dx < 0 ? -1 : 1;
+      hit = joint_side == 0 ? 5 : joint_side < 0 ? 3 : 2;
+      hit_line = joint_side > 0 ? i + 1 : i;
+      break;
+    }
+  }
+  if (my >= lane_y && my < wave_y && !hit) {
     for (int i = int(c.lines.size()) - 1; i >= 0 && !hit; --i) {
       const float x0 = to_x(c.lines[size_t(i)].start_ms), x1 = to_x(c.lines[size_t(i)].end_ms);
       if (mx < x0 - edge || mx > x1 + edge) continue;
@@ -846,6 +954,7 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
     if (hit) {
       drag_ = hit;
       drag_line_ = hit_line;
+      drag_joint_side_ = joint >= 0 ? joint_side : 2;
       line_ = hit_line;
       drag_grab_ms_ = to_ms(mx) - c.lines[size_t(hit_line)].start_ms;
       snap_playhead_ms_ = playhead_ms_;
@@ -897,13 +1006,21 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
         };
         consider(snap_playhead_ms_);
         for (int k = 0; k < int(c.lines.size()); ++k) {
-          if (k == drag_line_) continue;
+          if (k == drag_line_ || (drag_ == 5 && k == drag_line_ + 1)) continue;
           consider(c.lines[size_t(k)].start_ms);
           consider(c.lines[size_t(k)].end_ms);
         }
         return best;
       };
-      if (drag_ == 2) {
+      if (drag_ == 5 && drag_line_ + 1 < int(c.lines.size())) {
+        // Where they meet, both together.
+        sf::Line& r = c.lines[size_t(drag_line_) + 1];
+        const uint32_t r0 = r.start_ms;
+        const double t = std::clamp(snap(ms), double(l.start_ms) + 100.0, double(r.end_ms) - 100.0);
+        l.end_ms = uint32_t(t);
+        r.start_ms = uint32_t(t);
+        if (r.start_ms != r0) changed = true;
+      } else if (drag_ == 2) {
         l.start_ms = uint32_t(std::clamp(snap(ms), 0.0, double(l.end_ms) - 100.0));
       } else if (drag_ == 3) {
         l.end_ms = uint32_t(std::clamp(snap(ms), double(l.start_ms) + 100.0, total));
@@ -920,7 +1037,7 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
       if (l.start_ms != s0 || l.end_ms != e0) {
         changed = true;
         // Heard where the edge now is.
-        if (drag_ != 4) ScrubTo(drag_ == 2 ? l.start_ms : std::max(0.0, double(l.end_ms) - kGrainMs));
+        if (drag_ != 4) ScrubTo(drag_ == 2 ? l.start_ms : drag_ == 5 ? l.end_ms : std::max(0.0, double(l.end_ms) - kGrainMs));
       }
     }
     // Dragged past either side: the view follows.
@@ -941,8 +1058,17 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
     drag_ = 0;
     drag_line_ = -1;
   }
-  if (hovered && !drag_ && (hit == 2 || hit == 3)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-  if (drag_ == 2 || drag_ == 3) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+  if (hovered && !drag_ && (hit == 2 || hit == 3 || hit == 5)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+  if (drag_ == 2 || drag_ == 3 || drag_ == 5) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+  // (Which joint and side the marks below show: the one dragged, or under
+  // the mouse.)
+  int mark_joint = joint, mark_side = joint_side;
+  if (drag_ >= 2 && drag_ <= 5 && drag_joint_side_ != 2) {
+    mark_side = drag_joint_side_;
+    mark_joint = drag_joint_side_ > 0 ? drag_line_ - 1 : drag_line_;
+  } else if (drag_ || !hovered) {
+    mark_joint = -1;
+  }
   if (hovered && (io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f)) {
     if (io.KeyShift || io.MouseWheelH != 0.0f) {
       const float steps = io.MouseWheelH != 0.0f ? -io.MouseWheelH : -io.MouseWheel;
@@ -1037,6 +1163,34 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
                 sel ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 210), Named(c, l).c_str());
     dl->PopClipRect();
   }
+  // Where lines meet: a small mark on the joint; at the mouse (or while
+  // dragged) which side moves: the left line's end, the right's start, or
+  // both (arrows out of the joint, and the edge(s) lit).
+  for (int i = 0; i + 1 < int(c.lines.size()); ++i) {
+    if (!meets(i)) continue;
+    const float xb = joint_x(i), ym = (lane_y + wave_y) * 0.5f;
+    if (xb < p0.x - edge || xb > p0.x + w + edge) continue;
+    const bool on = i == mark_joint;
+    const float r = (on ? 5.0f : 3.5f) * unit;
+    dl->AddQuadFilled(ImVec2(xb, ym - r), ImVec2(xb + r, ym), ImVec2(xb, ym + r), ImVec2(xb - r, ym),
+                      on ? kGold : IM_COL32(255, 255, 255, 150));
+    if (!on) continue;
+    const float a = 7.0f * unit, top = lane_y + 3 * unit, bot = wave_y - 3 * unit;
+    auto arrow = [&](float dir) {  // a triangle pointing out of the joint
+      const float x = xb + dir * (r + 2 * unit);
+      dl->AddTriangleFilled(ImVec2(x + dir * a, ym), ImVec2(x, ym - a * 0.7f), ImVec2(x, ym + a * 0.7f), kGold);
+    };
+    if (mark_side <= 0) {
+      arrow(-1.0f);
+      const float x1 = to_x(c.lines[size_t(i)].end_ms);
+      dl->AddLine(ImVec2(x1, top), ImVec2(x1, bot), kGold, 3.0f * unit);
+    }
+    if (mark_side >= 0) {
+      arrow(1.0f);
+      const float x0 = to_x(c.lines[size_t(i) + 1].start_ms);
+      dl->AddLine(ImVec2(x0, top), ImVec2(x0, bot), kGold, 3.0f * unit);
+    }
+  }
   // The playhead.
   {
     const float x = to_x(playhead_ms_);
@@ -1104,7 +1258,20 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
       if (playhead_ms_ >= l.start_ms && playhead_ms_ < l.end_ms) now.push_back(&l);
     }
     const float tpx = movie ? std::max(px * 0.9f, bh * 0.055f) : px * 1.25f;
-    if (now.empty()) {
+    if (movie) {
+      // Exactly as the game shows them (subtitle_draw.h, the game's own look
+      // settings), over the game's 16:9 picture scaled to this one.
+      const float pw = std::min(w, bh * 16.0f / 9.0f), ph = pw * 9.0f / 16.0f;
+      const ImVec2 pic0(b0.x + (w - pw) * 0.5f, b0.y + (bh - ph) * 0.5f);
+      std::vector<amped3::subtitle_draw::Line> show;
+      for (size_t k = 0; k < now.size() && k < 3; ++k) {
+        show.push_back({GameNames() ? Named(c, *now[k]) : now[k]->text,
+                        GameColors() ? kSpeaker[now[k]->speaker] : IM_COL32(255, 255, 255, 255)});
+      }
+      dl->PushClipRect(b0, ImVec2(b0.x + w, b0.y + bh), true);
+      amped3::subtitle_draw::Draw(dl, font, GameStyle(), pic0, pw, ph, show, 0.0f);
+      dl->PopClipRect();
+    } else if (now.empty()) {
       if (!movie) {
         const char* t = "(no line here)";
         const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0, t);
@@ -1370,6 +1537,10 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play the picked line over and over (L)");
       ImGui::SameLine();
       if (ImGui::Button("Fit")) view_len_ms_ = 0;
+      ImGui::SameLine();
+      if (ImGui::Button("Look...")) ImGui::OpenPopup("##look");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the subtitles look in game (the preview shows it)");
+      DrawLook(unit);
       const bool have_line = line_ >= 0 && line_ < int(c.lines.size());
       ImGui::BeginDisabled(!have_line);
       if (ImGui::Button("Start here [")) {
