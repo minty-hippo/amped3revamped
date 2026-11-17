@@ -29,6 +29,10 @@ bool StartDetached(const std::vector<std::string>& argv, const std::filesystem::
 bool RunGame(const std::filesystem::path& exe, const std::filesystem::path& cwd,
              std::string* error);
 
+// Starts `exe` in place of this launcher (Linux: replaces this process, so
+// Steam keeps following it; Windows: starts it, and the caller quits).
+// Returns false if it couldn't.
+bool Relaunch(const std::filesystem::path& exe, std::string* error);
 // Removes terminal color codes and control characters.
 std::string CleanLine(const std::string& in);
 

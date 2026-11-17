@@ -156,6 +156,15 @@ SDL_Texture* TitleLogo::Frame(float height) {
   return m.texture;
 }
 
+void TitleLogo::Refresh() {
+  Impl& m = *impl_;
+  if (m.texture) SDL_DestroyTexture(m.texture);
+  m.texture = nullptr;
+  m.tex_w = m.tex_h = 0;
+  // (Uploaded again at the next Frame.)
+  m.factor = 0;
+}
+
 float TitleLogo::Aspect() const {
   return float(kCrop[2] - kCrop[0]) / float(kCrop[3] - kCrop[1]);
 }

@@ -21,12 +21,12 @@ include(FetchContent)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # SDL3, static, only what the launcher uses (window, renderer, controllers,
-# file dialogs).
+# file dialogs, sound for the subtitle editor's Play).
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(SDL_AUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_AUDIO ON CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -67,6 +67,7 @@ add_executable(amped3-launcher WIN32
     src/app.cpp
     src/title_logo.cpp
     src/game_settings.cpp
+    src/subtitle_editor.cpp
     ${TITLE_GIF_C}
     src/platform.cpp
     src/process.cpp
@@ -80,6 +81,31 @@ target_include_directories(amped3-launcher PRIVATE
     ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb)
 target_link_libraries(amped3-launcher PRIVATE SDL3::SDL3-static)
+
+# What this launcher is, for updating itself: launcher/VERSION, the commit
+# and the branch it was built from (GitHub Actions: GITHUB_SHA /
+# GITHUB_REF_NAME; elsewhere git's, and the channel "dev", which doesn't
+# update itself).
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/VERSION launcher_version)
+string(STRIP "${launcher_version}" launcher_version)
+set(launcher_commit "$ENV{GITHUB_SHA}")
+set(launcher_channel "$ENV{GITHUB_REF_NAME}")
+if(launcher_commit STREQUAL "")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE launcher_commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+endif()
+if(NOT launcher_channel STREQUAL "main" AND NOT launcher_channel STREQUAL "experimental")
+    set(launcher_channel "dev")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION)
+target_compile_definitions(amped3-launcher PRIVATE
+    AMPED3_LAUNCHER_VERSION="${launcher_version}"
+    AMPED3_LAUNCHER_COMMIT="${launcher_commit}"
+    AMPED3_LAUNCHER_CHANNEL="${launcher_channel}")
 
 if(MSVC)
     target_compile_options(amped3-launcher PRIVATE /utf-8)

@@ -109,11 +109,25 @@ int main(int, char**) {
         case SDL_EVENT_QUIT:
           running = false;
           break;
+        // (The title's texture made again: a resize or full screen can lose
+        // what's in it.)
+        case SDL_EVENT_RENDER_TARGETS_RESET:
+        case SDL_EVENT_RENDER_DEVICE_RESET:
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+        case SDL_EVENT_WINDOW_RESTORED:
+          app.OnWindowChanged();
+          break;
         case SDL_EVENT_GAMEPAD_ADDED:
           if (SDL_Gamepad* g = SDL_OpenGamepad(e.gdevice.which)) pads.push_back(g);
           break;
         case SDL_EVENT_KEY_DOWN:
           if (e.key.repeat) break;
+          // Typing in a text field (the subtitle editor): the keys are the text's.
+          if (ImGui::GetIO().WantTextInput) break;
           switch (e.key.key) {
             case SDLK_UP: press(launcher::Action::kUp, true); break;
             case SDLK_DOWN: press(launcher::Action::kDown, true); break;
@@ -202,6 +216,7 @@ int main(int, char**) {
       }
       return list;
     }();
+    if (frame == 2 && std::getenv("AMPED3_LAUNCHER_EDITOR")) app.OpenSubtitleEditor();
     static size_t script_at = 0;
     if (script_at < script.size() && frame % 10 == 0) app.OnAction(script[script_at++]);
     if (const char* shot = std::getenv("AMPED3_LAUNCHER_SCREENSHOT");
@@ -218,9 +233,10 @@ int main(int, char**) {
     }
     SDL_RenderPresent(renderer);
     // Idle: no need to redraw faster.
-    if (!app.Busy()) SDL_WaitEventTimeout(nullptr, 50);
+    if (!app.Busy() && !app.Animating()) SDL_WaitEventTimeout(nullptr, 50);
   }
 
+  app.Shutdown();
   for (SDL_Gamepad* g : pads) SDL_CloseGamepad(g);
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();

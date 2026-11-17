@@ -67,6 +67,21 @@ std::string GiB(uint64_t bytes) {
   return buf;
 }
 
+// A line without its terminal colors (install.sh's steps are colored).
+std::string StripAnsi(const std::string& line) {
+  std::string out;
+  out.reserve(line.size());
+  for (size_t i = 0; i < line.size(); ++i) {
+    if (line[i] == '\x1b' && i + 1 < line.size() && line[i + 1] == '[') {
+      i += 2;
+      while (i < line.size() && !(line[i] >= '@' && line[i] <= '~')) ++i;
+      continue;
+    }
+    if (line[i] != '\r') out += line[i];
+  }
+  return out;
+}
+
 std::string Elapsed(std::chrono::steady_clock::duration d) {
   const auto s = std::chrono::duration_cast<std::chrono::seconds>(d).count();
   char buf[32];
@@ -109,6 +124,48 @@ bool BranchHead(const std::string& repo, const std::string& branch, CommitInfo* 
     return false;
   }
   return true;
+}
+
+// This launcher (CMakeLists.txt: launcher/VERSION, its commit and branch).
+#ifndef AMPED3_LAUNCHER_VERSION
+#define AMPED3_LAUNCHER_VERSION "0"
+#define AMPED3_LAUNCHER_COMMIT ""
+#define AMPED3_LAUNCHER_CHANNEL "dev"
+#endif
+constexpr const char* kLauncherVersion = AMPED3_LAUNCHER_VERSION;
+constexpr const char* kLauncherCommit = AMPED3_LAUNCHER_COMMIT;
+constexpr const char* kLauncherChannel = AMPED3_LAUNCHER_CHANNEL;
+
+// The release's file for this system (.github/workflows/launcher.yml).
+#if defined(_WIN32)
+constexpr const char* kLauncherAsset = "amped3-launcher-windows-x64.exe";
+#elif defined(__aarch64__)
+constexpr const char* kLauncherAsset = "amped3-launcher-linux-arm64";
+#else
+constexpr const char* kLauncherAsset = "amped3-launcher-linux-x86_64";
+#endif
+
+// "0.5.2" < "0.6.0" (numbers, dot by dot).
+bool VersionNewer(const std::string& a, const std::string& b) {
+  auto parts = [](const std::string& v) {
+    std::vector<long> out;
+    std::stringstream ss(v);
+    std::string p;
+    while (std::getline(ss, p, '.')) out.push_back(std::strtol(p.c_str(), nullptr, 10));
+    return out;
+  };
+  std::vector<long> x = parts(a), y = parts(b);
+  const size_t n = std::max(x.size(), y.size());
+  x.resize(n, 0);
+  y.resize(n, 0);
+  return x > y;
+}
+
+std::string LauncherText() {
+  std::string t = std::string("launcher ") + kLauncherVersion;
+  if (std::string(kLauncherChannel) == "experimental") t += " experimental " + Shorten(kLauncherCommit, 7);
+  else if (std::string(kLauncherChannel) == "dev") t += " (built here)";
+  return t;
 }
 
 // Version files: branch=, commit=, date=.
@@ -173,9 +230,19 @@ struct App::Shared {
   std::vector<std::string> commits;
   std::string check_error;
 
+  // A newer launcher: found (its version, where it is), being downloaded,
+  // downloaded (to `launcher_file`), or failed.
+  enum class Launcher { kIdle, kChecking, kCurrent, kAvailable, kDownloading, kReady, kFailed } launcher =
+      Launcher::kIdle;
+  int launcher_gen = 0;
+  std::string launcher_name, launcher_url, launcher_error;
+  uint64_t launcher_size = 0;
+  fs::path launcher_file;
+
   enum class Job { kIdle, kRunning, kDone, kFailed, kCancelled } job = Job::kIdle;
   bool job_install = false;
-  bool job_upscale = false;  // the texture upscaler on its own
+  bool job_upscale = false;    // the texture upscaler on its own
+  bool job_subtitles = false;  // the subtitle maker on its own
   std::string step, job_error;
   std::deque<std::string> log;
   fs::path log_path;
@@ -187,16 +254,62 @@ struct App::Shared {
   std::string picked_disc, picked_folder;
   std::string dialog_error;
 
+  // How far along the job is (0..1; -1: no idea), for the bar: each step of
+  // the build a share of the whole (the compiles the most), and inside a
+  // compiling step how far the build tool says it is ("[12/345] ...").
+  float progress = -1.0f;
+  float phase_lo = 0.0f, phase_hi = 0.0f;
+
   void Log(const std::string& line) {
     std::lock_guard lock(m);
     if (log_file) log_file << line << '\n' << std::flush;
     log.push_back(line);
     while (log.size() > 500) log.pop_front();
+    // "[n/m]" at the start: the build tool's count.
+    size_t i = line.find_first_not_of(' ');
+    if (i != std::string::npos && line[i] == '[' && phase_hi > phase_lo) {
+      unsigned long n = 0, total = 0;
+      char close = 0;
+      if (std::sscanf(line.c_str() + i, "[%lu/%lu%c", &n, &total, &close) == 3 && close == ']' && total > 0 &&
+          n <= total) {
+        const float p = phase_lo + (phase_hi - phase_lo) * float(n) / float(total);
+        progress = std::max(progress, p);
+      }
+    }
   }
   void Step(const std::string& text) {
     {
       std::lock_guard lock(m);
       step = text;
+      // Each step's share (as a first install's build goes; an update skips
+      // what's built already, and the bar jumps ahead).
+      struct Phase {
+        const char* start;
+        float lo, hi;
+      };
+      static const Phase kPhases[] = {
+          {"Getting the ReXGlue SDK", 0.07f, 0.10f},
+          {"Getting whisper.cpp", 0.35f, 0.37f},
+          {"Getting ", 0.0f, 0.02f},
+          {"Extracting the game", 0.02f, 0.02f},
+          {"Building the SDK", 0.10f, 0.35f},
+          {"Building amped3", 0.49f, 0.95f},
+          {"Building", 0.02f, 0.02f},
+          {"Extracting to", 0.02f, 0.06f},
+          {"Checking the build tools", 0.06f, 0.07f},
+          {"Downloading", 0.37f, 0.39f},
+          {"Recompiling the game's code", 0.39f, 0.47f},
+          {"Round", 0.47f, 0.49f},
+          {"Test run", 0.95f, 0.98f},
+      };
+      for (const Phase& ph : kPhases) {
+        if (text.rfind(ph.start, 0) == 0) {
+          phase_lo = ph.lo;
+          phase_hi = ph.hi;
+          progress = std::max(progress, ph.lo);
+          break;
+        }
+      }
     }
     Log("== " + text);
   }
@@ -204,8 +317,27 @@ struct App::Shared {
 
 App::App() : s_(std::make_shared<Shared>()) {
   LoadSettings();
+  // Testing (AMPED3_LAUNCHER_TEST_PROGRESS=0.42): a pretend update that far
+  // along, to see the bar.
+  if (const char* tp = std::getenv("AMPED3_LAUNCHER_TEST_PROGRESS")) {
+    s_->job = Shared::Job::kRunning;
+    s_->job_start = std::chrono::steady_clock::now() - std::chrono::seconds(25);
+    s_->step = "Building the SDK (Release) - the first time takes a while";
+    s_->progress = float(std::atof(tp));
+  }
   discs_ = FindDiscImages();
   StartBranchList();
+  {
+    // What an update of the launcher left: the one it replaced (Windows),
+    // a download that didn't finish.
+    for (const fs::path& self : {ExePath(), InstalledLauncher(install_dir_)}) {
+      std::error_code ec;
+      if (self.empty() || !fs::is_directory(self.parent_path(), ec)) continue;
+      fs::remove(self.parent_path() / (PathText(self.filename()) + ".old"), ec);
+      fs::remove(self.parent_path() / (PathText(self.filename()) + ".download"), ec);
+    }
+  }
+  StartLauncherCheck();
   if (IsInstalled(install_dir_)) {
     // A launcher run from elsewhere (a new download) takes the installed
     // one's place.
@@ -220,6 +352,8 @@ App::~App() {
 
 bool App::Busy() const {
   std::lock_guard lock(s_->m);
+  // (Testing the bar: a pretend job, not busy for the screenshot.)
+  if (std::getenv("AMPED3_LAUNCHER_TEST_PROGRESS")) return false;
   return s_->job == Shared::Job::kRunning;
 }
 
@@ -246,6 +380,7 @@ void App::LoadSettings() {
   direct_start_ = get("direct_start") == "1";
   original_look_ = get("look") == "original";
   upscale_on_install_ = get("upscale_on_install") == "1";
+  subtitles_on_install_ = get("subtitles_on_install") == "1";
   std::string branch = get("branch");
   if (branch.empty()) {
     const Version v = ReadVersion(install_dir_ / "amped3-version.txt");
@@ -267,6 +402,7 @@ void App::SaveSettings() {
   kv["direct_start"] = direct_start_ ? "1" : "0";
   kv["look"] = original_look_ ? "original" : "revamped";
   kv["upscale_on_install"] = upscale_on_install_ ? "1" : "0";
+  kv["subtitles_on_install"] = subtitles_on_install_ ? "1" : "0";
   {
     std::lock_guard lock(s_->m);
     kv["branch"] = s_->branches[size_t(s_->branch)];
@@ -385,10 +521,177 @@ void App::StartCheck() {
   }).detach();
 }
 
+// ---- the launcher itself ------------------------------------------------------------
+
+// The launcher file to replace: the install folder's (where this one moved
+// itself, also when Windows still gives the name it started under), else
+// this one.
+static fs::path LauncherFile(const fs::path& install_dir) {
+  std::error_code ec;
+  const fs::path installed = InstalledLauncher(install_dir);
+  if (IsInstalled(install_dir) && fs::exists(installed, ec)) return installed;
+  return ExePath();
+}
+
+void App::StartLauncherCheck() {
+  // (Built here: nothing to compare with, unless testing.)
+  if (std::string(kLauncherChannel) == "dev" && !std::getenv("AMPED3_LAUNCHER_UPDATE_TEST")) return;
+  auto s = s_;
+  const std::string repo = repo_;
+  std::string branch;
+  int gen;
+  {
+    std::lock_guard lock(s->m);
+    if (s->launcher == Shared::Launcher::kDownloading || s->launcher == Shared::Launcher::kReady) return;
+    branch = s->branches[size_t(s->branch)];
+    gen = ++s->launcher_gen;
+    if (s->launcher != Shared::Launcher::kAvailable) s->launcher = Shared::Launcher::kChecking;
+  }
+  std::thread([s, repo, branch, gen] {
+    // The experimental branch: its pre-release (made on every change to the
+    // launcher there); any other: the newest release.
+    const bool exp = branch == "experimental";
+    const bool self_exp = std::string(kLauncherChannel) == "experimental";
+    Json rel;
+    std::string error, name, url;
+    uint64_t size = 0;
+    bool newer = false;
+    const bool ok = GitHub(repo, exp ? "/releases/tags/launcher-experimental" : "/releases/latest", &rel, &error);
+    if (ok) {
+      if (!exp) {
+        std::string v = rel["tag_name"].str();
+        if (v.rfind("launcher-v", 0) == 0) v = v.substr(10);
+        name = "v" + v;
+        newer = !v.empty() && VersionNewer(v, kLauncherVersion);
+      } else {
+        const std::string commit = rel["target_commitish"].str();
+        name = "experimental " + Shorten(commit, 7);
+        if (commit.empty() || commit == kLauncherCommit) {
+          newer = false;
+        } else if (std::string(kLauncherCommit).empty()) {
+          newer = true;
+        } else {
+          // Newer than this one: commits since it (an experimental launcher
+          // never goes back to an older one).
+          Json c;
+          std::string e2;
+          if (GitHub(repo, std::string("/compare/") + kLauncherCommit + "..." + commit, &c, &e2)) {
+            const int ahead = int(c["ahead_by"].num()), behind = int(c["behind_by"].num());
+            newer = ahead > 0 && (behind == 0 || !self_exp);
+          } else {
+            newer = !self_exp;
+          }
+        }
+      }
+      for (const Json& a : rel["assets"].items()) {
+        if (a["name"].str() == kLauncherAsset) {
+          url = a["browser_download_url"].str();
+          size = uint64_t(a["size"].num());
+        }
+      }
+      if (url.empty()) newer = false;
+    }
+    std::lock_guard lock(s->m);
+    if (gen != s->launcher_gen) return;
+    // (Not reachable: quietly nothing, as if current.)
+    s->launcher = newer ? Shared::Launcher::kAvailable : Shared::Launcher::kCurrent;
+    s->launcher_name = name;
+    s->launcher_url = url;
+    s->launcher_size = size;
+    s->launcher_error.clear();
+  }).detach();
+}
+
+void App::StartLauncherDownload() {
+  auto s = s_;
+  std::string url;
+  uint64_t size;
+  {
+    std::lock_guard lock(s->m);
+    if (s->launcher != Shared::Launcher::kAvailable && s->launcher != Shared::Launcher::kFailed) return;
+    if (s->launcher_url.empty()) return;
+    s->launcher = Shared::Launcher::kDownloading;
+    url = s->launcher_url;
+    size = s->launcher_size;
+  }
+  const fs::path self = LauncherFile(install_dir_);
+  std::thread([s, url, size, self] {
+    // Beside the one it replaces (the same drive: put in place with a rename).
+    const fs::path dest = self.parent_path() / (PathText(self.filename()) + ".download");
+    std::error_code ec;
+    fs::remove(dest, ec);
+    std::string out, err;
+    const int code = RunCapture({kCurl, "-fsSL", "--max-time", "900", "-H", "User-Agent: amped3-revamped-launcher",
+                                 "-o", PathText(dest), url},
+                                &out, &err);
+    std::string error;
+    const uint64_t got = fs::exists(dest, ec) ? uint64_t(fs::file_size(dest, ec)) : 0;
+    if (code != 0) {
+      error = code < 0 ? err : "download failed (" + FirstLine(out) + ")";
+    } else if (got < (1u << 20) || (size && got != size)) {
+      error = "the download came out wrong (" + std::to_string(got) + " bytes)";
+    }
+#if !defined(_WIN32)
+    if (error.empty()) {
+      fs::permissions(dest, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                                fs::perms::others_read | fs::perms::others_exec,
+                      ec);
+    }
+#endif
+    if (!error.empty()) fs::remove(dest, ec);
+    std::lock_guard lock(s->m);
+    s->launcher = error.empty() ? Shared::Launcher::kReady : Shared::Launcher::kFailed;
+    s->launcher_error = error;
+    s->launcher_file = dest;
+  }).detach();
+}
+
+// The downloaded launcher in this one's place, then started (this one quits).
+void App::FinishLauncherUpdate() {
+  fs::path file;
+  {
+    std::lock_guard lock(s_->m);
+    file = s_->launcher_file;
+    s_->launcher = Shared::Launcher::kFailed;  // (unless it goes)
+    s_->launcher_error = "couldn't put it in place";
+  }
+  const fs::path self = LauncherFile(install_dir_);
+  std::error_code ec;
+  std::string error;
+#if defined(_WIN32)
+  // A running program can be renamed (not replaced): this one aside as .old
+  // (removed when the new one starts).
+  const fs::path old = self.parent_path() / (PathText(self.filename()) + ".old");
+  fs::remove(old, ec);
+  ec.clear();
+  fs::rename(self, old, ec);
+  if (!ec) {
+    fs::rename(file, self, ec);
+    if (ec) {
+      std::error_code back;
+      fs::rename(old, self, back);
+    }
+  }
+#else
+  fs::rename(file, self, ec);  // (the running file stays open as it was)
+#endif
+  if (ec) error = "couldn't replace " + PathText(self) + " (" + ec.message() + ")";
+  if (error.empty()) {
+    SaveSettings();
+    if (Relaunch(self, &error)) {
+      quit_ = true;  // (Windows: the new one is running)
+      return;
+    }
+  }
+  std::lock_guard lock(s_->m);
+  s_->launcher_error = error;
+}
+
 // Downloads the branch into the sources folder (or updates a git checkout),
 // then runs the installer: an install from the disc image, or a rebuild of
 // the existing install.
-void App::StartJob(bool install, bool upscale) {
+void App::StartJob(bool install, Tool tool) {
+  const bool upscale = tool == Tool::kUpscale;
   std::string branch;
   {
     std::lock_guard lock(s_->m);
@@ -397,7 +700,11 @@ void App::StartJob(bool install, bool upscale) {
     s_->job = Shared::Job::kRunning;
     s_->job_install = install;
     s_->job_upscale = upscale;
+    s_->job_subtitles = tool == Tool::kSubtitles;
     s_->step = "Starting";
+    // (The tools on their own have no steps to go by: no bar.)
+    s_->progress = install || tool == Tool::kNone ? 0.0f : -1.0f;
+    s_->phase_lo = s_->phase_hi = 0.0f;
     s_->job_error.clear();
     s_->log.clear();
     s_->cancel = false;
@@ -416,14 +723,18 @@ void App::StartJob(bool install, bool upscale) {
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
     s_->log_path =
-        logs / (std::string(upscale ? "upscale_" : install ? "install_" : "update_") + stamp + ".log");
+        logs / (std::string(upscale                  ? "upscale_"
+                            : tool == Tool::kSubtitles ? "subtitles_"
+                            : install                  ? "install_"
+                                                       : "update_") +
+                stamp + ".log");
     s_->log_file.close();
     s_->log_file.open(s_->log_path);
   }
   SaveSettings();
   const fs::path iso = install && !discs_.empty() ? discs_[size_t(disc_)] : fs::path();
-  if (upscale) {
-    std::thread([this] { UpscaleMain(); }).detach();
+  if (tool != Tool::kNone) {
+    std::thread([this, tool] { ToolMain(tool); }).detach();
     return;
   }
   std::thread([this, install, branch, iso] { JobMain(install, branch, iso); }).detach();
@@ -447,8 +758,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   auto run = [&](const std::vector<std::string>& argv, const fs::path& cwd) {
     std::string error;
     const int code = RunProcess(argv, cwd, [&](const std::string& line) {
-      if (line.rfind("==> ", 0) == 0) s->Step(line.substr(4));
-      else s->Log(line);
+      const std::string clean = StripAnsi(line);
+      if (clean.rfind("==> ", 0) == 0) s->Step(clean.substr(4));
+      else s->Log(clean);
     }, &error);
     if (code < 0) s->Log(error);
     return code;
@@ -518,6 +830,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   else argv.insert(argv.end(), {"-GameDir", PathText(install_dir / "game")});
   argv.insert(argv.end(), {"-InstallDir", PathText(install_dir), "-Yes", "-UpscaleTextures",
                            install && upscale_on_install_ && kCanUpscale ? "yes" : "no"});
+  if (FileContains(build_src / "installer" / "Install-Amped3.ps1", "$Subtitles")) {
+    argv.insert(argv.end(), {"-Subtitles", install && subtitles_on_install_ ? "yes" : "no"});
+  }
   if (install && FileContains(build_src / "installer" / "Install-Amped3.ps1", "$Graphics")) {
     argv.insert(argv.end(), {"-Graphics", original_look_ ? "original" : "revamped"});
   }
@@ -529,6 +844,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   else argv.insert(argv.end(), {"--game-dir", PathText(install_dir / "game")});
   argv.insert(argv.end(), {"--install-dir", PathText(install_dir), "--yes", "--upscale-textures",
                            install && upscale_on_install_ && kCanUpscale ? "yes" : "no"});
+  if (FileContains(build_src / "install.sh", "--subtitles)")) {
+    argv.insert(argv.end(), {"--subtitles", install && subtitles_on_install_ ? "yes" : "no"});
+  }
   if (install && FileContains(build_src / "install.sh", "--graphics)")) {
     argv.insert(argv.end(), {"--graphics", original_look_ ? "original" : "revamped"});
   }
@@ -554,9 +872,10 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   finish(Shared::Job::kDone, "");
 }
 
-// Upscale textures: the install's texture upscaler (installer/Upscale-Textures.ps1,
-// linux/upscale-textures.sh from its sources), then the game uses them.
-void App::UpscaleMain() {
+// Upscale textures / Make subtitles: one of the install's tools on its own
+// (installer/Upscale-Textures.ps1 or Make-Subtitles.ps1, linux/upscale-textures.sh
+// or make-subtitles.sh from its sources), then the game uses what it made.
+void App::ToolMain(Tool tool) {
   auto s = s_;
   const fs::path install_dir = install_dir_;
   const fs::path source = source_dir_;
@@ -570,44 +889,49 @@ void App::UpscaleMain() {
       s->log_file.close();
     }
   };
+  const bool subs = tool == Tool::kSubtitles;
+  const char* what = subs ? "The subtitle maker" : "The texture upscaler";
   std::error_code ec;
-  s->Step("Upscaling textures (Real-ESRGAN): downloads 45 MB once, then a few minutes on the GPU");
+  s->Step(subs ? "Making subtitles (speech recognition): downloads 142 MB once, then a while on the CPU"
+               : "Upscaling textures (Real-ESRGAN): downloads 45 MB once, then a few minutes on the GPU");
   const fs::path src = NoSpacePath(source);
   std::vector<std::string> argv;
 #if defined(_WIN32)
-  const fs::path script = src / "installer" / "Upscale-Textures.ps1";
+  const fs::path script = src / "installer" / (subs ? "Make-Subtitles.ps1" : "Upscale-Textures.ps1");
   argv = {"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PathText(script),
           "-InstallDir", PathText(install_dir)};
   for (const auto& entry : fs::directory_iterator(src / "out" / "build", ec)) {
-    const fs::path tool = entry.path() / "amped3-texture-upscale.exe";
-    if (fs::exists(tool, ec)) {
-      argv.insert(argv.end(), {"-Tool", PathText(tool)});
+    const fs::path exe = entry.path() / (subs ? "amped3-subtitles.exe" : "amped3-texture-upscale.exe");
+    if (fs::exists(exe, ec)) {
+      argv.insert(argv.end(), {"-Tool", PathText(exe)});
       break;
     }
   }
 #else
-  const fs::path script = src / "linux" / "upscale-textures.sh";
+  const fs::path script = src / "linux" / (subs ? "make-subtitles.sh" : "upscale-textures.sh");
   argv = {"bash", PathText(script), "--install-dir", PathText(install_dir)};
 #endif
   if (!fs::exists(script, ec)) {
-    return finish(Shared::Job::kFailed,
-                  "The texture upscaler isn't in this install's sources (" + PathText(source) +
-                      "): Update first.");
+    return finish(Shared::Job::kFailed, std::string(what) + " isn't in this install's sources (" +
+                                            PathText(source) + "): Update first (or choose a branch that has it).");
   }
   std::string error;
   const int code = RunProcess(argv, src, [&](const std::string& line) {
-    if (line.rfind("==> ", 0) == 0) s->Step(line.substr(4));
-    else s->Log(line);
+    const std::string clean = StripAnsi(line);
+    if (clean.rfind("==> ", 0) == 0) s->Step(clean.substr(4));
+    else s->Log(clean);
   }, &error);
   if (code < 0) s->Log(error);
   if (code != 0) {
-    return finish(Shared::Job::kFailed, "The texture upscaler failed (exit " + std::to_string(code) + ").");
+    return finish(Shared::Job::kFailed, std::string(what) + " failed (exit " + std::to_string(code) + ").");
   }
-  // Used from now on (Graphics settings: Upscaled textures).
-  GameConfig config;
-  config.Load(install_dir / "amped3.toml");
-  for (const auto& gs : DisplaySettings()) {
-    if (std::string(gs.key) == "native_upscaled_textures") config.Set(gs, "true");
+  if (!subs) {
+    // Used from now on (Graphics settings: Upscaled textures).
+    GameConfig config;
+    config.Load(install_dir / "amped3.toml");
+    for (const auto& gs : DisplaySettings()) {
+      if (std::string(gs.key) == "native_upscaled_textures") config.Set(gs, "true");
+    }
   }
   finish(Shared::Job::kDone, "");
 }
@@ -721,24 +1045,41 @@ void App::BrowseFolder() {
 std::vector<App::Row> App::Rows() const {
   std::lock_guard lock(s_->m);
   if (s_->job == Shared::Job::kRunning) return {kRowCancel};
+  // A newer launcher: offered first (after Play).
+  const bool launcher = s_->launcher == Shared::Launcher::kAvailable ||
+                        s_->launcher == Shared::Launcher::kDownloading ||
+                        s_->launcher == Shared::Launcher::kReady || s_->launcher == Shared::Launcher::kFailed;
   if (!IsInstalled(install_dir_)) {
-    if (!kCanUpscale) return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowInstall, kRowQuit};
-    return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowUpscaleOnInstall, kRowInstall, kRowQuit};
+    std::vector<Row> rows;
+    if (launcher) rows.push_back(kRowLauncher);
+    for (Row r : {kRowDisc, kRowBranch, kRowFolder, kRowLook}) rows.push_back(r);
+    if (kCanUpscale) rows.push_back(kRowUpscaleOnInstall);
+    for (Row r : {kRowSubtitlesOnInstall, kRowInstall, kRowQuit}) rows.push_back(r);
+    return rows;
   }
+  if (page_ == Page::kSubtitleEditor) return {};
   if (page_ != Page::kHome) {
     std::vector<Row> rows;
     for (size_t i = 0; i < PageSettings().size(); ++i) rows.push_back(Row(kRowSetting + int(i)));
     if (page_ == Page::kDisplay) rows.push_back(kRowEffects);
+    if (page_ == Page::kSubtitles) {
+      rows.push_back(kRowSubtitles);
+      rows.push_back(kRowSubtitlesEdit);
+    }
     rows.push_back(kRowBack);
     return rows;
   }
-  std::vector<Row> rows = {kRowPlay, kRowGraphics};
+  std::vector<Row> rows = {kRowPlay};
+  if (launcher) rows.push_back(kRowLauncher);
+  rows.push_back(kRowGraphics);
   if (kCanUpscale) rows.push_back(kRowUpscale);
+  rows.push_back(kRowSubtitlesPage);
   for (Row r : {kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut, kRowQuit}) rows.push_back(r);
   return rows;
 }
 
 const std::vector<GameSetting>& App::PageSettings() const {
+  if (page_ == Page::kSubtitles) return SubtitleSettings();
   return page_ == Page::kEffects ? EffectSettings() : DisplaySettings();
 }
 
@@ -749,6 +1090,28 @@ void App::OpenPage(Page page) {
   cursor_ = 0;
   confirm_until_ = 0;
   if (page != Page::kHome) config_.Load(install_dir_ / "amped3.toml");
+}
+
+std::string App::SubtitleStatus() const {
+  const fs::path file = install_dir_ / "subtitles" / amped3::subtitle_file::kFileName;
+  std::ifstream f(file, std::ios::binary);
+  if (!f) return "";
+  std::stringstream ss;
+  ss << f.rdbuf();
+  std::vector<amped3::subtitle_file::Clip> clips;
+  if (!amped3::subtitle_file::Parse(ss.str(), &clips, nullptr)) return "";
+  size_t lines = 0, edited = 0, movies = 0;
+  for (const auto& c : clips) {
+    lines += c.lines.size();
+    edited += c.edited ? 1 : 0;
+    movies += c.kind == amped3::subtitle_file::Kind::kVideo ? 1 : 0;
+  }
+  auto count = [](size_t n, const char* one, const char* many) {
+    return std::to_string(n) + " " + (n == 1 ? one : many);
+  };
+  return count(lines, "line", "lines") + " in " + count(clips.size() - movies, "sound", "sounds") + " and " +
+         count(movies, "movie", "movies") +
+         (edited ? ", " + std::to_string(edited) + " corrected by hand" : std::string());
 }
 
 void App::Change(Row row, int step) {
@@ -762,10 +1125,11 @@ void App::Change(Row row, int step) {
     }
     SaveSettings();
     confirm_until_ = 0;
-    if (IsInstalled(install_dir_)) check_at_ = ImGui::GetTime() + 0.6;
+    check_at_ = ImGui::GetTime() + 0.6;  // (and the launcher for it)
   } else if (row == kRowDisc && !discs_.empty()) {
     disc_ = (disc_ + step + int(discs_.size())) % int(discs_.size());
-  } else if (row == kRowDirect || row == kRowLook || row == kRowUpscaleOnInstall) {
+  } else if (row == kRowDirect || row == kRowLook || row == kRowUpscaleOnInstall ||
+             row == kRowSubtitlesOnInstall) {
     Activate(row);
   } else if (row >= kRowSetting && size_t(row - kRowSetting) < PageSettings().size()) {
     if (!config_.Step(PageSettings()[size_t(row - kRowSetting)], step)) {
@@ -809,6 +1173,10 @@ void App::Activate(Row row) {
       break;
     case kRowCheck:
       StartCheck();
+      StartLauncherCheck();
+      break;
+    case kRowLauncher:
+      StartLauncherDownload();
       break;
     case kRowDirect:
       direct_start_ = !direct_start_;
@@ -838,7 +1206,19 @@ void App::Activate(Row row) {
     case kRowUpscale:
       if (now < confirm_until_) {
         confirm_until_ = 0;
-        StartJob(false, true);
+        StartJob(false, Tool::kUpscale);
+      } else {
+        confirm_until_ = now + 6.0;
+      }
+      break;
+    case kRowSubtitlesOnInstall:
+      subtitles_on_install_ = !subtitles_on_install_;
+      SaveSettings();
+      break;
+    case kRowSubtitles:
+      if (now < confirm_until_) {
+        confirm_until_ = 0;
+        StartJob(false, Tool::kSubtitles);
       } else {
         confirm_until_ = now + 6.0;
       }
@@ -846,6 +1226,19 @@ void App::Activate(Row row) {
     case kRowEffects:
       OpenPage(Page::kEffects);
       break;
+    case kRowSubtitlesPage:
+      OpenPage(Page::kSubtitles);
+      break;
+    case kRowSubtitlesEdit: {
+      std::string error;
+      if (editor_.Open(install_dir_, source_dir_, &error)) {
+        page_ = Page::kSubtitleEditor;
+        notice_.clear();
+      } else {
+        notice_ = error;
+      }
+      break;
+    }
     case kRowBack:
       OpenPage(page_ == Page::kEffects ? Page::kDisplay : Page::kHome);
       break;
@@ -855,7 +1248,21 @@ void App::Activate(Row row) {
   }
 }
 
+void App::OpenSubtitleEditor() {
+  std::string error;
+  if (editor_.Open(install_dir_, source_dir_, &error)) {
+    page_ = Page::kSubtitleEditor;
+    notice_.clear();
+  } else {
+    notice_ = error;
+  }
+}
+
 void App::OnAction(Action action) {
+  if (page_ == Page::kSubtitleEditor) {
+    if (action == Action::kBack && editor_.Back()) OpenPage(Page::kSubtitles);
+    return;
+  }
   const auto rows = Rows();
   if (rows.empty()) return;
   cursor_ = std::clamp(cursor_, 0, int(rows.size()) - 1);
@@ -886,11 +1293,30 @@ void App::OnAction(Action action) {
 }
 
 void App::SetRenderer(SDL_Renderer* renderer) {
+  editor_.SetRenderer(renderer);
   title_.reset();
   if (renderer) title_ = std::make_unique<TitleLogo>(renderer);
 }
 
+void App::OnWindowChanged() {
+  editor_.Refresh();
+  if (title_) title_->Refresh();
+}
+
 void App::Draw(ImFont* font) {
+  if (page_ == Page::kSubtitleEditor) {
+    // Sized by the display's scale (high DPI: 150% is 1.5) and the editor's
+    // own zoom, not the window's size (a bigger window: more room).
+    float scale = 1.0f;
+    if (window_) {
+      const float ds = SDL_GetWindowDisplayScale(window_), pd = SDL_GetWindowPixelDensity(window_);
+      if (ds > 0.0f && pd > 0.0f) scale = ds / pd;
+    }
+    if (const char* z = std::getenv("AMPED3_EDITOR_SCALE")) scale = float(std::atof(z));  // (testing)
+    const float unit = std::clamp(scale * editor_.Zoom(), 0.5f, 4.0f);
+    if (editor_.Draw(font, unit)) OpenPage(Page::kSubtitles);
+    return;
+  }
   // What the dialogs and threads reported.
   {
     std::lock_guard lock(s_->m);
@@ -914,7 +1340,26 @@ void App::Draw(ImFont* font) {
   }
   if (check_at_ > 0 && ImGui::GetTime() >= check_at_) {
     check_at_ = 0;
-    StartCheck();
+    if (IsInstalled(install_dir_)) StartCheck();
+    StartLauncherCheck();
+  }
+  // A new launcher downloaded: in this one's place, and started.
+  {
+    bool ready;
+    {
+      std::lock_guard lock(s_->m);
+      ready = s_->launcher == Shared::Launcher::kReady && s_->job != Shared::Job::kRunning;
+    }
+    if (ready) FinishLauncherUpdate();
+    // Testing (AMPED3_LAUNCHER_UPDATE_TEST=go): updates as soon as it can.
+    if (const char* t = std::getenv("AMPED3_LAUNCHER_UPDATE_TEST"); t && std::string(t) == "go") {
+      bool available;
+      {
+        std::lock_guard lock(s_->m);
+        available = s_->launcher == Shared::Launcher::kAvailable;
+      }
+      if (available) StartLauncherDownload();
+    }
   }
 
   // A copy of the shared state for drawing.
@@ -924,15 +1369,22 @@ void App::Draw(ImFont* font) {
   Shared::Check check;
   CommitInfo remote;
   int behind, ahead;
-  bool job_install, job_upscale;
+  bool job_install, job_upscale, job_subtitles;
   std::chrono::steady_clock::duration elapsed{};
+  float job_progress = -1.0f;
+  Shared::Launcher launcher;
+  std::string launcher_name, launcher_error;
   {
     std::lock_guard lock(s_->m);
+    launcher = s_->launcher;
+    launcher_name = s_->launcher_name;
+    launcher_error = s_->launcher_error;
     branch = s_->branches[size_t(s_->branch)];
     step = s_->step;
     job = s_->job;
     job_install = s_->job_install;
     job_upscale = s_->job_upscale;
+    job_subtitles = s_->job_subtitles;
     job_error = s_->job_error;
     check = s_->check;
     check_error = s_->check_error;
@@ -945,6 +1397,7 @@ void App::Draw(ImFont* font) {
     for (size_t i = s_->log.size() > keep ? s_->log.size() - keep : 0; i < s_->log.size(); ++i) {
       log_tail.push_back(s_->log[i]);
     }
+    job_progress = s_->progress;
     if (job == Shared::Job::kRunning) elapsed = std::chrono::steady_clock::now() - s_->job_start;
     else if (job != Shared::Job::kIdle) elapsed = s_->job_end - s_->job_start;
   }
@@ -953,6 +1406,7 @@ void App::Draw(ImFont* font) {
   const bool same_branch = version.branch.empty() || version.branch == branch;
   const auto rows = Rows();
   cursor_ = std::clamp(cursor_, 0, int(rows.size()) - 1);
+  const std::string subtitle_status = page_ == Page::kSubtitles ? SubtitleStatus() : std::string();
 
   ImGuiIO& io = ImGui::GetIO();
   const ImVec2 display = io.DisplaySize;
@@ -993,7 +1447,8 @@ void App::Draw(ImFont* font) {
       !installed                  ? "Build the game from your own Amped 3 (Xbox 360) disc image"
       : page_ == Page::kDisplay   ? "Graphics settings: display"
       : page_ == Page::kEffects   ? "Graphics settings: effects"
-                                  : "Installed version  " + VersionText();
+      : page_ == Page::kSubtitles ? "Subtitles"
+                                  : "Installed version  " + VersionText() + "     (" + LauncherText() + ")";
   dl->AddText(font, small_px, ImVec2(x0, y), kDim, sub.c_str());
   y += small_px * 2.0f;
 
@@ -1002,6 +1457,7 @@ void App::Draw(ImFont* font) {
     std::string label, value;
     ImU32 color = kWhite;
     bool enabled = true;
+    float progress = -1.0f;  // a bar behind the row (0..1)
   };
   std::vector<RowText> texts;
   const double now = ImGui::GetTime();
@@ -1032,7 +1488,8 @@ void App::Draw(ImFont* font) {
         const uint64_t free = FreeSpace(install_dir_);
         if (now < confirm_until_) {
           t.value = std::string("select again: ") + (original_look_ ? "Original" : "Revamped") +
-                    (upscale_on_install_ && kCanUpscale ? ", upscaled textures" : "");
+                    (upscale_on_install_ && kCanUpscale ? ", upscaled textures" : "") +
+                    (subtitles_on_install_ ? ", subtitles" : "");
           t.color = kGold;
         } else {
           t.value = "needs about 40 GB (" + GiB(free) + " free)";
@@ -1086,12 +1543,35 @@ void App::Draw(ImFont* font) {
         break;
       case kRowCancel:
         t.label = "Stop";
-        t.value = (job_upscale ? "upscaling " : job_install ? "installing " : "updating ") +
+        t.value = (job_upscale     ? "upscaling "
+                   : job_subtitles ? "making subtitles "
+                   : job_install   ? "installing "
+                                   : "updating ") +
+                  (job_progress >= 0.0f
+                       ? std::to_string(int(std::clamp(job_progress, 0.0f, 1.0f) * 100.0f + 0.5f)) + "%  "
+                       : std::string()) +
                   Elapsed(elapsed);
         t.color = kGold;
+        t.progress = job_progress;
         break;
       case kRowQuit:
         t.label = "Quit";
+        break;
+      case kRowLauncher:
+        t.label = "Update the launcher";
+        if (launcher == Shared::Launcher::kDownloading) {
+          t.value = "downloading " + launcher_name + "...";
+          t.color = kDim;
+        } else if (launcher == Shared::Launcher::kReady) {
+          t.value = "starting it...";
+          t.color = kDim;
+        } else if (launcher == Shared::Launcher::kFailed) {
+          t.value = launcher_error + ": select to try again";
+          t.color = kRed;
+        } else {
+          t.value = launcher_name + " is out: select to update";
+          t.color = kGold;
+        }
         break;
       case kRowGraphics:
         t.label = "Graphics settings";
@@ -1114,6 +1594,30 @@ void App::Draw(ImFont* font) {
           t.value = "menus, HUD, loading screens (Real-ESRGAN, 4x)";
           t.color = kDim;
         }
+        break;
+      case kRowSubtitlesOnInstall:
+        t.label = "Subtitles";
+        t.value = subtitles_on_install_ ? "<  Yes, made after the build  >" : "<  No  >";
+        break;
+      case kRowSubtitles:
+        t.label = subtitle_status.empty() ? "Make subtitles" : "Make again";
+        if (now < confirm_until_) {
+          t.value = "select again to start";
+          t.color = kGold;
+        } else {
+          t.value = subtitle_status.empty() ? "speech recognition on this PC, offline"
+                                            : "keeps what's corrected by hand";
+          t.color = kDim;
+        }
+        break;
+      case kRowSubtitlesPage:
+        t.label = "Subtitles";
+        t.value = ">";
+        break;
+      case kRowSubtitlesEdit:
+        t.label = "Edit subtitles";
+        t.value = subtitle_status.empty() ? "none made yet" : ">";
+        t.color = subtitle_status.empty() ? kDim : kWhite;
         break;
       case kRowEffects:
         t.label = "Effects";
@@ -1161,6 +1665,12 @@ void App::Draw(ImFont* font) {
     }
     ImGui::PopID();
     const bool selected = cursor_ == int(i);
+    // How far the job's got: the row filled that far.
+    if (t.progress >= 0.0f) {
+      const float p = std::clamp(t.progress, 0.0f, 1.0f);
+      dl->AddRectFilled(a, b, IM_COL32(255, 204, 0, 22), 6 * unit);
+      if (p > 0.0f) dl->AddRectFilled(a, ImVec2(a.x + (b.x - a.x) * p, b.y), IM_COL32(255, 204, 0, 70), 6 * unit);
+    }
     if (selected) dl->AddRectFilled(a, b, kSelect, 6 * unit);
     const float ty = y + (row_h - text_px) * 0.5f;
     dl->AddText(font, text_px, ImVec2(x0, ty), selected ? kGold : kWhite, t.label.c_str());
@@ -1203,10 +1713,11 @@ void App::Draw(ImFont* font) {
     if (job == Shared::Job::kRunning) {
       para(step, kGold);
     } else if (job == Shared::Job::kDone) {
-      para(job_upscale    ? "Textures upscaled and switched on (Graphics settings: Upscaled "
-                            "textures). Select Play."
-           : job_install ? "Installed. Select Play."
-                         : "Updated. Select Play.",
+      para(job_upscale      ? "Textures upscaled and switched on (Graphics settings: Upscaled "
+                              "textures). Select Play."
+           : job_subtitles ? "Subtitles made. Edit subtitles corrects the words and who says them."
+           : job_install   ? "Installed. Select Play."
+                           : "Updated. Select Play.",
            kGreen);
     } else {
       para(job_error.empty() ? std::string("Failed.") : job_error, kRed);
@@ -1216,6 +1727,16 @@ void App::Draw(ImFont* font) {
     const int fit = std::max(0, int((bottom - y) / line_h));
     const size_t from = log_tail.size() > size_t(fit) ? log_tail.size() - size_t(fit) : 0;
     for (size_t i = from; i < log_tail.size(); ++i) line(log_tail[i], kDim);
+  } else if (installed && page_ == Page::kSubtitles) {
+    para(subtitle_status.empty() ? std::string("No subtitles made yet.") : "Made: " + subtitle_status + ".",
+         subtitle_status.empty() ? kGold : kWhite);
+    para("Amped 3 has no subtitles of its own: Make subtitles writes them on this PC from your copy "
+         "of the game, listening to its dialogue with offline speech recognition (a 142 MB model, "
+         "downloaded once; it takes a while on the CPU, and can be stopped and run again). Each "
+         "speaker of a scene gets their own colour: white, yellow, pink, green. Edit subtitles "
+         "fixes the words, the times and who says them, with the sound to listen to.",
+         kDim);
+    para("The settings are saved to amped3.toml at once (also in the game: Options > Audio).", kDim);
   } else if (installed && page_ != Page::kHome) {
     para("Saved to amped3.toml in the install folder at once; the game uses them the next "
          "time it starts. The same settings are in the game's own Graphics panel.",

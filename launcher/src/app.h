@@ -25,6 +25,7 @@
 
 #include "platform.h"
 #include "game_settings.h"
+#include "subtitle_editor.h"
 #include "title_logo.h"
 
 struct ImFont;
@@ -50,7 +51,15 @@ class App {
   // The renderer the title animation's texture lives in (null before it is
   // destroyed).
   void SetRenderer(SDL_Renderer* renderer);
+  // The window resized, went full screen, or the renderer reset.
+  void OnWindowChanged();
   void OnAction(Action action);
+  // Testing (AMPED3_LAUNCHER_EDITOR): straight to the subtitle editor.
+  void OpenSubtitleEditor();
+  // Before SDL quits (the editor's sound output).
+  void Shutdown() { editor_.Shutdown(); }
+  // Drawing every frame for a while (the subtitle editor playing its sound).
+  bool Animating() const { return page_ == Page::kSubtitleEditor && editor_.Playing(); }
   void Draw(ImFont* font);  // inside an ImGui frame
   bool QuitRequested() const { return quit_; }
   // The window should stay open (a job is running).
@@ -65,9 +74,12 @@ class App {
     kRowCancel, kRowQuit,
     kRowGraphics, kRowEffects, kRowBack,                                 // settings pages
     kRowLook, kRowUpscaleOnInstall, kRowUpscale,                         // install choices
+    kRowSubtitlesOnInstall, kRowSubtitles,                               // Make subtitles
+    kRowSubtitlesPage, kRowSubtitlesEdit,
+    kRowLauncher,                                                        // a newer launcher
     kRowSetting = 100  // + the setting's index on the page
   };
-  enum class Page { kHome, kDisplay, kEffects };
+  enum class Page { kHome, kDisplay, kEffects, kSubtitles, kSubtitleEditor };
   Page page_ = Page::kHome;
   GameConfig config_;
   const std::vector<GameSetting>& PageSettings() const;
@@ -80,14 +92,24 @@ class App {
   void SaveSettings();
   void StartBranchList();
   void StartCheck();
-  void StartJob(bool install, bool upscale = false);
+  // The launcher itself: a newer one for the chosen branch (main: the
+  // newest release; experimental: its pre-release), downloaded beside this
+  // one, put in its place, and started.
+  void StartLauncherCheck();
+  void StartLauncherDownload();
+  void FinishLauncherUpdate();
+  enum class Tool { kNone, kUpscale, kSubtitles };
+  void StartJob(bool install, Tool tool = Tool::kNone);
   void JobMain(bool install, std::string branch, fs::path iso);
-  void UpscaleMain();  // the texture upscaler on its own (Upscale textures)
+  // One of the install's tools on its own (Upscale textures, Make subtitles).
+  void ToolMain(Tool tool);
   void BrowseDisc();
   void BrowseFolder();
   void MakeShortcut();
   void EnsureIcon();
   std::string VersionText() const;
+  std::string SubtitleStatus() const;  // what's made (the Subtitles page)
+  SubtitleEditor editor_;
 
   std::shared_ptr<Shared> s_;
   SDL_Window* window_ = nullptr;
@@ -107,6 +129,7 @@ class App {
   // and whether to upscale the textures after the build.
   bool original_look_ = false;
   bool upscale_on_install_ = false;
+  bool subtitles_on_install_ = false;  // make subtitles after the build
   std::vector<fs::path> discs_;
   int disc_ = 0;
 };

@@ -26,6 +26,7 @@ struct GameSetting {
 // As in the in-game Graphics panel: its Display tab, and its Effects tab.
 const std::vector<GameSetting>& DisplaySettings();
 const std::vector<GameSetting>& EffectSettings();
+const std::vector<GameSetting>& SubtitleSettings();
 
 class GameConfig {
  public:

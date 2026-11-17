@@ -334,4 +334,28 @@ bool RunGame(const std::filesystem::path& exe, const std::filesystem::path& cwd,
 #endif
 }
 
+bool Relaunch(const std::filesystem::path& exe, std::string* error) {
+#if defined(_WIN32)
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  std::wstring cmd = L"\"" + exe.wstring() + L"\"";
+  const std::wstring dir = exe.parent_path().wstring();
+  if (!CreateProcessW(exe.wstring().c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si,
+                      &pi)) {
+    if (error) *error = "couldn't start the new launcher (error " + std::to_string(GetLastError()) + ")";
+    return false;
+  }
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return true;
+#else
+  const std::string path = exe.string();
+  char* argv[] = {const_cast<char*>(path.c_str()), nullptr};
+  execv(path.c_str(), argv);
+  if (error) *error = "couldn't start the new launcher (" + std::string(std::strerror(errno)) + ")";
+  return false;
+#endif
+}
+
 }  // namespace launcher

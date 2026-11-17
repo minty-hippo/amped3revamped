@@ -74,6 +74,24 @@ const std::vector<GameSetting>& DisplaySettings() {
   return settings;
 }
 
+// The Subtitles page (the subtitles are made on this PC: the page's Make
+// subtitles; none to show until then).
+const std::vector<GameSetting>& SubtitleSettings() {
+  static const std::vector<GameSetting> settings = {
+      {"subtitles", "Subtitles", Kind::kChoice, "1",
+       {{"0", "Off"}, {"1", "Cutscenes and movies"}, {"2", "All speech"}}},
+      {"subtitles_speaker_colors", "Speaker colours", Kind::kToggle, "true"},
+      {"subtitles_speaker_names", "Speaker names", Kind::kToggle, "true"},
+      {"subtitles_size", "Text size", Kind::kSlider, "100", {}, 50, 200, 10, true},
+      {"subtitles_background", "Shading", Kind::kSlider, "60", {}, 0, 100, 10, true},
+      {"subtitles_box", "Shading shape", Kind::kChoice, "0", {{"0", "Each row"}, {"1", "One block"}}},
+      {"subtitles_edge", "Letters", Kind::kChoice, "1", {{"1", "Drop shadow"}, {"2", "Outline"}, {"0", "Plain"}}},
+      {"subtitles_position", "Height", Kind::kSlider, "8", {}, 2, 45, 1, true},
+      {"subtitles_width", "Width", Kind::kSlider, "78", {}, 40, 100, 2, true},
+  };
+  return settings;
+}
+
 const std::vector<GameSetting>& EffectSettings() {
   static const std::vector<GameSetting> settings = {
       {"revamped_graphics", "Revamped Graphics", Kind::kToggle, "true"},
@@ -83,7 +101,23 @@ const std::vector<GameSetting>& EffectSettings() {
        3.0, 0.1, false, true},
       {"native_speed_blur", "Speed blur", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_fog", "Distance fog", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
+      {"native_ambient_occlusion", "Ambient occlusion", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_god_rays", "God rays", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
+      {"native_shadow_resolution", "Shadow resolution", Kind::kChoice, "200",
+       {{"100", "1x (the game's)"}, {"150", "1.5x"}, {"200", "2x"}, {"300", "3x"}, {"400", "4x"}},
+       0, 0, 0, false, true},
+      {"native_shadow_distance", "Shadow distance", Kind::kChoice, "0",
+       {{"0", "The game's (40 m)"}, {"75", "75 m"}, {"100", "100 m"}, {"150", "150 m"},
+        {"200", "200 m"}, {"300", "300 m"}},
+       0, 0, 0, false, true},
+      {"native_shadow_softness", "Shadow softness", Kind::kChoice, "100",
+       {{"0", "Even (the game's)"}, {"50", "Subtle"}, {"100", "Natural"}, {"200", "Soft"}},
+       0, 0, 0, false, true},
+      {"native_world_shadows", "World shadows", Kind::kChoice, "2",
+       {{"0", "Painted (the game's)"}, {"2", "Baked, 2x"}, {"4", "Baked, 4x"}},
+       0, 0, 0, false, true},
+      {"native_world_shadows_saved", "World shadows: saved only", Kind::kToggle, "false", {}, 0, 0,
+       0, false, true},
       {"native_foliage_fade", "Branch fade", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
       {"native_map_clouds", "Trail map clouds", Kind::kToggle, "true", {}, 0, 0, 0, false, true},
   };
