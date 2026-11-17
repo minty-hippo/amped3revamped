@@ -126,6 +126,48 @@ bool BranchHead(const std::string& repo, const std::string& branch, CommitInfo* 
   return true;
 }
 
+// This launcher (CMakeLists.txt: launcher/VERSION, its commit and branch).
+#ifndef AMPED3_LAUNCHER_VERSION
+#define AMPED3_LAUNCHER_VERSION "0"
+#define AMPED3_LAUNCHER_COMMIT ""
+#define AMPED3_LAUNCHER_CHANNEL "dev"
+#endif
+constexpr const char* kLauncherVersion = AMPED3_LAUNCHER_VERSION;
+constexpr const char* kLauncherCommit = AMPED3_LAUNCHER_COMMIT;
+constexpr const char* kLauncherChannel = AMPED3_LAUNCHER_CHANNEL;
+
+// The release's file for this system (.github/workflows/launcher.yml).
+#if defined(_WIN32)
+constexpr const char* kLauncherAsset = "amped3-launcher-windows-x64.exe";
+#elif defined(__aarch64__)
+constexpr const char* kLauncherAsset = "amped3-launcher-linux-arm64";
+#else
+constexpr const char* kLauncherAsset = "amped3-launcher-linux-x86_64";
+#endif
+
+// "0.5.2" < "0.6.0" (numbers, dot by dot).
+bool VersionNewer(const std::string& a, const std::string& b) {
+  auto parts = [](const std::string& v) {
+    std::vector<long> out;
+    std::stringstream ss(v);
+    std::string p;
+    while (std::getline(ss, p, '.')) out.push_back(std::strtol(p.c_str(), nullptr, 10));
+    return out;
+  };
+  std::vector<long> x = parts(a), y = parts(b);
+  const size_t n = std::max(x.size(), y.size());
+  x.resize(n, 0);
+  y.resize(n, 0);
+  return x > y;
+}
+
+std::string LauncherText() {
+  std::string t = std::string("launcher ") + kLauncherVersion;
+  if (std::string(kLauncherChannel) == "experimental") t += " experimental " + Shorten(kLauncherCommit, 7);
+  else if (std::string(kLauncherChannel) == "dev") t += " (built here)";
+  return t;
+}
+
 // Version files: branch=, commit=, date=.
 struct Version {
   std::string branch, commit, date;
@@ -187,6 +229,15 @@ struct App::Shared {
   int behind = -1, ahead = -1;
   std::vector<std::string> commits;
   std::string check_error;
+
+  // A newer launcher: found (its version, where it is), being downloaded,
+  // downloaded (to `launcher_file`), or failed.
+  enum class Launcher { kIdle, kChecking, kCurrent, kAvailable, kDownloading, kReady, kFailed } launcher =
+      Launcher::kIdle;
+  int launcher_gen = 0;
+  std::string launcher_name, launcher_url, launcher_error;
+  uint64_t launcher_size = 0;
+  fs::path launcher_file;
 
   enum class Job { kIdle, kRunning, kDone, kFailed, kCancelled } job = Job::kIdle;
   bool job_install = false;
@@ -276,6 +327,17 @@ App::App() : s_(std::make_shared<Shared>()) {
   }
   discs_ = FindDiscImages();
   StartBranchList();
+  {
+    // What an update of the launcher left: the one it replaced (Windows),
+    // a download that didn't finish.
+    for (const fs::path& self : {ExePath(), InstalledLauncher(install_dir_)}) {
+      std::error_code ec;
+      if (self.empty() || !fs::is_directory(self.parent_path(), ec)) continue;
+      fs::remove(self.parent_path() / (PathText(self.filename()) + ".old"), ec);
+      fs::remove(self.parent_path() / (PathText(self.filename()) + ".download"), ec);
+    }
+  }
+  StartLauncherCheck();
   if (IsInstalled(install_dir_)) {
     // A launcher run from elsewhere (a new download) takes the installed
     // one's place.
@@ -457,6 +519,172 @@ void App::StartCheck() {
     s->commits = commits;
     s->check_error = error;
   }).detach();
+}
+
+// ---- the launcher itself ------------------------------------------------------------
+
+// The launcher file to replace: the install folder's (where this one moved
+// itself, also when Windows still gives the name it started under), else
+// this one.
+static fs::path LauncherFile(const fs::path& install_dir) {
+  std::error_code ec;
+  const fs::path installed = InstalledLauncher(install_dir);
+  if (IsInstalled(install_dir) && fs::exists(installed, ec)) return installed;
+  return ExePath();
+}
+
+void App::StartLauncherCheck() {
+  // (Built here: nothing to compare with, unless testing.)
+  if (std::string(kLauncherChannel) == "dev" && !std::getenv("AMPED3_LAUNCHER_UPDATE_TEST")) return;
+  auto s = s_;
+  const std::string repo = repo_;
+  std::string branch;
+  int gen;
+  {
+    std::lock_guard lock(s->m);
+    if (s->launcher == Shared::Launcher::kDownloading || s->launcher == Shared::Launcher::kReady) return;
+    branch = s->branches[size_t(s->branch)];
+    gen = ++s->launcher_gen;
+    if (s->launcher != Shared::Launcher::kAvailable) s->launcher = Shared::Launcher::kChecking;
+  }
+  std::thread([s, repo, branch, gen] {
+    // The experimental branch: its pre-release (made on every change to the
+    // launcher there); any other: the newest release.
+    const bool exp = branch == "experimental";
+    const bool self_exp = std::string(kLauncherChannel) == "experimental";
+    Json rel;
+    std::string error, name, url;
+    uint64_t size = 0;
+    bool newer = false;
+    const bool ok = GitHub(repo, exp ? "/releases/tags/launcher-experimental" : "/releases/latest", &rel, &error);
+    if (ok) {
+      if (!exp) {
+        std::string v = rel["tag_name"].str();
+        if (v.rfind("launcher-v", 0) == 0) v = v.substr(10);
+        name = "v" + v;
+        newer = !v.empty() && VersionNewer(v, kLauncherVersion);
+      } else {
+        const std::string commit = rel["target_commitish"].str();
+        name = "experimental " + Shorten(commit, 7);
+        if (commit.empty() || commit == kLauncherCommit) {
+          newer = false;
+        } else if (std::string(kLauncherCommit).empty()) {
+          newer = true;
+        } else {
+          // Newer than this one: commits since it (an experimental launcher
+          // never goes back to an older one).
+          Json c;
+          std::string e2;
+          if (GitHub(repo, std::string("/compare/") + kLauncherCommit + "..." + commit, &c, &e2)) {
+            const int ahead = int(c["ahead_by"].num()), behind = int(c["behind_by"].num());
+            newer = ahead > 0 && (behind == 0 || !self_exp);
+          } else {
+            newer = !self_exp;
+          }
+        }
+      }
+      for (const Json& a : rel["assets"].items()) {
+        if (a["name"].str() == kLauncherAsset) {
+          url = a["browser_download_url"].str();
+          size = uint64_t(a["size"].num());
+        }
+      }
+      if (url.empty()) newer = false;
+    }
+    std::lock_guard lock(s->m);
+    if (gen != s->launcher_gen) return;
+    // (Not reachable: quietly nothing, as if current.)
+    s->launcher = newer ? Shared::Launcher::kAvailable : Shared::Launcher::kCurrent;
+    s->launcher_name = name;
+    s->launcher_url = url;
+    s->launcher_size = size;
+    s->launcher_error.clear();
+  }).detach();
+}
+
+void App::StartLauncherDownload() {
+  auto s = s_;
+  std::string url;
+  uint64_t size;
+  {
+    std::lock_guard lock(s->m);
+    if (s->launcher != Shared::Launcher::kAvailable && s->launcher != Shared::Launcher::kFailed) return;
+    if (s->launcher_url.empty()) return;
+    s->launcher = Shared::Launcher::kDownloading;
+    url = s->launcher_url;
+    size = s->launcher_size;
+  }
+  const fs::path self = LauncherFile(install_dir_);
+  std::thread([s, url, size, self] {
+    // Beside the one it replaces (the same drive: put in place with a rename).
+    const fs::path dest = self.parent_path() / (PathText(self.filename()) + ".download");
+    std::error_code ec;
+    fs::remove(dest, ec);
+    std::string out, err;
+    const int code = RunCapture({kCurl, "-fsSL", "--max-time", "900", "-H", "User-Agent: amped3-revamped-launcher",
+                                 "-o", PathText(dest), url},
+                                &out, &err);
+    std::string error;
+    const uint64_t got = fs::exists(dest, ec) ? uint64_t(fs::file_size(dest, ec)) : 0;
+    if (code != 0) {
+      error = code < 0 ? err : "download failed (" + FirstLine(out) + ")";
+    } else if (got < (1u << 20) || (size && got != size)) {
+      error = "the download came out wrong (" + std::to_string(got) + " bytes)";
+    }
+#if !defined(_WIN32)
+    if (error.empty()) {
+      fs::permissions(dest, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                                fs::perms::others_read | fs::perms::others_exec,
+                      ec);
+    }
+#endif
+    if (!error.empty()) fs::remove(dest, ec);
+    std::lock_guard lock(s->m);
+    s->launcher = error.empty() ? Shared::Launcher::kReady : Shared::Launcher::kFailed;
+    s->launcher_error = error;
+    s->launcher_file = dest;
+  }).detach();
+}
+
+// The downloaded launcher in this one's place, then started (this one quits).
+void App::FinishLauncherUpdate() {
+  fs::path file;
+  {
+    std::lock_guard lock(s_->m);
+    file = s_->launcher_file;
+    s_->launcher = Shared::Launcher::kFailed;  // (unless it goes)
+    s_->launcher_error = "couldn't put it in place";
+  }
+  const fs::path self = LauncherFile(install_dir_);
+  std::error_code ec;
+  std::string error;
+#if defined(_WIN32)
+  // A running program can be renamed (not replaced): this one aside as .old
+  // (removed when the new one starts).
+  const fs::path old = self.parent_path() / (PathText(self.filename()) + ".old");
+  fs::remove(old, ec);
+  ec.clear();
+  fs::rename(self, old, ec);
+  if (!ec) {
+    fs::rename(file, self, ec);
+    if (ec) {
+      std::error_code back;
+      fs::rename(old, self, back);
+    }
+  }
+#else
+  fs::rename(file, self, ec);  // (the running file stays open as it was)
+#endif
+  if (ec) error = "couldn't replace " + PathText(self) + " (" + ec.message() + ")";
+  if (error.empty()) {
+    SaveSettings();
+    if (Relaunch(self, &error)) {
+      quit_ = true;  // (Windows: the new one is running)
+      return;
+    }
+  }
+  std::lock_guard lock(s_->m);
+  s_->launcher_error = error;
 }
 
 // Downloads the branch into the sources folder (or updates a git checkout),
@@ -685,7 +913,7 @@ void App::ToolMain(Tool tool) {
 #endif
   if (!fs::exists(script, ec)) {
     return finish(Shared::Job::kFailed, std::string(what) + " isn't in this install's sources (" +
-                                            PathText(source) + "): Update first.");
+                                            PathText(source) + "): Update first (or choose a branch that has it).");
   }
   std::string error;
   const int code = RunProcess(argv, src, [&](const std::string& line) {
@@ -817,12 +1045,17 @@ void App::BrowseFolder() {
 std::vector<App::Row> App::Rows() const {
   std::lock_guard lock(s_->m);
   if (s_->job == Shared::Job::kRunning) return {kRowCancel};
+  // A newer launcher: offered first (after Play).
+  const bool launcher = s_->launcher == Shared::Launcher::kAvailable ||
+                        s_->launcher == Shared::Launcher::kDownloading ||
+                        s_->launcher == Shared::Launcher::kReady || s_->launcher == Shared::Launcher::kFailed;
   if (!IsInstalled(install_dir_)) {
-    if (!kCanUpscale) {
-      return {kRowDisc, kRowBranch, kRowFolder, kRowLook, kRowSubtitlesOnInstall, kRowInstall, kRowQuit};
-    }
-    return {kRowDisc,    kRowBranch, kRowFolder, kRowLook, kRowUpscaleOnInstall, kRowSubtitlesOnInstall,
-            kRowInstall, kRowQuit};
+    std::vector<Row> rows;
+    if (launcher) rows.push_back(kRowLauncher);
+    for (Row r : {kRowDisc, kRowBranch, kRowFolder, kRowLook}) rows.push_back(r);
+    if (kCanUpscale) rows.push_back(kRowUpscaleOnInstall);
+    for (Row r : {kRowSubtitlesOnInstall, kRowInstall, kRowQuit}) rows.push_back(r);
+    return rows;
   }
   if (page_ == Page::kSubtitleEditor) return {};
   if (page_ != Page::kHome) {
@@ -836,7 +1069,9 @@ std::vector<App::Row> App::Rows() const {
     rows.push_back(kRowBack);
     return rows;
   }
-  std::vector<Row> rows = {kRowPlay, kRowGraphics};
+  std::vector<Row> rows = {kRowPlay};
+  if (launcher) rows.push_back(kRowLauncher);
+  rows.push_back(kRowGraphics);
   if (kCanUpscale) rows.push_back(kRowUpscale);
   rows.push_back(kRowSubtitlesPage);
   for (Row r : {kRowBranch, kRowUpdate, kRowCheck, kRowDirect, kRowShortcut, kRowQuit}) rows.push_back(r);
@@ -890,7 +1125,7 @@ void App::Change(Row row, int step) {
     }
     SaveSettings();
     confirm_until_ = 0;
-    if (IsInstalled(install_dir_)) check_at_ = ImGui::GetTime() + 0.6;
+    check_at_ = ImGui::GetTime() + 0.6;  // (and the launcher for it)
   } else if (row == kRowDisc && !discs_.empty()) {
     disc_ = (disc_ + step + int(discs_.size())) % int(discs_.size());
   } else if (row == kRowDirect || row == kRowLook || row == kRowUpscaleOnInstall ||
@@ -938,6 +1173,10 @@ void App::Activate(Row row) {
       break;
     case kRowCheck:
       StartCheck();
+      StartLauncherCheck();
+      break;
+    case kRowLauncher:
+      StartLauncherDownload();
       break;
     case kRowDirect:
       direct_start_ = !direct_start_;
@@ -1101,7 +1340,26 @@ void App::Draw(ImFont* font) {
   }
   if (check_at_ > 0 && ImGui::GetTime() >= check_at_) {
     check_at_ = 0;
-    StartCheck();
+    if (IsInstalled(install_dir_)) StartCheck();
+    StartLauncherCheck();
+  }
+  // A new launcher downloaded: in this one's place, and started.
+  {
+    bool ready;
+    {
+      std::lock_guard lock(s_->m);
+      ready = s_->launcher == Shared::Launcher::kReady && s_->job != Shared::Job::kRunning;
+    }
+    if (ready) FinishLauncherUpdate();
+    // Testing (AMPED3_LAUNCHER_UPDATE_TEST=go): updates as soon as it can.
+    if (const char* t = std::getenv("AMPED3_LAUNCHER_UPDATE_TEST"); t && std::string(t) == "go") {
+      bool available;
+      {
+        std::lock_guard lock(s_->m);
+        available = s_->launcher == Shared::Launcher::kAvailable;
+      }
+      if (available) StartLauncherDownload();
+    }
   }
 
   // A copy of the shared state for drawing.
@@ -1114,8 +1372,13 @@ void App::Draw(ImFont* font) {
   bool job_install, job_upscale, job_subtitles;
   std::chrono::steady_clock::duration elapsed{};
   float job_progress = -1.0f;
+  Shared::Launcher launcher;
+  std::string launcher_name, launcher_error;
   {
     std::lock_guard lock(s_->m);
+    launcher = s_->launcher;
+    launcher_name = s_->launcher_name;
+    launcher_error = s_->launcher_error;
     branch = s_->branches[size_t(s_->branch)];
     step = s_->step;
     job = s_->job;
@@ -1185,7 +1448,7 @@ void App::Draw(ImFont* font) {
       : page_ == Page::kDisplay   ? "Graphics settings: display"
       : page_ == Page::kEffects   ? "Graphics settings: effects"
       : page_ == Page::kSubtitles ? "Subtitles"
-                                  : "Installed version  " + VersionText();
+                                  : "Installed version  " + VersionText() + "     (" + LauncherText() + ")";
   dl->AddText(font, small_px, ImVec2(x0, y), kDim, sub.c_str());
   y += small_px * 2.0f;
 
@@ -1293,6 +1556,22 @@ void App::Draw(ImFont* font) {
         break;
       case kRowQuit:
         t.label = "Quit";
+        break;
+      case kRowLauncher:
+        t.label = "Update the launcher";
+        if (launcher == Shared::Launcher::kDownloading) {
+          t.value = "downloading " + launcher_name + "...";
+          t.color = kDim;
+        } else if (launcher == Shared::Launcher::kReady) {
+          t.value = "starting it...";
+          t.color = kDim;
+        } else if (launcher == Shared::Launcher::kFailed) {
+          t.value = launcher_error + ": select to try again";
+          t.color = kRed;
+        } else {
+          t.value = launcher_name + " is out: select to update";
+          t.color = kGold;
+        }
         break;
       case kRowGraphics:
         t.label = "Graphics settings";

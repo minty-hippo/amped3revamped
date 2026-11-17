@@ -216,7 +216,16 @@ Armada).
   Xbox 360 dashboard logo, taken at install from your `default.xex` by
   `amped3-icon` (`tools/xex-icon`) into `amped3-icon.ico` / `amped3-icon.png`
   in the install folder; nothing of the game ships with the project.
-- The installed version (branch, commit and date) is under the title.
+- The installed version (branch, commit and date) is under the title, with
+  the launcher's own version.
+- **Update the launcher:** shown when a newer launcher is out for the chosen
+  branch: on main, a newer release (a higher `launcher/VERSION`); on
+  experimental, a newer `launcher-experimental` pre-release (an experimental
+  launcher never goes back to an older one). The launcher looks when it starts,
+  when the branch changes and on **Check for updates**. Selecting it downloads
+  the file for your system next to the launcher, puts it in place of the old one
+  and starts it. On Windows the old one is renamed `.old` first and removed on
+  the next start. A launcher you built yourself doesn't update itself.
 
 It works with a controller (d-pad or stick, A), the keyboard (arrows, Enter)
 and the mouse, and opens full screen in Steam's Game Mode. Its settings are in

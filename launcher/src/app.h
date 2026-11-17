@@ -76,6 +76,7 @@ class App {
     kRowLook, kRowUpscaleOnInstall, kRowUpscale,                         // install choices
     kRowSubtitlesOnInstall, kRowSubtitles,                               // Make subtitles
     kRowSubtitlesPage, kRowSubtitlesEdit,
+    kRowLauncher,                                                        // a newer launcher
     kRowSetting = 100  // + the setting's index on the page
   };
   enum class Page { kHome, kDisplay, kEffects, kSubtitles, kSubtitleEditor };
@@ -91,6 +92,12 @@ class App {
   void SaveSettings();
   void StartBranchList();
   void StartCheck();
+  // The launcher itself: a newer one for the chosen branch (main: the
+  // newest release; experimental: its pre-release), downloaded beside this
+  // one, put in its place, and started.
+  void StartLauncherCheck();
+  void StartLauncherDownload();
+  void FinishLauncherUpdate();
   enum class Tool { kNone, kUpscale, kSubtitles };
   void StartJob(bool install, Tool tool = Tool::kNone);
   void JobMain(bool install, std::string branch, fs::path iso);

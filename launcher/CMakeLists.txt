@@ -82,6 +82,31 @@ target_include_directories(amped3-launcher PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb)
 target_link_libraries(amped3-launcher PRIVATE SDL3::SDL3-static)
 
+# What this launcher is, for updating itself: launcher/VERSION, the commit
+# and the branch it was built from (GitHub Actions: GITHUB_SHA /
+# GITHUB_REF_NAME; elsewhere git's, and the channel "dev", which doesn't
+# update itself).
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/VERSION launcher_version)
+string(STRIP "${launcher_version}" launcher_version)
+set(launcher_commit "$ENV{GITHUB_SHA}")
+set(launcher_channel "$ENV{GITHUB_REF_NAME}")
+if(launcher_commit STREQUAL "")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE launcher_commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+endif()
+if(NOT launcher_channel STREQUAL "main" AND NOT launcher_channel STREQUAL "experimental")
+    set(launcher_channel "dev")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION)
+target_compile_definitions(amped3-launcher PRIVATE
+    AMPED3_LAUNCHER_VERSION="${launcher_version}"
+    AMPED3_LAUNCHER_COMMIT="${launcher_commit}"
+    AMPED3_LAUNCHER_CHANNEL="${launcher_channel}")
+
 if(MSVC)
     target_compile_options(amped3-launcher PRIVATE /utf-8)
 elseif(UNIX AND NOT APPLE)
