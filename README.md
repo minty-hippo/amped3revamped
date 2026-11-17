@@ -843,6 +843,23 @@ done, Ctrl+Enter isn't needed: a line is one line in game), and a clip's
 first line too long for the list scrolls by while it's picked or under the
 mouse.
 
+**Organising the clips.** Clips corrected by hand have a gold bar down their
+left edge and a **CORRECTED** tag; an orange dot means a clip was changed and
+not saved yet. The count of corrected clips sits above the list. **+ Group** makes
+a group (type its name; double-click a group to rename it). Drag a clip onto a
+group to put it in that group, or onto another clip to put it just before or
+after that one (a gold line shows where it will go). Drag a group to move it
+among the others. Right-click a group to rename, move up or down, add a group
+below, or delete it (its clips aren't deleted; they go back to **Not in a
+group**). Right-click a clip to put it in a group, move it, or take it out of
+its group. Alt+Up / Alt+Down move the selected clip within its group. Click a
+group to open or close it. Each group shows how many clips it has and how many
+are corrected. Groups are only for the editor: they're kept in
+`subtitles\groups.txt`, by sound name, and the game and the subtitle maker
+ignore them. Clips in no group are listed last, in the file's order. The
+search and the kind filter still apply, and groups with no matching clips are
+hidden.
+
 | Subtitle editor | |
 |---|---|
 | Scrub (heard as you drag) | Click or drag on the timeline; Left / Right step 0.1 s (Shift: 1 s) |

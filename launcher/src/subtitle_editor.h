@@ -176,6 +176,27 @@ class SubtitleEditor {
   float speed_ = 1.0f;           // playing speed
   bool loop_ = false;            // the picked line over and over
   std::vector<int> visible_;     // the clips listed, in order (PageUp / PageDown)
+
+  // The list's groups (the player's own: labelled, in their order, their
+  // clips in order), kept in subtitles/groups.txt by source. Clips in no
+  // group are listed after them, as the file has them.
+  struct Group {
+    std::string label;
+    std::vector<std::string> sources;
+    bool open = true;
+  };
+  std::vector<Group> groups_;
+  bool ungrouped_open_ = true;
+  int renaming_group_ = -1;  // its label being typed
+  bool rename_focus_ = false;
+  char rename_buf_[128] = {};
+  std::vector<bool> unsaved_;  // per clip: changed since the last save
+  void LoadGroups();
+  void SaveGroups();
+  int GroupOf(const std::string& source, int* pos = nullptr) const;
+  void MoveClip(const std::string& source, int group, int pos);  // group -1: out of them all
+  void NewGroup(const std::string& first_source);
+  void DrawClipList(float px, float unit);
   bool scroll_to_selected_ = false;
 
   struct Step {

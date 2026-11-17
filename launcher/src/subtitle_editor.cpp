@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -483,6 +484,495 @@ void SubtitleEditor::SetZoom(float z) {
   SaveLayout();
 }
 
+// ---- the list's groups (kept in subtitles/groups.txt) ------------------------------
+//
+//   amped3-subtitle-groups 1
+//   group <open 0/1> <label>
+//   <source>           (its clips, in order)
+//   ...
+//   ungrouped <open 0/1>
+
+void SubtitleEditor::LoadGroups() {
+  groups_.clear();
+  ungrouped_open_ = true;
+  std::ifstream in(install_dir_ / "subtitles" / "groups.txt", std::ios::binary);
+  std::string line;
+  if (!std::getline(in, line) || line.rfind("amped3-subtitle-groups", 0) != 0) return;
+  std::vector<bool> taken(clips_.size(), false);
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+    if (line.rfind("group ", 0) == 0) {
+      Group g;
+      g.open = line.size() < 7 || line[6] != '0';
+      g.label = line.size() > 8 ? line.substr(8) : std::string();
+      groups_.push_back(std::move(g));
+    } else if (line.rfind("ungrouped ", 0) == 0) {
+      ungrouped_open_ = line.size() < 11 || line[10] != '0';
+    } else if (!groups_.empty()) {
+      // A clip (once, and only one the subtitles have).
+      for (size_t i = 0; i < clips_.size(); ++i) {
+        if (!taken[i] && clips_[i].source == line) {
+          taken[i] = true;
+          groups_.back().sources.push_back(line);
+          break;
+        }
+      }
+    }
+  }
+}
+
+void SubtitleEditor::SaveGroups() {
+  std::error_code ec;
+  const fs::path path = install_dir_ / "subtitles" / "groups.txt";
+  fs::create_directories(path.parent_path(), ec);
+  std::ofstream out(path, std::ios::binary);
+  out << "amped3-subtitle-groups 1\n";
+  for (const Group& g : groups_) {
+    out << "group " << (g.open ? 1 : 0) << " " << g.label << "\n";
+    for (const std::string& src : g.sources) out << src << "\n";
+  }
+  out << "ungrouped " << (ungrouped_open_ ? 1 : 0) << "\n";
+  if (!out) status_ = "Couldn't save the groups (" + PathText(path) + ").";
+}
+
+int SubtitleEditor::GroupOf(const std::string& source, int* pos) const {
+  for (int g = 0; g < int(groups_.size()); ++g) {
+    const auto& v = groups_[size_t(g)].sources;
+    auto it = std::find(v.begin(), v.end(), source);
+    if (it != v.end()) {
+      if (pos) *pos = int(it - v.begin());
+      return g;
+    }
+  }
+  if (pos) *pos = -1;
+  return -1;
+}
+
+void SubtitleEditor::MoveClip(const std::string& source, int group, int pos) {
+  int old_pos = -1;
+  const int old_group = GroupOf(source, &old_pos);
+  if (old_group >= 0) {
+    auto& v = groups_[size_t(old_group)].sources;
+    v.erase(v.begin() + old_pos);
+    if (old_group == group && pos > old_pos) --pos;
+  }
+  if (group >= 0 && group < int(groups_.size())) {
+    auto& v = groups_[size_t(group)].sources;
+    pos = (pos < 0 || pos > int(v.size())) ? int(v.size()) : pos;
+    v.insert(v.begin() + pos, source);
+  }
+  SaveGroups();
+}
+
+void SubtitleEditor::NewGroup(const std::string& first_source) {
+  Group g;
+  g.label = "Group " + std::to_string(groups_.size() + 1);
+  groups_.push_back(g);
+  if (!first_source.empty()) MoveClip(first_source, int(groups_.size()) - 1, -1);
+  renaming_group_ = int(groups_.size()) - 1;
+  rename_focus_ = true;
+  std::snprintf(rename_buf_, sizeof(rename_buf_), "%s", groups_.back().label.c_str());
+  SaveGroups();
+}
+
+// The list on the left: the groups (each a header, its clips under it), then
+// the clips in none. Drag a clip onto a header to put it in that group, onto
+// another clip to put it before or after that one; drag a header to reorder
+// the groups. Right-click either for the rest.
+void SubtitleEditor::DrawClipList(float px, float unit) {
+  if (unsaved_.size() != clips_.size()) unsaved_.assign(clips_.size(), false);
+  const std::string needle = Lower(search_);
+  const bool narrowed = filter_ != 0 || !needle.empty();
+  auto shown = [&](int i) {
+    const sf::Clip& c = clips_[size_t(i)];
+    if (filter_ == 1 && c.kind != sf::Kind::kStory) return false;
+    if (filter_ == 2 && c.kind != sf::Kind::kVideo) return false;
+    if (filter_ == 3 && c.kind != sf::Kind::kSpeech) return false;
+    if (filter_ == 4 && !c.edited) return false;
+    if (!needle.empty()) {
+      bool hit = Lower(c.source).find(needle) != std::string::npos;
+      for (const auto& l : c.lines) hit = hit || Lower(l.text).find(needle) != std::string::npos;
+      if (!hit) return false;
+    }
+    return true;
+  };
+  std::unordered_map<std::string, int> index;  // source -> clip
+  index.reserve(clips_.size());
+  for (int i = 0; i < int(clips_.size()); ++i) index.emplace(clips_[size_t(i)].source, i);
+  std::vector<bool> grouped(clips_.size(), false);
+  for (const Group& g : groups_) {
+    for (const std::string& src : g.sources) {
+      auto it = index.find(src);
+      if (it != index.end()) grouped[size_t(it->second)] = true;
+    }
+  }
+
+  // What the mouse let go of this frame (acted on after the list is drawn).
+  int drop_clip = -1, drop_group_to = -2, drop_pos = -1;  // a clip: into group (-1 none), at pos
+  int drag_group = -1, drop_group_at = -1;                // a group: to before that one
+  int menu_action = 0, menu_group = -1, menu_clip = -1;
+
+  ImDrawList* ldl = ImGui::GetWindowDrawList();
+  // Where a drop would land: a gold line across.
+  auto drop_line = [&](float y) {
+    const ImVec2 w0 = ImGui::GetWindowPos();
+    ldl->AddLine(ImVec2(w0.x + px * 0.2f, y), ImVec2(w0.x + ImGui::GetWindowWidth() - px * 0.2f, y), kGold,
+                 3.0f * unit);
+  };
+
+  // The top: a new group, all open / closed.
+  if (ImGui::SmallButton("+ Group")) NewGroup("");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("A new group, to put clips in (drag them onto it).\nDrag groups to put them in order.");
+  }
+  if (!groups_.empty()) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open all")) {
+      for (Group& g : groups_) g.open = true;
+      ungrouped_open_ = true;
+      SaveGroups();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Close all")) {
+      for (Group& g : groups_) g.open = false;
+      ungrouped_open_ = false;
+      SaveGroups();
+    }
+  }
+  {
+    int edited = 0;
+    for (const auto& c : clips_) edited += c.edited ? 1 : 0;
+    char done[64];
+    std::snprintf(done, sizeof(done), "%d/%d corrected", edited, int(clips_.size()));
+    ImGui::SameLine();
+    if (ImGui::CalcTextSize(done).x > ImGui::GetContentRegionAvail().x) ImGui::NewLine();
+    ImGui::TextColored(ImColor(kDim), "%s", done);
+  }
+  ImGui::Separator();
+
+  ImGui::BeginChild("##clip-rows", ImVec2(0, 0), ImGuiChildFlags_None);
+  ldl = ImGui::GetWindowDrawList();
+  visible_.clear();
+
+  // A group's header (g -1: the clips in none).
+  auto header = [&](int g, int count, int edited_count) {
+    const bool none = g < 0;
+    bool& open = none ? ungrouped_open_ : groups_[size_t(g)].open;
+    ImGui::PushID(none ? -1000 : -1 - g);
+    const float h = px * 1.6f;
+    if (!none && renaming_group_ == g) {
+      // Typing its label.
+      ImGui::SetNextItemWidth(-FLT_MIN);
+      if (rename_focus_) {
+        ImGui::SetKeyboardFocusHere();
+        rename_focus_ = false;
+      }
+      const bool enter = ImGui::InputText("##label", rename_buf_, sizeof(rename_buf_),
+                                          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+      if (enter || ImGui::IsItemDeactivated()) {
+        if (!ImGui::IsKeyPressed(ImGuiKey_Escape) && rename_buf_[0]) groups_[size_t(g)].label = rename_buf_;
+        renaming_group_ = -1;
+        SaveGroups();
+      }
+      ImGui::PopID();
+      return;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(255, 204, 0, 40));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(255, 204, 0, 70));
+    if (ImGui::Selectable("##group", true, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, h))) {
+      open = !open;
+      if (!none && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        // (Its clicks opened and closed it: as it was.)
+        renaming_group_ = g;
+        rename_focus_ = true;
+        std::snprintf(rename_buf_, sizeof(rename_buf_), "%s", groups_[size_t(g)].label.c_str());
+      }
+      SaveGroups();
+    }
+    ImGui::PopStyleColor(2);
+    const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
+    // Dragged (to reorder), dropped on.
+    if (!none && ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload("A3GROUP", &g, sizeof(g));
+      ImGui::Text("%s", groups_[size_t(g)].label.c_str());
+      ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget()) {
+      const ImGuiDragDropFlags peek = ImGuiDragDropFlags_AcceptBeforeDelivery | ImGuiDragDropFlags_AcceptNoDrawDefaultRect;
+      if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("A3CLIP", peek)) {
+        ldl->AddRect(r0, r1, kGold, 3.0f * unit, 0, 2.0f * unit);
+        if (p->IsDelivery()) {
+          drop_clip = *static_cast<const int*>(p->Data);
+          drop_group_to = g;
+          drop_pos = -1;
+        }
+      }
+      if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("A3GROUP", peek)) {
+        const int from = *static_cast<const int*>(p->Data);
+        const bool below = none || ImGui::GetMousePos().y > (r0.y + r1.y) * 0.5f;
+        const int at = none ? int(groups_.size()) : g + (below ? 1 : 0);
+        if (from != g) drop_line(below ? r1.y + 1 : r0.y - 1);
+        if (p->IsDelivery()) {
+          drag_group = from;
+          drop_group_at = at;
+        }
+      }
+      ImGui::EndDragDropTarget();
+    }
+    if (!none && ImGui::BeginPopupContextItem("##group-menu")) {
+      if (ImGui::MenuItem("Rename")) menu_action = 1, menu_group = g;
+      if (ImGui::MenuItem("Move up", nullptr, false, g > 0)) menu_action = 2, menu_group = g;
+      if (ImGui::MenuItem("Move down", nullptr, false, g + 1 < int(groups_.size()))) menu_action = 3, menu_group = g;
+      if (ImGui::MenuItem("New group below")) menu_action = 4, menu_group = g;
+      ImGui::Separator();
+      if (ImGui::MenuItem("Delete group (its clips stay, ungrouped)")) menu_action = 5, menu_group = g;
+      ImGui::EndPopup();
+    }
+    // An arrow, the label, how many.
+    const float a = px * 0.32f, cx = r0.x + px * 0.55f, cy = (r0.y + r1.y) * 0.5f;
+    if (open) {
+      ldl->AddTriangleFilled(ImVec2(cx - a, cy - a * 0.6f), ImVec2(cx + a, cy - a * 0.6f), ImVec2(cx, cy + a * 0.7f), kGold);
+    } else {
+      ldl->AddTriangleFilled(ImVec2(cx - a * 0.6f, cy - a), ImVec2(cx - a * 0.6f, cy + a), ImVec2(cx + a * 0.7f, cy), kGold);
+    }
+    char tail[64];
+    std::snprintf(tail, sizeof(tail), "%d clip%s, %d corrected", count, count == 1 ? "" : "s", edited_count);
+    const char* label = none ? "Not in a group" : groups_[size_t(g)].label.c_str();
+    const float x0 = r0.x + px * 1.3f;
+    if (ImGui::IsItemHovered() && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+      ImGui::SetTooltip(none ? "%s: %s\nDrag a clip here to take it out of its group."
+                             : "%s: %s\nClick: open or close. Double-click: rename.\n"
+                               "Drag it to reorder the groups; drag clips onto it to add them.\nRight-click: more.",
+                        label, tail);
+    }
+    // (Narrow: just corrected / clips.)
+    if (ImGui::CalcTextSize(label).x + ImGui::CalcTextSize(tail).x + px > r1.x - x0) {
+      std::snprintf(tail, sizeof(tail), "%d/%d", edited_count, count);
+    }
+    const float tw = ImGui::CalcTextSize(tail).x;
+    const float x_tail = r1.x - tw - px * 0.4f;
+    ldl->PushClipRect(ImVec2(x0, r0.y), ImVec2(std::max(x0, x_tail - px * 0.5f), r1.y), true);
+    ldl->AddText(ImVec2(x0, cy - px * 0.5f), none ? kDim : ImGui::GetColorU32(ImGuiCol_Text), label);
+    ldl->PopClipRect();
+    ldl->AddText(ImVec2(x_tail, cy - px * 0.5f), kDim, tail);
+    ImGui::PopID();
+  };
+
+  // A clip's row (g: its group, -1 none; pos: where in it).
+  auto row = [&](int i, int g, int pos) {
+    const sf::Clip& c = clips_[size_t(i)];
+    const std::string label =
+        "[" + std::string(KindLabel(c.kind)) + "] " + (c.lines.empty() ? std::string("(no lines)") : Named(c, c.lines[0]));
+    std::string src = c.source;
+    if (src.size() > 60) src = "..." + src.substr(src.size() - 57);
+    ImGui::PushID(i);
+    visible_.push_back(i);
+    if (ImGui::Selectable("##clip", selected_ == i, 0, ImVec2(0, px * 2.3f))) Select(i);
+    const bool row_hot = ImGui::IsItemHovered() || selected_ == i;
+    const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
+    if (selected_ == i && scroll_to_selected_) {
+      ImGui::SetScrollHereY(0.4f);
+      scroll_to_selected_ = false;
+    }
+    if (ImGui::IsItemHovered() && (c.edited || unsaved_[size_t(i)])) {
+      ImGui::SetTooltip("%s%s", c.edited ? "Corrected by hand (kept when subtitles are made again)" : "",
+                        unsaved_[size_t(i)] ? (c.edited ? "\nChanged: not saved yet" : "Changed: not saved yet") : "");
+    }
+    if (ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload("A3CLIP", &i, sizeof(i));
+      ImGui::Text("%s", label.c_str());
+      ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget()) {
+      const ImGuiDragDropFlags peek = ImGuiDragDropFlags_AcceptBeforeDelivery | ImGuiDragDropFlags_AcceptNoDrawDefaultRect;
+      if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("A3CLIP", peek)) {
+        const int from = *static_cast<const int*>(p->Data);
+        const bool below = ImGui::GetMousePos().y > (r0.y + r1.y) * 0.5f;
+        if (g < 0) {
+          ldl->AddRect(r0, r1, kGold, 3.0f * unit, 0, 2.0f * unit);  // (out of its group)
+        } else if (from != i) {
+          drop_line(below ? r1.y + 1 : r0.y - 1);
+        }
+        if (p->IsDelivery() && from != i) {
+          drop_clip = from;
+          drop_group_to = g;
+          drop_pos = g < 0 ? -1 : pos + (below ? 1 : 0);
+        }
+      }
+      ImGui::EndDragDropTarget();
+    }
+    if (ImGui::BeginPopupContextItem("##clip-menu")) {
+      if (ImGui::BeginMenu("Put in group", true)) {
+        for (int k = 0; k < int(groups_.size()); ++k) {
+          ImGui::PushID(k);
+          if (ImGui::MenuItem(groups_[size_t(k)].label.c_str(), nullptr, k == g, k != g)) {
+            menu_action = 10, menu_clip = i, menu_group = k;
+          }
+          ImGui::PopID();
+        }
+        if (!groups_.empty()) ImGui::Separator();
+        if (ImGui::MenuItem("New group...")) menu_action = 11, menu_clip = i;
+        ImGui::EndMenu();
+      }
+      const int n = g < 0 ? 0 : int(groups_[size_t(g)].sources.size());
+      if (ImGui::MenuItem("Move up", "Alt+Up", false, g >= 0 && pos > 0)) menu_action = 12, menu_clip = i;
+      if (ImGui::MenuItem("Move down", "Alt+Down", false, g >= 0 && pos + 1 < n)) menu_action = 13, menu_clip = i;
+      if (ImGui::MenuItem("Take out of the group", nullptr, false, g >= 0)) menu_action = 14, menu_clip = i;
+      ImGui::EndPopup();
+    }
+    // Corrected by hand: a gold bar down its left and a tag; changed and
+    // not saved: an orange dot.
+    float x0 = r0.x + px * 0.4f;
+    if (c.edited) {
+      ldl->AddRectFilled(ImVec2(r0.x, r0.y + 1), ImVec2(r0.x + 4.0f * unit, r1.y - 1), kGold);
+      x0 += 3.0f * unit;
+    }
+    float x1 = r1.x - px * 0.3f;
+    // Its first line: too long for the list, it scrolls by while picked or
+    // under the mouse (to and fro).
+    {
+      const float tw = ImGui::CalcTextSize(label.c_str()).x;
+      float shift = 0;
+      if (tw > x1 - x0 && row_hot) {
+        const float over = tw - (x1 - x0), speed = 45.0f * unit;
+        const double period = 2.0 * (over / speed + 1.2);
+        const double t = std::fmod(ImGui::GetTime(), period);
+        const double half = period * 0.5;
+        const double u = t < half ? t : period - t;  // there and back, a pause at each end
+        shift = float(std::clamp((u - 0.6) * speed, 0.0, double(over)));
+      }
+      ldl->PushClipRect(ImVec2(x0, r0.y), ImVec2(x1, r1.y), true);
+      ldl->AddText(ImVec2(x0 - shift, r0.y + px * 0.1f), ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
+      ldl->PopClipRect();
+    }
+    // The second: the tags (right), the sound's name and length.
+    const float ty = r0.y + px * 1.2f, small = px * 0.78f;
+    if (c.edited) {
+      const char* tag = "CORRECTED";
+      const ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(small, FLT_MAX, 0, tag);
+      const float bx1 = x1, bx0 = bx1 - ts.x - px * 0.5f;
+      ldl->AddRectFilled(ImVec2(bx0, ty), ImVec2(bx1, ty + px * 0.95f), kGold, px * 0.2f);
+      ldl->AddText(ImGui::GetFont(), small, ImVec2(bx0 + px * 0.25f, ty + (px * 0.95f - ts.y) * 0.5f),
+                   IM_COL32(20, 20, 20, 255), tag);
+      x1 = bx0 - px * 0.3f;
+    }
+    if (unsaved_[size_t(i)]) {
+      const float r = px * 0.22f;
+      ldl->AddCircleFilled(ImVec2(x1 - r, ty + px * 0.5f), r, IM_COL32(255, 140, 40, 255), 16);
+      x1 -= r * 2 + px * 0.3f;
+    }
+    char sub[160];
+    std::snprintf(sub, sizeof(sub), "%s   %s", src.c_str(), Clock(c.duration_ms, false).c_str());
+    ldl->PushClipRect(ImVec2(x0, r0.y), ImVec2(std::max(x0, x1), r1.y), true);
+    ldl->AddText(ImVec2(x0, ty), kDim, sub);
+    ldl->PopClipRect();
+    ImGui::PopID();
+  };
+
+  // The groups, then the clips in none.
+  for (int g = 0; g < int(groups_.size()); ++g) {
+    std::vector<std::pair<int, int>> rows;  // clip, pos
+    int edited = 0, count = 0;
+    const auto& v = groups_[size_t(g)].sources;
+    for (int k = 0; k < int(v.size()); ++k) {
+      auto it = index.find(v[size_t(k)]);
+      if (it == index.end()) continue;
+      ++count;
+      edited += clips_[size_t(it->second)].edited ? 1 : 0;
+      if (shown(it->second)) rows.push_back({it->second, k});
+    }
+    if (narrowed && rows.empty()) continue;
+    header(g, count, edited);
+    if (!groups_[size_t(g)].open) continue;
+    ImGui::Indent(px * 0.6f);
+    for (auto [i, k] : rows) row(i, g, k);
+    ImGui::Unindent(px * 0.6f);
+  }
+  {
+    std::vector<int> rows;
+    int edited = 0, count = 0;
+    for (int i = 0; i < int(clips_.size()); ++i) {
+      if (grouped[size_t(i)]) continue;
+      ++count;
+      edited += clips_[size_t(i)].edited ? 1 : 0;
+      if (shown(i)) rows.push_back(i);
+    }
+    // (With no groups: just the clips, no header.)
+    if (!groups_.empty() && (count > 0 || !narrowed) && !(narrowed && rows.empty())) header(-1, count, edited);
+    if (groups_.empty() || ungrouped_open_) {
+      for (int i : rows) row(i, -1, -1);
+    }
+  }
+  ImGui::EndChild();
+
+  // Alt+Up / Alt+Down: the picked clip up or down its group.
+  const ImGuiIO& io = ImGui::GetIO();
+  if (selected_ >= 0 && selected_ < int(clips_.size()) && io.KeyAlt && !io.WantTextInput &&
+      (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_DownArrow))) {
+    menu_action = ImGui::IsKeyPressed(ImGuiKey_UpArrow) ? 12 : 13;
+    menu_clip = selected_;
+  }
+
+  // What was dropped or picked.
+  if (drop_clip >= 0 && drop_clip < int(clips_.size())) {
+    MoveClip(clips_[size_t(drop_clip)].source, drop_group_to, drop_pos);
+  }
+  if (drag_group >= 0 && drag_group < int(groups_.size()) && drop_group_at >= 0) {
+    Group moving = std::move(groups_[size_t(drag_group)]);
+    groups_.erase(groups_.begin() + drag_group);
+    const int at = std::min(drop_group_at > drag_group ? drop_group_at - 1 : drop_group_at, int(groups_.size()));
+    groups_.insert(groups_.begin() + at, std::move(moving));
+    renaming_group_ = -1;
+    SaveGroups();
+  }
+  auto swap_groups = [&](int a, int b) {
+    std::swap(groups_[size_t(a)], groups_[size_t(b)]);
+    renaming_group_ = -1;
+    SaveGroups();
+  };
+  switch (menu_action) {
+    case 1:
+      renaming_group_ = menu_group;
+      rename_focus_ = true;
+      std::snprintf(rename_buf_, sizeof(rename_buf_), "%s", groups_[size_t(menu_group)].label.c_str());
+      break;
+    case 2: swap_groups(menu_group, menu_group - 1); break;
+    case 3: swap_groups(menu_group, menu_group + 1); break;
+    case 4: {
+      NewGroup("");
+      Group g = std::move(groups_.back());
+      groups_.pop_back();
+      groups_.insert(groups_.begin() + menu_group + 1, std::move(g));
+      renaming_group_ = menu_group + 1;
+      SaveGroups();
+      break;
+    }
+    case 5:
+      groups_.erase(groups_.begin() + menu_group);
+      renaming_group_ = -1;
+      SaveGroups();
+      break;
+    case 10: MoveClip(clips_[size_t(menu_clip)].source, menu_group, -1); break;
+    case 11: NewGroup(clips_[size_t(menu_clip)].source); break;
+    case 12:
+    case 13: {
+      const std::string& src = clips_[size_t(menu_clip)].source;
+      int pos = -1;
+      const int g = GroupOf(src, &pos);
+      if (g < 0) break;
+      const int n = int(groups_[size_t(g)].sources.size());
+      const int to = menu_action == 12 ? pos - 1 : pos + 2;  // (MoveClip: before that one)
+      if (to < 0 || to > n) break;
+      MoveClip(src, g, to);
+      scroll_to_selected_ = true;
+      break;
+    }
+    case 14: MoveClip(clips_[size_t(menu_clip)].source, -1, -1); break;
+    default: break;
+  }
+}
+
 // The speakers a clip has room for: everyone who says a line or is named,
 // and those added with + (at least one).
 int SubtitleEditor::Speakers(const sf::Clip& c) const {
@@ -523,6 +1013,9 @@ bool SubtitleEditor::Open(const fs::path& install_dir, const fs::path& source_di
   dirty_ = false;
   status_.clear();
   LoadLayout();
+  LoadGroups();
+  unsaved_.assign(clips_.size(), false);
+  renaming_group_ = -1;
   game_.Load(install_dir_ / "amped3.toml");
   return true;
 }
@@ -562,6 +1055,7 @@ void SubtitleEditor::Save() {
     return;
   }
   dirty_ = false;
+  unsaved_.assign(clips_.size(), false);
   status_ = "Saved. The game picks it up within a couple of seconds.";
 }
 
@@ -794,6 +1288,8 @@ void SubtitleEditor::StopAudio() {
 
 void SubtitleEditor::Remember() {
   if (selected_ < 0 || selected_ >= int(clips_.size())) return;
+  if (unsaved_.size() != clips_.size()) unsaved_.assign(clips_.size(), false);
+  unsaved_[size_t(selected_)] = true;
   undo_.push_back({selected_, clips_[size_t(selected_)]});
   if (undo_.size() > kUndoDepth) undo_.erase(undo_.begin());
   redo_.clear();
@@ -1427,56 +1923,7 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
   const float list_w = std::clamp(list_frac_, 0.12f, 0.6f) * display.x;
   const float body_h = display.y - ImGui::GetCursorPosY() - pad;
   ImGui::BeginChild("##clips", ImVec2(list_w, body_h), ImGuiChildFlags_Borders);
-  const std::string needle = Lower(search_);
-  visible_.clear();
-  for (int i = 0; i < int(clips_.size()); ++i) {
-    const sf::Clip& c = clips_[size_t(i)];
-    if (filter_ == 1 && c.kind != sf::Kind::kStory) continue;
-    if (filter_ == 2 && c.kind != sf::Kind::kVideo) continue;
-    if (filter_ == 3 && c.kind != sf::Kind::kSpeech) continue;
-    if (filter_ == 4 && !c.edited) continue;
-    if (!needle.empty()) {
-      bool hit = Lower(c.source).find(needle) != std::string::npos;
-      for (const auto& l : c.lines) hit = hit || Lower(l.text).find(needle) != std::string::npos;
-      if (!hit) continue;
-    }
-    std::string label = std::string(c.edited ? "* " : "") + "[" + KindLabel(c.kind) + "] " +
-                        (c.lines.empty() ? std::string("(no lines)") : Named(c, c.lines[0]));
-    std::string src = c.source;
-    if (src.size() > 60) src = "..." + src.substr(src.size() - 57);
-    ImGui::PushID(i);
-    visible_.push_back(i);
-    if (ImGui::Selectable("##clip", selected_ == i, 0, ImVec2(0, px * 2.3f))) Select(i);
-    const bool row_hot = ImGui::IsItemHovered() || selected_ == i;
-    const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
-    if (selected_ == i && scroll_to_selected_) {
-      ImGui::SetScrollHereY(0.4f);
-      scroll_to_selected_ = false;
-    }
-    // Its first line: too long for the list, it scrolls by while picked or
-    // under the mouse (to and fro).
-    {
-      ImDrawList* ldl = ImGui::GetWindowDrawList();
-      const float x0 = r0.x + px * 0.4f, x1 = r1.x - px * 0.3f;
-      const float tw = ImGui::CalcTextSize(label.c_str()).x;
-      float shift = 0;
-      if (tw > x1 - x0 && row_hot) {
-        const float over = tw - (x1 - x0), speed = 45.0f * unit;
-        const double period = 2.0 * (over / speed + 1.2);
-        const double t = std::fmod(ImGui::GetTime(), period);
-        const double half = period * 0.5;
-        const double u = t < half ? t : period - t;  // there and back, a pause at each end
-        shift = float(std::clamp((u - 0.6) * speed, 0.0, double(over)));
-      }
-      ldl->PushClipRect(ImVec2(x0, r0.y), ImVec2(x1, r1.y), true);
-      ldl->AddText(ImVec2(x0 - shift, r0.y + px * 0.1f), ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
-      char sub[160];
-      std::snprintf(sub, sizeof(sub), "%s   %s", src.c_str(), Clock(c.duration_ms, false).c_str());
-      ldl->AddText(ImVec2(x0, r0.y + px * 1.2f), kDim, sub);
-      ldl->PopClipRect();
-    }
-    ImGui::PopID();
-  }
+  DrawClipList(px, unit);
   ImGui::EndChild();
   // The bar between: drag to widen or narrow the list.
   ImGui::SameLine(0, 0);
@@ -1787,7 +2234,8 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       ScrubTo(std::max(0.0, to));
       if (was) StartPlaying();
     }
-    if (!c.lines.empty() && (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_DownArrow))) {
+    if (!c.lines.empty() && !io.KeyAlt &&
+        (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_DownArrow))) {
       line_ = std::clamp(line_ + (ImGui::IsKeyPressed(ImGuiKey_DownArrow) ? 1 : -1), 0, int(c.lines.size()) - 1);
       StopPlaying();
       ScrubTo(c.lines[size_t(line_)].start_ms);
