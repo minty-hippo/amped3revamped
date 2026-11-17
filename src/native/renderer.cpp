@@ -1982,7 +1982,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2073,7 +2073,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[60] = {};  // by CopyKind
+  VkShaderModule copy_fs_[61] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2418,6 +2418,7 @@ struct Renderer::Impl {
   void PickProbe(const Draw& d, const GpuState& st);
   void PickRead();
   Image spec_img_, spec_out_;
+  Image relight_params_;  // the far-off scenery's light (SunSpecular)
   bool spec_ok_ = false;
   void SunSpecular(const Draw& d, const GpuState& st);
   Image* SpecularScene(Image* scene);
@@ -2487,6 +2488,7 @@ struct Renderer::Impl {
   // The lighting's sky-light table tinted (its tf1), and a plain white
   // stand-in for the game's fixed shadows once the sun has moved away.
   Image tod_lut_, tod_white_, tod_colors_, tod_sky_img_;
+  Image tod_params_;  // the finished shadow mask's settings (TodShadows)
   Image* tod_lut_src_ = nullptr;
   bool tod_lut_ok_ = false;
   bool tod_sky_done_ = false;
@@ -6414,6 +6416,7 @@ layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the g
 layout(set = 0, binding = 2) uniform sampler2D depth;
 layout(set = 0, binding = 3) uniform sampler2D mask;     // the sun's shadows (1 lit)
 layout(set = 0, binding = 4) uniform sampler2D sky;      // 4 x 1: zenith, horizon (the hour's)
+layout(set = 0, binding = 5) uniform sampler2D relight;  // 4 x 1: the backdrop's light (SunSpecular)
 layout(push_constant) uniform Spec {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
   vec4 L;    // toward the light, -
@@ -6454,6 +6457,52 @@ void main() {
   vec3 P = wp.xyz / wp.w;
   vec3 V = normalize(pc.cam.xyz - P);
   vec4 nw = texelFetch(normals, ip, 0);
+  // No normal there (the lighting's clear): the far-off scenery beyond the
+  // slopes, drawn with its light painted in and never lit by the lighting
+  // pass. Lit again for the hour instead: its surface's facing from the
+  // depth (each way, the nearer side's: not across an outline), the painted
+  // light taken as the mountain's sun and sky, and the hour's put in their
+  // place. Out: that factor, the depth negated (the add multiplies).
+  // (The clear: not a normal, and its alpha whole - the game's material 3
+  // with our tag 7, which no surface is given; an edge's average isn't.)
+  if (abs(length(nw.xyz * 2.0 - 1.0) - 1.0) > 0.2 && nw.w > 254.5 / 255.0) {
+    vec4 r1 = texelFetch(relight, ivec2(1, 0), 0);
+    if (r1.w < 0.5) {
+      o = vec4(0.0);
+      return;
+    }
+    vec4 r0 = texelFetch(relight, ivec2(0, 0), 0);
+    vec4 r2 = texelFetch(relight, ivec2(2, 0), 0);
+    vec4 r3 = texelFetch(relight, ivec2(3, 0), 0);
+    vec3 side[4];
+    float dist[4];
+    const ivec2 kOff[4] = ivec2[4](ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
+    for (int k = 0; k < 4; ++k) {
+      ivec2 q = clamp(ip + kOff[k], ivec2(0), sz - 1);
+      float dq = texelFetch(depth, q, 0).r;
+      vec4 wq = pc.m * vec4((vec2(q) + 0.5) / vec2(sz) * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 1.0 - max(dq, 1e-7), 1.0);
+      side[k] = wq.xyz / wq.w - P;
+      dist[k] = dq <= 0.0 ? 1e9 : abs(dot(side[k], V));
+    }
+    vec3 dx = dist[0] < dist[1] ? side[0] : -side[1];
+    vec3 dy = dist[2] < dist[3] ? side[2] : -side[3];
+    vec3 Nb = cross(dx, dy);
+    float nlen = length(Nb);
+    Nb = nlen > 1e-6 ? Nb / nlen : V;
+    if (dot(Nb, V) < 0.0) Nb = -Nb;
+    float amb = r0.w;
+    float e0 = amb + (1.0 - amb) * max(dot(Nb, r0.xyz), 0.0);
+    // (The hour's sun through the mask: the clouds' shadows, the far
+    // shadows; not at the mountain's own hour, its painted shade is in.)
+    float sh = pc.cam.w > 0.5 ? mix(1.0, texelFetch(mask, ip, 0).r, r2.w) : 1.0;
+    vec3 e1 = amb * r1.rgb + (1.0 - amb) * r2.rgb * max(dot(Nb, r3.xyz), 0.0) * sh;
+    o = vec4(clamp(e1 / max(e0, 0.25), vec3(0.0), vec3(4.0)), -d);
+    return;
+  }
+  if (texelFetch(relight, ivec2(3, 0), 0).w < 0.5) {
+    o = vec4(0.0);  // (the sheen's off: the backdrop only)
+    return;
+  }
   vec3 N = normalize(nw.xyz * 2.0 - 1.0);
   vec3 L = pc.L.xyz;
   float nl = dot(N, L), nv = dot(N, V);
@@ -6540,6 +6589,11 @@ void main() {
   vec4 c = texelFetch(scene, ip, 0);
   vec4 s = texelFetch(spec, ip, 0);
   float d = texelFetch(depth, ip, 0).r;
+  // The far-off scenery lit again for the hour (negative depth): a factor.
+  if (s.a < 0.0) {
+    o = abs(d + s.a) > 1e-6 - s.a * 0.015 ? c : vec4(c.rgb * s.rgb, c.a);
+    return;
+  }
   // (Within a percent or two: a rider in front differs far more.)
   if (s.a <= 0.0 || abs(d - s.a) > 1e-6 + s.a * 0.015) {
     o = c;
@@ -6557,61 +6611,6 @@ void main() {
   // Snow tracks, 3: their own shadows in the sun's mask: a groove's wall
   // and a heap shading the snow beside them toward a low sun (marched over
   // the tracks' height toward it).
-  copy_fs_[51] = CompileBuiltin("builtin_tracks_shadow", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D depth;
-layout(set = 0, binding = 1) uniform sampler2D mask;    // the sun's shadows so far
-layout(set = 0, binding = 2) uniform sampler2D tracks;  // r groove, g heap
-layout(push_constant) uniform Sh {
-  mat4 m;  // ndc (x, y, 1 - depth, 1) -> world
-  vec4 L;  // toward the sun
-  vec4 a;  // the map's texel 0 (world x, z), texels a metre
-  vec4 b;  // groove depth (m), heap height (m)
-} pc;
-layout(location = 0) out vec4 o;
-)" + kTracksClumps + R"(
-float Ht(vec2 tc) {
-  vec2 f = tc - 0.5;
-  ivec2 i = ivec2(floor(f));
-  vec2 w = f - floor(f);
-  ivec2 n = textureSize(tracks, 0) - 1;
-  vec2 a = texelFetch(tracks, clamp(i, ivec2(0), n), 0).rg;
-  vec2 b = texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0).rg;
-  vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
-  vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
-  vec2 t = mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
-  float heap = t.g * (1.0 - t.r);
-  return -pc.b.x * t.r + pc.b.y * heap + Clumps(tc, heap) * pc.b.y;
-}
-// (Soft over a texel or so, as the tracks are shaded.)
-float Hs(vec2 tc) {
-  return (Ht(tc + vec2(0.7, 0.7)) + Ht(tc + vec2(-0.7, 0.7)) + Ht(tc + vec2(0.7, -0.7)) + Ht(tc - vec2(0.7))) * 0.25;
-}
-void main() {
-  ivec2 ip = ivec2(gl_FragCoord.xy);
-  float lit = texelFetch(mask, ip, 0).r;
-  o = vec4(lit);
-  float d = texelFetch(depth, ip, 0).r;
-  if (d <= 0.0 || lit <= 0.01) return;
-  vec2 uv = gl_FragCoord.xy / vec2(textureSize(depth, 0));
-  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
-  vec3 P = w.xyz / w.w;
-  vec2 tc = (P.xz - pc.a.xy) * pc.a.z;
-  vec2 n2 = vec2(textureSize(tracks, 0));
-  if (any(lessThan(tc, vec2(16.0))) || any(greaterThan(tc, n2 - 16.0))) return;
-  float h0 = Hs(tc);
-  vec3 L = pc.L.xyz;
-  float occ = 0.0;
-  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-  for (int i = 0; i < 10; ++i) {
-    float f = (float(i) + jit) / 10.0;
-    float t = 0.02 + 0.9 * f * f;  // 2 cm .. ~1 m
-    vec2 q = tc + L.xz * t * pc.a.z;
-    float ray = h0 + L.y * t;
-    occ = max(occ, smoothstep(0.0, 0.025, Hs(q) - ray));
-  }
-  o = vec4(lit * (1.0 - 0.75 * occ));
-}
-)", true);
   // Lens flare. 0: how much of the sun's disc is seen (one texel, eased:
   // the sky's share of it, and how near white it is there, so a cloud over
   // it dims it too); 1: the night lights' ghosts, mirrored through the
@@ -6832,79 +6831,6 @@ void main() {
   // underside), found in the depth: a short march toward the sun in screen
   // space, shadowed where it passes behind something drawn (not too far
   // behind: that's something else, farther off).
-  copy_fs_[55] = CompileBuiltin("builtin_contact_shadow", R"(#version 450
-layout(set = 0, binding = 0) uniform sampler2D depth;
-layout(set = 0, binding = 1) uniform sampler2D mask;  // the sun's shadows so far
-layout(push_constant) uniform Sh {
-  mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
-  vec4 r0;  // world -> clip: x
-  vec4 r1;  //               y
-  vec4 r3;  //               w
-  vec4 L;   // toward the sun, strength
-} pc;
-layout(location = 0) out vec4 o;
-vec3 World(vec2 uv, float d) {
-  vec4 w = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
-  return w.xyz / w.w;
-}
-// The distance (clip w) of what's drawn at a pixel (far for the sky).
-float Wat(ivec2 p, vec2 size) {
-  float d = texelFetch(depth, clamp(p, ivec2(0), ivec2(size) - 1), 0).r;
-  if (d <= 0.0) return 1e6;
-  return dot(pc.r3, vec4(World((vec2(p) + 0.5) / size, d), 1.0));
-}
-void main() {
-  ivec2 ip = ivec2(gl_FragCoord.xy);
-  float lit = texelFetch(mask, ip, 0).r;
-  o = vec4(lit);
-  float d = texelFetch(depth, ip, 0).r;
-  if (d <= 0.0 || lit <= 0.02) return;
-  vec2 size = vec2(textureSize(depth, 0));
-  vec2 uv = (gl_FragCoord.xy) / size;
-  vec3 P = World(uv, d);
-  float w0 = dot(pc.r3, vec4(P, 1.0));
-  if (w0 <= 0.0 || w0 > 120.0) return;
-  vec3 L = pc.L.xyz;
-  // (Reaching farther the farther off: about the same on screen.)
-  float reach = clamp(w0 * 0.02, 0.2, 1.2);
-  float bias = 0.03 + w0 * 0.002;
-  // How fast the surface's distance changes across the screen here (a
-  // slope seen edge-on: steps along it look 'behind' it): the smaller of
-  // each side's, so an outline doesn't count.
-  float gx = min(abs(Wat(ip + ivec2(1, 0), size) - w0), abs(Wat(ip - ivec2(1, 0), size) - w0));
-  float gy = min(abs(Wat(ip + ivec2(0, 1), size) - w0), abs(Wat(ip - ivec2(0, 1), size) - w0));
-  float grad = max(gx, gy);
-  // (A little jitter only: there's no frame blending to smooth noise out.)
-  float jit = 0.35 + 0.3 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-  float occ = 0.0;
-  for (int i = 0; i < 12; ++i) {
-    float f = (float(i) + jit) / 12.0;
-    float t = reach * (0.02 + 0.98 * f * f);
-    vec3 Q = P + L * t;
-    float cw = dot(pc.r3, vec4(Q, 1.0));
-    if (cw <= 0.05) break;
-    vec2 q = vec2(dot(pc.r0, vec4(Q, 1.0)), dot(pc.r1, vec4(Q, 1.0))) / cw;
-    vec2 quv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
-    if (any(lessThan(quv, vec2(0.0))) || any(greaterThan(quv, vec2(1.0)))) break;
-    ivec2 qp = ivec2(quv * size);
-    if (qp == ip) continue;
-    float ds = texelFetch(depth, qp, 0).r;
-    if (ds <= 0.0) continue;
-    float sw = dot(pc.r3, vec4(World(quv, ds), 1.0));
-    float behind = cw - sw;
-    // Behind what's drawn there, but within a thickness (more for nearer
-    // steps: a boot, a lip; not the slope far behind a rider's outline).
-    float thick = 0.3 + 0.6 * t;
-    // (Two steps behind for it all: one alone may be the depth's grain.)
-    float px = length(vec2(qp - ip));
-    if (behind > bias + t * 0.03 + grad * px * 0.6 && behind < thick) occ += 0.5 * (1.0 - f * 0.6);
-  }
-  occ = min(occ, 1.0);
-  // (Fading out with distance and at the screen's edges.)
-  float fade = 1.0 - smoothstep(60.0, 120.0, w0);
-  o = vec4(lit * (1.0 - occ * fade * pc.L.w));
-}
-)", true);
   // The sun's shadows eased over a step of the time of day's sun: when the
   // sun maps start over for a sun that's moved on (every degree and a half
   // or so), last frame's shadows, carried to where they are now on screen,
@@ -7062,17 +6988,35 @@ void main() {
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
   // the same way), a few hundred metres up, over each point toward the sun:
   // the sun's shadow mask darkened under them.
-  copy_fs_[42] = CompileBuiltin("builtin_cloud_shadow", R"(#version 450
+  // The sun's shadow mask finished, in one pass (TodShadows): from the sun
+  // maps' (kTodShadow), the clouds' shadows over it, the boards' tracks
+  // shading the snow beside them toward a low sun, contact shadows (what the
+  // maps are too coarse for, marched through the depth), and the far
+  // slopes' shadows (past those baked round the camera: the game's painted
+  // ones at the mountain's own hour, eased into ones marched toward the sun
+  // through the depth on screen as the sun moves away). Its settings are a
+  // row of texels (TodShadows lists them).
+  copy_fs_[60] = CompileBuiltin("builtin_mask_finish", std::string(R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D depth;
-layout(set = 0, binding = 1) uniform sampler2D mask;  // the sun's shadows
-layout(set = 0, binding = 2) uniform sampler2D cmap;  // the layer's thickness round about (builtin_cloud_map)
-layout(push_constant) uniform Clouds {
-  mat4 m;     // ndc (x, y, 1 - depth, 1) -> world
-  vec4 sun;   // toward the sun, cloud cover
-  vec4 c;     // seconds (the clouds' clock), height (m), darkness, -
-  vec4 map;   // the map's corner (the layer's coordinates), 1 / its span, -
-} pc;
+layout(set = 0, binding = 1) uniform sampler2D mask;     // the sun maps' shadows
+layout(set = 0, binding = 2) uniform sampler2D cmap;     // the clouds' layer round about (builtin_cloud_map)
+layout(set = 0, binding = 3) uniform sampler2D tracks;   // r groove, g heap
+layout(set = 0, binding = 4) uniform sampler2D params;   // the settings
+layout(set = 0, binding = 5) uniform sampler2D painted;  // the game's painted slope shadows
 layout(location = 0) out vec4 o;
+vec4 S(int i) { return texelFetch(params, ivec2(i, 0), 0); }
+mat4 M;
+vec4 R0, R1, R3;
+vec3 World(vec2 uv, float d) {
+  vec4 w = M * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  return w.xyz / w.w;
+}
+// The distance (clip w) of what's drawn at a pixel (far for the sky).
+float Wat(ivec2 p, vec2 size) {
+  float d = texelFetch(depth, clamp(p, ivec2(0), ivec2(size) - 1), 0).r;
+  if (d <= 0.0) return 1e6;
+  return dot(R3, vec4(World((vec2(p) + 0.5) / size, d), 1.0));
+}
 float hash(vec2 p) {
   p = fract(p * vec2(443.897, 441.423));
   p += dot(p, p.yx + 19.19);
@@ -7092,33 +7036,179 @@ float fbm(vec2 p) {
   }
   return v;
 }
+vec4 TB;  // the tracks' groove depth, heap height
+)") + kTracksClumps + R"(
+float Ht(vec2 tc) {
+  vec2 f = tc - 0.5;
+  ivec2 i = ivec2(floor(f));
+  vec2 w = f - floor(f);
+  ivec2 n = textureSize(tracks, 0) - 1;
+  vec2 a = texelFetch(tracks, clamp(i, ivec2(0), n), 0).rg;
+  vec2 b = texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0).rg;
+  vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
+  vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
+  vec2 t = mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+  float heap = t.g * (1.0 - t.r);
+  return -TB.x * t.r + TB.y * heap + Clumps(tc, heap) * TB.y;
+}
+// (Soft over a texel or so, as the tracks are shaded.)
+float Hs(vec2 tc) {
+  return (Ht(tc + vec2(0.7, 0.7)) + Ht(tc + vec2(-0.7, 0.7)) + Ht(tc + vec2(0.7, -0.7)) + Ht(tc - vec2(0.7))) * 0.25;
+}
+// The painted map at world x, z (its four nearest texels weighed: it's
+// coarse, a metre or so a texel).
+float Painted(vec2 xz, vec4 c5) {
+  vec2 n = vec2(textureSize(painted, 0));
+  vec2 t = (xz * c5.xy + c5.zw) * n - 0.5;
+  if (any(lessThan(t, vec2(0.0))) || any(greaterThan(t, n - 2.0))) return 1.0;
+  ivec2 i = ivec2(floor(t));
+  vec2 w = t - floor(t);
+  float a = texelFetch(painted, i, 0).r, b = texelFetch(painted, i + ivec2(1, 0), 0).r;
+  float c = texelFetch(painted, i + ivec2(0, 1), 0).r, d = texelFetch(painted, i + ivec2(1, 1), 0).r;
+  return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
 void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
   float lit = texelFetch(mask, ip, 0).r;
+  o = vec4(lit);
   float d = texelFetch(depth, ip, 0).r;
-  if (d <= 0.0) {
-    o = vec4(lit);
-    return;
+  vec2 size = vec2(textureSize(depth, 0));
+  vec2 uv = gl_FragCoord.xy / size;
+  M = mat4(S(0), S(1), S(2), S(3));
+  R0 = S(4);
+  R1 = S(5);
+  R3 = S(6);
+  vec4 wp = M * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - max(d, 1e-7), 1.0);
+  vec3 P = wp.xyz / (abs(wp.w) < 1e-9 ? 1.0 : wp.w);
+  // (The surface's facing, from the depth: before anything branches.)
+  vec3 Nf = cross(dFdx(P), dFdy(P));
+  if (d <= 0.0 || abs(wp.w) < 1e-9) return;
+  vec4 Ls = S(7);
+  vec3 L = Ls.xyz;
+  float w0 = dot(R3, vec4(P, 1.0));
+  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+
+  // The clouds' shadows.
+  vec4 cc = S(8);
+  if (cc.z > 0.0) {
+    vec4 cm = S(9);
+    // (Where its ray toward the sun meets the layer; the layer's scale as the
+    // sky draws it: 0.9 a height.)
+    vec2 q = P.xz + L.xz * (cc.y / max(L.y, 0.08));
+    vec2 p = q / cc.y * 0.9 + vec2(cc.x * 0.006, cc.x * 0.0025);
+    // (From the map round about; past it, the noise itself.)
+    vec2 mu = (p - cm.xy) * cm.z;
+    float n = all(greaterThan(mu, vec2(0.002))) && all(lessThan(mu, vec2(0.998))) ? textureLod(cmap, mu, 0.0).r : fbm(p);
+    float cloud = smoothstep(1.0 - cc.w - 0.03, 1.0 - cc.w + 0.1, n);
+    lit *= 1.0 - cc.z * cloud;
   }
-  vec2 uv = gl_FragCoord.xy / vec2(textureSize(depth, 0));
-  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
-  if (abs(wp.w) < 1e-9) {
-    o = vec4(lit);
-    return;
+
+  // The tracks toward a low sun: a groove's wall, a heap, a clump.
+  vec4 ta = S(10);
+  if (ta.w > 0.5 && lit > 0.01) {
+    TB = S(11);
+    vec2 tc = (P.xz - ta.xy) * ta.z;
+    vec2 n2 = vec2(textureSize(tracks, 0));
+    if (all(greaterThanEqual(tc, vec2(16.0))) && all(lessThanEqual(tc, n2 - 16.0))) {
+      float h0 = Hs(tc);
+      float occ = 0.0;
+      for (int i = 0; i < 10; ++i) {
+        float f = (float(i) + jit) / 10.0;
+        float t = 0.02 + 0.9 * f * f;  // 2 cm .. ~1 m
+        vec2 q = tc + L.xz * t * ta.z;
+        float ray = h0 + L.y * t;
+        occ = max(occ, smoothstep(0.0, 0.025, Hs(q) - ray));
+      }
+      lit *= 1.0 - 0.75 * occ;
+    }
   }
-  vec3 P = wp.xyz / wp.w;
-  vec3 L = pc.sun.xyz;
-  // (Where its ray toward the sun meets the layer; the layer's scale as the
-  // sky draws it: 0.9 a height.)
-  vec2 q = P.xz + L.xz * (pc.c.y / max(L.y, 0.08));
-  vec2 p = q / pc.c.y * 0.9 + vec2(pc.c.x * 0.006, pc.c.x * 0.0025);
-  // (From the map round about; past it, the noise itself.)
-  vec2 mu = (p - pc.map.xy) * pc.map.z;
-  float n = all(greaterThan(mu, vec2(0.002))) && all(lessThan(mu, vec2(0.998))) ? textureLod(cmap, mu, 0.0).r : fbm(p);
-  float cover = pc.sun.w;
-  // (Its shade: where it's thick enough, the edge soft over some metres.)
-  float cloud = smoothstep(1.0 - cover - 0.03, 1.0 - cover + 0.1, n);
-  o = vec4(lit * (1.0 - pc.c.z * cloud));
+
+  // Contact shadows: what the maps miss, near by.
+  if (Ls.w > 0.0 && lit > 0.02 && w0 > 0.0 && w0 <= 120.0) {
+    // (Reaching farther the farther off: about the same on screen.)
+    float reach = clamp(w0 * 0.02, 0.2, 1.2);
+    float bias = 0.03 + w0 * 0.002;
+    // How fast the surface's distance changes across the screen here (a
+    // slope seen edge-on: steps along it look 'behind' it): the smaller of
+    // each side's, so an outline doesn't count.
+    float gx = min(abs(Wat(ip + ivec2(1, 0), size) - w0), abs(Wat(ip - ivec2(1, 0), size) - w0));
+    float gy = min(abs(Wat(ip + ivec2(0, 1), size) - w0), abs(Wat(ip - ivec2(0, 1), size) - w0));
+    float grad = max(gx, gy);
+    // (A little jitter only.)
+    float cj = 0.35 + 0.3 * jit;
+    float occ = 0.0;
+    for (int i = 0; i < 12; ++i) {
+      float f = (float(i) + cj) / 12.0;
+      float t = reach * (0.02 + 0.98 * f * f);
+      vec3 Q = P + L * t;
+      float cw = dot(R3, vec4(Q, 1.0));
+      if (cw <= 0.05) break;
+      vec2 q = vec2(dot(R0, vec4(Q, 1.0)), dot(R1, vec4(Q, 1.0))) / cw;
+      vec2 quv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+      if (any(lessThan(quv, vec2(0.0))) || any(greaterThan(quv, vec2(1.0)))) break;
+      ivec2 qp = ivec2(quv * size);
+      if (qp == ip) continue;
+      float ds = texelFetch(depth, qp, 0).r;
+      if (ds <= 0.0) continue;
+      float sw = dot(R3, vec4(World(quv, ds), 1.0));
+      float behind = cw - sw;
+      // Behind what's drawn there, but within a thickness (more for nearer
+      // steps: a boot, a lip; not the slope far behind a rider's outline).
+      float thick = 0.3 + 0.6 * t;
+      // (Two steps behind for it all: one alone may be the depth's grain.)
+      float px = length(vec2(qp - ip));
+      if (behind > bias + t * 0.03 + grad * px * 0.6 && behind < thick) occ += 0.5 * (1.0 - f * 0.6);
+    }
+    occ = min(occ, 1.0);
+    float fade = 1.0 - smoothstep(60.0, 120.0, w0);
+    lit *= 1.0 - occ * fade * Ls.w;
+  }
+
+  // Far off: the slopes past those baked round the camera.
+  vec4 f0 = S(12), f1 = S(13);
+  if (f1.x > 0.0 && lit > 0.02) {
+    float k = smoothstep(f0.w, f0.w + f1.x, length(P.xz - f0.xz));
+    if (k > 0.0) {
+      float away = f1.y;  // 0: the painted shadows (the mountain's hour) .. 1: the marched
+      float pl = 1.0, ml = 1.0;
+      if (f1.z > 0.5 && away < 0.999) pl = Painted(P.xz, S(14));
+      // (Facing away from the sun: dark by its light already, nothing to find.)
+      vec3 N = normalize(Nf);
+      if (dot(N, P - f0.xyz) > 0.0) N = -N;  // (toward the camera)
+      if (away > 0.001 && dot(N, L) > 0.03) {
+        // Toward the sun in steps growing from a few metres to most of a
+        // kilometre, against what's drawn on screen: behind it (by more than
+        // the depth's grain), but not far behind (a nearer hill in front of
+        // the ray, not between it and the sun). Jittered frame to frame (the
+        // mask's easing smooths it).
+        float fj = fract(jit + f1.w * 0.618034);
+        float t0 = max(2.0, w0 * 0.006), t1 = clamp(w0 * 1.2, 250.0, 900.0);
+        float occ = 0.0;
+        for (int i = 0; i < 14; ++i) {
+          float f = (float(i) + fj) / 14.0;
+          float t = t0 * pow(t1 / t0, f);
+          vec3 Q = P + L * t;
+          float cw = dot(R3, vec4(Q, 1.0));
+          if (cw <= 0.5) break;
+          vec2 q = vec2(dot(R0, vec4(Q, 1.0)), dot(R1, vec4(Q, 1.0))) / cw;
+          vec2 quv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+          if (any(lessThan(quv, vec2(0.0))) || any(greaterThan(quv, vec2(1.0)))) break;
+          ivec2 qp = ivec2(quv * size);
+          if (qp == ip) continue;
+          float ds = texelFetch(depth, qp, 0).r;
+          if (ds <= 0.0) continue;
+          float behind = cw - dot(R3, vec4(World(quv, ds), 1.0));
+          float bias = 0.5 + cw * 0.004 + t * 0.02;
+          float thick = 12.0 + 0.3 * t;
+          occ = max(occ, smoothstep(bias, bias * 2.0 + 2.0, behind) * (1.0 - smoothstep(thick, thick * 1.4, behind)));
+          if (occ > 0.99) break;
+        }
+        ml = 1.0 - occ;
+      }
+      lit *= mix(1.0, mix(pl, ml, away), k);
+    }
+  }
+  o = vec4(lit);
 }
 )", true);
   copy_fs_[37] = CompileBuiltin("builtin_tod_shadow", R"(#version 450
@@ -11532,7 +11622,10 @@ void Renderer::Impl::PickRead() {
 // The sun's sheen, at the lighting pass (builtin_sun_spec): into spec_img_.
 void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   spec_ok_ = false;
-  if (specular_ <= 0.0f || !TodOn() || !tod_normal_ || Diag("nospec")) return;
+  // (The sheen, and the far-off scenery lit for the hour: both or either.)
+  const bool sheen = specular_ > 0.0f && !Diag("nospec");
+  const bool backdrop = !Diag("nobackdrop");
+  if (!(sheen || backdrop) || !TodOn() || !tod_normal_) return;
   std::string n0;
   Image* a3 = TextureFor(d, 3, st, &n0);
   auto dit = resolved_.find(depth_base_);
@@ -11557,8 +11650,44 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
                    t.sun_color.y * day + t.moon_color.y * t.night * t.moon_bright * 0.12,
                    t.sun_color.z * day + t.moon_color.z * t.night * t.moon_bright * 0.14};
   for (double& c : col) c *= dim * e * 0.9;
-  if (col[0] + col[1] + col[2] < 0.002) return;
+  if (col[0] + col[1] + col[2] < 0.002 && !backdrop) return;
   EndRendering();
+  // The backdrop's light: the mountain's sun it was painted with and the
+  // sky's share of that light (the rest the sun's); the hour's sky and sun,
+  // as the lighting has them (scaled per color), its direction; how far the
+  // sun is from the mountain's (its shadows then from the mask).
+  {
+    float f[16] = {};
+    for (int i = 0; i < 3; ++i) f[i] = tod_game_light_[i];
+    f[3] = 0.4f;
+    f[4] = float(lm_ambient_scale_.x);
+    f[5] = float(lm_ambient_scale_.y);
+    f[6] = float(lm_ambient_scale_.z);
+    f[7] = backdrop ? 1.0f : 0.0f;
+    f[8] = float(lm_light_scale_.x);
+    f[9] = float(lm_light_scale_.y);
+    f[10] = float(lm_light_scale_.z);
+    f[11] = float(std::clamp(tod_state_.away, 0.0, 1.0));
+    f[12] = float(lm_dir_.x);
+    f[13] = float(lm_dir_.y);
+    f[14] = float(lm_dir_.z);
+    f[15] = sheen ? 1.0f : 0.0f;
+    if (!lm_set_dir_) {
+      for (int i = 0; i < 3; ++i) f[12 + i] = tod_game_light_[i];
+    }
+    if (!relight_params_.image) {
+      relight_params_ = gpu_.CreateImage(4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "backdrop_light");
+      ToGeneral(cb_, relight_params_);
+    }
+    Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memcpy(staging.mapped, f, sizeof(f));
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {4, 1, 1};
+    Barrier();
+    vk::vkCmdCopyBufferToImage(cb_, staging.buffer, relight_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    staging_.push_back(staging);
+  }
   if (!spec_img_.image || spec_img_.width != a3->width || spec_img_.height != a3->height) {
     if (spec_img_.image) Retire(spec_img_);
     spec_img_ = gpu_.CreateImage(a3->width, a3->height, VK_FORMAT_R16G16B16A16_SFLOAT, false, "sun_spec");
@@ -11581,7 +11710,8 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   // (Its depth: a copy-sized float would lose nothing; R16F alpha keeps the
   // match test's tolerance relative.)
   FullscreenPass(CopyKind::kSunSpec, &spec_img_, albedo, tod_normal_, &dit->second, false, pc, 32, nullptr,
-                 tod_mask_ok_ ? &tod_mask_ : &tod_white_, tod_colors_.image ? &tod_colors_ : &tod_white_);
+                 tod_mask_ok_ ? &tod_mask_ : &tod_white_, tod_colors_.image ? &tod_colors_ : &tod_white_,
+                 &relight_params_);
   Barrier();
   dyn_ = DynState{};
   spec_ok_ = true;
@@ -12453,21 +12583,31 @@ void Renderer::Impl::TodShadows() {
     DrawIntoSunMap(draws, &tod_movers_map_, Om, Vinv);
     EndRendering();
   }
-  if (!tod_mask_.image || tod_mask_.width != depth->width || tod_mask_.height != depth->height) {
-    if (tod_mask_.image) Retire(tod_mask_);
-    tod_mask_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask");
+  // The masks: the sun's (kTodShadow) and then the finished one (the
+  // clouds, the tracks, contact and far shadows, in one pass), eased against
+  // last frame's. Passed from one image to the next rather than copied: this
+  // frame's finished mask is the next frame's last one (swapped).
+  std::swap(tod_mask_, tod_mask_prev_);
+  const bool prev_fresh = tod_mask_prev_ok_ && tod_mask_prev_.image && tod_mask_prev_.width == depth->width &&
+                          tod_mask_prev_.height == depth->height;
+  auto mask_image = [&](Image& im, const char* name) {
+    if (im.image && im.width == depth->width && im.height == depth->height) return;
+    if (im.image) Retire(im);
+    im = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, name);
     // Read as all four channels (whichever the lighting's fetch picks).
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vci.image = tod_mask_.image;
+    vci.image = im.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = VK_FORMAT_R8_UNORM;
     vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
                       VK_COMPONENT_SWIZZLE_R};
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vk::Check(vk::vkCreateImageView(gpu_.device, &vci, nullptr, &tod_mask_.sample_view),
-              "time of day shadow mask view");
-    ToGeneral(cb_, tod_mask_);
-  }
+    vk::Check(vk::vkCreateImageView(gpu_.device, &vci, nullptr, &im.sample_view), "time of day shadow mask view");
+    ToGeneral(cb_, im);
+  };
+  mask_image(tod_mask_, "tod_shadow_mask");
+  mask_image(tod_mask_raw_, "tod_shadow_mask_sun");
+  mask_image(tod_mask_prev_, "tod_shadow_mask_prev");
   Barrier();
   float pc[32] = {};
   for (int c = 0; c < 4; ++c) {
@@ -12492,14 +12632,32 @@ void Renderer::Impl::TodShadows() {
   // (Under a grey sky the sun's already dimmed: its clouds' shadows fainter.)
   const float cloud_dark = cloud_shadows_ * (1.0f - 0.8f * std::clamp(tod_.overcast, 0.0f, 1.0f));
   const bool clouds = cloud_dark > 0.01f && cover > 0.02f && !Diag("nocloudshadows");
-  if (clouds && (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width ||
-                 tod_mask_raw_.height != depth->height)) {
-    if (tod_mask_raw_.image) Retire(tod_mask_raw_);
-    tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
-    ToGeneral(cb_, tod_mask_raw_);
-  }
-  FullscreenPass(CopyKind::kTodShadow, clouds ? &tod_mask_raw_ : &tod_mask_, depth, &tod_movers_map_,
-                 world ? &sun_env_ : nullptr, false, pc, 32, nullptr, world ? tod_normal_ : nullptr);
+  const bool tracks = tracks_ok_ && tracks_map_.image && !Diag("notrackshadow");
+  const bool contact = contact_ > 0.0f && !Diag("nocontact");
+  // Far off (past the slopes' shadows baked round the camera, which reach
+  // 80% of the sun maps'): at the mountain's own hour the game's painted
+  // shadows, as the game has them; as the sun moves away from it, the
+  // shadows found by marching toward the sun through the depth on screen
+  // (ridges and peaks shading the slopes behind them), so the far slopes
+  // aren't left lit all over.
+  const bool painted = baked_ok_ && baked_src_ && baked_tod_ && !tod_.passive && bake_c5_[0] != 0.0f &&
+                       !Diag("nopainted");
+  const bool far = !tod_.passive && sun_r_ > 0.0 && !Diag("nofar");
+  // Eased (after a step of the sun) or smoothed (always) against last frame's.
+  const uint64_t since = frame_number_ - sun_turn_frame_;
+  const double jump = std::hypot(cam_pos_[0] - tod_mask_prev_cam_[0], cam_pos_[1] - tod_mask_prev_cam_[1],
+                                 cam_pos_[2] - tod_mask_prev_cam_[2]);
+  if (sun_turned_ && since > 45) sun_turned_ = false;
+  const bool steady = !sun_turned_ && !Diag("nomasksmooth");
+  double prev_vp[16];
+  const bool ease = (sun_turned_ || steady) && prev_fresh && jump < 5.0 && !Diag("noease") &&
+                    Invert4(tod_mask_prev_inv_vp_, prev_vp);
+  const bool finish = clouds || tracks || contact || far;
+  // sun -> (finish ->) (ease ->) tod_mask_
+  Image* finished = ease ? &tod_mask_raw_ : &tod_mask_;
+  Image* sun_out = finish ? (ease ? &tod_mask_ : &tod_mask_raw_) : finished;
+  FullscreenPass(CopyKind::kTodShadow, sun_out, depth, &tod_movers_map_, world ? &sun_env_ : nullptr, false, pc,
+                 32, nullptr, world ? tod_normal_ : nullptr);
   // (For the air's light later: the same maps.)
   std::memcpy(vol_shadow_pc_, pc, sizeof(pc));
   vol_shadow_ok_ = true;
@@ -12509,168 +12667,112 @@ void Renderer::Impl::TodShadows() {
   vol_cloud_[2] = 600.0f;
   vol_cloud_[3] = clouds ? std::min(1.0f, 0.4f + cloud_dark) : 0.0f;
   Barrier();
-  if (clouds) {
-    float cp[28] = {};
+  if (finish) {
+    // Its settings, a row of texels (more than the push constants hold).
+    float f[16 * 4] = {};
     for (int c = 0; c < 4; ++c) {
-      for (int r = 0; r < 4; ++r) cp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+      for (int r = 0; r < 4; ++r) f[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // 0-3: ndc -> world
     }
-    // Toward the sun: back along the sun map's depth axis.
-    double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
-    const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
-    for (int i = 0; i < 3; ++i) cp[16 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
-    cp[19] = cover;
-    cp[20] = tod_.cloud_clock > 0.0f ? tod_.cloud_clock : tod_.seconds;
-    cp[21] = 600.0f;
-    cp[22] = cloud_dark;
-    // The layer round about once (512 texels over ~600 m of it: a metre or
-    // so each), for this and the volumetric light.
-    {
-      if (!cloud_map_.image) {
-        cloud_map_ = gpu_.CreateImage(512, 512, VK_FORMAT_R16_SFLOAT, false, "cloud_map");
-        ToGeneral(cb_, cloud_map_);
-      }
-      const float H = cp[21], ly = std::max(cp[17], 0.08f);
-      const float px = (float(cam_pos_[0]) + cp[16] * H / ly) / H * 0.9f + cp[20] * 0.006f;
-      const float pz = (float(cam_pos_[2]) + cp[18] * H / ly) / H * 0.9f + cp[20] * 0.0025f;
-      const float span = 600.0f / H * 0.9f;
-      float mp[4] = {px - span * 0.5f, pz - span * 0.5f, span, 0.0f};
-      FullscreenPass(CopyKind::kCloudMap, &cloud_map_, nullptr, nullptr, nullptr, false, mp, 4);
-      Barrier();
-      cloud_map_at_[0] = mp[0];
-      cloud_map_at_[1] = mp[1];
-      cloud_map_at_[2] = 1.0f / span;
-      cp[24] = mp[0];
-      cp[25] = mp[1];
-      cp[26] = 1.0f / span;
-    }
-    // (At the camera, for the riders.)
-    {
-      const float H = cp[21], ly = std::max(cp[17], 0.08f);
-      const float qx = float(cam_pos_[0]) + cp[16] * H / ly, qz = float(cam_pos_[2]) + cp[18] * H / ly;
-      const float n = CloudFbm(qx / H * 0.9f + cp[20] * 0.006f, qz / H * 0.9f + cp[20] * 0.0025f);
-      const float lo = 1.0f - cover - 0.03f, hi = 1.0f - cover + 0.1f;
-      const float t = std::clamp((n - lo) / (hi - lo), 0.0f, 1.0f);
-      cloud_here_ = cloud_dark * t * t * (3.0f - 2.0f * t);
-    }
-    FullscreenPass(CopyKind::kCloudShadow, &tod_mask_, depth, &tod_mask_raw_, &cloud_map_, false, cp, 28);
-    Barrier();
-  }
-  // The boards' tracks shading the snow beside them (a low sun).
-  if (tracks_ok_ && tracks_map_.image && !Diag("notrackshadow")) {
-    if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
-      if (tod_mask_raw_.image) Retire(tod_mask_raw_);
-      tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
-      ToGeneral(cb_, tod_mask_raw_);
-    }
-    VkImageCopy all{};
-    all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    all.extent = {depth->width, depth->height, 1};
-    Barrier();
-    vk::vkCmdCopyImage(cb_, tod_mask_.image, VK_IMAGE_LAYOUT_GENERAL, tod_mask_raw_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
-    Barrier();
-    float tp[28] = {};
     for (int c = 0; c < 4; ++c) {
-      for (int r = 0; r < 4; ++r) tp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+      f[16 + c] = float(vp[0 * 4 + c]);  // 4-6: world -> clip x, y, w
+      f[20 + c] = float(vp[1 * 4 + c]);
+      f[24 + c] = float(vp[3 * 4 + c]);
     }
     double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
     const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
-    for (int i = 0; i < 3; ++i) tp[16 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
-    const int64_t N = kTracksN;
-    tp[20] = float(double(tracks_cx_ - N / 2) * kTracksTexel);
-    tp[21] = float(double(tracks_cz_ - N / 2) * kTracksTexel);
-    tp[22] = float(1.0 / kTracksTexel);
-    tp[24] = 0.06f * tracks_;
-    tp[25] = 0.22f * tracks_;
-    FullscreenPass(CopyKind::kTracksShadow, &tod_mask_, depth, &tod_mask_raw_, &tracks_map_, false, tp, 28);
-    Barrier();
-  }
-  // Contact shadows: what the maps miss, from the depth (the mask copied,
-  // then marched).
-  if (contact_ > 0.0f && !Diag("nocontact")) {
-    if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
-      if (tod_mask_raw_.image) Retire(tod_mask_raw_);
-      tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
-      ToGeneral(cb_, tod_mask_raw_);
-    }
-    VkImageCopy all{};
-    all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    all.extent = {depth->width, depth->height, 1};
-    Barrier();
-    vk::vkCmdCopyImage(cb_, tod_mask_.image, VK_IMAGE_LAYOUT_GENERAL, tod_mask_raw_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
-    Barrier();
-    float sp[32] = {};
-    for (int c = 0; c < 4; ++c) {
-      for (int r = 0; r < 4; ++r) sp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
-    }
-    for (int c = 0; c < 4; ++c) {
-      sp[16 + c] = float(vp[0 * 4 + c]);
-      sp[20 + c] = float(vp[1 * 4 + c]);
-      sp[24 + c] = float(vp[3 * 4 + c]);
-    }
-    double fd[3] = {sun_O_[8], sun_O_[9], sun_O_[10]};
-    const double fl = std::sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2]);
-    for (int i = 0; i < 3; ++i) sp[28 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
-    sp[31] = contact_;
-    FullscreenPass(CopyKind::kContactShadow, &tod_mask_, depth, &tod_mask_raw_, nullptr, false, sp, 32);
-    Barrier();
-  }
-  // Eased over a step of the sun: last frame's held while the maps are drawn
-  // again (three frames), then eased into the new over about two thirds of
-  // a second.
-  {
-    auto copy_mask = [&](Image& from, Image& to) {
-      VkImageCopy all{};
-      all.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-      all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-      all.extent = {from.width, from.height, 1};
-      Barrier();
-      vk::vkCmdCopyImage(cb_, from.image, VK_IMAGE_LAYOUT_GENERAL, to.image, VK_IMAGE_LAYOUT_GENERAL, 1, &all);
-      Barrier();
-    };
-    const uint64_t since = frame_number_ - sun_turn_frame_;
-    const double jump = std::hypot(cam_pos_[0] - tod_mask_prev_cam_[0], cam_pos_[1] - tod_mask_prev_cam_[1],
-                                   cam_pos_[2] - tod_mask_prev_cam_[2]);
-    if (sun_turned_ && since > 45) sun_turned_ = false;
-    const bool prev_ok = tod_mask_prev_ok_ && tod_mask_prev_.image && tod_mask_prev_.width == tod_mask_.width &&
-                         tod_mask_prev_.height == tod_mask_.height && jump < 5.0;
-    double prev_vp[16];
-    // (Eased after a step of the sun; otherwise smoothed a little, frame to
-    // frame, always.)
-    const bool steady = !sun_turned_ && !Diag("nomasksmooth");
-    if ((sun_turned_ || steady) && prev_ok && !Diag("noease") && Invert4(tod_mask_prev_inv_vp_, prev_vp)) {
-      if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
-        if (tod_mask_raw_.image) Retire(tod_mask_raw_);
-        tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
-        ToGeneral(cb_, tod_mask_raw_);
-      }
-      copy_mask(tod_mask_, tod_mask_raw_);
-      float ep[20] = {};
-      for (int r = 0; r < 4; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          double v = 0.0;
-          for (int k = 0; k < 4; ++k) v += prev_vp[r * 4 + k] * inv_vp_[k * 4 + c];
-          ep[c * 4 + r] = float(v);
+    for (int i = 0; i < 3; ++i) f[28 + i] = fl > 1e-12 ? float(-fd[i] / fl) : (i == 1 ? 1.0f : 0.0f);
+    f[31] = contact ? contact_ : 0.0f;  // 7: toward the sun, contact shadows
+    if (clouds) {
+      f[32] = tod_.cloud_clock > 0.0f ? tod_.cloud_clock : tod_.seconds;
+      f[33] = 600.0f;
+      // The layer round about once (512 texels over ~600 m of it: a metre or
+      // so each), for this and the volumetric light.
+      {
+        if (!cloud_map_.image) {
+          cloud_map_ = gpu_.CreateImage(512, 512, VK_FORMAT_R16_SFLOAT, false, "cloud_map");
+          ToGeneral(cb_, cloud_map_);
         }
+        const float H = f[33], ly = std::max(f[29], 0.08f);
+        const float px = (float(cam_pos_[0]) + f[28] * H / ly) / H * 0.9f + f[32] * 0.006f;
+        const float pz = (float(cam_pos_[2]) + f[30] * H / ly) / H * 0.9f + f[32] * 0.0025f;
+        const float span = 600.0f / H * 0.9f;
+        float mp[4] = {px - span * 0.5f, pz - span * 0.5f, span, 0.0f};
+        FullscreenPass(CopyKind::kCloudMap, &cloud_map_, nullptr, nullptr, nullptr, false, mp, 4);
+        Barrier();
+        cloud_map_at_[0] = mp[0];
+        cloud_map_at_[1] = mp[1];
+        cloud_map_at_[2] = 1.0f / span;
+        f[36] = mp[0];
+        f[37] = mp[1];
+        f[38] = 1.0f / span;
       }
-      ep[16] = steady ? 0.4f : since < 3 ? 0.0f : 0.12f;
-      ep[18] = steady ? 1.0f : 0.0f;  // (the neighbourhood clamp)
-      if (Diag("sun") && !steady) std::fprintf(stderr, "sun: shadows eased (%llu frames on)\n", (unsigned long long)since);
-      FullscreenPass(CopyKind::kMaskEase, &tod_mask_, &tod_mask_prev_, depth, &tod_mask_raw_, true, ep, 20);
-      Barrier();
+      // (At the camera, for the riders.)
+      {
+        const float H = f[33], ly = std::max(f[29], 0.08f);
+        const float qx = float(cam_pos_[0]) + f[28] * H / ly, qz = float(cam_pos_[2]) + f[30] * H / ly;
+        const float n = CloudFbm(qx / H * 0.9f + f[32] * 0.006f, qz / H * 0.9f + f[32] * 0.0025f);
+        const float lo = 1.0f - cover - 0.03f, hi = 1.0f - cover + 0.1f;
+        const float t = std::clamp((n - lo) / (hi - lo), 0.0f, 1.0f);
+        cloud_here_ = cloud_dark * t * t * (3.0f - 2.0f * t);
+      }
+      // (8: the clouds' clock, height, darkness, cover; 9: the map's corner, 1 / span.)
+      f[34] = cloud_dark;
+      f[35] = cover;
     }
-    // (Kept for the next frame.)
-    if (!tod_mask_prev_.image || tod_mask_prev_.width != tod_mask_.width || tod_mask_prev_.height != tod_mask_.height) {
-      if (tod_mask_prev_.image) Retire(tod_mask_prev_);
-      tod_mask_prev_ = gpu_.CreateImage(tod_mask_.width, tod_mask_.height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_prev");
-      ToGeneral(cb_, tod_mask_prev_);
+    if (tracks) {
+      const int64_t N = kTracksN;
+      f[40] = float(double(tracks_cx_ - N / 2) * kTracksTexel);  // 10: the map's texel 0, texels a metre, on
+      f[41] = float(double(tracks_cz_ - N / 2) * kTracksTexel);
+      f[42] = float(1.0 / kTracksTexel);
+      f[43] = 1.0f;
+      f[44] = 0.06f * tracks_;  // 11: groove depth, heap height
+      f[45] = 0.22f * tracks_;
     }
-    copy_mask(tod_mask_, tod_mask_prev_);
-    tod_mask_prev_ok_ = true;
-    std::memcpy(tod_mask_prev_inv_vp_, inv_vp_, sizeof(tod_mask_prev_inv_vp_));
-    for (int i = 0; i < 3; ++i) tod_mask_prev_cam_[i] = cam_pos_[i];
+    if (far) {
+      for (int i = 0; i < 3; ++i) f[48 + i] = float(cam_pos_[i]);  // 12: camera, from (m)
+      f[51] = float(0.8 * sun_r_);
+      f[52] = float(0.2 * sun_r_);  // 13: over (m), how far the sun's from the mountain's, painted, jitter
+      f[53] = painted ? float(std::clamp(tod_state_.away, 0.0, 1.0)) : 1.0f;
+      f[54] = painted ? 1.0f : 0.0f;
+      f[55] = float(frame_number_ % 64);
+      for (int i = 0; i < 4; ++i) f[56 + i] = bake_c5_[i];  // 14: the painted map's world x, z -> u, v
+    }
+    if (!tod_params_.image) {
+      tod_params_ = gpu_.CreateImage(16, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "tod_mask_settings");
+      ToGeneral(cb_, tod_params_);
+    }
+    Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memcpy(staging.mapped, f, sizeof(f));
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {16, 1, 1};
+    Barrier();
+    vk::vkCmdCopyBufferToImage(cb_, staging.buffer, tod_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    staging_.push_back(staging);
+    Barrier();
+    FullscreenPass(CopyKind::kMaskFinish, finished, depth, sun_out, clouds ? &cloud_map_ : nullptr, false, nullptr,
+                   0, nullptr, tracks ? &tracks_map_ : nullptr, &tod_params_, painted ? baked_src_ : nullptr);
+    Barrier();
   }
+  if (ease) {
+    float ep[20] = {};
+    for (int r = 0; r < 4; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        double v = 0.0;
+        for (int k = 0; k < 4; ++k) v += prev_vp[r * 4 + k] * inv_vp_[k * 4 + c];
+        ep[c * 4 + r] = float(v);
+      }
+    }
+    ep[16] = steady ? 0.4f : since < 3 ? 0.0f : 0.12f;
+    ep[18] = steady ? 1.0f : 0.0f;  // (the neighbourhood clamp)
+    if (Diag("sun") && !steady) std::fprintf(stderr, "sun: shadows eased (%llu frames on)\n", (unsigned long long)since);
+    FullscreenPass(CopyKind::kMaskEase, &tod_mask_, &tod_mask_prev_, depth, finished, true, ep, 20);
+    Barrier();
+  }
+  // (Kept for the next frame: tod_mask_ itself, swapped in as the last.)
+  tod_mask_prev_ok_ = true;
+  std::memcpy(tod_mask_prev_inv_vp_, inv_vp_, sizeof(tod_mask_prev_inv_vp_));
+  for (int i = 0; i < 3; ++i) tod_mask_prev_cam_[i] = cam_pos_[i];
   // The lighting's lookup u = c6.p / c9.p, v = c7.p / c9.p: the screen's.
   for (int i = 0; i < 4; ++i) {
     tod_mask_rows_[0 + i] = 0.5 * vp[0 * 4 + i] + 0.5 * vp[3 * 4 + i];
@@ -13789,6 +13891,13 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       SceneInputs(d, st);
     }
   }
+  // Diagnostics: A3_LOG_DRAWS=1 lists each draw (its shaders, whether
+  // after the lighting pass, its first texture, its count) on stderr.
+  if (static const char* ld = std::getenv("A3_LOG_DRAWS"); ld) {
+    std::fprintf(stderr, "draw %u vs %016llx ps %016llx lit %d tex %016llx idx %u\n", number,
+                 (unsigned long long)vs->info.ucode_hash, (unsigned long long)ps->info.ucode_hash, int(light_seen_),
+                 (unsigned long long)DrawTextureHash(d, st, 0), d.count);
+  }
   // Diagnostics: A3_SKIP_VS=<hash>[,<hash>...] not drawn (which draws are
   // what); A3_SKIP_TEX the same by the first texture's hash.
   if (static const char* skip = std::getenv("A3_SKIP_VS"); skip) {
@@ -14305,7 +14414,12 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     c255[1] /= shadow_res_;
     std::memcpy(out + 255 * 16, c255, 16);
   }
-  if ((shadow_av_ != 1.0f || shadow_fade_ != 1.0f) && ps->info.ucode_hash == kLightingPixelShader) {
+  // (The time of day's mask holds the sun's shadows all over the screen -
+  // near by from the sun maps, the clouds', far off the far slopes' - so
+  // the game's fade of its shadow map with distance is left out: whole
+  // everywhere.)
+  const bool mask_all = TodOn() && tod_mask_ok_ && !Diag("maskfade");
+  if ((shadow_av_ != 1.0f || shadow_fade_ != 1.0f || mask_all) && ps->info.ucode_hash == kLightingPixelShader) {
     // The lighting pass's lookup into the shadow map (rows c6, c7 over c9:
     // u, v), remapped the same way: v' = av (v - 1) + 1.
     uint8_t* out;
@@ -14324,6 +14438,11 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     std::memcpy(c11, src + 11 * 4, 16);
     c10[0] *= shadow_fade_;
     c11[0] *= shadow_fade_;
+    if (mask_all) {
+      // (fade = saturate((depth - c10) / (c11 - c10)): 1 for any depth.)
+      c10[0] = -2.0f;
+      c11[0] = -1.0f;
+    }
     std::memcpy(out + 10 * 16, c10, 16);
     std::memcpy(out + 11 * 16, c11, 16);
   }
@@ -16108,7 +16227,7 @@ Renderer::Impl::~Impl() {
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &icons_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
-                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_}) {
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_, &relight_params_, &tod_params_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);

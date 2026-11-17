@@ -606,6 +606,35 @@ that rule against a save that has the pass.
 - The instant replay's copy of each frame (1.5-2 ms a frame, plus freeing the
   frame after) moved off the render thread onto a thread of its own.
 - The log's "draw state" now shows its vertex buffers' share.
+- The far-off scenery (the mountains and ridges around and beyond the
+  runs, outside where you can ride) is lit for the hour too. It's drawn
+  with its light painted in (a texture, never lit by the game's lighting
+  pass), so with time of day on it stayed at the mountain's own afternoon
+  light: bright at dusk and at night, while the slopes in front went dark.
+  Now it is lit again for the hour: which way its surface faces (from the
+  depth), the painted light taken as the mountain's own sun and sky, and the
+  hour's sun, sky and moon put in their place, with the clouds' shadows and
+  the far shadows below. At the mountain's own hour it looks as the game has
+  it.
+- Far shadows: the slopes' shadows were only baked within about 145 m of
+  where you've been (80% of the sun maps' reach), and the game fades its
+  shadow map out with distance, so with time of day on the far slopes had
+  no shadows at all. Past that reach, at the mountain's own hour, the game's
+  painted shadows are used, as the game has them. As the sun moves away from
+  there, they ease into shadows found by marching toward the sun through the
+  depth on screen: steps from a few metres out to most of a kilometre, so
+  ridges and peaks shade the slopes behind them. The game's fade of its
+  shadow map is left out (the time of day's mask holds the shadows all over
+  the screen), so the clouds' shadows now drift across the far slopes too.
+- Fewer passes for the sun's shadow mask: the clouds' shadows, the tracks'
+  shadows toward a low sun, the contact shadows and the new far shadows are
+  one full-screen pass, where they were three, each with a full-size copy
+  of the mask before it. The settings are read from a small table, since
+  they don't all fit in the push constants. The masks are passed from one
+  image to the next and swapped as last frame's, rather than copied (four
+  full-size copies a frame fewer). The results are the same as before.
+  Diagnostics: `nofar`, `nopainted`, `nobackdrop` and `maskfade` (the
+  game's fade kept) turn the new parts off one at a time.
 - Steadier shadows: the sun maps (trees' and the world's shadows) are drawn
   without the wind's sway. They're redrawn a third at a time every few
   metres, and trees caught at different moments of a sway made their
