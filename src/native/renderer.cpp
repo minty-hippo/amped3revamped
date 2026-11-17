@@ -2319,6 +2319,7 @@ struct Renderer::Impl {
   // Over a step of the time of day's sun (the sun maps started over for it):
   // the frame it went, last frame's mask and view (eased from, TodShadows).
   uint64_t sun_turn_frame_ = 0;
+  double sun_step_light_[3] = {};  // the time of day's light at the sun maps' last start
   bool sun_turned_ = false;
   // A step of the time of day's sun: the maps from before it held for
   // what reads them (the terrain's mask, the riders' shade, the light in the
@@ -9772,9 +9773,12 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
   double f[3];
   {
     double k1[3], k2[3], k3[3];
-    cross(c6, c7, k1);
+    // (From the game's own rows: the shadow distance's remap of v (c7) moves
+    // with the reach each frame, and with it, a little, the direction worked
+    // out from it.)
+    cross(c6, c7o, k1);
     cross(c6, c9, k2);
-    cross(c7, c9, k3);
+    cross(c7o, c9, k3);
     const double* best = k1;
     if (dot3(k2, k2) > dot3(best, best)) best = k2;
     if (dot3(k3, k3) > dot3(best, best)) best = k3;
@@ -9909,17 +9913,26 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     // each eased into the next, nearly a glide; the maps are drawn again
     // every couple of metres the camera moves anyway.)
     const double step_cos = TodOn() && !Diag("bigsunsteps") ? 0.99996 : 0.9997;
-    const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < step_cos || R != sun_r_ ||
+    // (The time of day: a step only when its sun has moved, not for the
+    // game's own shadow frustum wavering under it.)
+    bool sun_moved = dot3(f, sun_f_) < step_cos;
+    const double ld[3] = {lm_dir_.x, lm_dir_.y, lm_dir_.z};
+    if (sun_moved && sun_map_ok_ && TodOn() && dot3(f, sun_f_) > 0.9997 && dot3(ld, sun_step_light_) > 0.999995 &&
+        !Diag("nosunhyst")) {
+      sun_moved = false;
+    }
+    const bool reset = !sun_map_ok_ || sun_moved || R != sun_r_ ||
                        moved > 0.5 * R ||
                        std::fabs(dot3(cam, sun_f_) - sun_ref_) > 0.3 * kSunDepth ||
                        std::fabs(cam[1] - sun_href_) > 0.3 * kSunDepth;
     const float far_depth[4] = {0, 0, 0, 0};
     if (reset) {
       // (The time of day's sun moved on, the camera where it was: eased over.)
-      if (sun_map_ok_ && TodOn() && dot3(f, sun_f_) < step_cos && R == sun_r_ && moved <= 0.5 * R) {
+      if (sun_map_ok_ && TodOn() && sun_moved && R == sun_r_ && moved <= 0.5 * R) {
         sun_turn_frame_ = frame_number_;
         sun_turned_ = true;
         bake_ease_pending_ = true;
+        ++stats_.sun_steps;
         // What's there kept, for what reads it while the new are drawn.
         if (!Diag("nohold")) {
           if (!sun_env_hold_.image || sun_env_hold_.width != sun_env_.width ||
@@ -9950,6 +9963,7 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
       for (double& v : e1) v /= n1;
       cross(f, e1, e2);
       std::memcpy(sun_f_, f, sizeof(f));
+      std::memcpy(sun_step_light_, ld, sizeof(ld));
       std::memcpy(sun_e1_, e1, sizeof(e1));
       std::memcpy(sun_e2_, e2, sizeof(e2));
       std::memcpy(sun_c0_, ahead, sizeof(ahead));
@@ -10617,6 +10631,7 @@ void Renderer::Impl::SunHoldApply() {
   std::swap(sun_env_, sun_env_hold_);
   std::memcpy(sun_O_, sun_O_hold_, sizeof(sun_O_));
   sun_hold_swapped_ = true;
+  ++stats_.sun_held;
   if (Diag("sun")) std::fprintf(stderr, "sun: maps from before the step held\n");
 }
 
@@ -12335,6 +12350,7 @@ float CloudFbm(float x, float y) {
 void Renderer::Impl::TodShadows() {
   std::vector<CasterDraw> draws;
   draws.swap(tod_movers_draws_);
+  stats_.tod_casters = uint32_t(draws.size());
   tod_mask_ok_ = false;
   cloud_here_ = 0.0f;
   vol_shadow_ok_ = false;
@@ -16148,6 +16164,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   res_ = &resources;
   stats_ = RenderStats{};
   stats_.scene_lit = light_seen_;
+  stats_.tod_mask = tod_mask_ok_;
   stats_.notices = std::move(pending_notices_);
   pending_notices_.clear();
   profile_frame_ = frame_number_ % 30 == 0 || Diag("profile");

@@ -171,6 +171,12 @@ struct RenderStats {
   uint32_t tree_casters = 0;       // trees drawn into the tree map
   uint32_t sun_receivers = 0;      // terrain drawn again from the sun
   uint32_t sun_map_resets = 0;     // tree map started over
+  // The time of day's shadows: the sun maps started over for a step of its
+  // sun (held over meanwhile), the screen's shadow mask made, and the riders'
+  // and objects' copies drawn into its casters' map, this frame.
+  uint32_t sun_steps = 0, sun_held = 0;
+  bool tod_mask = false;
+  uint32_t tod_casters = 0;
   // The nearest character to the camera (world units; 1e9: none).
   float nearest_character = 1e9f;
   // Object motion blur: scene draws given motion vectors, and of those the

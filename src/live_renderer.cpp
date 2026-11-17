@@ -2010,6 +2010,8 @@ struct Timings {
   uint32_t part_frames = 0;
   // Render passes and clears (RenderStats).
   uint64_t passes = 0, clear_passes = 0, clears_merged = 0, clears_in_pass = 0;
+  // Time of day's shadows: frames, sun steps, held, mask made, casters' copies (sum), frames without any.
+  uint64_t tod_frames = 0, sun_steps = 0, sun_held = 0, tod_mask = 0, tod_casters = 0, tod_no_casters = 0, sun_resets = 0;
   // GPU time by part (Renderer::GpuParts), summed per name; frames measured.
   std::map<std::string, double> gpu_parts;
   uint32_t gpu_part_frames = 0;
@@ -2090,6 +2092,13 @@ void LogTimings(bool shared) {
       "{:.1f} folded into a pass's load op, {:.1f} inside a pass",
       double(t.passes) / n, double(t.clear_passes) / n, double(t.clears_merged) / n,
       double(t.clears_in_pass) / n);
+  if (t.tod_frames && (t.tod_mask || t.sun_resets)) {
+    REXLOG_INFO("Native renderer: shadows over {} frames: sun maps started over {} times ({} for the sun's "
+                "steps, held {} frames); time of day's mask {} frames; casters {:.1f} a frame, none in {} "
+                "frames",
+                t.tod_frames, t.sun_resets, t.sun_steps, t.sun_held, t.tod_mask,
+                double(t.tod_casters) / double(std::max<uint64_t>(t.tod_mask, 1)), t.tod_no_casters);
+  }
   if (t.gpu_part_frames) {
     // The biggest parts first.
     std::vector<std::pair<double, std::string>> parts;
@@ -2744,6 +2753,15 @@ void WorkerMain() {
         g_timings.prepass += stats.prepass_ms;
         g_timings.draw += stats.record_ms;
         g_timings.passes += stats.passes;
+        if (stats.scene_lit) {
+          ++g_timings.tod_frames;
+          g_timings.sun_steps += stats.sun_steps;
+          g_timings.sun_held += stats.sun_held;
+          g_timings.sun_resets += stats.sun_map_resets;
+          g_timings.tod_mask += stats.tod_mask ? 1 : 0;
+          g_timings.tod_casters += stats.tod_casters;
+          g_timings.tod_no_casters += stats.tod_mask && !stats.tod_casters ? 1 : 0;
+        }
         g_timings.clear_passes += stats.clear_passes;
         g_timings.clears_merged += stats.clears_merged;
         g_timings.clears_in_pass += stats.clears_in_pass;
