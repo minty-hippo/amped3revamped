@@ -118,6 +118,7 @@ const std::vector<Tab>& Tabs() {
            {"native_weather", "Weather", Kind::kStops, 0, 0, 0,
             {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"}, {"5", "Blizzard"}}},
            {"native_wind_sway", "Wind in the Trees"},
+           {"native_wind_strength", "Wind Strength", Kind::kSlider, 0.0, 3.0, 0.1},
            {"native_snow_cover", "Snow Settles"},
            {"native_drifting_snow", "Drifting Snow"},
            {"native_ice_halo", "Ice Halo", Kind::kSlider, 0.0, 2.0, 0.1},

@@ -471,7 +471,12 @@ that rule against a save that has the pass.
   The wind moves the trees (Time of Day: Wind in the Trees,
   `native_wind_sway`): their foliage sways with it and flutters, whole trees
   (the clustered and distant ones) bend from their foot, each its own way,
-  gusts sweeping across; gently when calm, hard in a blizzard. Snow that
+  gusts sweeping across; gently when calm, hard in a blizzard. The weather's
+  winds are stronger than before (clear about 2.5 m/s, overcast 5, snowing
+  6, a blizzard 14), the trees sway about twice as far, and the snow tracks
+  start wearing away in a moderate breeze rather than only in a blizzard;
+  loose snow starts drifting from about 4.5 m/s. Wind Strength
+  (`native_wind_strength`, 1; 0 to 3) scales all of it. Snow that
   falls settles (Snow Settles, `native_snow_cover`): on tree boughs, roofs,
   rocks and props, wherever they face up, patchy at first, building over a
   few minutes of snowfall and melting slowly after. It isn't flat white: on
@@ -563,6 +568,18 @@ that rule against a save that has the pass.
   dust and smudges on the lens, out of focus (soft discs, a little brighter
   at the rim, and faint smears), that light up when the sun is in view,
   most near it.
+- Shadows while the time of day's sun moves: the sun maps follow it in
+  half-degree steps (were 1.4), each eased into the next, so the shadows
+  glide rather than tick. While the maps are drawn again after a step (three
+  frames), whatever reads them (the slopes' shadow mask, the riders' shade
+  under trees, the light in the air) gets the maps from before the step, not
+  half-drawn ones: no shadows blinking out for a frame or two.
+- The time of day costs less on the CPU: the lighting values it changes in
+  the riders', characters' and props' shaders are worked out once for each
+  set of constants and shared by the draws that use them, rather than redone
+  for every draw (about 60% less time on constants in a Northstar replay).
+  The log's "draws by part" line now splits the old "uniforms" into "draw
+  state" and "constants".
 - Ambient occlusion: its far taps read smaller copies of the depth (half to
   an eighth size), one read each and kept in the cache (it was the dearest
   effect up close, 6-9 ms a frame on an Arc). With time of day on it dims

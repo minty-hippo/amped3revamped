@@ -495,6 +495,10 @@ const std::vector<Tab>& Tabs() {
                        "With time of day on: the trees and their foliage sway in the wind, gently "
                        "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "
                        "across)."),
+                SliderF("native_wind_strength", "Wind strength",
+                        "How hard the wind blows, times the weather's own: the trees and "
+                        "banners swaying, loose snow drifting, the tracks worn away. 0: still "
+                        "air.", "%.1f", 0.0, 3.0),
                 Choices("native_night_light_shadows", "Night light shadows",
                         "Shadows from the lamps, floodlights and fires: riders, trees, posts "
                         "and buildings each cast one from every light near them. Traced "

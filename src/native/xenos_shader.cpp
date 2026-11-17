@@ -766,16 +766,16 @@ uint xe_vertex_index() {
                      sin(t * 0.37 + 1.3);
   if (mode == 1) {
     // Leaves and needles: a sway with the wind and a quick flutter.
-    off.xz = dir * k * 0.05 * gust + k * 0.02 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
-    off.y = k * 0.012 * sin(t * 2.9 + ph * 4.3);
+    off.xz = dir * k * 0.10 * gust + k * 0.035 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
+    off.y = k * 0.02 * sin(t * 2.9 + ph * 4.3);
   } else if (mode == 2) {
     // A tree: bending with the wind from its foot (more the higher), its
     // branches fluttering.
     float h = max(m.y, 0.0);
-    float bend = h * h * 0.0016 * k * gust;
+    float bend = h * h * 0.0028 * k * gust;
     off.xz = dir * bend + bend * 0.25 * vec2(sin(t * 1.4 + seed), cos(t * 1.1 + seed));
     off.y = -0.15 * bend * bend / max(h, 0.5);
-    off.xz += k * 0.012 * min(h, 6.0) / 6.0 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
+    off.xz += k * 0.025 * min(h, 6.0) / 6.0 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
   } else {
     // Cloth (a banner, a flag): blown out with the wind, rippling across.
     float wave = sin(t * (4.5 + 0.3 * k) - dot(m, vec3(2.1, 1.3, 2.1)) + seed);

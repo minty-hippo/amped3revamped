@@ -250,6 +250,11 @@ REXCVAR_DEFINE_BOOL(native_snow_cover, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_wind_sway, true, "GPU",
                     "Time of day: the wind moves the trees and their foliage (gently when "
                     "calm, hard in a blizzard)");
+REXCVAR_DEFINE_DOUBLE(native_wind_strength, 1.0, "GPU",
+                      "Time of day: how hard the wind blows, times the weather's own (the "
+                      "trees, the banners, the snow drifting and wearing the tracks away; 0: "
+                      "still air)")
+    .range(0.0, 3.0);
 REXCVAR_DEFINE_DOUBLE(native_weather_minutes, 6.0, "GPU",
                       "Time of day, changing weather: about how many minutes each spell lasts")
     .range(1.0, 120.0);
@@ -798,10 +803,10 @@ struct WeatherKind {
   float overcast, snow, wind, mist;
 };
 constexpr WeatherKind kWeather[4] = {
-    {"clear", 0.0f, 0.0f, 1.5f, 0.0f},
-    {"overcast", 0.85f, 0.0f, 3.0f, 0.08f},
-    {"snowing", 0.92f, 0.55f, 3.5f, 0.3f},
-    {"a blizzard", 1.0f, 1.0f, 11.0f, 1.0f},
+    {"clear", 0.0f, 0.0f, 2.5f, 0.0f},
+    {"overcast", 0.85f, 0.0f, 5.0f, 0.08f},
+    {"snowing", 0.92f, 0.55f, 6.0f, 0.3f},
+    {"a blizzard", 1.0f, 1.0f, 14.0f, 1.0f},
 };
 struct WeatherNow {
   int kind = 0;
@@ -1931,7 +1936,7 @@ struct Timings {
   double worst = 0;
   std::string worst_detail;
   // Sampled frames: the worker's draw recording by part (RenderStats::draw_part_ms).
-  double parts[9] = {};
+  double parts[10] = {};
   uint32_t part_frames = 0;
   // Render passes and clears (RenderStats).
   uint64_t passes = 0, clear_passes = 0, clears_merged = 0, clears_in_pass = 0;
@@ -2005,10 +2010,10 @@ void LogTimings(bool shared) {
     const double k = 1.0 / t.part_frames;
     REXLOG_INFO(
         "Native renderer: draws by part (ms per frame, {} sampled): setup {:.2f}, targets {:.2f}, "
-        "textures {:.2f}, pipeline {:.2f}, uniforms {:.2f}, texture sets {:.2f}, indices {:.2f}, "
-        "Vulkan commands {:.2f}, after {:.2f}",
+        "textures {:.2f}, pipeline {:.2f}, draw state {:.2f}, constants {:.2f}, texture sets {:.2f}, "
+        "indices {:.2f}, Vulkan commands {:.2f}, after {:.2f}",
         t.part_frames, t.parts[0] * k, t.parts[1] * k, t.parts[2] * k, t.parts[3] * k,
-        t.parts[4] * k, t.parts[5] * k, t.parts[6] * k, t.parts[7] * k, t.parts[8] * k);
+        t.parts[9] * k, t.parts[4] * k, t.parts[5] * k, t.parts[6] * k, t.parts[7] * k, t.parts[8] * k);
   }
   REXLOG_INFO(
       "Native renderer: per frame {:.1f} render passes; clears: {:.1f} as passes of their own, "
@@ -2464,12 +2469,13 @@ void WorkerMain() {
               tod.overcast = g_weather.overcast;
               tod.snow = g_weather.snow;
               tod.snow_cover = REXCVAR_GET(native_snow_cover) ? g_weather.cover : 0.0f;
-              tod.wind[0] = float(std::cos(g_weather.wind_angle) * g_weather.wind);
-              tod.wind[1] = float(std::sin(g_weather.wind_angle) * g_weather.wind);
+              const double wind = g_weather.wind * std::clamp(REXCVAR_GET(native_wind_strength), 0.0, 3.0);
+              tod.wind[0] = float(std::cos(g_weather.wind_angle) * wind);
+              tod.wind[1] = float(std::sin(g_weather.wind_angle) * wind);
               tod.sway = REXCVAR_GET(native_wind_sway);
               // The clouds' clock: faster in the wind.
               static double cloud_clock = 1.0;
-              if (running) cloud_clock += dt * (0.5 + g_weather.wind / 3.0);
+              if (running) cloud_clock += dt * (0.5 + wind / 3.0);
               tod.cloud_clock = float(std::fmod(cloud_clock, 100000.0) + 1.0);
               // The fog closing in: heavy snow a few hundred metres, a
               // blizzard a few dozen.
@@ -2672,7 +2678,7 @@ void WorkerMain() {
         g_timings.clears_merged += stats.clears_merged;
         g_timings.clears_in_pass += stats.clears_in_pass;
         if (stats.draw_parts_sampled) {
-          for (int k = 0; k < 9; ++k) g_timings.parts[k] += stats.draw_part_ms[k];
+          for (int k = 0; k < 10; ++k) g_timings.parts[k] += stats.draw_part_ms[k];
           ++g_timings.part_frames;
         }
         perf::ReportRenderFrame(states_ms + stats.prepass_ms + stats.record_ms);

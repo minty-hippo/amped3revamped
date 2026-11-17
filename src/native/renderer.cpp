@@ -1439,6 +1439,23 @@ struct Renderer::Impl {
   };
   std::array<ConstUpload, 8> const_uploads_[2];
   uint32_t const_upload_next_[2] = {};
+  // The same brought to the hour (time of day: TodApply), offset UINT32_MAX
+  // when nothing changed: draw after draw of one shader with the same
+  // constants (a rider's parts, the props) share one.
+  std::array<ConstUpload, 8> tod_uploads_[2];
+  uint32_t tod_upload_next_[2] = {};
+  bool TodUploadFind(int stage, uint64_t version, const Shader* sh, uint32_t* offset) const {
+    for (const ConstUpload& c : tod_uploads_[stage]) {
+      if (c.shader == sh && c.version == version) {
+        *offset = c.offset;
+        return true;
+      }
+    }
+    return false;
+  }
+  void TodUploadKeep(int stage, uint64_t version, const Shader* sh, uint32_t offset) {
+    tod_uploads_[stage][tod_upload_next_[stage]++ & 7] = {version, sh, offset};
+  }
   uint64_t bool_loop_version_ = 0;
   uint32_t bool_loop_offset_ = 0;
   uint32_t last_fetch_[192] = {};
@@ -1760,7 +1777,7 @@ struct Renderer::Impl {
   VkBuffer cur_index_buffer_ = VK_NULL_HANDLE;
   bool index_cache_ = true;
   bool profile_frame_ = false;
-  double draw_part_ms_[9] = {};  // off with the diagnostic "noixcache"
+  double draw_part_ms_[10] = {};  // off with the diagnostic "noixcache"
   std::unordered_map<std::string, uint64_t> mem_sizes_;
   // Vertex data kept in one GPU buffer across frames (Prepass): a resource
   // is copied only when its bytes changed (FrameResources::Version). A region
@@ -2221,6 +2238,14 @@ struct Renderer::Impl {
   // the frame it went, last frame's mask and view (eased from, TodShadows).
   uint64_t sun_turn_frame_ = 0;
   bool sun_turned_ = false;
+  // A step of the time of day's sun: the maps from before it held for
+  // what reads them (the terrain's mask, the riders' shade, the light in the
+  // air) while the new are drawn (three frames), then let go.
+  Image sun_env_hold_;
+  double sun_O_hold_[16] = {};
+  bool sun_hold_on_ = false, sun_hold_swapped_ = false, sun_hold_phase0_ = false;
+  uint64_t sun_hold_frame_ = 0;
+  void SunHoldApply();
   Image tod_mask_prev_;
   bool tod_mask_prev_ok_ = false;
   double tod_mask_prev_inv_vp_[16] = {};
@@ -3364,7 +3389,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
         if (Image* snowy = SnowScene(scene)) scene = snowy;
         MarkPart("effect: snow");
       }
-      if (tod_sky && drift_ && std::hypot(tod_.wind[0], tod_.wind[1]) > 5.0f && !Diag("nodrift")) {
+      if (tod_sky && drift_ && std::hypot(tod_.wind[0], tod_.wind[1]) > 4.5f && !Diag("nodrift")) {
         if (Image* drifting = DriftScene(scene)) scene = drifting;
         MarkPart("effect: drifting snow");
       }
@@ -8221,6 +8246,8 @@ void Renderer::Impl::BeginFrame() {
   uniform_used_ = 0;
   for (auto& c : const_uploads_) c = {};
   const_upload_next_[0] = const_upload_next_[1] = 0;
+  for (auto& c : tod_uploads_) c = {};
+  tod_upload_next_[0] = tod_upload_next_[1] = 0;
   bool_loop_version_ = 0;
   last_fetch_offset_ = UINT32_MAX;
   last_sys_offset_ = UINT32_MAX;
@@ -8854,6 +8881,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
   light_seen_ = true;
   UpdateShadowReach(st);
   DrawSunShadows(d, st);
+  SunHoldApply();
   TodLightingInputs(d, st);
   // Ambient occlusion: the world's depth, kept before it's resolved again.
   ao_depth_ok_ = false;
@@ -9290,6 +9318,11 @@ void Renderer::Impl::SunCycle(const double cam[3], const double dir[3]) {
 //   unblurred one filtered with penumbras that widen away from the caster
 //   (Shadow softness).
 void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
+  // (Last frame's held maps put back: the new ones drawn on.)
+  if (sun_hold_swapped_) {
+    std::swap(sun_env_, sun_env_hold_);
+    sun_hold_swapped_ = false;
+  }
   std::vector<CasterDraw> env, height;
   env.swap(env_draws_);
   height.swap(height_draws_);
@@ -9456,17 +9489,42 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     // Started over when the sun moves (another mountain: its direction is
     // fixed per mountain), the camera jumps (a restart, another run) or the
     // maps' size changes.
-    const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < 0.9997 || R != sun_r_ ||
+    // (The time of day's sun followed in small steps, about half a degree:
+    // each eased into the next, nearly a glide; the maps are drawn again
+    // every couple of metres the camera moves anyway.)
+    const double step_cos = TodOn() && !Diag("bigsunsteps") ? 0.99996 : 0.9997;
+    const bool reset = !sun_map_ok_ || dot3(f, sun_f_) < step_cos || R != sun_r_ ||
                        moved > 0.5 * R ||
                        std::fabs(dot3(cam, sun_f_) - sun_ref_) > 0.3 * kSunDepth ||
                        std::fabs(cam[1] - sun_href_) > 0.3 * kSunDepth;
     const float far_depth[4] = {0, 0, 0, 0};
     if (reset) {
       // (The time of day's sun moved on, the camera where it was: eased over.)
-      if (sun_map_ok_ && TodOn() && dot3(f, sun_f_) < 0.9997 && R == sun_r_ && moved <= 0.5 * R) {
+      if (sun_map_ok_ && TodOn() && dot3(f, sun_f_) < step_cos && R == sun_r_ && moved <= 0.5 * R) {
         sun_turn_frame_ = frame_number_;
         sun_turned_ = true;
         bake_ease_pending_ = true;
+        // What's there kept, for what reads it while the new are drawn.
+        if (!Diag("nohold")) {
+          if (!sun_env_hold_.image || sun_env_hold_.width != sun_env_.width ||
+              sun_env_hold_.height != sun_env_.height || sun_env_hold_.format != sun_env_.format) {
+            if (sun_env_hold_.image) Retire(sun_env_hold_);
+            sun_env_hold_ = gpu_.CreateImage(sun_env_.width, sun_env_.height, sun_env_.format, true, "sun_world_held");
+            ToGeneral(cb_, sun_env_hold_);
+          }
+          VkImageCopy all{};
+          all.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+          all.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+          all.extent = {sun_env_.width, sun_env_.height, 1};
+          Barrier();
+          vk::vkCmdCopyImage(cb_, sun_env_.image, VK_IMAGE_LAYOUT_GENERAL, sun_env_hold_.image,
+                             VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+          Barrier();
+          std::memcpy(sun_O_hold_, sun_O_, sizeof(sun_O_hold_));
+          sun_hold_on_ = true;
+          sun_hold_phase0_ = false;
+          sun_hold_frame_ = frame_number_;
+        }
         if (Diag("sun")) std::fprintf(stderr, "sun: the time of day's sun moved on: eased over\n");
       }
       const double up[3] = {0.0, 1.0, 0.0}, side[3] = {1.0, 0.0, 0.0};
@@ -9560,6 +9618,11 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     // The rays whose sunward side is in view at the end of an update (with
     // the world drawn into the maps): what casts on them has been drawn.
     const bool update_done = sun_phase_ == 2 || sun_phase_ == 3;
+    // (Held until a whole update's drawn since the step.)
+    if (sun_hold_on_ && frame_number_ != sun_hold_frame_) {
+      if (sun_phase_ == 0 || sun_phase_ == 3) sun_hold_phase0_ = true;
+      if ((update_done && sun_hold_phase0_) || frame_number_ > sun_hold_frame_ + 8) sun_hold_on_ = false;
+    }
     if (update_done) {
       double Oinv[16], vp[16];
       if (Invert4(O, Oinv) && Invert4(inv_vp_, vp)) {
@@ -10128,6 +10191,19 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
 // light them: they're shaded by themselves) darkened where the world shades
 // them, and where they shade themselves (the game's own shadow map: an arm
 // on the body), on the surfaces facing the sun. Worked out at half size.
+// While the time of day's sun maps are drawn again after a step: what reads
+// them this frame gets the ones from before (and their rows).
+void Renderer::Impl::SunHoldApply() {
+  if (!sun_hold_on_ || sun_hold_swapped_ || !sun_env_hold_.image || !sun_env_.image ||
+      sun_env_hold_.width != sun_env_.width || !TodOn()) {
+    return;
+  }
+  std::swap(sun_env_, sun_env_hold_);
+  std::memcpy(sun_O_, sun_O_hold_, sizeof(sun_O_));
+  sun_hold_swapped_ = true;
+  if (Diag("sun")) std::fprintf(stderr, "sun: maps from before the step held\n");
+}
+
 Image* Renderer::Impl::ShadedMovers(Image* scene) {
   if (movers_done_) return movers_result_;
   movers_done_ = true;
@@ -11231,7 +11307,7 @@ Image* Renderer::Impl::DriftScene(Image* scene) {
   }
   const float speed = std::hypot(tod_.wind[0], tod_.wind[1]);
   // (From a stiff breeze to a gale: 5 .. 18 m/s.)
-  const float amount = std::clamp((speed - 5.0f) / 13.0f, 0.0f, 1.0f);
+  const float amount = std::clamp((speed - 4.5f) / 12.0f, 0.0f, 1.0f);
   if (amount <= 0.0f) return nullptr;
   EndRendering();
   if (!drift_out_.image || drift_out_.width != scene->width || drift_out_.height != scene->height ||
@@ -11439,11 +11515,11 @@ void Renderer::Impl::TracksUpdate() {
       }
       const double speed = std::hypot(wx, wz);
       if (speed > 0.1) {
-        scour += float(tod::SmoothStep(3.0, 15.0, speed)) * dt / 50.0f;
-        drift += float(tod::SmoothStep(4.0, 16.0, speed)) * dt / 200.0f;
+        scour += float(tod::SmoothStep(1.5, 14.0, speed)) * dt / 40.0f;
+        drift += float(tod::SmoothStep(2.5, 15.0, speed)) * dt / 150.0f;
         // (The loose snow at the surface: about a hundredth of the wind's
         // speed, in texels.)
-        const double moved = tod::SmoothStep(3.0, 12.0, speed) * 0.012 * speed * dt / kTracksTexel;
+        const double moved = tod::SmoothStep(2.0, 10.0, speed) * 0.012 * speed * dt / kTracksTexel;
         carried[0] += wx / speed * moved;
         carried[1] += wz / speed * moved;
       }
@@ -13634,6 +13710,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
     }
   }
+  mark(9);  // (the draw's system constants and vertex data)
   // Uniform blocks: each written only when it differs from what an earlier
   // draw this frame already uploaded.
   uint32_t offsets[5];
@@ -13660,7 +13737,12 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // c9, c10 over c12: the time of day's mask, through the screen's rows.)
   const bool trail_tod = TodOn() && tod_mask_ok_ && vs->info.ucode_hash == kTrailVertexShader;
   const bool vs_needs = LightModOn() && TodNeeds(0, *vs);
-  if (vs_needs || trail_tod) {
+  uint32_t tod_vs_off = 0;
+  const bool vs_cached = vs_needs && !trail_tod && !Diag("nconstcache") &&
+                         TodUploadFind(0, st.vs_consts.version(), vs, &tod_vs_off);
+  if (vs_cached) {
+    if (tod_vs_off != UINT32_MAX) offsets[1] = tod_vs_off;
+  } else if (vs_needs || trail_tod) {
     uint32_t vc[1024];
     std::memcpy(vc, st.vs_consts.data(), sizeof(vc));
     bool changed = vs_needs && TodApply(0, *vs, vc);
@@ -13678,6 +13760,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
       std::memcpy(out, vc, ConstBytes(*vs));
     }
+    if (!trail_tod) TodUploadKeep(0, st.vs_consts.version(), vs, changed ? offsets[1] : UINT32_MAX);
   }
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
   // Freecam: the lighting pass works out each pixel's world position from
@@ -13722,12 +13805,21 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
     std::memcpy(out, fc_consts, ConstBytes(*ps));
   } else if (LightModOn() && TodNeeds(1, *ps)) {
-    if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
-    if (TodApply(1, *ps, fc_consts)) {
-      lit_src = fc_consts;
-      uint8_t* out;
-      offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
-      std::memcpy(out, fc_consts, ConstBytes(*ps));
+    const bool plain = lit_src == st.ps_consts.data() && !Diag("nconstcache");
+    uint32_t off = 0;
+    if (plain && TodUploadFind(1, st.ps_consts.version(), ps, &off)) {
+      // (Brought to the hour already for an earlier draw: shared.)
+      if (off != UINT32_MAX) offsets[2] = off;
+    } else {
+      if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
+      const bool changed = TodApply(1, *ps, fc_consts);
+      if (changed) {
+        lit_src = fc_consts;
+        uint8_t* out;
+        offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
+        std::memcpy(out, fc_consts, ConstBytes(*ps));
+      }
+      if (plain) TodUploadKeep(1, st.ps_consts.version(), ps, changed ? offsets[2] : UINT32_MAX);
     }
   }
   if (shadow_res_ > 1.0f && ps->info.ucode_hash == kShadowBlurPixelShader &&
@@ -15523,7 +15615,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(ao_depth_);
   gpu_.DestroyImage(ao_late_depth_);
   for (Image* im : {&sun_raw_, &sun_zo_, &sun_prep_, &sun_out_, &sun_env_,
-                    &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &baked_, &bake_old_, &bake_new_,
+                    &sun_height_, &sun_scratch_, &sun_seen_, &sun_seen_scratch_, &sun_env_hold_, &baked_, &bake_old_, &bake_new_,
                     &sun_tiles_, &sun_tiles2_, &movers_pos_, &movers_shade_, &movers_blur_,
                     &movers_out_}) {
     gpu_.DestroyImage(*im);
@@ -15646,6 +15738,10 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   movers_done_ = false;
   movers_result_ = nullptr;
   sun_frame_ok_ = false;
+  if (sun_hold_swapped_) {
+    std::swap(sun_env_, sun_env_hold_);  // (the held maps were for last frame's reading only)
+    sun_hold_swapped_ = false;
+  }
   sun_phase_ = Diag("sunevery") ? 3 : sun_next_phase_;
   sun_next_phase_ = -1;
   sun_draw_seq_ = 0;

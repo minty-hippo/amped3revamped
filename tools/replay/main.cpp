@@ -884,8 +884,8 @@ int main(int argc, char** argv) {
       if (st.draw_parts_sampled) {
         const auto& p = st.draw_part_ms;
         std::printf("  draws by part (ms): setup %.2f, targets %.2f, textures %.2f, pipeline %.2f, "
-                    "uniforms %.2f, texture sets %.2f, indices %.2f, commands %.2f, after %.2f\n",
-                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]);
+                    "draw state %.2f, constants %.2f, texture sets %.2f, indices %.2f, commands %.2f, after %.2f\n",
+                    p[0], p[1], p[2], p[3], p[9], p[4], p[5], p[6], p[7], p[8]);
       }
     };
     if (reactive_debug) renderer.SetUpscaleParams(16.7f, 0.0f, true);
@@ -1091,8 +1091,21 @@ int main(int argc, char** argv) {
         tod.on = !tod.on;
         renderer.SetTimeOfDay(tod);
       }
+      // A3_TOD_RATE=hours: the clock running, that much each repeat.
+      if (const char* rt = std::getenv("A3_TOD_RATE")) {
+        tod.hour = std::fmod(tod.hour + float(std::atof(rt)), 24.0f);
+        tod.seconds += 1.0f / 60.0f;
+        renderer.SetTimeOfDay(tod);
+      }
       stats = renderer.Render(cap, files, max_draws);
       first_use(("repeat " + std::to_string(i)).c_str(), stats);
+      // A3_SAVE_EACH: every repeat's picture kept (frame_NN.png).
+      if (std::getenv("A3_SAVE_EACH")) {
+        const auto each = renderer.FinalImage();
+        char name[32];
+        std::snprintf(name, sizeof(name), "frame_%02d.png", i);
+        if (!each.name.empty()) WritePng(renderer, each, out / name);
+      }
       if (std::getenv("A3_PICK_SURFACE")) {
         uint64_t h = 0;
         int g = 0;
