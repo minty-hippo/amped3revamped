@@ -9,7 +9,7 @@ name: Launcher
 
 on:
   push:
-    paths: ['launcher/**', 'src/subtitle_file.h', 'third_party/stb/stb_image.h', '.github/workflows/launcher.yml']
+    paths: ['launcher/**', 'src/subtitle_file.h', 'src/subtitle_draw.h', 'third_party/stb/stb_image.h', '.github/workflows/launcher.yml']
   workflow_dispatch:
 
 permissions:
