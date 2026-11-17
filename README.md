@@ -597,6 +597,25 @@ that rule against a save that has the pass.
 - The instant replay's copy of each frame (1.5-2 ms a frame, plus freeing the
   frame after) moved off the render thread onto a thread of its own.
 - The log's "draw state" now shows its vertex buffers' share.
+- Steadier shadows: the sun maps (trees' and the world's shadows) are drawn
+  without the wind's sway. They're redrawn a third at a time every few
+  metres, and trees caught at different moments of a sway made their
+  shadows shimmer on the ground and on the trees themselves. The riders'
+  and objects' shadows (drawn whole every frame) still move with them. The
+  slopes' shadow mask is also smoothed a little frame to frame (last
+  frame's, carried to where it is now, kept only within what's round about
+  now, so a moving shadow doesn't trail): the flicker of shadow edges in
+  front of the rider, from the contact shadows and the upscaler's jitter,
+  settles.
+- Wind in trees whose trunks don't move (the big pines' foliage and the bare
+  trees' twigs, drawn apart from their trunks): only a small sway and
+  flutter, so the branches no longer break away from the trunk in a strong
+  wind (the clustered trees still bend whole from their foot).
+- Drifting snow: drawn after the upscaler (streaming over the ground with no
+  motion of its own, it smeared and broke up through it), only on the
+  ground (not riders, trunks or walls), with a smoother pattern (whole-
+  number hashing: no blocky noise far out on the mountain), soft long
+  streaks, and a little more visible.
 - Shadows while the time of day's sun moves: the sun maps follow it in
   half-degree steps (were 1.4), each eased into the next, so the shadows
   glide rather than tick. While the maps are drawn again after a step (three

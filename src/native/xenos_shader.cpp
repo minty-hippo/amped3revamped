@@ -765,9 +765,12 @@ uint xe_vertex_index() {
   float gust = 0.6 + 0.4 * sin(t * 0.83 + dot(m.xz, vec2(0.021, 0.017)) + seed * 0.1) *
                      sin(t * 0.37 + 1.3);
   if (mode == 1) {
-    // Leaves and needles: a sway with the wind and a quick flutter.
-    off.xz = dir * k * 0.10 * gust + k * 0.035 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
-    off.y = k * 0.02 * sin(t * 2.9 + ph * 4.3);
+    // Leaves and needles (and a bare tree's twigs): their trunks stay still
+    // (drawn as the world's meshes), so only a little sway with the wind,
+    // kept short of breaking away from them, and a quick flutter.
+    float kk = min(k, 2.0);
+    off.xz = dir * kk * 0.035 * gust + kk * 0.03 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
+    off.y = kk * 0.015 * sin(t * 2.9 + ph * 4.3);
   } else if (mode == 2) {
     // A tree: bending with the wind from its foot (more the higher), its
     // branches fluttering.

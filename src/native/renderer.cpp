@@ -3548,10 +3548,6 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
         if (Image* snowy = SnowScene(scene)) scene = snowy;
         MarkPart("effect: snow");
       }
-      if (tod_sky && drift_ && std::hypot(tod_.wind[0], tod_.wind[1]) > 4.5f && !Diag("nodrift")) {
-        if (Image* drifting = DriftScene(scene)) scene = drifting;
-        MarkPart("effect: drifting snow");
-      }
       if (tod_sky && dust_ > 0.0f) {
         if (Image* dusty = DustScene(scene)) scene = dusty;
         MarkPart("effect: diamond dust");
@@ -3594,6 +3590,13 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
       if (upscaler_) {
         if (Image* up = UpscaledScene(scene)) scene = up;
         MarkPart("effect: upscaler");
+      }
+      // Drifting snow: after the upscaler (streaming over the ground, it has
+      // no motion of its own the upscaler could follow: it smeared and broke
+      // up through it), at the picture's own size.
+      if (tod_sky && drift_ && std::hypot(tod_.wind[0], tod_.wind[1]) > 4.5f && !Diag("nodrift")) {
+        if (Image* drifting = DriftScene(scene)) scene = drifting;
+        MarkPart("effect: drifting snow");
       }
       if (scene != &sit->second) return scene;
     }
@@ -6933,7 +6936,22 @@ void main() {
   if (q.w <= 1e-4) return;
   vec2 puv = vec2(q.x / q.w * 0.5 + 0.5, 0.5 - q.y / q.w * 0.5);
   if (any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) return;
-  o = vec4(mix(textureLod(prev, puv, 0.0).r, c, pc.p.x));
+  float h = textureLod(prev, puv, 0.0).r;
+  if (pc.p.z > 0.5) {
+    // (Every frame: last frame's kept only within what's round about now,
+    // so a moving shadow doesn't trail; the flicker of a shadow's edge
+    // between frames smoothed.)
+    float lo = c, hi = c;
+    for (int y = -1; y <= 1; ++y) {
+      for (int x = -1; x <= 1; ++x) {
+        float v = texelFetch(cur, clamp(ip + ivec2(x, y), ivec2(0), textureSize(cur, 0) - 1), 0).r;
+        lo = min(lo, v);
+        hi = max(hi, v);
+      }
+    }
+    h = clamp(h, lo - 0.04, hi + 0.04);
+  }
+  o = vec4(mix(h, c, pc.p.x));
 }
 )", true);
   // Time of day turned on or off: the last picture before eased into the new
@@ -6968,54 +6986,76 @@ void main() {
   // over the snowy ground, thicker in a gale.
   copy_fs_[52] = CompileBuiltin("builtin_drift", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D scene;
-layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 1) uniform sampler2D depth;  // (the render's size: the scene may be upscaled)
 layout(push_constant) uniform Drift {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
   vec4 cam;  // camera, seconds
   vec4 w;    // the wind's direction (x, z), speed (m/s), how much (0..1)
 } pc;
 layout(location = 0) out vec4 o;
-float hash(vec2 p) {
-  p = fract(p * vec2(443.897, 441.423));
-  p += dot(p, p.yx + 19.19);
-  return fract((p.x + p.y) * p.x);
+// (Whole-number cells hashed as integers: the same pattern however far out
+// on the mountain, no float hash breaking up into blocks.)
+float hash(ivec2 c) {
+  uvec2 q = uvec2(c) * uvec2(1597334673u, 3812015801u);
+  uint n = (q.x ^ q.y) * 1597334673u;
+  n ^= n >> 16;
+  n *= 2246822519u;
+  n ^= n >> 13;
+  return float(n & 0xFFFFFFu) / 16777216.0;
 }
 float noise(vec2 p) {
-  vec2 i = floor(p), f = fract(p);
+  vec2 fl = floor(p);
+  ivec2 i = ivec2(fl);
+  vec2 f = p - fl;
   vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
+  return mix(mix(hash(i), hash(i + ivec2(1, 0)), u.x), mix(hash(i + ivec2(0, 1)), hash(i + ivec2(1, 1)), u.x), u.y);
+}
+vec3 World(vec2 uv, float d) {
+  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  return wp.xyz / wp.w;
 }
 void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
   vec4 c = texelFetch(scene, ip, 0);
   o = c;
-  float d = texelFetch(depth, ip, 0).r;
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(scene, 0));
+  ivec2 ds = textureSize(depth, 0);
+  ivec2 dp = clamp(ivec2(uv * vec2(ds)), ivec2(0), ds - 2);
+  float d = texelFetch(depth, dp, 0).r;
   if (d <= 0.0) return;
-  vec2 uv = gl_FragCoord.xy / vec2(textureSize(depth, 0));
-  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
-  vec3 P = wp.xyz / wp.w;
+  vec2 duv = (vec2(dp) + 0.5) / vec2(ds);
+  vec3 P = World(duv, d);
+  // Only on the ground: the depth's slope here near level (not a rider, a
+  // tree, a wall or a lip's face).
+  float dx = texelFetch(depth, dp + ivec2(1, 0), 0).r, dy = texelFetch(depth, dp + ivec2(0, 1), 0).r;
+  if (dx <= 0.0 || dy <= 0.0) return;
+  vec3 Px = World(duv + vec2(1.0 / float(ds.x), 0.0), dx), Py = World(duv + vec2(0.0, 1.0 / float(ds.y)), dy);
+  vec3 n = cross(Px - P, Py - P);
+  float nl = length(n);
+  if (nl < 1e-8) return;
+  float level = smoothstep(0.3, 0.55, abs(n.y) / nl);  // (steep slopes too; not walls, riders, trunks)
   float dist = length(P - pc.cam.xyz);
   float lum = dot(c.rgb, vec3(0.3, 0.59, 0.11));
   // (On the snow: light, grey ground; not too near or far.)
-  float snowy = smoothstep(0.25, 0.45, lum) * smoothstep(0.25, 0.1, max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)));
-  float fade = smoothstep(2.0, 6.0, dist) * smoothstep(90.0, 40.0, dist);
-  if (snowy * fade <= 0.0) return;
+  float snowy = smoothstep(0.2, 0.4, lum) * smoothstep(0.25, 0.1, max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)));
+  float fade = smoothstep(3.0, 8.0, dist) * smoothstep(130.0, 60.0, dist);
+  float where = snowy * fade * level;
+  if (where <= 0.0) return;
   vec2 wd = pc.w.xy;
   vec2 wn = vec2(-wd.y, wd.x);
   float t = pc.cam.w;
   // Along the wind (moving with it, a little slower than the air) and
-  // across it (narrow streaks), two scales.
+  // across it (long, soft streaks), two scales; patches that come and go.
   float u = dot(P.xz, wd), v = dot(P.xz, wn);
-  float sp = pc.w.z * 0.7;
-  float n = noise(vec2((u - t * sp) * 0.35, v * 2.2)) * 0.6 +
-            noise(vec2((u - t * sp * 1.3) * 0.9, v * 5.5 + 7.0)) * 0.4;
-  // Gusts: patches that come and go.
-  float g = noise(vec2((u - t * sp * 0.5) * 0.04, v * 0.04));
-  float wisp = smoothstep(0.55 - 0.25 * pc.w.w, 0.85, n) * mix(0.4, 1.0, g);
-  float a = wisp * snowy * fade * pc.w.w * 0.8;
+  float sp = pc.w.z * 0.6;
+  float n1 = noise(vec2((u - t * sp) * 0.22, v * 1.3)) * 0.6 +
+             noise(vec2((u - t * sp * 1.25) * 0.55, v * 3.1 + 7.0)) * 0.4;
+  float g = noise(vec2((u - t * sp * 0.4) * 0.03, v * 0.03 + 3.0));
+  float wisp = smoothstep(0.5 - 0.2 * pc.w.w, 0.9, n1) * smoothstep(0.25, 0.75, g);
+  float a = wisp * where * min(1.0, 0.35 + pc.w.w) * 0.75;
   // (The streaming snow hides the slope's texture under it: its own even,
   // light color, a little brighter than the ground's.)
-  vec3 veil = vec3(0.97, 0.98, 1.0) * (lum * 1.12 + 0.04);
+  vec3 veil = vec3(0.97, 0.98, 1.0) * min(lum * 1.22 + 0.07, 1.05);
   o = vec4(mix(c.rgb, veil, a), c.a);
 }
 )", true);
@@ -11733,13 +11773,14 @@ Image* Renderer::Impl::DustScene(Image* scene) {
 Image* Renderer::Impl::DriftScene(Image* scene) {
   auto dit = resolved_.find(depth_base_);
   if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT || dit->second.samples != 1 ||
-      dit->second.width != scene->width || dit->second.height != scene->height || scene->samples > 1) {
+      scene->samples > 1) {
     return nullptr;
   }
   const float speed = std::hypot(tod_.wind[0], tod_.wind[1]);
   // (From a stiff breeze to a gale: 5 .. 18 m/s.)
   const float amount = std::clamp((speed - 4.5f) / 12.0f, 0.0f, 1.0f);
   if (amount <= 0.0f) return nullptr;
+  if (Diag("driftdiag")) std::fprintf(stderr, "drift: amount %.2f scene %ux%u\n", amount, scene->width, scene->height);
   EndRendering();
   if (!drift_out_.image || drift_out_.width != scene->width || drift_out_.height != scene->height ||
       drift_out_.format != scene->format) {
@@ -12595,7 +12636,10 @@ void Renderer::Impl::TodShadows() {
     const bool prev_ok = tod_mask_prev_ok_ && tod_mask_prev_.image && tod_mask_prev_.width == tod_mask_.width &&
                          tod_mask_prev_.height == tod_mask_.height && jump < 5.0;
     double prev_vp[16];
-    if (sun_turned_ && prev_ok && !Diag("noease") && Invert4(tod_mask_prev_inv_vp_, prev_vp)) {
+    // (Eased after a step of the sun; otherwise smoothed a little, frame to
+    // frame, always.)
+    const bool steady = !sun_turned_ && !Diag("nomasksmooth");
+    if ((sun_turned_ || steady) && prev_ok && !Diag("noease") && Invert4(tod_mask_prev_inv_vp_, prev_vp)) {
       if (!tod_mask_raw_.image || tod_mask_raw_.width != depth->width || tod_mask_raw_.height != depth->height) {
         if (tod_mask_raw_.image) Retire(tod_mask_raw_);
         tod_mask_raw_ = gpu_.CreateImage(depth->width, depth->height, VK_FORMAT_R8_UNORM, false, "tod_shadow_mask_sun");
@@ -12610,8 +12654,9 @@ void Renderer::Impl::TodShadows() {
           ep[c * 4 + r] = float(v);
         }
       }
-      ep[16] = since < 3 ? 0.0f : 0.12f;
-      if (Diag("sun")) std::fprintf(stderr, "sun: shadows eased (%llu frames on)\n", (unsigned long long)since);
+      ep[16] = steady ? 0.4f : since < 3 ? 0.0f : 0.12f;
+      ep[18] = steady ? 1.0f : 0.0f;  // (the neighbourhood clamp)
+      if (Diag("sun") && !steady) std::fprintf(stderr, "sun: shadows eased (%llu frames on)\n", (unsigned long long)since);
       FullscreenPass(CopyKind::kMaskEase, &tod_mask_, &tod_mask_prev_, depth, &tod_mask_raw_, true, ep, 20);
       Barrier();
     }
@@ -14613,6 +14658,11 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       c.first = first_index;
       c.count = indexed ? index_count : d.count;
       c.sys = sys;
+      // (The sun maps hold still: drawn a third at a time, every few metres,
+      // trees caught mid-sway made their shadows shimmer and break up as the
+      // parts were drawn again at other moments. The casters' map, drawn
+      // whole every frame, sways with them.)
+      if ((&to == &env_draws_ || &to == &height_draws_) && !Diag("windshadows")) c.sys.wind2[0] = 0.0f;
       // Cut-outs by alpha to coverage (MSAA) become an alpha test: the
       // maps have one sample.
       if (alpha_test && (st.reg(0x2202) & 0x10)) {

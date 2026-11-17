@@ -901,6 +901,7 @@ int main(int argc, char** argv) {
     if (std::getenv("A3_COLLECT_INSTANCES")) renderer.SetCollectInstances(true);
     renderer.SetLensDirt(dirt);
     renderer.SetDiamondDust(dust);
+    renderer.SetDriftingSnow(std::getenv("A3_DRIFT") != nullptr);
     renderer.SetContactShadows(contact);
   renderer.SetCloudShadows(cloud_shadows);
   renderer.SetSnowTracks(tracks);
