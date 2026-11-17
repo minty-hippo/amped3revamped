@@ -81,6 +81,7 @@ const std::vector<GameSetting>& SubtitleSettings() {
       {"subtitles", "Subtitles", Kind::kChoice, "1",
        {{"0", "Off"}, {"1", "Cutscenes and movies"}, {"2", "All speech"}}},
       {"subtitles_speaker_colors", "Speaker colours", Kind::kToggle, "true"},
+      {"subtitles_speaker_names", "Speaker names", Kind::kToggle, "true"},
       {"subtitles_size", "Text size", Kind::kSlider, "100", {}, 50, 200, 10, true},
   };
   return settings;

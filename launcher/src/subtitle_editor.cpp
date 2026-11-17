@@ -15,6 +15,21 @@
 #include <SDL3/SDL.h>
 #include <imgui.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_JPEG
+#define STBI_NO_STDIO
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+#include "stb_image.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "platform.h"
 #include "process.h"
 
@@ -117,7 +132,223 @@ struct SubtitleEditor::Loader {
   std::string error;
 };
 
-SubtitleEditor::~SubtitleEditor() { StopAudio(); }
+struct SubtitleEditor::VideoLoader {
+  std::mutex m;
+  int state = 1;  // 1 working, 2 ready, 3 failed
+  std::string source;
+  std::shared_ptr<Video> video;
+  std::string error;
+};
+
+SubtitleEditor::~SubtitleEditor() { Shutdown(); }
+
+void SubtitleEditor::Shutdown() {
+  StopAudio();
+  if (video_tex_) SDL_DestroyTexture(video_tex_);
+  video_tex_ = nullptr;
+  video_tex_frame_ = -1;
+}
+
+void SubtitleEditor::SetRenderer(SDL_Renderer* renderer) {
+  if (renderer == renderer_) return;
+  if (video_tex_) SDL_DestroyTexture(video_tex_);
+  video_tex_ = nullptr;
+  video_tex_frame_ = -1;
+  renderer_ = renderer;
+}
+
+std::string SubtitleEditor::Named(const sf::Clip& c, const sf::Line& l) const {
+  const std::string& n = c.names[std::clamp(l.speaker, 0, sf::kSpeakers - 1)];
+  return n.empty() ? l.text : n + ": " + l.text;
+}
+
+// ---- the movie preview ---------------------------------------------------------
+
+namespace {
+
+bool ReadVideoIndex(const fs::path& dir, SubtitleEditor::Video* v) {
+  std::ifstream in(dir / "index.txt");
+  std::string a, b, c, d;
+  if (!(in >> a >> v->fps >> b >> v->frames >> c >> v->width >> d >> v->height)) return false;
+  v->dir = dir;
+  return a == "fps" && v->fps > 0 && v->frames > 0 && v->width > 0 && v->height > 0;
+}
+
+}  // namespace
+
+void SubtitleEditor::FetchVideo(const std::string& source) {
+  if (video_ && video_source_ == source) return;
+  if (video_loader_ && video_loader_->source == source) return;
+  auto p = std::make_shared<VideoLoader>();
+  p->source = source;
+  video_loader_ = p;
+  const uint64_t h = sf::Fnv1a64(reinterpret_cast<const uint8_t*>(source.data()), source.size());
+  char name[40];
+  std::snprintf(name, sizeof(name), "%016llx_frames", static_cast<unsigned long long>(h));
+  const fs::path dir = install_dir_ / "subtitles" / "work" / "play" / name;
+  std::vector<std::string> argv;
+  std::error_code ec;
+  if (!fs::exists(dir / "index.txt", ec)) {
+    const fs::path tool = ToolPath();
+    if (tool.empty()) {
+      p->state = 3;
+      p->error = "The subtitle maker isn't built (Update first): no movie to show.";
+      return;
+    }
+    argv = {PathText(tool), "--game", PathText(install_dir_ / "game"), "--movie-frames", source, "--frames",
+            PathText(dir)};
+  }
+  std::thread([p, argv, dir] {
+    if (!argv.empty()) {
+      std::string output, err;
+      const int code = RunCapture(argv, &output, &err);
+      std::error_code e2;
+      if (code != 0 || !fs::exists(dir / "index.txt", e2)) {
+        std::lock_guard lock(p->m);
+        p->state = 3;
+        p->error = "Couldn't get the movie's pictures (" + (err.empty() ? output.substr(0, 200) : err) +
+                   "): the subtitle maker may need updating.";
+        return;
+      }
+    }
+    auto v = std::make_shared<Video>();
+    const bool ok = ReadVideoIndex(dir, v.get());
+    std::lock_guard lock(p->m);
+    if (ok) {
+      p->video = v;
+      p->state = 2;
+    } else {
+      p->state = 3;
+      p->error = "The movie's pictures couldn't be read.";
+    }
+  }).detach();
+}
+
+void SubtitleEditor::UpdateVideo() {
+  if (!video_loader_) return;
+  const auto p = video_loader_;
+  std::lock_guard lock(p->m);
+  if (p->state == 2) {
+    video_ = p->video;
+    video_source_ = p->source;
+    video_tex_frame_ = -1;
+  } else if (p->state == 3) {
+    status_ = p->error;
+  } else {
+    return;
+  }
+  video_loader_.reset();
+}
+
+bool SubtitleEditor::VideoFrame(int* width, int* height) {
+  if (!renderer_ || !video_ || selected_ < 0 || selected_ >= int(clips_.size()) ||
+      clips_[size_t(selected_)].source != video_source_) {
+    return false;
+  }
+  const Video& v = *video_;
+  if (!video_tex_) {
+    video_tex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, v.width, v.height);
+    if (!video_tex_) return false;
+    SDL_SetTextureScaleMode(video_tex_, SDL_SCALEMODE_LINEAR);
+    video_tex_frame_ = -1;
+  }
+  float tw = 0, th = 0;
+  SDL_GetTextureSize(video_tex_, &tw, &th);
+  if (int(tw) != v.width || int(th) != v.height) {
+    SDL_DestroyTexture(video_tex_);
+    video_tex_ = nullptr;
+    return VideoFrame(width, height);
+  }
+  // The picture at the playhead (the sound and the pictures start together).
+  const int frame = std::clamp(int(playhead_ms_ / 1000.0 * v.fps), 0, v.frames - 1);
+  if (frame != video_tex_frame_) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "frame_%05d.jpg", frame);
+    std::ifstream in(v.dir / name, std::ios::binary);
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    int w = 0, h = 0, comp = 0;
+    stbi_uc* px = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), int(bytes.size()), &w, &h, &comp, 4);
+    if (px && w == v.width && h == v.height) {
+      SDL_UpdateTexture(video_tex_, nullptr, px, w * 4);
+      video_tex_frame_ = frame;
+    }
+    if (px) stbi_image_free(px);
+  }
+  *width = v.width;
+  *height = v.height;
+  return video_tex_frame_ >= 0;
+}
+
+// ---- speakers' names ---------------------------------------------------------------
+
+bool SubtitleEditor::DrawNames(float px, float unit) {
+  sf::Clip& c = clips_[size_t(selected_)];
+  // The names typed in anywhere, offered (gathered now and then).
+  if (ImGui::GetTime() >= names_scan_at_) {
+    names_scan_at_ = ImGui::GetTime() + 1.0;
+    known_names_.clear();
+    for (const sf::Clip& k : clips_) {
+      for (const std::string& n : k.names) {
+        if (!n.empty() && std::find(known_names_.begin(), known_names_.end(), n) == known_names_.end()) {
+          known_names_.push_back(n);
+        }
+      }
+    }
+    std::sort(known_names_.begin(), known_names_.end());
+  }
+  // Which speakers say anything here (the others' names aren't needed).
+  int used = 1;
+  for (const auto& l : c.lines) used = std::max(used, std::clamp(l.speaker, 0, sf::kSpeakers - 1) + 1);
+  bool changed = false;
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextColored(ImColor(kDim), "Speakers");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Who each speaker is: shown before their lines (\"Name: line\") when the game's Speaker "
+                      "names setting is on. Leave one empty to show none.");
+  }
+  for (int i = 0; i < sf::kSpeakers; ++i) {
+    if (i >= used && c.names[i].empty()) continue;
+    ImGui::SameLine();
+    ImGui::PushID(1000 + i);
+    char hint[16];
+    std::snprintf(hint, sizeof(hint), "Speaker %d", i + 1);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s", c.names[i].c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, kSpeaker[i]);
+    ImGui::SetNextItemWidth(130 * unit);
+    if (ImGui::InputTextWithHint("##name", hint, buf, sizeof(buf))) {
+      std::string n = sf::OneLine(buf);
+      n.erase(std::remove(n.begin(), n.end(), '|'), n.end());
+      c.names[i] = n;
+      changed = true;
+    }
+    if (ImGui::IsItemActivated()) Remember();
+    ImGui::PopStyleColor();
+    // Pick one already typed in elsewhere.
+    ImGui::SameLine(0, 2 * unit);
+    if (ImGui::ArrowButton("##pick", ImGuiDir_Down)) ImGui::OpenPopup("##names");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("A name used in other clips");
+    if (ImGui::BeginPopup("##names")) {
+      if (known_names_.empty()) ImGui::TextColored(ImColor(kDim), "No names typed in yet");
+      for (const std::string& n : known_names_) {
+        if (ImGui::Selectable(n.c_str(), n == c.names[i])) {
+          Remember();
+          c.names[i] = n;
+          changed = true;
+        }
+      }
+      if (!c.names[i].empty() && ImGui::Selectable("(no name)")) {
+        Remember();
+        c.names[i].clear();
+        changed = true;
+      }
+      ImGui::EndPopup();
+    }
+    ImGui::PopID();
+  }
+  (void)px;
+  return changed;
+}
 
 bool SubtitleEditor::Open(const fs::path& install_dir, const fs::path& source_dir, std::string* error) {
   install_dir_ = install_dir;
@@ -267,8 +498,12 @@ void SubtitleEditor::Fetch(const std::string& source) {
 void SubtitleEditor::UpdateAudio() {
   if (fetch_at_ > 0 && ImGui::GetTime() >= fetch_at_) {
     fetch_at_ = 0;
-    if (selected_ >= 0 && selected_ < int(clips_.size())) Fetch(clips_[size_t(selected_)].source);
+    if (selected_ >= 0 && selected_ < int(clips_.size())) {
+      Fetch(clips_[size_t(selected_)].source);
+      if (clips_[size_t(selected_)].kind == sf::Kind::kVideo) FetchVideo(clips_[size_t(selected_)].source);
+    }
   }
+  UpdateVideo();
   if (!loader_) return;
   const auto p = loader_;  // (outlives the lock)
   std::lock_guard lock(p->m);
@@ -739,7 +974,7 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
     dl->AddRect(a, b, bad ? kRed : sel ? kGold : WithAlpha(col, 200), 3.0f * unit, 0, sel || bad ? 2.0f : 1.0f);
     dl->PushClipRect(ImVec2(x0 + 3 * unit, a.y), ImVec2(x1 - 3 * unit, b.y), true);
     dl->AddText(font, px * 0.85f, ImVec2(x0 + 5 * unit, a.y + (b.y - a.y - px * 0.85f) * 0.5f),
-                sel ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 210), l.text.c_str());
+                sel ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 210), Named(c, l).c_str());
     dl->PopClipRect();
   }
   // The playhead.
@@ -775,30 +1010,55 @@ bool SubtitleEditor::DrawTimeline(ImFont* font, float px, float unit) {
                           std::max(0.0, total - view_len_ms_));
   }
 
-  // What's heard now, as the game shows it.
+  // What's heard now, as the game shows it: over the movie's picture at the
+  // playhead (a movie), or on its own.
   {
     ImGui::Spacing();
     const ImVec2 b0 = ImGui::GetCursorScreenPos();
-    const float bh = px * 3.6f;
+    int vw = 0, vh = 0;
+    const bool movie = c.kind == sf::Kind::kVideo && VideoFrame(&vw, &vh);
+    const float max_bh = std::max(px * 3.6f, ImGui::GetIO().DisplaySize.y * 0.34f);
+    const float bh = movie ? std::min(max_bh, w * float(vh) / float(vw)) : px * 3.6f;
     ImGui::Dummy(ImVec2(w, bh));
     dl->AddRectFilled(b0, ImVec2(b0.x + w, b0.y + bh), IM_COL32(0, 0, 0, 200), 6.0f * unit);
+    float text_bottom = b0.y + bh;
+    float text_w = w;
+    float text_x0 = b0.x;
+    if (movie) {
+      const float iw = bh * float(vw) / float(vh);
+      const ImVec2 i0(b0.x + (w - iw) * 0.5f, b0.y);
+      dl->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(video_tex_))), i0, ImVec2(i0.x + iw, b0.y + bh));
+      text_bottom = b0.y + bh * 0.93f;
+      text_w = iw;
+      text_x0 = i0.x;
+    } else if (c.kind == sf::Kind::kVideo && (video_loader_ && video_loader_->source == c.source)) {
+      const char* t = "Getting the movie's pictures...";
+      dl->AddText(font, px * 0.8f, ImVec2(b0.x + 8 * unit, b0.y + 4 * unit), kDim, t);
+    }
     std::vector<const sf::Line*> now;
     for (const auto& l : c.lines) {
       if (playhead_ms_ >= l.start_ms && playhead_ms_ < l.end_ms) now.push_back(&l);
     }
-    const float tpx = px * 1.25f;
+    const float tpx = movie ? std::max(px * 0.9f, bh * 0.055f) : px * 1.25f;
     if (now.empty()) {
-      const char* t = "(no line here)";
-      const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0, t);
-      dl->AddText(font, px, ImVec2(b0.x + (w - ts.x) * 0.5f, b0.y + (bh - ts.y) * 0.5f), kDim, t);
+      if (!movie) {
+        const char* t = "(no line here)";
+        const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0, t);
+        dl->AddText(font, px, ImVec2(b0.x + (w - ts.x) * 0.5f, b0.y + (bh - ts.y) * 0.5f), kDim, t);
+      }
     } else {
-      float y = b0.y + (bh - tpx * 1.2f * float(std::min<size_t>(now.size(), 2))) * 0.5f;
-      for (size_t k = 0; k < now.size() && k < 2; ++k) {
-        const char* t = now[k]->text.c_str();
-        const ImVec2 ts = font->CalcTextSizeA(tpx, w - 20 * unit, 0, t);
-        const float x = b0.x + std::max(10 * unit, (w - ts.x) * 0.5f);
-        dl->AddText(font, tpx, ImVec2(x + 2, y + 2), IM_COL32(0, 0, 0, 255), t);
-        dl->AddText(font, tpx, ImVec2(x, y), kSpeaker[std::clamp(now[k]->speaker, 0, 3)], t);
+      const size_t n = std::min<size_t>(now.size(), 2);
+      float y = movie ? text_bottom - tpx * 1.2f * float(n) : b0.y + (bh - tpx * 1.2f * float(n)) * 0.5f;
+      for (size_t k = 0; k < n; ++k) {
+        const std::string t = Named(c, *now[k]);
+        const ImVec2 ts = font->CalcTextSizeA(tpx, text_w - 20 * unit, 0, t.c_str());
+        const float x = text_x0 + std::max(10 * unit, (text_w - ts.x) * 0.5f);
+        if (movie) {
+          dl->AddRectFilled(ImVec2(x - tpx * 0.4f, y - tpx * 0.1f), ImVec2(x + ts.x + tpx * 0.4f, y + tpx * 1.15f),
+                            IM_COL32(0, 0, 0, 150), tpx * 0.2f);
+        }
+        dl->AddText(font, tpx, ImVec2(x + 2, y + 2), IM_COL32(0, 0, 0, 255), t.c_str());
+        dl->AddText(font, tpx, ImVec2(x, y), kSpeaker[std::clamp(now[k]->speaker, 0, 3)], t.c_str());
         y += tpx * 1.2f;
       }
     }
@@ -989,6 +1249,7 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       }
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Kept as it is when the subtitles are made again.");
     }
+    changed |= DrawNames(px, unit);
     changed |= DrawTimeline(font, px, unit);
     sf::Clip& c = clips_[size_t(selected_)];
 
@@ -1017,8 +1278,12 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
       ImGui::PushStyleColor(ImGuiCol_Button, kSpeaker[sp]);
       ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kSpeaker[sp]);
       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 0, 0, 255));
-      char who[8];
-      std::snprintf(who, sizeof(who), " %d ", sp + 1);
+      char who[48];
+      if (c.names[sp].empty()) {
+        std::snprintf(who, sizeof(who), " %d ", sp + 1);
+      } else {
+        std::snprintf(who, sizeof(who), " %d %.24s ", sp + 1, c.names[sp].c_str());
+      }
       if (ImGui::Button(who)) {
         Remember();
         l.speaker = (sp + 1) % sf::kSpeakers;
@@ -1128,8 +1393,9 @@ bool SubtitleEditor::Draw(ImFont* font, float unit) {
         "start and end at the playhead, Up / Down pick a line, / splits it at the playhead, M joins it "
         "to the next, L loops it. Dragged edges snap to other lines and the playhead (Alt: not). "
         "Speakers: 1 white, 2 yellow, 3 pink, 4 green (click for the next, right-click for the one "
-        "before, or the keys 1 to 4). Page Up / Down: the previous / next clip. Ctrl+Z / Ctrl+Y undo "
-        "and redo, Ctrl+S saves.");
+        "before, or the keys 1 to 4); type their names in above the timeline (or pick one used before) "
+        "to show them before their lines. Movies: the picture at the playhead, under the timeline. "
+        "Page Up / Down: the previous / next clip. Ctrl+Z / Ctrl+Y undo and redo, Ctrl+S saves.");
     ImGui::PopStyleColor();
     ImGui::EndChild();
   } else {

@@ -780,6 +780,23 @@ fetches its sound (written out from your game files) and shows it on a
 timeline: the waveform, each line on it in its speaker's colour, the
 playhead, and below it the line being heard as the game shows it.
 
+**Speaker names.** Above the timeline, each speaker of the clip can be given
+a name (or one picked from the names typed in elsewhere: the arrow beside
+it). A named speaker's lines show it first, "Name: line", on the timeline,
+in the line list, the preview, and in game (**Options > Audio > Speaker
+names**, `subtitles_speaker_names`, on; an unnamed speaker shows no name).
+The names are kept with the clip in the subtitle file (a `names` line;
+older game builds skip it).
+
+**Movie preview.** A movie's clip shows its picture under the timeline, at
+the playhead: it follows the sound as it plays, and as you scrub, drag,
+step or jump to a line, with the subtitles over it as the game shows them.
+The pictures come from your movie file the first time the clip is chosen
+(the subtitle maker decodes it with FFmpeg's Bink video decoder: 15
+pictures a second, 480 wide, a few seconds and some MB a movie, kept in
+`subtitles\work\play`). The subtitle maker has to be rebuilt for it once
+(Update).
+
 | Subtitle editor | |
 |---|---|
 | Scrub (heard as you drag) | Click or drag on the timeline; Left / Right step 0.1 s (Shift: 1 s) |

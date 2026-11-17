@@ -209,12 +209,25 @@ if(AMPED3_WHISPER_DIR AND EXISTS "${AMPED3_WHISPER_DIR}/CMakeLists.txt" AND _amp
     set(BUILD_SHARED_LIBS OFF)
     add_subdirectory("${AMPED3_WHISPER_DIR}" "${CMAKE_BINARY_DIR}/whisper.cpp" EXCLUDE_FROM_ALL)
     set(BUILD_SHARED_LIBS "${_amped3_shared}")
+    # The editor's movie preview: FFmpeg's Bink video decoder, built in here
+    # (the SDK's FFmpeg has no video decoders), its plain C versions.
+    set(_amped3_bink
+        ${_amped3_ffmpeg}/libavcodec/bink.c
+        ${_amped3_ffmpeg}/libavcodec/binkdsp.c
+        ${_amped3_ffmpeg}/libavcodec/hpeldsp.c
+        ${_amped3_ffmpeg}/libavcodec/blockdsp.c
+        tools/subtitles/bink_video_stubs.c)
     add_executable(amped3-subtitles EXCLUDE_FROM_ALL
         tools/subtitles/main.cpp
         src/gui_patch_core.cpp
-        third_party/miniz/miniz.c)
+        third_party/miniz/miniz.c
+        ${_amped3_bink})
+    set_source_files_properties(${_amped3_bink} PROPERTIES
+        COMPILE_DEFINITIONS "HAVE_AV_CONFIG_H;_USE_MATH_DEFINES"
+        COMPILE_OPTIONS "-w")
     target_include_directories(amped3-subtitles PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
         ${_amped3_ffmpeg})
     target_link_libraries(amped3-subtitles PRIVATE whisper ${_amped3_avcodec})
     if(TARGET rex::libavutil)

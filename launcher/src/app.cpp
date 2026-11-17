@@ -1054,11 +1054,13 @@ void App::OnAction(Action action) {
 }
 
 void App::SetRenderer(SDL_Renderer* renderer) {
+  editor_.SetRenderer(renderer);
   title_.reset();
   if (renderer) title_ = std::make_unique<TitleLogo>(renderer);
 }
 
 void App::OnWindowChanged() {
+  editor_.Refresh();
   if (title_) title_->Refresh();
 }
 

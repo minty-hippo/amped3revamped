@@ -60,6 +60,13 @@ extern "C" {
 
 #include "whisper.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
+// FFmpeg's Bink video decoder (bink_video_stubs.c).
+extern "C" const AVCodec* amped3_bink_video_decoder(void);
+
 namespace fs = std::filesystem;
 namespace sf = amped3::subtitle_file;
 using Bytes = std::vector<uint8_t>;
@@ -862,6 +869,104 @@ bool DecodeBinkTrack(const Bytes& d, const BinkFile& b, size_t track, std::vecto
   return !out->empty();
 }
 
+// ---- a movie's pictures (the editor's preview) -----------------------------------
+//
+// Every frame decoded (FFmpeg's Bink video decoder: Bink frames build on the
+// ones before), at most kPreviewFps of them a second kept, kPreviewWidth
+// pixels wide, as JPEGs: frame_00000.jpg on, and index.txt, written last:
+// "fps <kept a second> frames <n> width <w> height <h>".
+
+constexpr double kPreviewFps = 15.0;
+constexpr int kPreviewWidth = 480;
+
+bool MovieFrames(const fs::path& movie, const fs::path& dir) {
+  Bytes d;
+  BinkFile b;
+  if (!ReadFile(movie, &d) || !ParseBink(d, &b)) {
+    std::fprintf(stderr, "Not a Bink movie: %s\n", movie.string().c_str());
+    return false;
+  }
+  const uint32_t width = Le32(&d[20]), height = Le32(&d[24]);
+  if (!width || !height || width > 4096 || height > 4096) return false;
+  const AVCodec* codec = amped3_bink_video_decoder();
+  AVCodecContext* ctx = avcodec_alloc_context3(codec);
+  if (!ctx) return false;
+  ctx->codec_tag = Le32(&d[0]);
+  ctx->width = int(width);
+  ctx->height = int(height);
+  ctx->extradata = static_cast<uint8_t*>(av_mallocz(4 + AV_INPUT_BUFFER_PADDING_SIZE));
+  std::memcpy(ctx->extradata, &d[36], 4);  // the video's flags (alpha, grey)
+  ctx->extradata_size = 4;
+  if (avcodec_open2(ctx, codec, nullptr) < 0) {
+    avcodec_free_context(&ctx);
+    std::fprintf(stderr, "The Bink video decoder wouldn't open\n");
+    return false;
+  }
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  fs::remove(dir / "index.txt", ec);
+  const int step = std::max(1, int(std::lround(b.fps / kPreviewFps)));
+  const int ow = std::min<int>(kPreviewWidth, int(width));
+  const int oh = std::max(2, int(std::lround(double(height) * ow / width)) & ~1);
+  AVPacket* pkt = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  std::vector<uint8_t> buf, rgb(size_t(ow) * oh * 3);
+  int decoded = 0, kept = 0;
+  auto keep = [&](const AVFrame* f) {
+    if (decoded++ % step) return;
+    // Box-filtered down to ow x oh, YUV (BT.601, video range) to RGB.
+    const double sx = double(f->width) / ow, sy = double(f->height) / oh;
+    for (int y = 0; y < oh; ++y) {
+      const int y0 = int(y * sy), y1 = std::max(y0 + 1, int((y + 1) * sy));
+      for (int x = 0; x < ow; ++x) {
+        const int x0 = int(x * sx), x1 = std::max(x0 + 1, int((x + 1) * sx));
+        double Y = 0, U = 0, V = 0;
+        int n = 0;
+        for (int yy = y0; yy < y1 && yy < f->height; ++yy) {
+          for (int xx = x0; xx < x1 && xx < f->width; ++xx) {
+            Y += f->data[0][yy * f->linesize[0] + xx];
+            U += f->data[1][(yy >> 1) * f->linesize[1] + (xx >> 1)];
+            V += f->data[2][(yy >> 1) * f->linesize[2] + (xx >> 1)];
+            ++n;
+          }
+        }
+        if (!n) n = 1;
+        const double c = (Y / n - 16.0) * 1.164, du = U / n - 128.0, dv = V / n - 128.0;
+        uint8_t* o = &rgb[(size_t(y) * ow + x) * 3];
+        o[0] = uint8_t(std::clamp(c + 1.596 * dv, 0.0, 255.0));
+        o[1] = uint8_t(std::clamp(c - 0.392 * du - 0.813 * dv, 0.0, 255.0));
+        o[2] = uint8_t(std::clamp(c + 2.017 * du, 0.0, 255.0));
+      }
+    }
+    char name[32];
+    std::snprintf(name, sizeof(name), "frame_%05d.jpg", kept++);
+    stbi_write_jpg((dir / name).string().c_str(), ow, oh, 3, rgb.data(), 80);
+  };
+  for (const auto& [pos, size] : b.frame) {
+    // The frame: each audio track's packet (a size, then the data), then
+    // the picture's.
+    size_t o = pos, end = size_t(pos) + size;
+    for (size_t t = 0; t < b.tracks.size() && o + 4 <= end; ++t) o += 4 + Le32(&d[o]);
+    if (o > end) break;
+    buf.assign(d.begin() + std::ptrdiff_t(o), d.begin() + std::ptrdiff_t(end));
+    buf.resize(buf.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+    pkt->data = buf.data();
+    pkt->size = int(end - o);
+    if (avcodec_send_packet(ctx, pkt) < 0) {
+      ++decoded;  // (a frame lost: the times stay right)
+      continue;
+    }
+    while (avcodec_receive_frame(ctx, frame) >= 0) keep(frame);
+  }
+  av_frame_free(&frame);
+  av_packet_free(&pkt);
+  avcodec_free_context(&ctx);
+  if (!kept) return false;
+  std::ofstream idx(dir / "index.txt");
+  idx << "fps " << b.fps / step << " frames " << kept << " width " << ow << " height " << oh << "\n";
+  return bool(idx);
+}
+
 // ---- which sounds ------------------------------------------------------------------
 
 bool NamedLike(const std::string& lower, std::initializer_list<const char*> words) {
@@ -1062,6 +1167,8 @@ struct Options {
   fs::path speaker_model;  // --speaker-model: Resemblyzer's pretrained.pt (who says what)
   std::string extract;     // --extract <source> --wav <file>: one sound as a WAV (the editor's Play)
   fs::path extract_wav;
+  std::string movie_frames;  // --movie-frames <source> --frames <folder>: a movie's pictures (the editor's preview)
+  fs::path frames_dir;
   fs::path bink_dump;  // --bink-tracks <movie>: each audio track as a WAV in --out (checking)  // --transcribe-wav: one 16 kHz mono 16-bit WAV, lines printed (checking)
   size_t limit = 0;
 };
@@ -1101,10 +1208,19 @@ int main(int argc, char** argv) {
     else if (a == "--speaker-model") o.speaker_model = next();
     else if (a == "--extract") o.extract = next();
     else if (a == "--wav") o.extract_wav = next();
+    else if (a == "--movie-frames") o.movie_frames = next();
+    else if (a == "--frames") o.frames_dir = next();
     else {
       Usage();
       return 2;
     }
+  }
+  if (!o.movie_frames.empty()) {
+    if (o.game.empty() || o.frames_dir.empty()) {
+      Usage();
+      return 2;
+    }
+    return MovieFrames(o.game / fs::path(o.movie_frames), o.frames_dir) ? 0 : 1;
   }
   if (!o.bink_dump.empty()) {
     Bytes d;

@@ -49,6 +49,9 @@ REXCVAR_DEFINE_INT32(subtitles_size, 100, "Amped 3/Subtitles",
 REXCVAR_DEFINE_BOOL(subtitles_speaker_colors, true, "Amped 3/Subtitles",
                     "Each speaker of a scene in their own colour (first white, then yellow, pink "
                     "and green, the game's colours); off: all white");
+REXCVAR_DEFINE_BOOL(subtitles_speaker_names, true, "Amped 3/Subtitles",
+                    "Each line led by its speaker's name, where the subtitle editor has one for "
+                    "them (\"Name: line\")");
 REXCVAR_DEFINE_BOOL(trace_subtitles, false, "Amped 3/Diagnostics",
                     "Log which sounds the subtitles recognise as they start, and the ones "
                     "they don't (to the log file).");
@@ -116,6 +119,13 @@ struct Shown {
   int speaker = 0;
 };
 std::vector<Shown> g_shown;
+
+// A line as shown: its speaker's name first, when there is one.
+Shown ShownLine(const sf::Clip& c, const sf::Line& l) {
+  const int sp = std::clamp(l.speaker, 0, sf::kSpeakers - 1);
+  if (REXCVAR_GET(subtitles_speaker_names) && !c.names[sp].empty()) return {c.names[sp] + ": " + l.text, l.speaker};
+  return {l.text, l.speaker};
+}
 
 // The speakers' colours: white, then the yellow, pink and green of the
 // game's menus and HUD (sampled from its UI textures).
@@ -343,7 +353,7 @@ void Monitor(rex::Runtime* runtime) {
         if (mode == 1 && cl.kind == sf::Kind::kSpeech) continue;
         const uint32_t ms = uint32_t(t.elapsed * 1000.0);
         for (const sf::Line& l : cl.lines) {
-          if (ms >= l.start_ms && ms < l.end_ms) shown.push_back({l.text, l.speaker});
+          if (ms >= l.start_ms && ms < l.end_ms) shown.push_back(ShownLine(cl, l));
         }
       }
     }
@@ -371,7 +381,7 @@ void Monitor(rex::Runtime* runtime) {
     if (mode > 0 && movie_clip >= 0) {
       const uint32_t ms = uint32_t((now - movie_start) * 1000.0);
       for (const sf::Line& l : g_clips[size_t(movie_clip)].lines) {
-        if (ms >= l.start_ms && ms < l.end_ms) shown.push_back({l.text, l.speaker});
+        if (ms >= l.start_ms && ms < l.end_ms) shown.push_back(ShownLine(g_clips[size_t(movie_clip)], l));
       }
     }
     if (shown.size() > 3) shown.erase(shown.begin(), shown.end() - 3);

@@ -677,6 +677,9 @@ const std::vector<Tab>& Tabs() {
                        "speak: white, yellow, pink, green (the game's colours). Who says what "
                        "is worked out when the subtitles are made, and can be corrected in the "
                        "launcher's subtitle editor. Off: all white."),
+                Toggle("subtitles_speaker_names", "Speaker names",
+                       "Each line led by its speaker's name (\"Name: line\"), where one has "
+                       "been typed in for them in the launcher's subtitle editor."),
             }},
        }},
       {"Controls",

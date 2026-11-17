@@ -25,6 +25,8 @@
 
 struct ImFont;
 struct SDL_AudioStream;
+struct SDL_Renderer;
+struct SDL_Texture;
 
 namespace launcher {
 
@@ -41,8 +43,20 @@ class SubtitleEditor {
   // Back within a few seconds closes without saving).
   bool Back();
   bool Playing() const;
-  // Before SDL quits: the sound output closed.
-  void Shutdown() { StopAudio(); }
+  // Before SDL quits: the sound output closed (and the movie's picture let go).
+  void Shutdown();
+  // Where the movie preview's pictures are drawn (null: none).
+  void SetRenderer(SDL_Renderer* renderer);
+  // The window recreated or resized: the preview's picture uploaded again.
+  void Refresh() { video_tex_frame_ = -1; }
+
+  // A movie's pictures for the preview (the subtitle maker writes them out:
+  // JPEGs, kPreviewFps a second at most).
+  struct Video {
+    fs::path dir;
+    double fps = 15;
+    int frames = 0, width = 0, height = 0;
+  };
 
   // The sound of a clip, decoded (float samples, interleaved).
   struct Audio {
@@ -82,6 +96,16 @@ class SubtitleEditor {
   // The timeline and the preview under it (the selected clip); true when a
   // line was changed.
   bool DrawTimeline(ImFont* font, float px, float unit);
+  // The selected clip's speakers' names (typed in; offered from the other
+  // clips'); true when one changed.
+  bool DrawNames(float px, float unit);
+  // A movie's pictures: fetched (made on a thread when they aren't yet).
+  void FetchVideo(const std::string& source);
+  void UpdateVideo();
+  // The movie's picture at the playhead, uploaded; false if there's none.
+  bool VideoFrame(int* width, int* height);
+  // A line's text with its speaker's name first (when named).
+  std::string Named(const amped3::subtitle_file::Clip& c, const amped3::subtitle_file::Line& l) const;
 
   fs::path install_dir_, source_dir_, file_;
   std::vector<amped3::subtitle_file::Clip> clips_;
@@ -100,6 +124,18 @@ class SubtitleEditor {
   std::shared_ptr<Audio> audio_;
   std::string audio_source_;  // whose sound audio_ is
   double fetch_at_ = 0;       // when to fetch (a moment after a clip is chosen)
+
+  // The movie preview: its pictures (made by the tool on a thread), the one
+  // shown uploaded into a texture.
+  struct VideoLoader;
+  std::shared_ptr<VideoLoader> video_loader_;
+  std::shared_ptr<Video> video_;
+  std::string video_source_;
+  SDL_Renderer* renderer_ = nullptr;
+  SDL_Texture* video_tex_ = nullptr;
+  int video_tex_frame_ = -1;
+  std::vector<std::string> known_names_;  // every name typed in, for picking
+  double names_scan_at_ = -1;
 
   // Output: one stream, fed a little ahead.
   SDL_AudioStream* stream_ = nullptr;
