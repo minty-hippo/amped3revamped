@@ -559,6 +559,13 @@ that rule against a save that has the pass.
   share is left as it is, so sunlit snow beside a tree isn't greyed, only
   the shaded side. Lamp shadows take fewer steps where they can't show much
   (a faint light, or far off).
+- Sharper slope shadows near the camera (time of day on): the world shadow
+  map over the whole mountain is about a quarter metre a texel (16384 across
+  at most), so a jump's lip or a ridge cast a soft, blocky shadow whatever
+  the shadow resolution. Within ~110 m of the camera the slopes' shadows now
+  come from the screen's shadow mask instead, from the sun maps (about 9 cm
+  a texel, finer with the shadow resolution), smoothly filtered; the
+  mountain-wide map takes over beyond, fading in over ~20 m.
 - Contact shadows (Contact Shadows, `native_contact_shadows`, 1; part of Sun
   shadows Medium and High): with time of day and the sun's shadows on, the
   shadows the maps are too coarse for, where a rock, a rail, a jump's lip or

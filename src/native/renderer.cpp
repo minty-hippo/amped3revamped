@@ -6695,12 +6695,19 @@ void main() {
     float zr = dot(pc.o2, Q);
     float n = float(textureSize(world, 0).x);
     vec2 tc = (0.5 + 0.5 * st) * n;
-    if (all(greaterThan(tc, vec2(2.0))) && all(lessThan(tc, vec2(n - 2.0)))) {
+    if (all(greaterThan(tc, vec2(3.0))) && all(lessThan(tc, vec2(n - 3.0)))) {
+      // (Each of 3 x 3 taps a texel apart weighed between its four nearest
+      // texels: the edge smooth, not in texel steps.)
+      vec2 b = tc - 0.5;
+      vec2 f = fract(b);
+      ivec2 i0 = ivec2(floor(b));
       float l = 0.0;
-      for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-          float z = texelFetch(world, ivec2(tc + vec2(x, y)), 0).r;
-          l += (z >= 1.0 || z >= zr - 0.25 * dpm) ? 1.0 : 0.0;
+      for (int y = -1; y <= 2; ++y) {
+        for (int x = -1; x <= 2; ++x) {
+          float z = texelFetch(world, i0 + ivec2(x, y), 0).r;
+          float wx = x == -1 ? 1.0 - f.x : x == 2 ? f.x : 1.0;
+          float wy = y == -1 ? 1.0 - f.y : y == 2 ? f.y : 1.0;
+          l += ((z >= 1.0 || z >= zr - 0.25 * dpm) ? 1.0 : 0.0) * wx * wy;
         }
       }
       lit = min(lit, l / 9.0);
@@ -7617,7 +7624,16 @@ vec2 Disc(int i, int n) {
 void main() {
   vec2 uv = gl_FragCoord.xy / pc.sz.xy;
   vec2 xz = (uv - pc.c5.zw) / pc.c5.xy;
-  if (length(xz - pc.q.yz) > pc.q.x) discard;
+  float from_cam = length(xz - pc.q.yz);
+  if (from_cam > pc.q.x) discard;
+  // (The time of day, near the camera: left lit - the slopes' shadows there
+  // come sharper from the screen's mask, at the sun maps' detail rather than
+  // this map's quarter metre. sz.z: that far all lit, sz.w: then fading in.)
+  float near_lit = pc.sz.z > 0.0 ? 1.0 - smoothstep(pc.sz.z, pc.sz.z + pc.sz.w, from_cam) : 0.0;
+  if (near_lit >= 0.999) {
+    o = vec4(1.0);
+    return;
+  }
   ivec2 hn = textureSize(heights, 0);
   vec2 ht = (0.5 + 0.5 * (xz * pc.hm.x + pc.hm.yz)) * vec2(hn);
   if (any(lessThan(ht, vec2(0.0))) || any(greaterThanEqual(ht, vec2(hn)))) discard;
@@ -7681,7 +7697,7 @@ void main() {
     float z = texelFetch(world, ivec2(tc + off), 0).r;
     sh += (z < 1.0 && z < zr + dot(grad, off) - bias) ? 1.0 : 0.0;
   }
-  o = vec4(1.0 - sh / 32.0);
+  o = vec4(mix(1.0 - sh / 32.0, 1.0, near_lit));
 }
 )", true);
   // Shaded riders, 1 (half size): the pixels drawn after the lighting pass
@@ -9908,7 +9924,10 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     } else {
       FullscreenPass(CopyKind::kBakeInit, &baked_, src, nullptr, nullptr, true, inv, 4);
     }
-    if (Diag("sun")) std::fprintf(stderr, "sun: world shadows %ux%u\n", w, h);
+    if (Diag("sun")) {
+      std::fprintf(stderr, "sun: world shadows %ux%u, texel %.3f x %.3f m; sun maps' reach %.1f m\n", w, h,
+                   1.0 / (std::fabs(c5[0]) * w), 1.0 / (std::fabs(c5[1]) * h), sun_r_);
+    }
     // A saved one: read in the background.
     const std::string path = BakePath(w, h);
     std::error_code ec;
@@ -9992,6 +10011,12 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     pc[26] = float(cam_pos_[2]);
     pc[28] = float(w);
     pc[29] = float(h);
+    // (The time of day with the screen's mask doing the slopes near by:
+    // within 0.6 of the sun maps' reach left lit here, fading in to 0.7.)
+    if (baked_tod_ && world_detail_ > 0 && sun_r_ > 0.0 && !Diag("nonearworld")) {
+      pc[30] = float(0.6 * sun_r_);
+      pc[31] = float(0.1 * sun_r_);
+    }
     if (baked_tod_) {
       // The time of day: every ray baked outright (the sun moves on: what
       // was dark before mustn't stay dark), nothing saved. After a step of
