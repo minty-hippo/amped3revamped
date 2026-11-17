@@ -67,6 +67,21 @@ std::string GiB(uint64_t bytes) {
   return buf;
 }
 
+// A line without its terminal colors (install.sh's steps are colored).
+std::string StripAnsi(const std::string& line) {
+  std::string out;
+  out.reserve(line.size());
+  for (size_t i = 0; i < line.size(); ++i) {
+    if (line[i] == '\x1b' && i + 1 < line.size() && line[i + 1] == '[') {
+      i += 2;
+      while (i < line.size() && !(line[i] >= '@' && line[i] <= '~')) ++i;
+      continue;
+    }
+    if (line[i] != '\r') out += line[i];
+  }
+  return out;
+}
+
 std::string Elapsed(std::chrono::steady_clock::duration d) {
   const auto s = std::chrono::duration_cast<std::chrono::seconds>(d).count();
   char buf[32];
@@ -188,16 +203,62 @@ struct App::Shared {
   std::string picked_disc, picked_folder;
   std::string dialog_error;
 
+  // How far along the job is (0..1; -1: no idea), for the bar: each step of
+  // the build a share of the whole (the compiles the most), and inside a
+  // compiling step how far the build tool says it is ("[12/345] ...").
+  float progress = -1.0f;
+  float phase_lo = 0.0f, phase_hi = 0.0f;
+
   void Log(const std::string& line) {
     std::lock_guard lock(m);
     if (log_file) log_file << line << '\n' << std::flush;
     log.push_back(line);
     while (log.size() > 500) log.pop_front();
+    // "[n/m]" at the start: the build tool's count.
+    size_t i = line.find_first_not_of(' ');
+    if (i != std::string::npos && line[i] == '[' && phase_hi > phase_lo) {
+      unsigned long n = 0, total = 0;
+      char close = 0;
+      if (std::sscanf(line.c_str() + i, "[%lu/%lu%c", &n, &total, &close) == 3 && close == ']' && total > 0 &&
+          n <= total) {
+        const float p = phase_lo + (phase_hi - phase_lo) * float(n) / float(total);
+        progress = std::max(progress, p);
+      }
+    }
   }
   void Step(const std::string& text) {
     {
       std::lock_guard lock(m);
       step = text;
+      // Each step's share (as a first install's build goes; an update skips
+      // what's built already, and the bar jumps ahead).
+      struct Phase {
+        const char* start;
+        float lo, hi;
+      };
+      static const Phase kPhases[] = {
+          {"Getting the ReXGlue SDK", 0.07f, 0.10f},
+          {"Getting whisper.cpp", 0.35f, 0.37f},
+          {"Getting ", 0.0f, 0.02f},
+          {"Extracting the game", 0.02f, 0.02f},
+          {"Building the SDK", 0.10f, 0.35f},
+          {"Building amped3", 0.49f, 0.95f},
+          {"Building", 0.02f, 0.02f},
+          {"Extracting to", 0.02f, 0.06f},
+          {"Checking the build tools", 0.06f, 0.07f},
+          {"Downloading", 0.37f, 0.39f},
+          {"Recompiling the game's code", 0.39f, 0.47f},
+          {"Round", 0.47f, 0.49f},
+          {"Test run", 0.95f, 0.98f},
+      };
+      for (const Phase& ph : kPhases) {
+        if (text.rfind(ph.start, 0) == 0) {
+          phase_lo = ph.lo;
+          phase_hi = ph.hi;
+          progress = std::max(progress, ph.lo);
+          break;
+        }
+      }
     }
     Log("== " + text);
   }
@@ -205,6 +266,14 @@ struct App::Shared {
 
 App::App() : s_(std::make_shared<Shared>()) {
   LoadSettings();
+  // Testing (AMPED3_LAUNCHER_TEST_PROGRESS=0.42): a pretend update that far
+  // along, to see the bar.
+  if (const char* tp = std::getenv("AMPED3_LAUNCHER_TEST_PROGRESS")) {
+    s_->job = Shared::Job::kRunning;
+    s_->job_start = std::chrono::steady_clock::now() - std::chrono::seconds(25);
+    s_->step = "Building the SDK (Release) - the first time takes a while";
+    s_->progress = float(std::atof(tp));
+  }
   discs_ = FindDiscImages();
   StartBranchList();
   if (IsInstalled(install_dir_)) {
@@ -221,6 +290,8 @@ App::~App() {
 
 bool App::Busy() const {
   std::lock_guard lock(s_->m);
+  // (Testing the bar: a pretend job, not busy for the screenshot.)
+  if (std::getenv("AMPED3_LAUNCHER_TEST_PROGRESS")) return false;
   return s_->job == Shared::Job::kRunning;
 }
 
@@ -403,6 +474,9 @@ void App::StartJob(bool install, Tool tool) {
     s_->job_upscale = upscale;
     s_->job_subtitles = tool == Tool::kSubtitles;
     s_->step = "Starting";
+    // (The tools on their own have no steps to go by: no bar.)
+    s_->progress = install || tool == Tool::kNone ? 0.0f : -1.0f;
+    s_->phase_lo = s_->phase_hi = 0.0f;
     s_->job_error.clear();
     s_->log.clear();
     s_->cancel = false;
@@ -456,8 +530,9 @@ void App::JobMain(bool install, std::string branch, fs::path iso) {
   auto run = [&](const std::vector<std::string>& argv, const fs::path& cwd) {
     std::string error;
     const int code = RunProcess(argv, cwd, [&](const std::string& line) {
-      if (line.rfind("==> ", 0) == 0) s->Step(line.substr(4));
-      else s->Log(line);
+      const std::string clean = StripAnsi(line);
+      if (clean.rfind("==> ", 0) == 0) s->Step(clean.substr(4));
+      else s->Log(clean);
     }, &error);
     if (code < 0) s->Log(error);
     return code;
@@ -614,8 +689,9 @@ void App::ToolMain(Tool tool) {
   }
   std::string error;
   const int code = RunProcess(argv, src, [&](const std::string& line) {
-    if (line.rfind("==> ", 0) == 0) s->Step(line.substr(4));
-    else s->Log(line);
+    const std::string clean = StripAnsi(line);
+    if (clean.rfind("==> ", 0) == 0) s->Step(clean.substr(4));
+    else s->Log(clean);
   }, &error);
   if (code < 0) s->Log(error);
   if (code != 0) {
@@ -982,6 +1058,10 @@ void App::SetRenderer(SDL_Renderer* renderer) {
   if (renderer) title_ = std::make_unique<TitleLogo>(renderer);
 }
 
+void App::OnWindowChanged() {
+  if (title_) title_->Refresh();
+}
+
 void App::Draw(ImFont* font) {
   if (page_ == Page::kSubtitleEditor) {
     const float unit = std::max(ImGui::GetIO().DisplaySize.y / 720.0f, 0.6f);
@@ -1023,6 +1103,7 @@ void App::Draw(ImFont* font) {
   int behind, ahead;
   bool job_install, job_upscale, job_subtitles;
   std::chrono::steady_clock::duration elapsed{};
+  float job_progress = -1.0f;
   {
     std::lock_guard lock(s_->m);
     branch = s_->branches[size_t(s_->branch)];
@@ -1043,6 +1124,7 @@ void App::Draw(ImFont* font) {
     for (size_t i = s_->log.size() > keep ? s_->log.size() - keep : 0; i < s_->log.size(); ++i) {
       log_tail.push_back(s_->log[i]);
     }
+    job_progress = s_->progress;
     if (job == Shared::Job::kRunning) elapsed = std::chrono::steady_clock::now() - s_->job_start;
     else if (job != Shared::Job::kIdle) elapsed = s_->job_end - s_->job_start;
   }
@@ -1102,6 +1184,7 @@ void App::Draw(ImFont* font) {
     std::string label, value;
     ImU32 color = kWhite;
     bool enabled = true;
+    float progress = -1.0f;  // a bar behind the row (0..1)
   };
   std::vector<RowText> texts;
   const double now = ImGui::GetTime();
@@ -1191,8 +1274,12 @@ void App::Draw(ImFont* font) {
                    : job_subtitles ? "making subtitles "
                    : job_install   ? "installing "
                                    : "updating ") +
+                  (job_progress >= 0.0f
+                       ? std::to_string(int(std::clamp(job_progress, 0.0f, 1.0f) * 100.0f + 0.5f)) + "%  "
+                       : std::string()) +
                   Elapsed(elapsed);
         t.color = kGold;
+        t.progress = job_progress;
         break;
       case kRowQuit:
         t.label = "Quit";
@@ -1289,6 +1376,12 @@ void App::Draw(ImFont* font) {
     }
     ImGui::PopID();
     const bool selected = cursor_ == int(i);
+    // How far the job's got: the row filled that far.
+    if (t.progress >= 0.0f) {
+      const float p = std::clamp(t.progress, 0.0f, 1.0f);
+      dl->AddRectFilled(a, b, IM_COL32(255, 204, 0, 22), 6 * unit);
+      if (p > 0.0f) dl->AddRectFilled(a, ImVec2(a.x + (b.x - a.x) * p, b.y), IM_COL32(255, 204, 0, 70), 6 * unit);
+    }
     if (selected) dl->AddRectFilled(a, b, kSelect, 6 * unit);
     const float ty = y + (row_h - text_px) * 0.5f;
     dl->AddText(font, text_px, ImVec2(x0, ty), selected ? kGold : kWhite, t.label.c_str());

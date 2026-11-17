@@ -51,6 +51,8 @@ class App {
   // The renderer the title animation's texture lives in (null before it is
   // destroyed).
   void SetRenderer(SDL_Renderer* renderer);
+  // The window resized, went full screen, or the renderer reset.
+  void OnWindowChanged();
   void OnAction(Action action);
   // Testing (AMPED3_LAUNCHER_EDITOR): straight to the subtitle editor.
   void OpenSubtitleEditor();

@@ -109,6 +109,18 @@ int main(int, char**) {
         case SDL_EVENT_QUIT:
           running = false;
           break;
+        // (The title's texture made again: a resize or full screen can lose
+        // what's in it.)
+        case SDL_EVENT_RENDER_TARGETS_RESET:
+        case SDL_EVENT_RENDER_DEVICE_RESET:
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+        case SDL_EVENT_WINDOW_RESTORED:
+          app.OnWindowChanged();
+          break;
         case SDL_EVENT_GAMEPAD_ADDED:
           if (SDL_Gamepad* g = SDL_OpenGamepad(e.gdevice.which)) pads.push_back(g);
           break;

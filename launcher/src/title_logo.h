@@ -24,6 +24,10 @@ class TitleLogo {
   // and that part's texture coordinates.
   float Aspect() const;
   void Uv(float* u0, float* v0, float* u1, float* v1) const;
+  // The window resized, went full screen or the renderer reset: its texture
+  // made again from the frame it holds (a reset loses what was in it; once
+  // the animation's over nothing else would upload it again).
+  void Refresh();
 
  private:
   struct Impl;
