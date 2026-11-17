@@ -211,6 +211,11 @@ REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
                     "Native renderer: dynamic time of day (F5): the sun and moon move across "
                     "the sky, the mountain's light, sky, stars and clouds follow the hour; "
                     "off: each mountain at its own fixed hour, as the game has it");
+REXCVAR_DEFINE_BOOL(native_tod_effects, true, "GPU",
+                    "Native renderer, with dynamic time of day off: its effects still on (the "
+                    "sharper shadows, the sun's sheen, lens flare, light glow, diamond dust, "
+                    "contact shadows, night lights after dark) for the mountain's own hour, "
+                    "its light and sky as the game has them");
 REXCVAR_DEFINE_DOUBLE(native_tod_day_minutes, 24.0, "GPU",
                       "Time of day: minutes a whole day takes (0: the clock stands still)")
     .range(0.0, 1440.0);
@@ -2443,6 +2448,9 @@ void WorkerMain() {
           native::Renderer::TimeOfDay tod;
           tod.on = REXCVAR_GET(native_time_of_day) && !locked && tod_hour >= 0.0;
           tod.hour = float(std::max(tod_hour, 0.0));
+          // (Off: its effects alone, at the mountain's own hour.)
+          const bool tod_passive = !tod.on && revamped && REXCVAR_GET(native_tod_effects) &&
+                                   renderer->MountainHour() >= 0.0f;
           tod.moon_phase = float(REXCVAR_GET(native_tod_moon_phase));
           tod.clouds = float(REXCVAR_GET(native_tod_clouds));
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
@@ -2474,6 +2482,13 @@ void WorkerMain() {
             } else {
               g_weather_kind = -1;
             }
+          }
+          if (tod_passive) {
+            tod.on = true;
+            tod.passive = true;
+            tod.hour = renderer->MountainHour();
+            tod.clouds = 0.0f;
+            tod.sway = false;
           }
           renderer->SetTimeOfDay(tod);
           // (Only what the night lights use: copies to follow, the editor.)
@@ -2570,7 +2585,7 @@ void WorkerMain() {
             }
           }
           renderer->SetEyeAdaptation(revamped ? float(REXCVAR_GET(native_eye_adaptation)) : 0.0f);
-          g_tod_hour = tod.on ? float(tod_hour) : -1.0f;
+          g_tod_hour = tod.on && !tod.passive ? float(tod_hour) : -1.0f;
         }
         renderer->SetHideInterface(g_hide_interface.load());
         {

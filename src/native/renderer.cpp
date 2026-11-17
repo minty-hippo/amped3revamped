@@ -2384,6 +2384,8 @@ struct Renderer::Impl {
   bool tod_sky_done_ = false;
   Image* tod_sky_result_ = nullptr;
   bool TodOn() const { return tod_.on && tod_state_.valid; }
+  // (On, but only for its effects: the game's own light and sky kept.)
+  bool TodPassive() const { return TodOn() && tod_.passive; }
   // The lighting's change this frame (time of day and/or eye adaptation):
   // toward the light (time of day), its color and the sky's light scaled.
   bool lm_on_ = false, lm_set_dir_ = false;
@@ -8761,7 +8763,13 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
         tod_layout_ = tod::MakeLayout({tod_game_light_[0], tod_game_light_[1], tod_game_light_[2]});
         tod_mountain_hour_ = float(tod_layout_.mountain_hour);
       }
-      if (tod_.on) {
+      if (tod_.on && tod_.passive) {
+        // Effects only: the mountain's own hour, its light exactly the game's.
+        tod_state_ = tod::At(tod_layout_, tod_layout_.mountain_hour, tod_.moon_phase, tod_.night_light);
+        tod_state_.light = tod_layout_.mountain_sun;
+        tod_state_.light_scale = tod_state_.ambient_scale = {1.0, 1.0, 1.0};
+        tod_state_.away = 0.0;
+      } else if (tod_.on) {
         tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
         tod::ApplyWeather(&tod_state_, tod_.overcast);
       }
@@ -8769,7 +8777,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
       CenterRead();
       ResolveInstances();
       lm_on_ = TodOn() || eye_strength_ > 0.0f;
-      lm_set_dir_ = TodOn();
+      lm_set_dir_ = TodOn() && !tod_.passive;
       const double e = eye_strength_ > 0.0f ? exposure_ : 1.0;
       if (TodOn()) {
         lm_dir_ = tod_state_.light;
@@ -8816,7 +8824,7 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
       }
       std::memcpy(sun_dir_painted_, painted, sizeof(painted));
       std::memcpy(sun_dir_, painted, sizeof(painted));
-      if (TodOn()) {
+      if (TodOn() && !tod_.passive) {
         // The fog's glow and the god rays: from the sun, or the moon at night.
         const tod::Vec3 v =
             tod_state_.sun_elevation > -1.0 * tod::kDeg ? tod_state_.sun : tod_state_.moon;
@@ -9814,7 +9822,7 @@ void Renderer::Impl::BakeIoTick(Image* src) {
   if (io.upload) {
     // A saved bake read: copied in (if it's still this mountain's).
     if (io.ok && baked_.image && baked_src_ == src && baked_.width == io.w &&
-        baked_.height == io.h && io.sig == bake_sig_applied_ && !baked_tod_) {
+        baked_.height == io.h && io.sig == bake_sig_applied_ && (!baked_tod_ || tod_.passive)) {
       EndRendering();
       VkBufferImageCopy r{};
       r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -9824,6 +9832,10 @@ void Renderer::Impl::BakeIoTick(Image* src) {
                                  &r);
       Barrier();
       bake_loaded_ = true;
+      // (The time of day's effects alone: the mountain's own sun, so what's
+      // saved is right; round the camera baked again at once, left to the
+      // screen's mask there.)
+      if (baked_tod_) sun_cycle_cam_[0] = 1e30;
       pending_notices_.push_back("world shadows: loaded what's baked (" + io.path + ")");
       // (The buffer is in use by this frame: destroyed a few frames on.)
       bake_retired_.push_back({frame_number_, io.buffer});
@@ -9915,7 +9927,7 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     // The painted map, magnified (until a saved one is in); for the time of
     // day: lit everywhere until baked.
     const float inv[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
-    if (baked_tod_) {
+    if (baked_tod_ && !tod_.passive) {
       VkClearColorValue one{};
       for (float& v : one.float32) v = 1.0f;
       VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -9931,7 +9943,7 @@ void Renderer::Impl::BakeWorldShadows(const Draw& d, const GpuState& st, const d
     // A saved one: read in the background.
     const std::string path = BakePath(w, h);
     std::error_code ec;
-    if (!baked_tod_ && !path.empty() && bake_io_.state.load() == 0 &&
+    if ((!baked_tod_ || tod_.passive) && !path.empty() && bake_io_.state.load() == 0 &&
         std::filesystem::exists(path, ec)) {
       BakeIo& io = bake_io_;
       io.buffer = gpu_.CreateBuffer(VkDeviceSize(w) * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -11098,7 +11110,7 @@ double Renderer::Impl::PixelAngle(uint32_t h) const {
 // too short to tell). Each frame's kept for that.
 Image* Renderer::Impl::TodFade(Image* scene) {
   if (scene->samples > 1 || scene->depth) return nullptr;
-  const bool on = TodOn();
+  const bool on = TodOn() && !tod_.passive;  // (the look changing, not the effects)
   const bool kept = fade_copy_frame_ + 1 == frame_number_ && fade_img_.image &&
                     fade_img_.width == scene->width && fade_img_.height == scene->height &&
                     fade_img_.format == scene->format;
@@ -12536,7 +12548,7 @@ Image* Renderer::Impl::TodSky(Image* scene) {
   if (tod_sky_done_) return tod_sky_result_;
   tod_sky_done_ = true;
   tod_sky_result_ = nullptr;
-  if (!TodOn()) return nullptr;
+  if (!TodOn() || tod_.passive) return nullptr;  // (effects only: the game's own sky)
   auto dit = resolved_.find(depth_base_);
   if (dit == resolved_.end() || dit->second.format != VK_FORMAT_R32_SFLOAT ||
       dit->second.width != scene->width || dit->second.height != scene->height ||

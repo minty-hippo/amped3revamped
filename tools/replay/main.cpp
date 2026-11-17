@@ -540,6 +540,12 @@ int main(int argc, char** argv) {
     } else if (a == "--tod" && i + 1 < argc) {
       tod.on = true;
       tod.hour = std::stof(argv[++i]);
+    } else if (a == "--tod-effects") {
+      // (Time of day off, its effects on: the mountain's hour, held.)
+      tod.on = true;
+      tod.passive = true;
+      tod.clouds = 0.0f;
+      tod.sway = false;
     } else if (a == "--tod-moon" && i + 1 < argc) {
       tod.moon_phase = std::stof(argv[++i]);
     } else if (a == "--test-lights") {

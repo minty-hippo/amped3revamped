@@ -427,6 +427,17 @@ night with stars, and clouds drifting overhead. Each mountain starts at the
 hour it was made for, where it looks as the game has it; every other hour is
 worked out from that, so it fits each mountain's own look.
 
+**Its effects with it off** (Time of Day: Effects with It Off,
+`native_tod_effects`, on by default): with dynamic time of day off, each
+mountain stays at its own hour with its light and sky exactly as the game
+has them, but the effects built for the time of day still run: the sharper
+slope shadows near the camera, contact shadows, the sun's sheen on snow and
+ice, lens flare and lens dirt, light glow (bloom), diamond dust, the
+ambient occlusion that dims only the sky's light, and the night lights on
+mountains set after dark. Each still follows its own setting. Not drawn
+with it off: the time of day's sky, clouds, weather, snow cover and wind.
+Turn it off to get the game's plain look back.
+
 (Off for now: day and night run at Northstar from the start on every save,
 and the setting below is ignored and hidden from the menus.)
 Northstar keeps its own hour until the Night Pass is earned (Time of Day:

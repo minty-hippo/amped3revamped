@@ -317,6 +317,11 @@ class Renderer {
     bool sway = true;  // the wind moving trees and foliage
     float cloud_clock = 0.0f;  // the clouds' drift (faster in wind); 0: seconds
     float snow_cover = 0.0f;   // fresh snow lying on things (0..1: builds as it snows, melts)
+    // The time of day's effects without the time of day: the mountain's own
+    // hour, held, its light and sky left as the game has them (no sky drawn,
+    // no weather); the sharper shadows, the sun's sheen, lens flare, diamond
+    // dust and the rest on top.
+    bool passive = false;
   };
   void SetTimeOfDay(const TimeOfDay& tod);
   // The hour the mountain is made for (its own sun), -1 before a lit frame.
