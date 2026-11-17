@@ -30,6 +30,7 @@
 #include <string_view>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -1777,7 +1778,7 @@ struct Renderer::Impl {
   VkBuffer cur_index_buffer_ = VK_NULL_HANDLE;
   bool index_cache_ = true;
   bool profile_frame_ = false;
-  double draw_part_ms_[10] = {};  // off with the diagnostic "noixcache"
+  double draw_part_ms_[12] = {};  // 10, 11: parts of 'after' (the shadow maps' and tracks' copies; instances)  // off with the diagnostic "noixcache"
   std::unordered_map<std::string, uint64_t> mem_sizes_;
   // Vertex data kept in one GPU buffer across frames (Prepass): a resource
   // is copied only when its bytes changed (FrameResources::Version). A region
@@ -2482,6 +2483,33 @@ struct Renderer::Impl {
     auto it = tod_blocks_[stage].find(sh.info.ucode_hash);
     return it == tod_blocks_[stage].end() || it->second.looks < 4 || !it->second.regs.empty();
   }
+  // (A register the shader never reads: the game's whole lighting block
+  // sits in most shaders' constants, read or not; nothing to change there.)
+  static bool TodReads(const Shader& sh, int r) {
+    return sh.info.dynamic_constants || ((sh.info.float_constants[r >> 5] >> (r & 31)) & 1u);
+  }
+  // Where a shader keeps the lighting block (looked for in its first few
+  // draws' constants `c`).
+  TodBlock& TodScan(int stage, const Shader& sh, const uint32_t* c) {
+    TodBlock& b = tod_blocks_[stage][sh.info.ucode_hash];
+    if (b.looks < 4) {
+      ++b.looks;
+      for (int r = 0; r < 256; ++r) {
+        if (!TodReads(sh, r) && !Diag("todallregs")) continue;
+        for (int k = 0; k < 29; ++k) {
+          if (!TodMatches(&c[r * 4], k)) continue;
+          const std::pair<uint16_t, uint16_t> e{uint16_t(r), uint16_t(k)};
+          if (std::find(b.regs.begin(), b.regs.end(), e) == b.regs.end()) b.regs.push_back(e);
+          break;
+        }
+      }
+    }
+    return b;
+  }
+  // A draw's constants uploaded brought to the hour (once for each block
+  // version and shader this frame): only the registers holding the lighting
+  // block changed, in the upload itself.
+  uint32_t TodConstants(int stage, const StateBlock<1024>& block, const Shader& sh);
   // The constants `c` (a copy) brought to the hour; false: nothing to change.
   bool TodApply(int stage, const Shader& sh, uint32_t* c) {
     if (!tod_ref_ok_) return false;
@@ -2489,6 +2517,7 @@ struct Renderer::Impl {
     if (b.looks < 4) {
       ++b.looks;
       for (int r = 0; r < 256; ++r) {
+        if (!TodReads(sh, r) && !Diag("todallregs")) continue;
         for (int k = 0; k < 29; ++k) {
           if (!TodMatches(&c[r * 4], k)) continue;
           const std::pair<uint16_t, uint16_t> e{uint16_t(r), uint16_t(k)};
@@ -2597,6 +2626,17 @@ struct Renderer::Impl {
   std::vector<std::vector<uint32_t>> words_pool_;  // vel_prev_'s vectors, reused
   std::unordered_map<const Shader*, Shader*> vel_by_vs_;    // draw shader -> velocity shader
   std::unordered_map<VkPipeline, VkPipeline> vel_pipelines_;  // draw pipeline -> velocity one
+  // The same for the copies drawn again into the sun maps (world, heights)
+  // and the time of day's casters' map: draw pipeline -> theirs.
+  std::unordered_map<VkPipeline, VkPipeline> sun_env_pipes_, sun_height_pipes_, tod_mover_pipes_;
+  VkPipeline DerivedPipeline(std::unordered_map<VkPipeline, VkPipeline>& cache, VkPipeline from,
+                             const std::function<VkPipeline()>& make) {
+    if (from == VK_NULL_HANDLE || Diag("nopipecache")) return make();
+    if (auto it = cache.find(from); it != cache.end()) return it->second;
+    const VkPipeline p = make();
+    if (p) cache.emplace(from, p);
+    return p;
+  }
   std::vector<Image*> vel_colors_;
   Shader* VelocityShader(const std::string& stem);
   void DrawVelocities();
@@ -2716,6 +2756,39 @@ uint32_t Renderer::Impl::ConstantsFor(int stage, const StateBlock<1024>& block,
   ConstUpload& slot = const_uploads_[stage][const_upload_next_[stage]++ & 7];
   slot = {version, &shader, offset};
   return offset;
+}
+
+uint32_t Renderer::Impl::TodConstants(int stage, const StateBlock<1024>& block, const Shader& sh) {
+  const uint64_t version = block.version();
+  uint32_t off = 0;
+  if (TodUploadFind(stage, version, &sh, &off)) return off;
+  const uint32_t* src = block.data();
+  const TodBlock& b = TodScan(stage, sh, src);
+  bool any = false;
+  for (const auto& [r, k] : b.regs) {
+    if ((any = TodMatches(&src[r * 4], k))) break;
+  }
+  if (!any) {
+    off = ConstantsFor(stage, block, sh);
+  } else {
+    uint8_t* out;
+    off = ReserveConstants(ConstBytes(sh), &out);
+    if (sh.info.dynamic_constants) {
+      std::memcpy(out, src, 4096);
+    } else {
+      for (uint32_t w = 0; w < 8; ++w) {
+        for (uint32_t bits = sh.info.float_constants[w]; bits; bits &= bits - 1) {
+          const uint32_t c = w * 32 + uint32_t(std::countr_zero(bits));
+          std::memcpy(out + c * 16, src + c * 4, 16);
+        }
+      }
+    }
+    for (const auto& [r, k] : b.regs) {
+      if (TodMatches(&src[r * 4], k)) std::memcpy(out + r * 16, &tod_new_[k * 4], k == 0 ? 12 : 16);
+    }
+  }
+  TodUploadKeep(stage, version, &sh, off);
+  return off;
 }
 
 uint32_t Renderer::Impl::WriteUniform(const void* data, size_t size) {
@@ -13737,11 +13810,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   // c9, c10 over c12: the time of day's mask, through the screen's rows.)
   const bool trail_tod = TodOn() && tod_mask_ok_ && vs->info.ucode_hash == kTrailVertexShader;
   const bool vs_needs = LightModOn() && TodNeeds(0, *vs);
-  uint32_t tod_vs_off = 0;
-  const bool vs_cached = vs_needs && !trail_tod && !Diag("nconstcache") &&
-                         TodUploadFind(0, st.vs_consts.version(), vs, &tod_vs_off);
-  if (vs_cached) {
-    if (tod_vs_off != UINT32_MAX) offsets[1] = tod_vs_off;
+  if (vs_needs && !trail_tod && vs->info.ucode_hash != kTrailVertexShader && !Diag("nconstcache")) {
+    offsets[1] = TodConstants(0, st.vs_consts, *vs);
   } else if (vs_needs || trail_tod) {
     uint32_t vc[1024];
     std::memcpy(vc, st.vs_consts.data(), sizeof(vc));
@@ -13760,7 +13830,6 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       offsets[1] = ReserveConstants(ConstBytes(*vs), &out);
       std::memcpy(out, vc, ConstBytes(*vs));
     }
-    if (!trail_tod) TodUploadKeep(0, st.vs_consts.version(), vs, changed ? offsets[1] : UINT32_MAX);
   }
   offsets[2] = ConstantsFor(1, st.ps_consts, *ps);
   // Freecam: the lighting pass works out each pixel's world position from
@@ -13805,21 +13874,16 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
     std::memcpy(out, fc_consts, ConstBytes(*ps));
   } else if (LightModOn() && TodNeeds(1, *ps)) {
-    const bool plain = lit_src == st.ps_consts.data() && !Diag("nconstcache");
-    uint32_t off = 0;
-    if (plain && TodUploadFind(1, st.ps_consts.version(), ps, &off)) {
-      // (Brought to the hour already for an earlier draw: shared.)
-      if (off != UINT32_MAX) offsets[2] = off;
+    if (lit_src == st.ps_consts.data() && !Diag("nconstcache")) {
+      offsets[2] = TodConstants(1, st.ps_consts, *ps);
     } else {
       if (lit_src != fc_consts) std::memcpy(fc_consts, lit_src, sizeof(fc_consts));
-      const bool changed = TodApply(1, *ps, fc_consts);
-      if (changed) {
+      if (TodApply(1, *ps, fc_consts)) {
         lit_src = fc_consts;
         uint8_t* out;
         offsets[2] = ReserveConstants(ConstBytes(*ps), &out);
         std::memcpy(out, fc_consts, ConstBytes(*ps));
       }
-      if (plain) TodUploadKeep(1, st.ps_consts.version(), ps, changed ? offsets[2] : UINT32_MAX);
     }
   }
   if (shadow_res_ > 1.0f && ps->info.ucode_hash == kShadowBlurPixelShader &&
@@ -14214,13 +14278,15 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     const uint64_t vh = vs->info.ucode_hash;
     static const std::vector<Image*> kNoColors;
     if (scene_pass && !shadow_caster_vs_.count(vh)) {
-      const VkPipeline cp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_env_, 0, false, false,
-                                        false, true);
+      const VkPipeline cp = DerivedPipeline(sun_env_pipes_, pipeline, [&] {
+        return PipelineFor(d, st, *vs, *ps, kNoColors, &sun_env_, 0, false, false, false, true);
+      });
       if (cp) keep(cp, env_draws_, true);
       if (Diag("sunrec")) ++sun_rec_counts_[vh];
       if (!IsShadowCaster(vh) && sun_height_.image) {
-        const VkPipeline hp = PipelineFor(d, st, *vs, *ps, kNoColors, &sun_height_, 0, false,
-                                          false, false, true);
+        const VkPipeline hp = DerivedPipeline(sun_height_pipes_, pipeline, [&] {
+          return PipelineFor(d, st, *vs, *ps, kNoColors, &sun_height_, 0, false, false, false, true);
+        });
         if (hp) keep(hp, height_draws_, true);
       }
     }
@@ -14234,8 +14300,9 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       // The time of day: the same casters (riders, rails, objects) drawn
       // again from the hour's sun (TodLightingInputs).
       if (TodOn() && ps->info.ucode_hash != kTerrainShadowPixelShader && tod_movers_map_.image) {
-        const VkPipeline mp = PipelineFor(d, st, *vs, *ps, kNoColors, &tod_movers_map_, 0, false,
-                                          false, false, true);
+        const VkPipeline mp = DerivedPipeline(tod_mover_pipes_, pipeline, [&] {
+          return PipelineFor(d, st, *vs, *ps, kNoColors, &tod_movers_map_, 0, false, false, false, true);
+        });
         if (mp) keep(mp, tod_movers_draws_, true);
       }
       // The light's view-projection: c0-c3 of a draw with world-space
@@ -14254,6 +14321,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
     }
   }
+  mark(10);
   if (Diag("winddiag") && !light_seen_ && tiling_.width && depth && (st.reg(0x2200) & 6) == 6) {
     float c[16];
     std::memcpy(c, st.vs_consts.data(), 64);
@@ -14330,6 +14398,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     }
     pending_instances_.push_back(pi);
   }
+  mark(11);
   // Speed blur: how close the nearest character is (the rider, when riding).
   if (light_seen_ && tiling_.width && depth && vs->info.dynamic_constants &&
       max_draws_ == UINT32_MAX) {

@@ -577,9 +577,12 @@ that rule against a save that has the pass.
 - The time of day costs less on the CPU: the lighting values it changes in
   the riders', characters' and props' shaders are worked out once for each
   set of constants and shared by the draws that use them, rather than redone
-  for every draw (about 60% less time on constants in a Northstar replay).
-  The log's "draws by part" line now splits the old "uniforms" into "draw
-  state" and "constants".
+  for every draw, only in the registers each shader actually reads (the
+  game leaves its whole lighting block in nearly every shader's constants,
+  read or not), and written straight into the upload. In a Northstar replay
+  the draws' constants went from about 5 ms a frame to under 1.5. The log's
+  "draws by part" line now splits the old "uniforms" into "draw state" and
+  "constants".
 - Ambient occlusion: its far taps read smaller copies of the depth (half to
   an eighth size), one read each and kept in the cache (it was the dearest
   effect up close, 6-9 ms a frame on an Arc). With time of day on it dims

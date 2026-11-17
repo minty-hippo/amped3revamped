@@ -147,7 +147,7 @@ struct RenderStats {
   // lookup, uniforms, texture descriptor sets, indices, Vulkan commands,
   // after (motion blur copies).
   bool draw_parts_sampled = false;
-  double draw_part_ms[10] = {};
+  double draw_part_ms[12] = {};
   // Async: identifies the frame for WaitFrame / ReadOutput.
   uint64_t ticket = 0;
   // An output was requested and drawn (Render's `output`).

@@ -2679,6 +2679,7 @@ void WorkerMain() {
         g_timings.clears_in_pass += stats.clears_in_pass;
         if (stats.draw_parts_sampled) {
           for (int k = 0; k < 10; ++k) g_timings.parts[k] += stats.draw_part_ms[k];
+          g_timings.parts[8] += stats.draw_part_ms[10] + stats.draw_part_ms[11];  // (all 'after')
           ++g_timings.part_frames;
         }
         perf::ReportRenderFrame(states_ms + stats.prepass_ms + stats.record_ms);
