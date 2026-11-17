@@ -568,6 +568,23 @@ that rule against a save that has the pass.
   dust and smudges on the lens, out of focus (soft discs, a little brighter
   at the rim, and faint smears), that light up when the sun is in view,
   most near it.
+- Loading into a mountain:
+  - **Precompiling** (Precompile on Loading, `native_precompile`, on; needs
+    Background shader compilation): every pipeline the native renderer
+    builds is listed, with its shaders' microcode, in
+    `logs\native_pipelines` (a list per MSAA / smooth-foliage setting). On a
+    loading screen everything on that list not built yet this session is
+    built again in the background on spare cores, with a progress bar under
+    the slides ("Preparing shaders 120 / 640"). What the driver already has
+    cached takes moments; after an update that changes the shaders, or a new
+    driver, it's where the compiling happens instead of mid-run. The list
+    grows as you play (a mountain's pipelines are listed the first time
+    you ride it).
+  - **Press X to Continue** (Press X After Loading, `native_load_continue`,
+    on): once the mountain has loaded (onto the trail map, or riding), its
+    loading screen's last picture stays up with "Press (X) to Continue" until
+    X, Enter, Space or a click (once the precompiling is done); the game's
+    controls are held meanwhile, and the map's clouds part after.
 - Fewer hitches from pipeline builds: a pipeline the driver has to compile
   (not in its cache; 150-800 ms each on an Arc) is now built in the
   background at once, even the first one in a frame, the draw left out for

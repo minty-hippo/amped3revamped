@@ -333,6 +333,15 @@ const std::vector<Tab>& Tabs() {
                        "With the native renderer: scenery whose pipeline isn't built yet appears "
                        "a frame or two later instead of the frame stalling (built pipelines are "
                        "kept on disk, so this happens once)."),
+                Toggle("native_precompile", "Precompile on loading screens",
+                       "While a mountain loads, every pipeline the native renderer has used "
+                       "before at these settings is built again in the background, with a "
+                       "progress bar under the slides, so the driver has them all ready: far "
+                       "fewer hitches after an update or a driver change. Needs Background "
+                       "shader compilation."),
+                Toggle("native_load_continue", "Press X to continue after loading",
+                       "Once a mountain has loaded, its loading screen stays up until you "
+                       "press X (or Enter), after the shaders are ready."),
                 Choices("readback_resolve", "GPU readback",
                         "Lets the game read back images the GPU drew. Leave off unless parts of "
                         "the HUD, menus, photos or reflections are missing or wrong.",

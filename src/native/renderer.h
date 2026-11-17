@@ -148,6 +148,9 @@ struct RenderStats {
   // after (motion blur copies).
   bool draw_parts_sampled = false;
   double draw_part_ms[13] = {};
+  // The game's 3D scene was drawn this frame (its lighting pass): not a
+  // loading screen, a menu or a video.
+  bool scene_lit = false;
   // Async: identifies the frame for WaitFrame / ReadOutput.
   uint64_t ticket = 0;
   // An output was requested and drawn (Render's `output`).
@@ -324,6 +327,18 @@ class Renderer {
     bool passive = false;
   };
   void SetTimeOfDay(const TimeOfDay& tod);
+  // Precompiling: every pipeline drawn with before at these settings (a list
+  // kept on disk next to the pipeline cache, with the shaders' microcode)
+  // built again in the background, so the driver's cache has them all
+  // before they're needed. Started (again) on a loading screen; what's
+  // already built this session is skipped. Progress: done of total (0 of 0:
+  // nothing to do).
+  void StartPrecompile();
+  void PrecompileProgress(uint32_t* done, uint32_t* total) const;
+  // Holding the picture (loading into a mountain): while the scene isn't
+  // drawn (the loading screen) the picture is shown and kept; once it is,
+  // the kept one is shown instead, until let go.
+  void SetHoldPicture(bool hold);
   // The hour the mountain is made for (its own sun), -1 before a lit frame.
   float MountainHour() const;
   // Night lights (time of day): lamps and lit windows, shining on the

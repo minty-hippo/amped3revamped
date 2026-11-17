@@ -4,6 +4,7 @@
 #include "audio_trace.h"
 #include "camera_scan.h"
 #include "freecam.h"
+#include "load_screen.h"
 #include "notice.h"
 #include "replay.h"
 #include "subtitles.h"
@@ -475,6 +476,22 @@ void Amped3App::OnPostSetup() {
     };
     amped3::replay::Install(std::move(host));
   }
+  // Loading into a mountain: precompiling's progress, then "Press X to
+  // Continue" (the game's input held meanwhile).
+  {
+    amped3::load_screen::Host host;
+    host.drawer = imgui_drawer();
+    host.post_ui = [this](std::function<void()> fn) { app_context().CallInUIThread(std::move(fn)); };
+    host.block_game_input = [this](bool block) {
+      if (block) {
+        unblock_when_released_ = false;
+        game_input_blocked_ = true;
+      } else {
+        unblock_when_released_ = true;  // the watcher, once every button is up
+      }
+    };
+    amped3::load_screen::Install(std::move(host));
+  }
   // Short notices (keyboard shortcuts that change a setting).
   amped3::notice::Install(imgui_drawer(), [this](std::function<void()> fn) {
     app_context().CallInUIThread(std::move(fn));
@@ -611,7 +628,7 @@ void Amped3App::StartControllerHotkeyWatcher() {
       amped3::replay::OnPad(pad);
       amped3::night_lights::Tick();
       amped3::night_pass::Tick();
-      if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ &&
+      if (unblock_when_released_ && pad.buttons == 0 && !options_menu_open_ && !amped3::load_screen::Waiting() &&
           !graphics_panel_open_ && !amped3::freecam::Active() && !amped3::replay::Active()) {
         unblock_when_released_ = false;
         game_input_blocked_ = false;

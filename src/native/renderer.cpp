@@ -45,6 +45,8 @@
 #include <thread>
 #include <deque>
 #include <filesystem>
+#include <cstdarg>
+#include <fstream>
 #include <mutex>
 #include <condition_variable>
 #include <vector>
@@ -1149,7 +1151,28 @@ struct Shader {
   ShaderInfo info;
   std::string error;
   std::vector<uint8_t> vfetch;  // the vertex fetch constants it reads (info's bits as a list)
+  // How to make it again (the pipeline list for precompiling): 1 a vertex
+  // shader, 2 a pixel shader, 3 a velocity vertex shader, from the microcode
+  // with this hash; 4 the velocity, 5 the exemption pixel shader (built in).
+  // 0: not listed.
+  uint8_t recipe = 0;
+  uint64_t recipe_hash = 0;
 };
+
+std::string fmt_line(const char* f, ...) {
+  char buf[256];
+  va_list a;
+  va_start(a, f);
+  const int n = std::vsnprintf(buf, sizeof(buf), f, a);
+  va_end(a);
+  return std::string(buf, size_t(std::clamp(n, 0, int(sizeof(buf)) - 1)));
+}
+
+uint64_t HashBytes(const uint8_t* p, size_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
 
 // Texture fetch constant words for tf<fc>: the draw's texture line when there
 // is one (older captures have no fetch lines), else the fetch constants.
@@ -1205,7 +1228,10 @@ struct Renderer::Impl {
     {
       const std::string& pcp = options_.pipeline_cache_path;
       const size_t slash = pcp.find_last_of("/\\");
-      if (slash != std::string::npos) bake_dir_ = pcp.substr(0, slash) + "/world_shadows";
+      if (slash != std::string::npos) {
+        bake_dir_ = pcp.substr(0, slash) + "/world_shadows";
+        precompile_dir_ = pcp.substr(0, slash) + "/native_pipelines";
+      }
     }
     LoadCloudSprite();
     if (options_.texture_pack || options_.hd_fonts || options_.upscaled_textures) {
@@ -1983,6 +2009,55 @@ struct Renderer::Impl {
   std::vector<std::thread> pq_threads_;
   bool pq_stop_ = false;
   void QueuePipeline(std::unique_ptr<PipelineBuild> build);
+  void SpawnBuilder();
+  // Precompiling (StartPrecompile): the pipeline list, the microcode kept
+  // with it, and what's being built from it.
+  std::string precompile_dir_;
+  bool precompiling_ = false;     // PipelineFor called for the list: queued, not listed
+  std::string last_queued_key_;
+  std::unordered_set<std::string> listed_;     // recipes in the list (this session's, and read)
+  bool listed_read_ = false;
+  std::unordered_set<uint64_t> ucode_kept_;    // microcode already in the store
+  struct PrecompileItem {
+    Draw d;
+    GpuState st;
+    std::vector<Image> images;  // the colors', then the depth's (format, samples)
+    size_t ncolors = 0;
+    Shader* vs = nullptr;
+    Shader* ps = nullptr;
+    uint32_t mask_bits = 0, flags = 0;
+  };
+  std::mutex pc_mutex_;
+  std::condition_variable pc_cv_;
+  std::thread pc_thread_;
+  bool pc_stop_ = false;
+  uint32_t pc_busy_ = 0;
+  std::deque<std::unique_ptr<PrecompileItem>> pc_ready_;
+  std::atomic<uint32_t> precompile_handled_{0};
+  void PrecompileMain();
+  void StopPrecompile();
+  std::deque<std::string> precompile_todo_;
+  std::vector<std::string> precompile_keys_;   // queued, to tell when they're done
+  std::unordered_set<std::string> precompiled_;  // recipes done this session
+  uint32_t precompile_total_ = 0;
+  std::atomic<uint32_t> precompile_failed_{0};
+  std::map<std::pair<uint8_t, uint64_t>, Shader> precompile_shaders_;
+  std::string ListPath() const;
+  void ReadList();
+  uint64_t KeepMicrocode(const std::vector<uint8_t>& bytes);
+  void ListPipeline(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
+                    const std::vector<Image*>& colors, Image* depth, uint32_t mask_bits, bool velocity,
+                    bool mask, bool reactive, bool caster);
+  Shader* PrecompileShader(uint8_t recipe, uint64_t hash);
+  void PrecompileStep(double budget_ms);
+  size_t PrecompileThreads() const {
+    const unsigned n = std::thread::hardware_concurrency();
+    return std::clamp<size_t>(n > 4 ? n - 3 : 2, 2, 8);
+  }
+  // Holding the picture (SetHoldPicture).
+  bool hold_picture_ = false;
+  Image hold_img_;
+  bool hold_valid_ = false;
   void CollectPipelines();
   void StopPipelineBuilders();
   // Disk pipeline cache: pipelines built since it was last written, and the
@@ -2896,6 +2971,10 @@ Shader* Renderer::Impl::GetShader(const std::string& stem, ShaderStage stage) {
   s.info = r.info;
   for (uint32_t vf = 0; vf < 96; ++vf) {
     if (s.info.vertex_fetch_constants[vf >> 5] & (1u << (vf & 31))) s.vfetch.push_back(uint8_t(vf));
+  }
+  if (!debug_stores_ && !precompiling_) {
+    s.recipe = stage == ShaderStage::kVertex ? 1 : 2;
+    s.recipe_hash = KeepMicrocode(bytes);
   }
   std::vector<uint32_t> spirv;
   std::string error;
@@ -3947,6 +4026,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   pci.pDynamicState = &dy;
   pci.layout = layout_;
   build->key = std::string(key);
+  if (!precompiling_) ListPipeline(d, st, vs, ps, colors, depth, color_mask_bits, velocity, mask, reactive, caster);
   // Scene geometry (and the motion blur's extra passes) can wait: once this
   // frame has spent its budget building pipelines, the rest are built in the
   // background and the draw is left out until its pipeline is ready (a
@@ -3954,6 +4034,11 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   // (So can the copies drawn again into the sun maps, the casters' and the
   // tracks' maps: a frame without one is a shadow late by a frame.)
   const bool deferrable = options_.async_pipelines && (tiling_.width != 0 || velocity || mask || caster);
+  if (precompiling_) {
+    // (Precompiling: always in the background.)
+    QueuePipeline(std::move(build));
+    return VK_NULL_HANDLE;
+  }
   // Just after the renderer starts (most pipelines then come from the disk
   // cache, quickly) a longer stall beats a scene missing for a frame.
   const double budget = frame_number_ < 120 ? 100.0 : kPipelineSyncBudgetMs;
@@ -4004,13 +4089,236 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   return p;
 }
 
+// --- Precompiling -------------------------------------------------------------
+
+// The list for these settings (what changes the pipelines' make-up: the
+// targets' sample counts and the cut-outs' coverage).
+std::string Renderer::Impl::ListPath() const {
+  if (precompile_dir_.empty()) return {};
+  return precompile_dir_ + "/pipelines_" + (options_.msaa ? "msaa" : "nomsaa") +
+         (options_.smooth_alpha ? "_smooth" : "") + ".txt";
+}
+
+void Renderer::Impl::ReadList() {
+  if (listed_read_) return;
+  listed_read_ = true;
+  const std::string path = ListPath();
+  if (path.empty()) return;
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("p1 ", 0) == 0) listed_.insert(line);
+  }
+}
+
+// The microcode kept (its hash: the recipe's), once per session per shader.
+uint64_t Renderer::Impl::KeepMicrocode(const std::vector<uint8_t>& bytes) {
+  const uint64_t h = HashBytes(bytes.data(), bytes.size());
+  if (precompile_dir_.empty() || !ucode_kept_.insert(h).second) return h;
+  char name[32];
+  std::snprintf(name, sizeof(name), "/ucode/%016llX.bin", (unsigned long long)h);
+  const std::string path = precompile_dir_ + name;
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    std::filesystem::create_directories(precompile_dir_ + "/ucode", ec);
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()),
+                                                std::streamsize(bytes.size()));
+  }
+  return h;
+}
+
+// A pipeline being built: its recipe added to the list (the shaders, the
+// state it's made from, the targets' formats and samples).
+void Renderer::Impl::ListPipeline(const Draw& d, const GpuState& st, const Shader& vs, const Shader& ps,
+                                  const std::vector<Image*>& colors, Image* depth, uint32_t mask_bits,
+                                  bool velocity, bool mask, bool reactive, bool caster) {
+  if (precompile_dir_.empty() || !vs.recipe || !ps.recipe || DiagRange() || Diag("nolist")) return;
+  ReadList();
+  std::string r = fmt_line("p1 %u %016llX %u %016llX %u %u", vs.recipe, (unsigned long long)vs.recipe_hash,
+                           ps.recipe, (unsigned long long)ps.recipe_hash, d.prim, unsigned(d.kind));
+  for (uint32_t reg : {0x2200u, 0x2201u, 0x2202u, 0x2205u, 0x2209u, 0x220Au, 0x220Bu, 0x2312u}) {
+    r += fmt_line(" %08X", st.reg(reg));
+  }
+  r += fmt_line(" %u %u %zu", mask_bits,
+                (velocity ? 1u : 0u) | (mask ? 2u : 0u) | (reactive ? 4u : 0u) | (caster ? 8u : 0u),
+                colors.size());
+  for (const Image* c : colors) r += fmt_line(" %u %u %u", unsigned(c->format), c->samples, c->sample_scale);
+  if (depth) {
+    r += fmt_line(" %u %u %u", unsigned(depth->format), depth->samples, depth->sample_scale);
+  } else {
+    r += " 0 0 0";
+  }
+  if (!listed_.insert(r).second) return;
+  precompiled_.insert(r);  // (built this session already)
+  std::error_code ec;
+  std::filesystem::create_directories(precompile_dir_, ec);
+  std::ofstream(ListPath(), std::ios::app) << r << "\n";
+}
+
+// A shader for a recipe, from the microcode kept.
+Shader* Renderer::Impl::PrecompileShader(uint8_t recipe, uint64_t hash) {
+  if (recipe == 4) return &vel_ps_;
+  if (recipe == 5) return &exempt_ps_;
+  if (recipe < 1 || recipe > 3) return nullptr;
+  auto key = std::make_pair(recipe, hash);
+  auto it = precompile_shaders_.find(key);
+  if (it != precompile_shaders_.end()) return it->second.module ? &it->second : nullptr;
+  Shader& s = precompile_shaders_[key];
+  char name[32];
+  std::snprintf(name, sizeof(name), "/ucode/%016llX.bin", (unsigned long long)hash);
+  std::ifstream in(precompile_dir_ + name, std::ios::binary);
+  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (bytes.size() < 12 || bytes.size() % 4) return nullptr;
+  std::vector<uint32_t> ucode(bytes.size() / 4);
+  for (size_t i = 0; i < ucode.size(); ++i) {
+    ucode[i] = (uint32_t(bytes[i * 4]) << 24) | (uint32_t(bytes[i * 4 + 1]) << 16) |
+               (uint32_t(bytes[i * 4 + 2]) << 8) | bytes[i * 4 + 3];
+  }
+  // (Translated as GetShader / VelocityShader do: the same SPIR-V, so the
+  // driver's cache entry is the one the game's draws will ask for.)
+  amped3::native::TranslateOptions topt;
+  topt.velocity = recipe == 3;
+  topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
+  const ShaderStage stage = recipe == 2 ? ShaderStage::kPixel : ShaderStage::kVertex;
+  auto r = amped3::native::TranslateShader(stage, ucode.data(), ucode.size(), topt);
+  if (!r.ok) return nullptr;
+  s.info = r.info;
+  std::vector<uint32_t> spirv;
+  std::string error;
+  char stem[40];
+  std::snprintf(stem, sizeof(stem), "precompile_%016llX%s", (unsigned long long)hash, recipe == 3 ? "_velocity" : "");
+  if (!options_.compile || !options_.compile(stage == ShaderStage::kPixel, stem, r.glsl, &spirv, &error)) {
+    return nullptr;
+  }
+  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  ci.codeSize = spirv.size() * 4;
+  ci.pCode = spirv.data();
+  if (vk::vkCreateShaderModule(gpu_.device, &ci, nullptr, &s.module) != VK_SUCCESS) s.module = VK_NULL_HANDLE;
+  return s.module ? &s : nullptr;
+}
+
+// The precompile thread: the list's lines made ready (parsed, their shaders
+// translated and compiled: the slow part) for the worker to queue.
+void Renderer::Impl::PrecompileMain() {
+  for (;;) {
+    std::string line;
+    {
+      std::unique_lock lock(pc_mutex_);
+      pc_cv_.wait(lock, [this] { return pc_stop_ || !precompile_todo_.empty(); });
+      if (pc_stop_) return;
+      line = std::move(precompile_todo_.front());
+      precompile_todo_.pop_front();
+      ++pc_busy_;
+    }
+    auto item = std::make_unique<PrecompileItem>();
+    bool ok = false;
+    {
+      std::istringstream in(line);
+      std::string tag, vh, ph;
+      unsigned vk_ = 0, pk_ = 0, prim = 0, kind = 0;
+      size_t ncolors = 0;
+      uint32_t regs[8] = {};
+      in >> tag >> vk_ >> vh >> pk_ >> ph >> prim >> kind;
+      for (uint32_t& v : regs) in >> std::hex >> v;
+      in >> std::dec >> item->mask_bits >> item->flags >> ncolors;
+      ok = bool(in) && ncolors <= 4;
+      if (ok) {
+        item->images.resize(ncolors + 1);
+        for (size_t i = 0; i <= ncolors; ++i) {
+          unsigned f = 0, samples = 0, scale = 0;
+          in >> f >> samples >> scale;
+          Image& im = item->images[i];
+          im.format = VkFormat(f);
+          im.samples = std::max(samples, 1u);
+          im.sample_scale = scale;
+          im.depth = i == ncolors;
+        }
+        ok = bool(in);
+        item->ncolors = ncolors;
+        item->d.prim = prim;
+        item->d.kind = Draw::Kind(kind & 3);
+        const uint32_t which[8] = {0x2200, 0x2201, 0x2202, 0x2205, 0x2209, 0x220A, 0x220B, 0x2312};
+        for (int i = 0; i < 8; ++i) item->st.regs.set(which[i] - 0x2000, regs[i]);
+      }
+      if (ok) {
+        item->vs = PrecompileShader(uint8_t(vk_), std::strtoull(vh.c_str(), nullptr, 16));
+        item->ps = PrecompileShader(uint8_t(pk_), std::strtoull(ph.c_str(), nullptr, 16));
+        ok = item->vs && item->ps;
+      }
+    }
+    std::lock_guard lock(pc_mutex_);
+    --pc_busy_;
+    if (ok) {
+      pc_ready_.push_back(std::move(item));
+    } else {
+      ++precompile_failed_;
+      if (Diag("precompile")) std::fprintf(stderr, "precompile: couldn't make %s\n", line.c_str());
+    }
+  }
+}
+
+// The worker: what's ready queued for the pipeline builders.
+void Renderer::Impl::PrecompileStep(double budget_ms) {
+  const auto t0 = std::chrono::steady_clock::now();
+  for (;;) {
+    std::unique_ptr<PrecompileItem> item;
+    {
+      std::lock_guard lock(pc_mutex_);
+      if (pc_ready_.empty()) return;
+      item = std::move(pc_ready_.front());
+      pc_ready_.pop_front();
+    }
+    std::vector<Image*> colors;
+    for (size_t i = 0; i < item->ncolors; ++i) colors.push_back(&item->images[i]);
+    Image* depth = item->images[item->ncolors].format != VK_FORMAT_UNDEFINED ? &item->images[item->ncolors] : nullptr;
+    precompiling_ = true;
+    last_queued_key_.clear();
+    const VkPipeline p = PipelineFor(item->d, item->st, *item->vs, *item->ps, colors, depth, item->mask_bits,
+                                     item->flags & 1, item->flags & 2, item->flags & 4, item->flags & 8);
+    precompiling_ = false;
+    if (Diag("precompile")) std::fprintf(stderr, "precompile: queued %d\n", !p && !last_queued_key_.empty() ? 1 : 0);
+    if (!p && !last_queued_key_.empty()) {
+      precompile_keys_.push_back(last_queued_key_);
+    } else {
+      ++precompile_handled_;  // (built already: nothing to wait for)
+    }
+    if (MsSince(t0) >= budget_ms) return;
+  }
+}
+
+void Renderer::Impl::StopPrecompile() {
+  {
+    std::lock_guard lock(pc_mutex_);
+    pc_stop_ = true;
+    precompile_todo_.clear();
+  }
+  pc_cv_.notify_all();
+  if (pc_thread_.joinable()) pc_thread_.join();
+  pc_ready_.clear();
+}
+
 void Renderer::Impl::QueuePipeline(std::unique_ptr<PipelineBuild> build) {
+  last_queued_key_ = build->key;
   pipelines_pending_.insert(build->key);
   ++stats_.deferred_pipelines;
   std::lock_guard lock(pq_mutex_);
   if (pq_threads_.empty()) {
     // Two builders: drivers compile pipelines on one thread each.
     for (int i = 0; i < 2; ++i) {
+      SpawnBuilder();
+    }
+  }
+  // (Precompiling: more, the cores the game isn't using.)
+  if (precompiling_ && pq_threads_.size() < PrecompileThreads()) {
+    while (pq_threads_.size() < PrecompileThreads()) SpawnBuilder();
+  }
+  pq_.push_back(std::move(build));
+  pq_cv_.notify_one();
+}
+
+void Renderer::Impl::SpawnBuilder() {
+  {
+    {
       pq_threads_.emplace_back([this] {
         for (;;) {
           std::unique_ptr<PipelineBuild> b;
@@ -4032,8 +4340,6 @@ void Renderer::Impl::QueuePipeline(std::unique_ptr<PipelineBuild> build) {
       });
     }
   }
-  pq_.push_back(std::move(build));
-  pq_cv_.notify_one();
 }
 
 // Pipelines finished in the background since the last frame.
@@ -8290,6 +8596,8 @@ void main() {
   // when last frame's constants were found (XE_FLAG_VELOCITY), else 0 (the
   // blur uses the camera's motion there); w = 1 on the player character, 0.5
   // on other characters (drawn after the lighting pass), 0 on the scenery.
+  exempt_ps_.recipe = 5;
+  vel_ps_.recipe = 4;
   exempt_ps_.module = CompileBuiltin("builtin_exempt", R"(#version 450
 layout(location = 0) out vec4 o;
 void main() { o = vec4(0.0, 0.0, 0.0, 2.0); }  // (2: an event icon; the player's is 1)
@@ -14935,6 +15243,10 @@ Shader* Renderer::Impl::VelocityShader(const std::string& stem) {
     return &s;
   }
   s.info = r.info;
+  if (!precompiling_) {
+    s.recipe = 3;
+    s.recipe_hash = KeepMicrocode(bytes);
+  }
   std::vector<uint32_t> spirv;
   std::string error;
   if (!options_.compile || !options_.compile(false, stem + "_velocity", r.glsl, &spirv, &error)) {
@@ -15499,16 +15811,24 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
 
   // Map clouds: their state this frame; while they close in on leaving the
   // map, its last frame is shown (already through the gamma table) instead.
-  UpdateClouds();
-  const bool clouds = map_clouds_ && cloud_active_;
+  if (!(hold_picture_ && light_seen_ && hold_valid_)) UpdateClouds();
+  const bool clouds = map_clouds_ && cloud_active_ && !(hold_picture_ && light_seen_ && hold_valid_);
   if (cloud_closing_ && (!cloud_held_valid_ || cloud_held_.width != w || cloud_held_.height != h)) {
     cloud_closing_ = false;  // nothing to show: part over the riding view now
     StartCloudsParting(std::chrono::steady_clock::now());
   }
-  const bool held = clouds && cloud_closing_;
+  bool held = clouds && cloud_closing_;
   if (held) {
     src = &cloud_held_;
     lut = nullptr;
+  }
+  // Holding the picture (loading into a mountain): the scene there, the
+  // loading screen's last picture shown instead.
+  const bool hold_show = hold_picture_ && light_seen_ && hold_valid_ && hold_img_.width == w && hold_img_.height == h;
+  if (hold_show) {
+    src = &hold_img_;
+    lut = nullptr;
+    held = true;
   }
   const CopyKind kind = src->samples > 1 ? CopyKind::kOutputMs : CopyKind::kOutput;
   VkPipeline p = CopyPipeline(kind, dst->format);
@@ -15572,6 +15892,22 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
   }
   vk::vkCmdEndRendering(cb_);
   dyn_ = DynState{};  // all of it: a new pass or command buffer binds nothing yet
+  // Holding: the loading screen's picture kept (each frame without the scene).
+  if (hold_picture_ && !light_seen_) {
+    if (hold_img_.width != w || hold_img_.height != h) {
+      if (hold_img_.image) Retire(hold_img_);
+      hold_img_ = gpu_.CreateImage(w, h, VK_FORMAT_A2B10G10R10_UNORM_PACK32, false, "load_held");
+      ToGeneral(cb_, hold_img_);
+    }
+    Barrier();
+    VkImageCopy hr{};
+    hr.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    hr.dstSubresource = hr.srcSubresource;
+    hr.extent = {w, h, 1};
+    vk::vkCmdCopyImage(cb_, dst->image, VK_IMAGE_LAYOUT_GENERAL, hold_img_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &hr);
+    Barrier();
+    hold_valid_ = true;
+  }
   // Clouds done: keep the frame, for closing in over it at a cut to or from
   // the map.
   if (map_clouds_ && cloud_known_ && !cloud_active_ && light_seen_) {
@@ -15659,6 +15995,7 @@ Renderer::Impl::~Impl() {
   if (stream_.active()) stream_.End();  // a frame left unfinished (an error)
   if (!gpu_.device) return;
   g_phase = "closing the old renderer: stopping the pipeline builders";
+  StopPrecompile();  // (its thread makes shader modules)
   StopPipelineBuilders();
   g_phase = "closing the old renderer: saving the pipeline cache";
   if (cache_save_.valid()) cache_save_.wait();
@@ -15758,6 +16095,11 @@ Renderer::Impl::~Impl() {
   for (auto& [k, p] : copy_pipelines_) {
     if (p) vk::vkDestroyPipeline(dev, p, nullptr);
   }
+  for (auto& [k, sh] : precompile_shaders_) {
+    if (sh.module) vk::vkDestroyShaderModule(dev, sh.module, nullptr);
+  }
+  precompile_shaders_.clear();
+  gpu_.DestroyImage(hold_img_);
   for (auto& [k, s] : shaders_) {
     if (s.module) vk::vkDestroyShaderModule(dev, s.module, nullptr);
   }
@@ -15805,6 +16147,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   frame_ = &frame;
   res_ = &resources;
   stats_ = RenderStats{};
+  stats_.scene_lit = light_seen_;
   stats_.notices = std::move(pending_notices_);
   pending_notices_.clear();
   profile_frame_ = frame_number_ % 30 == 0 || Diag("profile");
@@ -15882,6 +16225,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   dyn_ = DynState{};
   CollectPipelines();
   pipeline_sync_ms_ = 0;
+  if (pc_thread_.joinable()) PrecompileStep(3.0);
   Prepass();
   FreecamFrame();
   // The frame's commands: recorded on the command stream's thread (from a
@@ -16157,6 +16501,43 @@ void Renderer::SetTimeOfDay(const TimeOfDay& tod) {
   if (im.wind_t_ < im.wind_prev_t_ || im.wind_t_ - im.wind_prev_t_ > 0.25) im.wind_prev_t_ = im.wind_t_;
 }
 void Renderer::SetNightLights(const std::vector<NightLight>& lights) { impl_->lights_ = lights; }
+void Renderer::StartPrecompile() {
+  auto& im = *impl_;
+  if (im.precompile_dir_.empty() || !im.options_.async_pipelines || im.Diag("noprecompile")) return;
+  im.ReadList();
+  // (Again from the list: what's not built this session yet.)
+  std::lock_guard lock(im.pc_mutex_);
+  im.precompile_todo_.clear();
+  im.pc_ready_.clear();
+  im.precompile_keys_.clear();
+  im.precompile_failed_ = 0;
+  im.precompile_handled_ = 0;
+  for (const std::string& r : im.listed_) {
+    if (im.precompiled_.insert(r).second) im.precompile_todo_.push_back(r);
+  }
+  im.precompile_total_ = uint32_t(im.precompile_todo_.size());
+  if (!im.precompile_total_) return;
+  im.pending_notices_.push_back("precompiling " + std::to_string(im.precompile_total_) +
+                                " pipelines (" + im.ListPath() + ")");
+  if (!im.pc_thread_.joinable()) im.pc_thread_ = std::thread([&im] { im.PrecompileMain(); });
+  im.pc_cv_.notify_all();
+}
+void Renderer::PrecompileProgress(uint32_t* done, uint32_t* total) const {
+  auto& im = *impl_;
+  uint32_t finished = 0;
+  {
+    std::lock_guard lock(im.pc_mutex_);
+    finished = im.precompile_failed_ + im.precompile_handled_;
+  }
+  for (const std::string& k : im.precompile_keys_) finished += im.pipelines_pending_.count(k) ? 0u : 1u;
+  *total = im.precompile_total_;
+  *done = std::min(finished, im.precompile_total_);
+}
+void Renderer::SetHoldPicture(bool hold) {
+  auto& im = *impl_;
+  if (hold && !im.hold_picture_) im.hold_valid_ = false;
+  im.hold_picture_ = hold;
+}
 uint64_t Renderer::MountainKey() const {
   if (!impl_->tod_layout_.valid) return 0;
   uint64_t h = 1469598103934665603ull;

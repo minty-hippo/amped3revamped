@@ -1092,6 +1092,14 @@ int main(int argc, char** argv) {
         tod.on = !tod.on;
         renderer.SetTimeOfDay(tod);
       }
+      // A3_PRECOMPILE: the pipeline list built again from repeat 1, its
+      // progress each repeat.
+      if (std::getenv("A3_PRECOMPILE")) {
+        if (i == 1) renderer.StartPrecompile();
+        uint32_t done = 0, total = 0;
+        renderer.PrecompileProgress(&done, &total);
+        std::printf("precompile: %u of %u\n", done, total);
+      }
       // A3_TOD_RATE=hours: the clock running, that much each repeat.
       if (const char* rt = std::getenv("A3_TOD_RATE")) {
         tod.hour = std::fmod(tod.hour + float(std::atof(rt)), 24.0f);

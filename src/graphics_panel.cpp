@@ -135,6 +135,8 @@ const std::vector<Tab>& Tabs() {
       {"Display",
        {
            {"fullscreen", "Fullscreen", Kind::kFullscreen},
+           {"native_precompile", "Precompile on Loading"},
+           {"native_load_continue", "Press X After Loading"},
            {"frame_rate_limit", "Frame Rate", Kind::kStops, 0, 0, 0,
             {{"30", "30 fps"},
              {"40", "40 fps"},

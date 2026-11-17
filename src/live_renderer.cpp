@@ -44,6 +44,7 @@
 #include "live_present.h"
 #include "night_pass.h"
 #include "quality.h"
+#include "load_screen.h"
 #include "notice.h"
 #include "xm_radio.h"
 #include "perf_overlay.h"
@@ -207,6 +208,14 @@ REXCVAR_DEFINE_INT32(native_night_light_shadow_lamps, 0, "GPU",
                      "Time of day: how many lamps cast night light shadows at each spot (the "
                      "nearest; 0: every one)")
     .range(0, 8);
+REXCVAR_DEFINE_BOOL(native_precompile, true, "GPU",
+                    "Native renderer: on a loading screen, every pipeline used before at the "
+                    "current settings is built again in the background (the driver's cache "
+                    "filled before they're needed: fewer hitches after an update or a driver "
+                    "change), with a progress bar under the slides");
+REXCVAR_DEFINE_BOOL(native_load_continue, true, "GPU",
+                    "Native renderer: once a mountain has loaded, its loading screen stays up "
+                    "until X (or Enter) is pressed to continue (after the shaders are ready)");
 REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
                     "Native renderer: dynamic time of day (F5): the sun and moon move across "
                     "the sky, the mountain's light, sky, stars and clouds follow the hour; "
@@ -2769,6 +2778,44 @@ void WorkerMain() {
       LogTimings(shared);
       // (Kept for the instant replay on the keeper thread: the frame's its now.)
       const bool frame_replay = f->replay;
+      // Loading into a mountain: a long run of frames without the scene (a
+      // loading screen; menus too) starts the precompiling and keeps the
+      // picture; the scene's first frame after it holds the loading screen
+      // up until the player continues (Press X), when it's onto the trail
+      // map or riding (not a menu's scene, a story scene, a replay).
+      {
+        static int dark = 0;
+        static bool loading = false, waiting = false;
+        const bool gate = REXCVAR_GET(native_load_continue);
+        if (!frame_replay) dark = stats.scene_lit ? 0 : dark + 1;
+        if (!loading && dark >= 90 && !frame_replay) {
+          loading = true;
+          if (REXCVAR_GET(native_precompile)) renderer->StartPrecompile();
+          renderer->SetHoldPicture(gate);
+        }
+        if (loading && !waiting && stats.scene_lit && !frame_replay) {
+          const int state = GameState();
+          // (Onto the trail map (7) or riding (13): a mountain, not a menu's
+          // scene behind it.)
+          if (gate && (state == 7 || state == 13) && !g_replay_playing.load()) {
+            waiting = true;
+            REXLOG_INFO("Native renderer: mountain loaded (game state {}): waiting for the player to continue",
+                        state);
+          } else {
+            loading = false;
+            renderer->SetHoldPicture(false);
+          }
+        }
+        if (waiting && (load_screen::TakeContinue() || !gate)) {
+          waiting = loading = false;
+          renderer->SetHoldPicture(false);
+        }
+        uint32_t done = 0, total = 0;
+        renderer->PrecompileProgress(&done, &total);
+        // (Continue only once the precompiling is done.)
+        if (waiting && done < total) load_screen::TakeContinue();
+        load_screen::Update(done, total, waiting);
+      }
       if (ReplayWants(*f, stats.camera_signature)) HandToKeeper(f, stats.game_camera);
       {
         float pose[6];
