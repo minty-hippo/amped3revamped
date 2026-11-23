@@ -1093,6 +1093,7 @@ int main(int argc, char** argv) {
       }
       std::cout << "Test lights around " << g[0] << " " << g[1] << " " << g[2] << "\n";
     }
+    for (const auto& n : stats.notices) std::cout << "Notice: " << n << "\n";
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";
     if (stats.fogged) std::cout << "Fog applied\n";
     if (stats.god_rays) std::cout << "God rays applied\n";

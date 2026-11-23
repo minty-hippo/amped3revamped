@@ -1161,6 +1161,7 @@ struct Shader {
   // 0: not listed.
   uint8_t recipe = 0;
   uint64_t recipe_hash = 0;
+  int safe_level = 0;  // TranslateOptions::safe_level it was made with
 };
 
 std::string fmt_line(const char* f, ...) {
@@ -2044,6 +2045,14 @@ struct Renderer::Impl {
   // again (their draws left out), nor precompiled from the list.
   std::unordered_set<std::string> crashed_ids_, crashed_lines_;
   std::unordered_set<std::string> crashed_told_;
+  // Per vertex shader (its microcode hash) that crashed the driver: the
+  // plainer translation to try next (TranslateOptions::safe_level).
+  std::unordered_map<uint64_t, int> safe_level_;
+  int SafeLevel(const uint32_t* ucode, size_t n) const {
+    if (safe_level_.empty()) return 0;
+    auto it = safe_level_.find(amped3::native::HashMicrocode(ucode, n));
+    return it == safe_level_.end() ? 0 : it->second;
+  }
   std::string precompile_line_;  // the list's line being queued (PrecompileStep)
   void ReadCrashed();
   bool listed_read_ = false;
@@ -3031,6 +3040,14 @@ Shader* Renderer::Impl::GetShader(const std::string& stem, ShaderStage stage) {
   amped3::native::TranslateOptions topt;
   topt.debug_vertex_stores = debug_stores_;
   topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
+  if (stage == ShaderStage::kVertex) topt.safe_level = SafeLevel(ucode.data(), ucode.size());
+  s.safe_level = topt.safe_level;
+  if (s.safe_level) {
+    char m[160];
+    std::snprintf(m, sizeof(m), "vertex shader %016llX made plainer (level %d): it crashed the driver before",
+                  (unsigned long long)amped3::native::HashMicrocode(ucode.data(), ucode.size()), s.safe_level);
+    pending_notices_.push_back(m);
+  }
   auto r = amped3::native::TranslateShader(stage, ucode.data(), ucode.size(), topt);
   if (!r.ok) {
     s.error = "translation failed: " + r.error;
@@ -3953,11 +3970,12 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   }
   // Which it is, the same from run to run (for the crash report, and to
   // leave out one that crashed the driver before).
-  char pipe_id[96];
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s",
+  char pipe_id[112];
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
-                reactive ? " reactive" : "", caster ? " caster" : "");
+                reactive ? " reactive" : "", caster ? " caster" : "",
+                vs.safe_level == 1 ? " safe1" : vs.safe_level >= 2 ? " safe2" : "");
   if (!crashed_ids_.empty() && crashed_ids_.count(pipe_id)) {
     if (crashed_told_.insert(pipe_id).second) {
       pending_notices_.push_back(std::string("left out a pipeline that crashed the driver before: ") + pipe_id);
@@ -4203,8 +4221,20 @@ void Renderer::Impl::ReadCrashed() {
     // "pipeline <id>[ | <the list's line>]"
     if (line.rfind("pipeline ", 0) != 0) continue;
     const size_t bar = line.find(" | ");
-    crashed_ids_.insert(line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9));
-    if (bar != std::string::npos) crashed_lines_.insert(line.substr(bar + 3));
+    const std::string id = line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9);
+    crashed_ids_.insert(id);
+    // (A vertex shader's crash: its plainer translation next, one step per
+    // crash; past the last, the pipeline's left out.)
+    unsigned long long vsh = 0;
+    int lvl = 0;
+    if (std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
+      const size_t at = id.find(" safe");
+      if (at != std::string::npos) lvl = std::atoi(id.c_str() + at + 5);
+      int& l = safe_level_[uint64_t(vsh)];
+      l = std::max(l, lvl + 1);
+    }
+    // (The list's line only once the plainest has crashed too.)
+    if (bar != std::string::npos && lvl >= 2) crashed_lines_.insert(line.substr(bar + 3));
   }
   if (!crashed_ids_.empty()) {
     pending_notices_.push_back(std::to_string(crashed_ids_.size()) +
@@ -4294,6 +4324,14 @@ Shader* Renderer::Impl::PrecompileShader(uint8_t recipe, uint64_t hash) {
   topt.velocity = recipe == 3;
   topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
   const ShaderStage stage = recipe == 2 ? ShaderStage::kPixel : ShaderStage::kVertex;
+  if (stage == ShaderStage::kVertex) topt.safe_level = SafeLevel(ucode.data(), ucode.size());
+  s.safe_level = topt.safe_level;
+  if (s.safe_level) {
+    char m[160];
+    std::snprintf(m, sizeof(m), "vertex shader %016llX made plainer (level %d): it crashed the driver before",
+                  (unsigned long long)amped3::native::HashMicrocode(ucode.data(), ucode.size()), s.safe_level);
+    pending_notices_.push_back(m);
+  }
   auto r = amped3::native::TranslateShader(stage, ucode.data(), ucode.size(), topt);
   if (!r.ok) return nullptr;
   s.info = r.info;
@@ -16096,6 +16134,14 @@ Shader* Renderer::Impl::VelocityShader(const std::string& stem) {
   amped3::native::TranslateOptions topt;
   topt.velocity = true;
   topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
+  topt.safe_level = SafeLevel(ucode.data(), ucode.size());
+  s.safe_level = topt.safe_level;
+  if (s.safe_level) {
+    char m[160];
+    std::snprintf(m, sizeof(m), "vertex shader %016llX made plainer (level %d): it crashed the driver before",
+                  (unsigned long long)amped3::native::HashMicrocode(ucode.data(), ucode.size()), s.safe_level);
+    pending_notices_.push_back(m);
+  }
   auto r = amped3::native::TranslateShader(ShaderStage::kVertex, ucode.data(), ucode.size(), topt);
   if (!r.ok) {
     s.error = "velocity translation failed: " + r.error;

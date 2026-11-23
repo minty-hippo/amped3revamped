@@ -750,6 +750,7 @@ uint xe_vertex_index() {
     // Wind (docs/native-shaders.md): the vertex moved in the space the draw's
     // c0..c3 take it from (the world, or the object's own), so it moves with
     // whatever placed it.
+    if (options_.safe_level >= 2) g += "vec4 xe_wind(vec4 p, float t) { return p; }\n#if 0\n";
     g += R"(vec4 xe_wind(vec4 p, float t) {
   if (xe_sys.wind2.x <= 0.0) return p;
   vec4 q = xe_sys.wind_minv * p;
@@ -813,6 +814,7 @@ uint xe_vertex_index() {
 }
 
 )";
+    if (options_.safe_level >= 2) g += "#endif\n";
   }
   if (options_.velocity && vs()) {
     // The same program reading last frame's constants.
@@ -1750,7 +1752,8 @@ bool Translator::EmitVertexFetch(const Fetch& f) {
     // An instance's placement (the world's instanced meshes: trees, their
     // foliage): three rows of four floats from vf94, their w where it
     // stands - for the wind to bend it from its foot.
-    if (vs() && vf == 94 && format == kVf_32_32_32_32_FLOAT && (off == 0 || off == 4 || off == 8)) {
+    if (vs() && vf == 94 && format == kVf_32_32_32_32_FLOAT && (off == 0 || off == 4 || off == 8) &&
+        options_.safe_level < 1) {
       Line(Fmt("xe_wind_org[%d] = xe_t0.w;", off / 4));
       Line(Fmt("xe_wind_rows |= %d;", 1 << (off / 4)));
     }

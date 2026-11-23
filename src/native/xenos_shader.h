@@ -89,6 +89,10 @@ struct TranslateOptions {
   // instead of the interpolators. gl_Position is the same as the normal
   // variant's, so a depth-EQUAL pass matches the scene.
   bool velocity = false;
+  // A plainer vertex shader, for a driver that crashed building the normal
+  // one (renderer.cpp: crashed_pipelines.txt): 1 without an instance's
+  // placement (the trunk-bending wind), 2 without wind at all.
+  int safe_level = 0;
 };
 
 // `ucode` is the microcode in host byte order.

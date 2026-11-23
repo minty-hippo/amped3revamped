@@ -632,9 +632,13 @@ that rule against a save that has the pass.
     the Odin 3's Turnip driver): the crash report now says what the crashing
     thread was building ("while: pipeline vs ... ps ..." or "built-in pass
     N"), and the same line goes into `logs\native_pipelines\crashed_pipelines.txt`.
-    On the next start that pipeline is left out (not precompiled, and its
-    draws skipped, named once in the log) rather than crashing again; delete
-    the file to try them again.
+    On the next start its vertex shader is made plainer instead, one step
+    per crash: first without an instance's placement (the trunk-bending
+    wind), then without wind at all; only if the plainest crashes too is
+    the pipeline left out (not precompiled, its draws skipped). Each step is
+    named in the log ("vertex shader ... made plainer (level N)"); delete
+    the file to try the full shaders again. (The Odin 3's crash: the
+    instanced trees' and foliage's vertex shader, 0B81497C6E3B216A.)
 - Fewer hitches from pipeline builds: a pipeline the driver has to compile
   (not in its cache; 150-800 ms each on an Arc) is now built in the
   background at once, even the first one in a frame, the draw left out for
