@@ -628,6 +628,15 @@ that rule against a save that has the pass.
     a load from the menus: coming back to riding from a story scene (game
     state 20, or one in the few seconds before the dark) goes straight on.
     The log names the game states the load went through.
+  - **Odin 3 crash found: Turnip can't compile the Direct3D 9 multiply**.
+    With `IR3_SHADER_DEBUG=disasm,vs` the driver printed "Unhandled ALU op:
+    fmadz" just before crashing: Mesa 26.3 recognises the shaders' "0 times
+    anything is 0" multiply (a float test for zero, then the product) as its
+    own zero-preserving multiply-add, which the Adreno backend can't emit.
+    On Adreno / Turnip the shaders now test for zero on the float's bits
+    instead, which the driver doesn't fold (diagnostics `bitmulz` /
+    `floatmulz` force it either way). Crash records are now " tv7", so
+    every pipeline left out before is tried again.
   - **Pipelines built one at a time on Adreno (Turnip)**: the Odin 3's
     driver (Mesa 26.3) crashed in its shader compiler with many different
     shaders, always on the background builders, since pipelines started
@@ -643,7 +652,7 @@ that rule against a save that has the pass.
     wind (no wind, the uniform block without its later members - the
     25 October form), named in the log ("made plainer (level 1)"); if that
     crashes too, the pipeline is left out (not precompiled, its draws
-    skipped). Records carry the shader translation's version (" tv6"), so an update
+    skipped). Records carry the shader translation's version (" tv7"), so an update
     that may fix a crash tries again by itself; delete the file to start
     over. (The Odin 3, Turnip / Mesa 26.3: the instanced trees drawn into
     a depth target alone - the game's shadow map - vertex shader

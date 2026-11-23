@@ -675,12 +675,27 @@ bool Translator::Run(TranslateResult& out) {
   if (vs()) g += "float xe_tf_lod = 0.0;\nvec3 xe_tf_gh = vec3(0.0), xe_tf_gv = vec3(0.0);\n";
   g += "\n";
   // Helpers.
-  g += R"(// Direct3D 9 multiplication: 0 * anything (including inf / NaN) = 0.
+  if (options_.bit_zero_mul) {
+    g += R"(// Direct3D 9 multiplication: 0 * anything (including inf / NaN) = 0
+// (zero tested on the bits: +0 and -0 shifted left are 0).
+float xe_mul(float a, float b) {
+  return ((floatBitsToUint(a) << 1u) == 0u || (floatBitsToUint(b) << 1u) == 0u) ? 0.0 : a * b;
+}
+vec4 xe_mul4(vec4 a, vec4 b) {
+  bvec4 zz = bvec4(uvec4(equal(floatBitsToUint(a) << 1u, uvec4(0u))) | uvec4(equal(floatBitsToUint(b) << 1u, uvec4(0u))));
+  return mix(a * b, vec4(0.0), zz);
+}
+)";
+  } else {
+    g += R"(// Direct3D 9 multiplication: 0 * anything (including inf / NaN) = 0.
 float xe_mul(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 vec4 xe_mul4(vec4 a, vec4 b) {
   bvec4 z = bvec4(uvec4(equal(a, vec4(0.0))) | uvec4(equal(b, vec4(0.0))));
   return mix(a * b, vec4(0.0), z);
 }
+)";
+  }
+  g += R"(
 float xe_dp4(vec4 a, vec4 b) { vec4 m = xe_mul4(a, b); return (m.x + m.y) + (m.z + m.w); }
 float xe_dp3(vec4 a, vec4 b) { vec4 m = xe_mul4(a, b); return (m.x + m.y) + m.z; }
 vec4 xe_max(vec4 a, vec4 b) { return mix(b, a, greaterThanEqual(a, b)); }

@@ -1242,6 +1242,9 @@ struct Renderer::Impl {
     serial_pipes_ = (gpu_.device_name.find("Adreno") != std::string::npos ||
                      gpu_.device_name.find("Turnip") != std::string::npos || Diag("serialpipes")) &&
                     !Diag("parallelpipes");
+    bit_zero_mul_ = (gpu_.device_name.find("Adreno") != std::string::npos ||
+                     gpu_.device_name.find("Turnip") != std::string::npos || Diag("bitmulz")) &&
+                    !Diag("floatmulz");
     if (serial_pipes_) {
       pending_notices_.push_back("pipelines built one at a time (" + gpu_.device_name +
                                  ": its driver crashes building several at once)");
@@ -2109,6 +2112,11 @@ struct Renderer::Impl {
   // at once - the crashes came with many different shaders, always on the
   // background builders, since builds went parallel (17 November).
   bool serial_pipes_ = false;
+  // Shaders test multiplication's zeros on the bits (TranslateOptions::
+  // bit_zero_mul): Turnip folds the float tests into an fmadz its Adreno
+  // backend can't emit ("Unhandled ALU op: fmadz") and crashes. Diags
+  // "bitmulz" / "floatmulz" force it on / off.
+  bool bit_zero_mul_ = false;
   std::mutex pipe_build_mutex_;
   std::unique_lock<std::mutex> PipeLock() {
     return serial_pipes_ ? std::unique_lock<std::mutex>(pipe_build_mutex_) : std::unique_lock<std::mutex>();
@@ -3064,6 +3072,7 @@ Shader* Renderer::Impl::GetShader(const std::string& stem, ShaderStage stage) {
   amped3::native::TranslateOptions topt;
   topt.debug_vertex_stores = debug_stores_;
   topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
+  topt.bit_zero_mul = bit_zero_mul_;
   if (stage == ShaderStage::kVertex) topt.safe_level = SafeLevel(ucode.data(), ucode.size());
   s.safe_level = topt.safe_level;
   if (s.safe_level) {
@@ -4041,7 +4050,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   char pipe_id[112];
   // (" tv<N>": the shader translation's version, bumped when a change may
   // fix a driver crash, so what crashed an older one is tried again.)
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv6",
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv7",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
                 reactive ? " reactive" : "", caster ? " caster" : "",
@@ -4300,7 +4309,7 @@ void Renderer::Impl::ReadCrashed() {
       // (Only this translation's crashes: see pipe_id's " tv".)
       const size_t bar0 = line.find(" | ");
       const std::string head = line.substr(0, bar0);
-      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv6") != 0) {
+      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv7") != 0) {
         continue;  // (crashes before pipelines were built one at a time: tried again)
       }
     }
@@ -4411,6 +4420,7 @@ Shader* Renderer::Impl::PrecompileShader(uint8_t recipe, uint64_t hash) {
   amped3::native::TranslateOptions topt;
   topt.velocity = recipe == 3;
   topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
+  topt.bit_zero_mul = bit_zero_mul_;
   const ShaderStage stage = recipe == 2 ? ShaderStage::kPixel : ShaderStage::kVertex;
   if (stage == ShaderStage::kVertex) topt.safe_level = SafeLevel(ucode.data(), ucode.size());
   s.safe_level = topt.safe_level;
@@ -16225,6 +16235,7 @@ Shader* Renderer::Impl::VelocityShader(const std::string& stem) {
   amped3::native::TranslateOptions topt;
   topt.velocity = true;
   topt.swap_variant = Diag("swap0") ? 0 : Diag("swap2") ? 2 : Diag("swap3") ? 3 : 1;
+  topt.bit_zero_mul = bit_zero_mul_;
   topt.safe_level = SafeLevel(ucode.data(), ucode.size());
   s.safe_level = topt.safe_level;
   if (s.safe_level) {

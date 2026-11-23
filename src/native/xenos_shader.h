@@ -93,6 +93,11 @@ struct TranslateOptions {
   // one (renderer.cpp: crashed_pipelines.txt): 1 as before the wind - no
   // wind, and the uniform block without its later members.
   int safe_level = 0;
+  // Direct3D 9 multiplication (0 * anything = 0) with the zero test on the
+  // bits instead of a float compare, so the driver can't fold it into its
+  // own zero-preserving multiply. Turnip (Mesa 26.3, Odin 3) folds it into
+  // fmulz / fmadz, then fails with "Unhandled ALU op: fmadz" and crashes.
+  bool bit_zero_mul = false;
 };
 
 // `ucode` is the microcode in host byte order.
