@@ -216,10 +216,13 @@ REXCVAR_DEFINE_BOOL(native_precompile, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_load_continue, true, "GPU",
                     "Native renderer: once a mountain has loaded, its loading screen stays up "
                     "until X (or Enter) is pressed to continue (after the shaders are ready)");
-REXCVAR_DEFINE_BOOL(native_time_of_day, false, "GPU",
-                    "Native renderer: dynamic time of day (F5): the sun and moon move across "
-                    "the sky, the mountain's light, sky, stars and clouds follow the hour; "
-                    "off: each mountain at its own fixed hour, as the game has it");
+// (Renamed from native_time_of_day so a setting saved on while it was the
+// default look goes back to off: the fixed hour is the default now.)
+REXCVAR_DEFINE_BOOL(native_dynamic_time_of_day, false, "GPU",
+                    "Native renderer: dynamic time of day (experimental; menu only): the sun "
+                    "and moon move across the sky, the mountain's light, sky, stars and clouds "
+                    "follow the hour; off (the default): each mountain at its own fixed hour, "
+                    "as the game has it, with the Revamped effects lit for that hour");
 REXCVAR_DEFINE_BOOL(native_tod_effects, true, "GPU",
                     "Native renderer, with dynamic time of day off: its effects still on (the "
                     "sharper shadows, the sun's sheen, lens flare, light glow, diamond dust, "
@@ -2508,7 +2511,7 @@ void WorkerMain() {
             // A new hour while the clock's already going: wound round to it
             // over a few seconds (the sun swept across, the shadows with it)
             // rather than jumped to.
-            if (tod_start_seen > -2.0 && start >= 0.0 && tod_hour >= 0.0 && REXCVAR_GET(native_time_of_day)) {
+            if (tod_start_seen > -2.0 && start >= 0.0 && tod_hour >= 0.0 && REXCVAR_GET(native_dynamic_time_of_day)) {
               tod_target = start;
             } else {
               tod_hour = start >= 0.0 ? start : -1.0;
@@ -2531,7 +2534,7 @@ void WorkerMain() {
           // (Northstar before the Night Pass: its own hour, as the game has it.)
           const bool locked = night_pass::Locked();
           if (locked) tod_hour = renderer->MountainHour() >= 0.0f ? renderer->MountainHour() : tod_hour;
-          const bool running = REXCVAR_GET(native_time_of_day) && !locked && !f->replay &&
+          const bool running = REXCVAR_GET(native_dynamic_time_of_day) && !locked && !f->replay &&
                                GameState() != 15 && dt > 0.0 && dt < 0.25;
           const double minutes = REXCVAR_GET(native_tod_day_minutes);
           if (running) {
@@ -2541,7 +2544,7 @@ void WorkerMain() {
             }
           }
           native::Renderer::TimeOfDay tod;
-          tod.on = revamped && REXCVAR_GET(native_time_of_day) && !locked && tod_hour >= 0.0;
+          tod.on = revamped && REXCVAR_GET(native_dynamic_time_of_day) && !locked && tod_hour >= 0.0;
           tod.hour = float(std::max(tod_hour, 0.0));
           // (Off: its effects alone, at the mountain's own hour.)
           const bool tod_passive = !tod.on && revamped && REXCVAR_GET(native_tod_effects) &&

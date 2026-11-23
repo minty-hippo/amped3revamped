@@ -105,7 +105,7 @@ const std::vector<Tab>& Tabs() {
        }},
       {"Time of Day",
        {
-           {"native_time_of_day", "Dynamic Time of Day"},
+           {"native_dynamic_time_of_day", "Dynamic Time of Day (experimental)"},
            {"native_tod_effects", "Effects with It Off"},
            {"native_tod_start_hour", "Set the Hour", Kind::kSlider, -1.0, 24.0, 0.25},
            {"native_tod_day_minutes", "Minutes per Day", Kind::kStops, 0, 0, 0,

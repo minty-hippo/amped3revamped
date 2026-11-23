@@ -438,8 +438,14 @@ menus untouched.
 
 ### Dynamic time of day (experimental)
 
-Off by default; F5, or Graphics panel > Time of Day, or `native_time_of_day`
-turns it on. The sun and moon move across the sky, and the mountain's light
+Off by default, and turned on only from the options menu (Graphics >
+Dynamic time of day), the Graphics panel (Time of Day), or
+`native_dynamic_time_of_day`: it still needs work, so with Revamped Graphics
+each mountain stays at its original hour, as the game has it, with the
+Revamped lighting and effects lit for that hour (below). It has no key by
+default (F5 before); one can be set in the F4 panel (`bind_time_of_day`).
+The setting was renamed from `native_time_of_day`, so a copy saved on
+earlier goes back to off. The sun and moon move across the sky, and the mountain's light
 follows the hour: low warm sun at dawn and dusk, blue twilight, a moonlit
 night with stars, and clouds drifting overhead. Each mountain starts at the
 hour it was made for, where it looks as the game has it; every other hour is
@@ -484,7 +490,7 @@ that rule against a save that has the pass.
   As the weather turns it's announced in the game's own song popup (the XM
   Radio box: "Weather Alert / Gusts 55 km/h / Whiteout"), with a forecast a
   minute ahead ("Forecast / Snow on the way / Next hour"), or a notice where
-  there's no popup (F5 on a mountain shows the weather in it too); the clouds drift faster in the wind; in a heavy snowstorm the
+  there's no popup (turning dynamic time of day on shows the weather in its notice too); the clouds drift faster in the wind; in a heavy snowstorm the
   night lights come on part way by day.
   The wind moves the trees (Time of Day: Wind in the Trees,
   `native_wind_sway`): their foliage sways with it and flutters, whole trees
@@ -771,7 +777,7 @@ that rule against a save that has the pass.
   Cover, Night Brightness.
   Setting a new hour while the clock is going winds round to it over a few
   seconds (the sun sweeps across) rather than jumping.
-  Turning time of day on or off (F5 or the menus) eases the picture from the
+  Turning time of day on or off (from the menus) eases the picture from the
   old lighting to the new over most of a second instead of cutting.
 - Smooth as the sun moves: the world's shadows are drawn again for the sun
   every degree and a half or so, and each time the part around the camera
@@ -987,7 +993,6 @@ it is. The file is plain text too (`subtitles\amped3.subtitles`, described in
 | Back + Start (View + Menu), or F1 | Options menu |
 | In menu: D-pad or left stick / A / B / LB-RB | Move / change / close / switch tabs |
 | F2 | Revamped Graphics on or off (every enhancement at once, to compare with the original look; a notice shows which) |
-| F5 | Dynamic time of day on or off (native renderer; a notice shows the hour) |
 | F6, or tap both sticks in (L3 + R3) | Freecam: fly the camera around the scene, HUD hidden (native renderer). Two modes, D-pad down / N to switch: **noclip** (the default) moves the game's own camera, so the game draws the whole world around it - explore anywhere; **view** moves only the renderer's view of what the game drew (zoom works there). Pause first (Start) for a photo mode; while riding the game goes on underneath. Left stick / W A S D move (L3 / Shift: faster until the stick returns to neutral), right stick / arrows / right mouse look, LT RT / Q E down and up, LB RB / Z C zoom (view mode), X / Alt slower, Y / R back to the game's camera, View / H hides the controls bar, B / F6 / Esc leave. With the game paused or in a replay, noclip can't move the game's camera, so it flies on as view mode from the same spot until the game runs again. Switching modes keeps the camera where it is (no jump back to the rider). Hiding the controls bar hides it completely. The game only draws what its own camera sees, so flying far from it shows gaps |
 | F7, or hold both sticks in (L3 + R3) for 0.6 s | Instant replay: the last 20 seconds of riding again (native renderer; setting `replay_seconds`, up to 60, and `replay_memory_mb`). While riding it pauses the game for you and resumes it after; from the pause menu it plays what came before the pause. A / Space play or pause, LB RB / [ ] slower or faster (1/8x to 2x), LT RT / Left Right scrub, Y / Home from the start, View / H hides the controls bar, B / Esc / F7 leave. The freecam works in the replay too (tap L3 + R3), flying around what the replay drew |
 | F8 | Camera scan (diagnostics, for the coming noclip freecam): where the game keeps its camera in memory, written to `logs\amped3_camera_scan_*.txt`. Best with the game paused |

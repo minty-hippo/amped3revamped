@@ -352,12 +352,14 @@ void Amped3App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // Every enhancement at once, on or off (to compare with the original look).
   rex::ui::RegisterBind(kRevampedBind, "F2", "Turn Revamped Graphics on or off",
                         [this] { ToggleRevampedGraphics(); });
-  rex::ui::RegisterBind(kTimeOfDayBind, "F5", "Dynamic time of day on or off (native renderer)",
+  // (No key by default: dynamic time of day is experimental, so it's turned
+  // on from the menu; a key can still be set for it in the F4 panel.)
+  rex::ui::RegisterBind(kTimeOfDayBind, "", "Dynamic time of day on or off (native renderer, experimental)",
                         [this] {
-                          const bool on = rex::cvar::GetFlagByName("native_time_of_day") != "true";
-                          if (!rex::cvar::SetFlagByName("native_time_of_day", on ? "true" : "false")) return;
+                          const bool on = rex::cvar::GetFlagByName("native_dynamic_time_of_day") != "true";
+                          if (!rex::cvar::SetFlagByName("native_dynamic_time_of_day", on ? "true" : "false")) return;
                           if (!config_path_.empty()) rex::cvar::SaveConfig(config_path_);
-                          REXLOG_INFO("Time of day {} (F5)", on ? "on" : "off");
+                          REXLOG_INFO("Time of day {} (key)", on ? "on" : "off");
                           std::string text = on ? "Time of day: on" : "Time of day: off";
                           const float h = amped3::live::TimeOfDayHour();
                           if (on && h >= 0.0f) {

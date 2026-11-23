@@ -19,7 +19,7 @@ REXCVAR_DEFINE_BOOL(native_tod_night_pass_lock, true, "GPU",
                     "Time of day: Northstar keeps its own hour (the game's) until the Night "
                     "Pass is earned; off: the day and night run there from the start");
 REXCVAR_DECLARE(bool, trace_challenges);
-REXCVAR_DECLARE(bool, native_time_of_day);
+REXCVAR_DECLARE(bool, native_dynamic_time_of_day);
 
 namespace amped3::night_pass {
 namespace {
@@ -114,7 +114,7 @@ void Tick() {
     REXLOG_INFO("Night Pass: earned");
     notice::Show("Night Pass earned: day and night now run at Northstar");
   }
-  if (!g_told && Locked() && REXCVAR_GET(native_time_of_day)) {
+  if (!g_told && Locked() && REXCVAR_GET(native_dynamic_time_of_day)) {
     g_told = true;
     notice::Show("Time of day: Northstar keeps its own hour until you earn the Night Pass");
   }

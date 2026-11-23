@@ -443,8 +443,10 @@ const std::vector<Tab>& Tabs() {
                         "tones down in glare, easing over a second or two like eyes "
                         "adjusting. 0: off. Part of Revamped Graphics. Native renderer only.",
                         "%.1f", 0.0, 1.0),
-                Toggle("native_time_of_day", "Dynamic time of day (F5)",
-                       "The sun and moon move across the sky: the mountain's light, its "
+                Toggle("native_dynamic_time_of_day", "Dynamic time of day (experimental)",
+                       "Off (the default): each mountain stays at the hour the game set it "
+                       "at, with the Revamped lighting and effects lit for that hour. On: the "
+                       "sun and moon move across the sky: the mountain's light, its "
                        "colors, the sky, stars and drifting clouds follow the hour, from "
                        "sunrise through dusk to a moonlit night. Each mountain starts at the "
                        "hour it was made for and looks as the game has it then. Shadows follow "
@@ -1260,7 +1262,7 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
     Close();
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("   F2: Revamped Graphics   F5: time of day   F6 / tap L3+R3: freecam   F7 / hold L3+R3: replay   F4: every setting");
+  ImGui::TextDisabled("   F2: Revamped Graphics   F6 / tap L3+R3: freecam   F7 / hold L3+R3: replay   F4: every setting");
 
   ImGui::End();
 
