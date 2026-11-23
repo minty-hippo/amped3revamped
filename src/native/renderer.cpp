@@ -54,6 +54,7 @@
 #include "vk.h"
 #include "cmd_stream.h"
 #include "xenos_shader.h"
+#include "crash_note.h"
 #include "xenos_texture.h"
 #include "upscaler.h"
 #include "texture_replace.h"
@@ -170,6 +171,7 @@ struct PipelineBuild {
   VkPipelineRenderingCreateInfo pr{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
   VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   std::string key;
+  std::string note;  // for the crash report (crash_note.h): which pipeline
 };
 
 class Gpu {
@@ -1235,6 +1237,7 @@ struct Renderer::Impl {
         precompile_dir_ = pcp.substr(0, slash) + "/native_pipelines";
       }
     }
+    ReadCrashed();
     LoadCloudSprite();
     if (options_.texture_pack || options_.hd_fonts || options_.upscaled_textures) {
       const std::string& pc = options_.pipeline_cache_path;
@@ -2036,6 +2039,13 @@ struct Renderer::Impl {
   bool precompiling_ = false;     // PipelineFor called for the list: queued, not listed
   std::string last_queued_key_;
   std::unordered_set<std::string> listed_;     // recipes in the list (this session's, and read)
+  // Pipelines that crashed the graphics driver as it built them (a crash
+  // report wrote what was being built to crashed_pipelines.txt): not built
+  // again (their draws left out), nor precompiled from the list.
+  std::unordered_set<std::string> crashed_ids_, crashed_lines_;
+  std::unordered_set<std::string> crashed_told_;
+  std::string precompile_line_;  // the list's line being queued (PrecompileStep)
+  void ReadCrashed();
   bool listed_read_ = false;
   std::unordered_set<uint64_t> ucode_kept_;    // microcode already in the store
   struct PrecompileItem {
@@ -2046,6 +2056,7 @@ struct Renderer::Impl {
     Shader* vs = nullptr;
     Shader* ps = nullptr;
     uint32_t mask_bits = 0, flags = 0;
+    std::string line;  // the list's
   };
   std::mutex pc_mutex_;
   std::condition_variable pc_cv_;
@@ -3940,10 +3951,26 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
     last_pipeline_pending_ = true;
     return VK_NULL_HANDLE;
   }
+  // Which it is, the same from run to run (for the crash report, and to
+  // leave out one that crashed the driver before).
+  char pipe_id[96];
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s",
+                (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
+                unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
+                reactive ? " reactive" : "", caster ? " caster" : "");
+  if (!crashed_ids_.empty() && crashed_ids_.count(pipe_id)) {
+    if (crashed_told_.insert(pipe_id).second) {
+      pending_notices_.push_back(std::string("left out a pipeline that crashed the driver before: ") + pipe_id);
+    }
+    pipelines_.emplace(std::string(key), VK_NULL_HANDLE);
+    return VK_NULL_HANDLE;
+  }
 
   // Everything the create info points at lives in `build`, so it can be
   // compiled on another thread.
   auto build = std::make_unique<PipelineBuild>();
+  build->note = std::string("pipeline ") + pipe_id;
+  if (precompiling_ && !precompile_line_.empty()) build->note += " | " + precompile_line_;
   auto& stages = build->stages;
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
   stages[0].module = vs.module;
@@ -4111,6 +4138,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   }
   VkPipeline p = VK_NULL_HANDLE;
   const auto t_pipe = std::chrono::steady_clock::now();
+  const amped3::crash_note::Scope note(build->note.c_str());
   // Past the start: one the driver would have to compile (not in its cache;
   // a few hundred ms on some) goes to the background at once, even the
   // frame's first, rather than only once the frame's budget is spent.
@@ -4161,6 +4189,30 @@ std::string Renderer::Impl::ListPath() const {
          (options_.smooth_alpha ? "_smooth" : "") + ".txt";
 }
 
+// What crashed the driver last time (crash_note.h), and where a crash notes
+// it this time.
+void Renderer::Impl::ReadCrashed() {
+  if (precompile_dir_.empty()) return;
+  std::error_code ec;
+  std::filesystem::create_directories(precompile_dir_, ec);
+  const std::string path = precompile_dir_ + "/crashed_pipelines.txt";
+  amped3::crash_note::SetPath(path.c_str());
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line)) {
+    // "pipeline <id>[ | <the list's line>]"
+    if (line.rfind("pipeline ", 0) != 0) continue;
+    const size_t bar = line.find(" | ");
+    crashed_ids_.insert(line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9));
+    if (bar != std::string::npos) crashed_lines_.insert(line.substr(bar + 3));
+  }
+  if (!crashed_ids_.empty()) {
+    pending_notices_.push_back(std::to_string(crashed_ids_.size()) +
+                               " pipeline(s) crashed the graphics driver before: left out (" + path +
+                               "; delete it to try them again)");
+  }
+}
+
 void Renderer::Impl::ReadList() {
   if (listed_read_) return;
   listed_read_ = true;
@@ -4169,7 +4221,7 @@ void Renderer::Impl::ReadList() {
   std::ifstream in(path);
   std::string line;
   while (std::getline(in, line)) {
-    if (line.rfind("p1 ", 0) == 0) listed_.insert(line);
+    if (line.rfind("p1 ", 0) == 0 && !crashed_lines_.count(line)) listed_.insert(line);
   }
 }
 
@@ -4273,6 +4325,7 @@ void Renderer::Impl::PrecompileMain() {
       ++pc_busy_;
     }
     auto item = std::make_unique<PrecompileItem>();
+    item->line = line;
     bool ok = false;
     {
       std::istringstream in(line);
@@ -4334,10 +4387,12 @@ void Renderer::Impl::PrecompileStep(double budget_ms) {
     for (size_t i = 0; i < item->ncolors; ++i) colors.push_back(&item->images[i]);
     Image* depth = item->images[item->ncolors].format != VK_FORMAT_UNDEFINED ? &item->images[item->ncolors] : nullptr;
     precompiling_ = true;
+    precompile_line_ = item->line;
     last_queued_key_.clear();
     const VkPipeline p = PipelineFor(item->d, item->st, *item->vs, *item->ps, colors, depth, item->mask_bits,
                                      item->flags & 1, item->flags & 2, item->flags & 4, item->flags & 8);
     precompiling_ = false;
+    precompile_line_.clear();
     if (Diag("precompile")) std::fprintf(stderr, "precompile: queued %d\n", !p && !last_queued_key_.empty() ? 1 : 0);
     if (!p && !last_queued_key_.empty()) {
       precompile_keys_.push_back(last_queued_key_);
@@ -4392,9 +4447,12 @@ void Renderer::Impl::SpawnBuilder() {
             pq_.pop_front();
           }
           VkPipeline p = VK_NULL_HANDLE;
-          if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &b->pci, nullptr,
-                                            &p) != VK_SUCCESS) {
-            p = VK_NULL_HANDLE;
+          {
+            const amped3::crash_note::Scope note(b->note.c_str());
+            if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &b->pci, nullptr,
+                                              &p) != VK_SUCCESS) {
+              p = VK_NULL_HANDLE;
+            }
           }
           std::lock_guard lock(pq_mutex_);
           pq_done_.emplace_back(std::move(b->key), p);
@@ -9466,6 +9524,9 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
     pci.pColorBlendState = &cbs;
     pci.pDynamicState = &dy;
     pci.layout = kind == CopyKind::kClouds ? clouds_layout_ : copy_layout_;
+    char what[64];
+    std::snprintf(what, sizeof(what), "built-in pass %d (format %d)", int(kind), int(format));
+    const amped3::crash_note::Scope note(what);
     vk::Check(vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p),
               "copy pipeline");
   }

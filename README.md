@@ -624,7 +624,17 @@ that rule against a save that has the pass.
     on): once the mountain has loaded (onto the trail map, or riding), its
     loading screen's last picture stays up with "Press (X) to Continue" until
     X, Enter, Space or a click (once the precompiling is done); the game's
-    controls are held meanwhile, and the map's clouds part after.
+    controls are held meanwhile, and the map's clouds part after. Only after
+    a load from the menus: coming back to riding from a story scene (game
+    state 20, or one in the few seconds before the dark) goes straight on.
+    The log names the game states the load went through.
+  - **A pipeline that crashes the graphics driver** as it's built (seen on
+    the Odin 3's Turnip driver): the crash report now says what the crashing
+    thread was building ("while: pipeline vs ... ps ..." or "built-in pass
+    N"), and the same line goes into `logs\native_pipelines\crashed_pipelines.txt`.
+    On the next start that pipeline is left out (not precompiled, and its
+    draws skipped, named once in the log) rather than crashing again; delete
+    the file to try them again.
 - Fewer hitches from pipeline builds: a pipeline the driver has to compile
   (not in its cache; 150-800 ms each on an Arc) is now built in the
   background at once, even the first one in a frame, the draw left out for

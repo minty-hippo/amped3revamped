@@ -2,6 +2,8 @@
 
 #include "crash_report.h"
 
+#include "native/crash_note.h"
+
 #include <rex/logging.h>
 
 #if defined(_WIN32)
@@ -180,6 +182,16 @@ LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* info) {
                                                          : "executing";
     const uint64_t target = rec->ExceptionInformation[1];
     report += fmt::format("  {} 0x{:016X}{}\n", op, target, GuestNote(target));
+  }
+  // What the thread was doing (a pipeline the driver was building, say).
+  if (amped3::crash_note::g_note[0]) {
+    report += fmt::format("  while: {}\n", amped3::crash_note::g_note);
+    if (amped3::crash_note::g_note_path[0]) {
+      if (FILE* f = std::fopen(amped3::crash_note::g_note_path, "a")) {
+        std::fprintf(f, "%s\n", amped3::crash_note::g_note);
+        std::fclose(f);
+      }
+    }
   }
 
   // Walk the faulting thread's stack. Recompiled functions are named after
@@ -445,10 +457,25 @@ void WriteReport(const char* what, uint64_t fault_address, uint64_t pc) {
       }
       Put(fd, "\n");
     }
+    // What the thread was doing (a pipeline the driver was building, say).
+    if (amped3::crash_note::g_note[0]) {
+      Put(fd, "  while: ");
+      Put(fd, amped3::crash_note::g_note);
+      Put(fd, "\n");
+    }
     Put(fd, "Stack (build with --config RelWithDebInfo for function names):\n");
     backtrace_symbols_fd(frames, n, fd);
   }
   if (fds[0] >= 0) close(fds[0]);
+  // (Kept for the next start: renderer.cpp's crashed_pipelines.txt.)
+  if (amped3::crash_note::g_note[0] && amped3::crash_note::g_note_path[0]) {
+    const int nf = open(amped3::crash_note::g_note_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (nf >= 0) {
+      Put(nf, amped3::crash_note::g_note);
+      Put(nf, "\n");
+      close(nf);
+    }
+  }
 }
 
 // Last in the SDK's chain: nothing else claimed the fault.

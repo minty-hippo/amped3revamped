@@ -2826,25 +2826,51 @@ void WorkerMain() {
       // picture; the scene's first frame after it holds the loading screen
       // up until the player continues (Press X), when it's onto the trail
       // map or riding (not a menu's scene, a story scene, a replay).
+      // Only after a load from the menus: not after a story scene (game
+      // state 20, its video or the dark between), which goes back to riding
+      // the same way.
       {
         static int dark = 0;
         static bool loading = false, waiting = false;
+        static bool saw_scene = false;  // a story scene in (or just before) this dark run
+        static int recent_scene = 0;    // frames since state 20 was last seen
+        static std::string states_seen;
         const bool gate = REXCVAR_GET(native_load_continue);
+        const int now_state = GameState();
+        recent_scene = now_state == 20 ? 0 : std::min(recent_scene + 1, 1 << 20);
         if (!frame_replay) dark = stats.scene_lit ? 0 : dark + 1;
         if (!loading && dark >= 90 && !frame_replay) {
           loading = true;
+          // (A story scene in the last few seconds: its dark, not a load.)
+          saw_scene = recent_scene < 90 + 240;
+          states_seen = std::to_string(now_state);
           if (REXCVAR_GET(native_precompile)) renderer->StartPrecompile();
-          renderer->SetHoldPicture(gate);
+          renderer->SetHoldPicture(gate && !saw_scene);
+        }
+        if (loading && !waiting) {
+          if (now_state == 20 && !saw_scene) {
+            saw_scene = true;
+            renderer->SetHoldPicture(false);
+          }
+          const std::string st = std::to_string(now_state);
+          if (states_seen.size() < 200 &&
+              (states_seen.size() < st.size() || states_seen.compare(states_seen.size() - st.size(), st.size(), st) != 0)) {
+            states_seen += " " + st;
+          }
         }
         if (loading && !waiting && stats.scene_lit && !frame_replay) {
-          const int state = GameState();
+          const int state = now_state;
           // (Onto the trail map (7) or riding (13): a mountain, not a menu's
-          // scene behind it.)
-          if (gate && (state == 7 || state == 13) && !g_replay_playing.load()) {
+          // scene behind it; and not back from a story scene.)
+          if (gate && (state == 7 || state == 13) && !saw_scene && !g_replay_playing.load()) {
             waiting = true;
-            REXLOG_INFO("Native renderer: mountain loaded (game state {}): waiting for the player to continue",
-                        state);
+            REXLOG_INFO("Native renderer: mountain loaded (game states {}): waiting for the player to continue",
+                        states_seen);
           } else {
+            if (saw_scene && (state == 7 || state == 13)) {
+              REXLOG_INFO("Native renderer: back from a story scene (game states {}): no continue prompt",
+                          states_seen);
+            }
             loading = false;
             renderer->SetHoldPicture(false);
           }
