@@ -638,12 +638,14 @@ that rule against a save that has the pass.
     the pipeline left out (not precompiled, its draws skipped). Each step is
     named in the log ("vertex shader ... made plainer (level N)"); delete
     the file to try the full shaders again. Records carry the shader
-    translation's version (" tv2"), so an update that may fix a crash tries
-    again by itself. (The Odin 3's crash: an instanced vertex shader,
-    0B81497C6E3B216A, that writes only the position - it crashed with and
-    without wind; vertex shaders like it now start their interpolators at a
-    zero the driver's compiler can't fold, on the guess that Turnip trips
-    over a pipeline whose vertex outputs are all constant.)
+    translation's version (" tv3"), so an update that may fix a crash tries
+    again by itself. (The Odin 3's crash: the instanced trees drawn into a
+    depth target alone - the game's shadow map - vertex shader
+    0B81497C6E3B216A; it crashed with and without wind, and with its
+    interpolators made non-constant. Pipelines with no color targets and
+    one sample now get the pixel shader without its color outputs and
+    sample mask, which go nowhere there; the picture is unchanged.
+    Diagnostic `nodepthps` turns that off.)
 - Fewer hitches from pipeline builds: a pipeline the driver has to compile
   (not in its cache; 150-800 ms each on an Arc) is now built in the
   background at once, even the first one in a frame, the draw left out for

@@ -1162,6 +1162,7 @@ struct Shader {
   uint8_t recipe = 0;
   uint64_t recipe_hash = 0;
   int safe_level = 0;  // TranslateOptions::safe_level it was made with
+  std::string glsl;    // pixel shaders: the source (for the depth-only variant)
 };
 
 std::string fmt_line(const char* f, ...) {
@@ -2048,6 +2049,10 @@ struct Renderer::Impl {
   // Per vertex shader (its microcode hash) that crashed the driver: the
   // plainer translation to try next (TranslateOptions::safe_level).
   std::unordered_map<uint64_t, int> safe_level_;
+  // Game pixel shaders as drawn into a depth target alone (one sample): no
+  // color outputs, no sample mask (DepthOnlyPs).
+  std::unordered_map<const Shader*, Shader> depth_only_ps_;
+  const Shader& DepthOnlyPs(const Shader& ps);
   int SafeLevel(const uint32_t* ucode, size_t n) const {
     if (safe_level_.empty()) return 0;
     auto it = safe_level_.find(amped3::native::HashMicrocode(ucode, n));
@@ -3054,6 +3059,7 @@ Shader* Renderer::Impl::GetShader(const std::string& stem, ShaderStage stage) {
     return &s;
   }
   s.info = r.info;
+  if (stage == ShaderStage::kPixel) s.glsl = r.glsl;
   for (uint32_t vf = 0; vf < 96; ++vf) {
     if (s.info.vertex_fetch_constants[vf >> 5] & (1u << (vf & 31))) s.vfetch.push_back(uint8_t(vf));
   }
@@ -3891,10 +3897,53 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
   return &cached.image;
 }
 
+// A game pixel shader for a pipeline with no color targets and one sample:
+// the same program without its color outputs and sample mask (they'd go
+// nowhere). Turnip (Mesa 26.3, the Odin 3) crashes building such a
+// pipeline with them.
+const Shader& Renderer::Impl::DepthOnlyPs(const Shader& ps) {
+  auto it = depth_only_ps_.find(&ps);
+  if (it != depth_only_ps_.end()) return it->second.module ? it->second : ps;
+  Shader& s = depth_only_ps_[&ps];
+  s.info = ps.info;
+  s.recipe = ps.recipe;
+  s.recipe_hash = ps.recipe_hash;
+  std::string g;
+  {
+    std::istringstream in(ps.glsl);
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.find("gl_SampleMask[0] =") != std::string::npos) continue;
+      if (line.find("out vec4 xe_color") != std::string::npos) continue;
+      if (line.find("xe_color") != std::string::npos && line.find("= xe_oC[") != std::string::npos) continue;
+      g += line;
+      g += '\n';
+    }
+  }
+  std::vector<uint32_t> spirv;
+  std::string error;
+  char stem[48];
+  std::snprintf(stem, sizeof(stem), "depthonly_%016llX", (unsigned long long)ps.info.ucode_hash);
+  if (!options_.compile || !options_.compile(true, stem, g, &spirv, &error)) return ps;
+  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  ci.codeSize = spirv.size() * 4;
+  ci.pCode = spirv.data();
+  if (vk::vkCreateShaderModule(gpu_.device, &ci, nullptr, &s.module) != VK_SUCCESS) {
+    s.module = VK_NULL_HANDLE;
+    return ps;
+  }
+  return s;
+}
+
 VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const Shader& vs,
-                                 const Shader& ps, const std::vector<Image*>& colors, Image* depth,
+                                 const Shader& ps_in, const std::vector<Image*>& colors, Image* depth,
                                  uint32_t color_mask_bits, bool velocity, bool mask,
                                  bool reactive, bool caster) {
+  // (Depth alone, one sample: the pixel shader without its color outputs.)
+  const Shader& ps = colors.empty() && depth && depth->samples == 1 && !ps_in.glsl.empty() &&
+                             !Diag("nodepthps")
+                         ? DepthOnlyPs(ps_in)
+                         : ps_in;
   const uint32_t mode = st.reg(0x2205);        // PA_SU_SC_MODE_CNTL
   const uint32_t depth_ctl = st.reg(0x2200);   // RB_DEPTHCONTROL
   uint32_t blend[4] = {st.reg(0x2201), st.reg(0x2209), st.reg(0x220A), st.reg(0x220B)};
@@ -3973,7 +4022,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   char pipe_id[112];
   // (" tv<N>": the shader translation's version, bumped when a change may
   // fix a driver crash, so what crashed an older one is tried again.)
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv2",
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv3",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
                 reactive ? " reactive" : "", caster ? " caster" : "",
@@ -4226,7 +4275,7 @@ void Renderer::Impl::ReadCrashed() {
       // (Only this translation's crashes: see pipe_id's " tv".)
       const size_t bar0 = line.find(" | ");
       const std::string head = line.substr(0, bar0);
-      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv2") != 0) continue;
+      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv3") != 0) continue;
     }
     const size_t bar = line.find(" | ");
     const std::string id = line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9);
@@ -4343,6 +4392,7 @@ Shader* Renderer::Impl::PrecompileShader(uint8_t recipe, uint64_t hash) {
   auto r = amped3::native::TranslateShader(stage, ucode.data(), ucode.size(), topt);
   if (!r.ok) return nullptr;
   s.info = r.info;
+  if (stage == ShaderStage::kPixel) s.glsl = r.glsl;
   std::vector<uint32_t> spirv;
   std::string error;
   char stem[40];
