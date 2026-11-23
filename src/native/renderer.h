@@ -175,6 +175,7 @@ struct RenderStats {
   // sun (held over meanwhile), the screen's shadow mask made, and the riders'
   // and objects' copies drawn into its casters' map, this frame.
   uint32_t sun_steps = 0, sun_held = 0;
+  uint32_t gi_updates = 0, gi_traces = 0;  // world-space light: occupancy rebuilt, traced
   bool tod_mask = false;
   uint32_t tod_casters = 0;
   // The nearest character to the camera (world units; 1e9: none).
@@ -437,6 +438,11 @@ class Renderer {
   // Riders' and characters' highlight (their own shaders'), 0..2: 1 as
   // the game has it, below that dimmer and tighter (cloth, not plastic).
   void SetRiderShine(float shine);
+  // World-space light (prototype), 0..2: the sky's light blocked by the
+  // world round each point taken off, and the light of what's there put
+  // on, traced through the world voxelised round the camera (needs World
+  // shadows: their draws). 0: off (the screen-space Light bounce instead).
+  void SetGi(float strength);
   // In a strong wind, loose snow streaming along the slopes in low wisps.
   void SetDriftingSnow(bool on);
   // Lens flare: the sun's (ghosts, a starburst, glare, as much as the sun is

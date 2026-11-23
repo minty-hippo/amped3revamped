@@ -98,6 +98,7 @@ const std::vector<Tab>& Tabs() {
            {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_sun_sheen", "Sun Sheen", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_light_bounce", "Light Bounce", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_world_light", "World Light (experimental)", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_rider_shine", "Rider Shine", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_eye_adaptation", "Eye Adaptation", Kind::kSlider, 0.0, 1.0, 0.1},
            {"native_contact_shadows", "Contact Shadows", Kind::kSlider, 0.0, 1.0, 0.1},

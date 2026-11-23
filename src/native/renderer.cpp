@@ -2020,7 +2020,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2148,7 +2148,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[63] = {};  // by CopyKind
+  VkShaderModule copy_fs_[66] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2499,6 +2499,35 @@ struct Renderer::Impl {
   float bounce_ = 0.0f;
   bool bounce_ok_ = false;
   Image bounce_albedo_, bounce_img_;
+  // World-space light (SetGi, prototype): the world that stays put
+  // voxelised into two camera-centred cascades (128 voxels a side: 1 m,
+  // then 4 m), and each half-size pixel's light from round it traced
+  // through them: the sky's light where it's blocked taken off (the game
+  // lights everything as under an open sky), the light of what's there put
+  // on instead (from the screen where it shows, else worked out).
+  // Voxelising: the scene pass's draws of what stays put (the sun maps'
+  // env draws) drawn again, orthographically, into five depth maps per
+  // cascade (from above, and from either side along x and z), each texel
+  // the nearest surface that way; the cascade's occupancy built from them
+  // (one 128-bit column of y per texel: RGBA32UI), kept and shifted as the
+  // camera moves, so what's been seen stays.
+  float gi_ = 0.0f;
+  static constexpr uint32_t kGiN = 128, kGiMap = 256;
+  struct GiCascade {
+    double voxel = 1.0;
+    int64_t org[3] = {0, 0, 0};      // the occupancy's (voxels)
+    int64_t pending[3] = {0, 0, 0};  // the maps' being drawn
+    Image maps[5];
+    Image occ[2];
+    int cur = 0;
+    bool ok = false, drawing = false;
+    bool skip = false;  // this update: still near enough its box
+  };
+  GiCascade gi_c_[2];
+  Image gi_params_, gi_blur_;
+  bool GiReady() const { return gi_ > 0.0f && gi_c_[0].ok && gi_c_[1].ok && !Diag("nogi"); }
+  void GiVoxelize(std::vector<CasterDraw>& env, bool start, bool done);
+  void GiTrace(Image* scene, Image* depth);
   Image relight_params_;  // the sheen's settings: the sky, the far-off scenery's light (SunSpecular)
   Image spec_stencil_dummy_;  // (its stencil when the lighting has none)
   bool spec_ok_ = false;
@@ -7126,13 +7155,263 @@ void main() {
   o = vec4(e, d);
 }
 )", true);
+  // World-space light, 1: a cascade's occupancy (see gi_): each texel a
+  // column of voxels along y (128 bits), from the nearest surfaces seen
+  // from above and from either side along x and z (each map twice the
+  // cascade's size: four samples a voxel face), merged with the occupancy
+  // before, moved to this box.
+  copy_fs_[63] = CompileBuiltin("builtin_gi_occupancy", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D top;  // from above: u x, v z; depth down from the top
+layout(set = 0, binding = 1) uniform sampler2D xp;   // from +x: u z, v y; depth in from the +x side
+layout(set = 0, binding = 2) uniform sampler2D xn;   // from -x
+layout(set = 0, binding = 3) uniform sampler2D zp;   // from +z: u x, v y
+layout(set = 0, binding = 4) uniform sampler2D zn;   // from -z
+layout(set = 0, binding = 5) uniform usampler2D old; // the occupancy before
+layout(push_constant) uniform Occ {
+  vec4 a;  // voxels a side, map texels a side, this box's origin minus the old one's (x, y)
+  vec4 b;  // (z), the old one kept (0/1)
+} pc;
+layout(location = 0) out uvec4 o;
+void Set(inout uvec4 b, int y) { b[y >> 5] |= 1u << uint(y & 31); }
+void main() {
+  int N = int(pc.a.x);
+  int R = int(pc.a.y) / N;
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  int x = c.x, z = c.y;
+  uvec4 bits = uvec4(0u);
+  for (int j = 0; j < R; ++j) {
+    for (int i = 0; i < R; ++i) {
+      float d = texelFetch(top, ivec2(x * R + i, z * R + j), 0).r;
+      if (d < 1.0) Set(bits, clamp(int((1.0 - d) * float(N)), 0, N - 1));
+    }
+  }
+  for (int y = 0; y < N; ++y) {
+    bool hit = false;
+    for (int j = 0; j < R && !hit; ++j) {
+      for (int i = 0; i < R && !hit; ++i) {
+        float d = texelFetch(xp, ivec2(z * R + i, y * R + j), 0).r;
+        hit = hit || (d < 1.0 && int((1.0 - d) * float(N)) == x);
+        d = texelFetch(xn, ivec2(z * R + i, y * R + j), 0).r;
+        hit = hit || (d < 1.0 && int(d * float(N)) == x);
+        d = texelFetch(zp, ivec2(x * R + i, y * R + j), 0).r;
+        hit = hit || (d < 1.0 && int((1.0 - d) * float(N)) == z);
+        d = texelFetch(zn, ivec2(x * R + i, y * R + j), 0).r;
+        hit = hit || (d < 1.0 && int(d * float(N)) == z);
+      }
+    }
+    if (hit) Set(bits, y);
+  }
+  if (pc.b.y > 0.5) {
+    ivec3 sh = ivec3(int(pc.a.z), int(pc.a.w), int(pc.b.x));
+    ivec2 oc = ivec2(x, z) + sh.xz;
+    if (all(greaterThanEqual(oc, ivec2(0))) && all(lessThan(oc, ivec2(N)))) {
+      uvec4 ob = texelFetch(old, oc, 0);
+      for (int y = 0; y < N; ++y) {
+        int yo = y + sh.y;
+        if (yo >= 0 && yo < N && ((ob[yo >> 5] >> uint(yo & 31)) & 1u) != 0u) Set(bits, y);
+      }
+    }
+  }
+  o = bits;
+}
+)", true);
+  // World-space light, 2 (half size): see GiTrace. Out: the light to add
+  // (times the albedo; negative where the sky's is taken off), its depth.
+  copy_fs_[64] = CompileBuiltin("builtin_gi_trace", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;    // lit (linear)
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2) uniform sampler2D normals;  // the lighting's
+layout(set = 0, binding = 3) uniform usampler2D occ0;    // 1 m voxels
+layout(set = 0, binding = 4) uniform usampler2D occ1;    // 4 m
+layout(set = 0, binding = 5) uniform sampler2D params;
+layout(push_constant) uniform Gi { vec4 a; } pc;  // 1 / width, 1 / height (full size), voxels a side
+layout(location = 0) out vec4 o;
+mat4 M, VP;
+vec4 kBox[2], kSun, kCam, kSh[7], kSet;
+int N;
+ivec2 kSize;
+vec4 Param(int i) { return texelFetch(params, ivec2(i, 0), 0); }
+bool Occ(int k, ivec3 v) {
+  if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, ivec3(N)))) return false;
+  uvec4 c = k == 0 ? texelFetch(occ0, v.xz, 0) : texelFetch(occ1, v.xz, 0);
+  return ((c[v.y >> 5] >> uint(v.y & 31)) & 1u) != 0u;
+}
+// The sky's light from (or onto a surface facing) n: the lighting's own.
+vec3 Sky(vec3 n) {
+  vec4 n4 = vec4(n, 1.0);
+  vec4 q = n.xyzz * n.yzzx;
+  vec3 r = vec3(dot(kSh[0], n4), dot(kSh[1], n4), dot(kSh[2], n4)) +
+           vec3(dot(kSh[3], q), dot(kSh[4], q), dot(kSh[5], q)) + kSh[6].xyz * (n.x * n.x - n.y * n.y);
+  return max(r, vec3(0.0));
+}
+// Along P + t D through the cascades (the fine one, then on in the coarse
+// one), at most tmax and budget voxels each: t of the first occupied voxel
+// (-1: none), the face it was entered by.
+float Trace(vec3 P, vec3 D, float tmax, int budget, out vec3 n) {
+  n = vec3(0.0, 1.0, 0.0);
+  vec3 Ds = D + vec3(equal(D, vec3(0.0))) * 1e-6;
+  vec3 inv = 1.0 / Ds;
+  ivec3 st = ivec3(sign(Ds));
+  float t = 0.0;
+  for (int k = 0; k < 2; ++k) {
+    float vs = kBox[k].w;
+    vec3 B = kBox[k].xyz;
+    float S = float(N) * vs;
+    vec3 t0 = (B - P) * inv, t1 = (B + vec3(S) - P) * inv;
+    vec3 lo = min(t0, t1), hi = max(t0, t1);
+    float tin = max(max(max(lo.x, lo.y), lo.z), t);
+    float tout = min(min(min(hi.x, hi.y), hi.z), tmax);
+    if (tout <= tin) continue;
+    vec3 p = (P + D * (tin + 1e-3) - B) / vs;
+    ivec3 v = clamp(ivec3(floor(p)), ivec3(0), ivec3(N - 1));
+    vec3 tDelta = abs(vec3(vs) * inv);
+    vec3 tMax = ((vec3(v) + max(vec3(st), vec3(0.0))) * vs + B - P) * inv;
+    int axis = -1;
+    float tc = tin;
+    for (int i = 0; i < budget; ++i) {
+      if (Occ(k, v)) {
+        if (axis >= 0) {
+          n = vec3(0.0);
+          n[axis] = -float(st[axis]);
+        } else {
+          n = -D;
+        }
+        return tc;
+      }
+      axis = tMax.x < tMax.y ? (tMax.x < tMax.z ? 0 : 2) : (tMax.y < tMax.z ? 1 : 2);
+      tc = tMax[axis];
+      if (tc > tout) break;
+      v[axis] += st[axis];
+      tMax[axis] += tDelta[axis];
+    }
+    t = tout;
+    if (t >= tmax) break;
+  }
+  return -1.0;
+}
+vec3 World(vec2 uv, float d) {
+  vec4 p = M * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 1.0 - max(d, 1e-7), 1.0);
+  return p.xyz / p.w;
+}
+// The light leaving a hit point toward the ray: as lit on screen, if it
+// shows there; else worked out.
+vec3 Radiance(vec3 H, vec3 n, float vs) {
+  vec4 cl = VP * vec4(H, 1.0);
+  if (cl.w > 0.0) {
+    vec3 ndc = cl.xyz / cl.w;
+    vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
+      float ds = texelFetch(depth, ivec2(uv * vec2(kSize)), 0).r;
+      if (ds > 0.0 && length(World(uv, ds) - H) < 1.5 * vs) return textureLod(scene, uv, 0.0).rgb;
+    }
+  }
+  // (Facing up: snow; else darker: rock, wood, trees.)
+  float alb = mix(0.3, 0.75, smoothstep(0.3, 0.8, n.y));
+  vec3 e = Sky(n);
+  float nl = dot(n, kSun.xyz);
+  if (nl > 0.0) {
+    vec3 nn;
+    if (Trace(H + n * vs * 1.01, kSun.xyz, 300.0, 64, nn) < 0.0) e += vec3(kSun.w * nl);
+  }
+  return alb * e;
+}
+void main() {
+  N = int(pc.a.z);
+  kSize = textureSize(depth, 0);
+  for (int i = 0; i < 4; ++i) {
+    M[i] = Param(i);
+    VP[i] = Param(4 + i);
+  }
+  kBox[0] = Param(8);
+  kBox[1] = Param(9);
+  kSun = Param(10);
+  kCam = Param(11);
+  for (int i = 0; i < 7; ++i) kSh[i] = Param(12 + i);
+  kSet = Param(19);
+  ivec2 c = min(ivec2(gl_FragCoord.xy) * 2, kSize - 1);
+  float d = texelFetch(depth, c, 0).r;
+  o = vec4(0.0, 0.0, 0.0, d);
+  vec2 uv = (vec2(c) + 0.5) * pc.a.xy;
+  if (Param(20).x > 0.5) {
+    // (Diagnostics, "giview": the voxels seen from the camera, by the face
+    // hit and how far; through gishow's 0.5 + 1.5 x.)
+    vec3 Pf = World(uv, 0.5);
+    vec3 D = normalize(Pf - kCam.xyz);
+    vec3 n;
+    float t = Trace(kCam.xyz, D, 600.0, 400, n);
+    vec3 col = t < 0.0 ? vec3(0.2, 0.2, 0.5) : (n * 0.5 + 0.5) * (1.0 - 0.7 * clamp(t / 300.0, 0.0, 1.0));
+    o = vec4((col - 0.5) / 1.5, d);
+    return;
+  }
+  if (d <= 0.0) return;
+  vec3 P = World(uv, d);
+  float dist = length(P - kCam.xyz);
+  if (dist > kCam.w) return;
+  vec3 Nn = texelFetch(normals, c, 0).xyz * 2.0 - 1.0;
+  float nl = length(Nn);
+  if (abs(nl - 1.0) > 0.2) return;
+  Nn /= nl;
+  // (Off its own surface by a voxel and a half of the cascade it's in.)
+  vec3 rel = P - kBox[0].xyz;
+  bool fine = all(greaterThanEqual(rel, vec3(0.0))) && all(lessThan(rel, vec3(float(N) * kBox[0].w)));
+  float vs = fine ? kBox[0].w : kBox[1].w;
+  vec3 O = P + Nn * vs * 1.5;
+  vec3 T = abs(Nn.y) < 0.9 ? normalize(cross(Nn, vec3(0.0, 1.0, 0.0))) : normalize(cross(Nn, vec3(1.0, 0.0, 0.0)));
+  vec3 Bt = cross(Nn, T);
+  float rnd = fract(52.9829189 * fract(dot(gl_FragCoord.xy + kSet.w * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
+  int rays = int(kSet.x);
+  vec3 sum = vec3(0.0);
+  for (int i = 0; i < rays; ++i) {
+    // Cosine-weighted round the normal (a spiral, turned per pixel).
+    float u1 = (float(i) + 0.5) / float(rays);
+    float ph = 6.2831853 * fract(float(i) * 0.618034 + rnd);
+    float r = sqrt(u1);
+    vec3 D = normalize(T * (r * cos(ph)) + Bt * (r * sin(ph)) + Nn * sqrt(max(1.0 - u1, 0.0)));
+    vec3 n;
+    float t = Trace(O, D, 400.0, 160, n);
+    if (t < 0.0) continue;
+    vec3 H = O + D * t;
+    float hv = t < float(N) * kBox[0].w * 0.5 ? kBox[0].w : kBox[1].w;
+    sum += Radiance(H, n, hv) * kSet.z - Sky(D) * kSet.y;
+  }
+  vec3 e = sum / float(rays);
+  e *= 1.0 - smoothstep(kCam.w * 0.7, kCam.w, dist);
+  o = vec4(e, d);
+}
+)", true);
+  // World-space light, 3: its half-size result blurred one way (9 taps,
+  // a.xy the step), only across what's at about the same depth.
+  copy_fs_[65] = CompileBuiltin("builtin_gi_blur", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D src;  // the light, its depth in alpha
+layout(push_constant) uniform Blur { vec4 a; } pc;  // step (texels)
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 sz = textureSize(src, 0);
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(src, p, 0);
+  if (c.a <= 0.0) {
+    o = c;
+    return;
+  }
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int i = -4; i <= 4; ++i) {
+    vec4 b = texelFetch(src, clamp(p + ivec2(pc.a.xy * float(i)), ivec2(0), sz - 1), 0);
+    if (b.a <= 0.0) continue;
+    float w = exp(-float(i * i) / 10.0) * exp(-abs(b.a - c.a) / max(c.a * 0.02, 1e-6));
+    sum += b.rgb * w;
+    wsum += w;
+  }
+  o = vec4(wsum > 1e-5 ? sum / wsum : c.rgb, c.a);
+}
+)", true);
   copy_fs_[50] = CompileBuiltin("builtin_spec_add", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D spec;
 layout(set = 0, binding = 1) uniform sampler2D scene;
 layout(set = 0, binding = 2) uniform sampler2D depth;
 layout(set = 0, binding = 3) uniform sampler2D bounce;  // half size: the light bounced here, its depth
 layout(set = 0, binding = 4) uniform sampler2D albedo;  // as the lighting had it
-layout(push_constant) uniform Add { vec4 a; } pc;  // strength, diagnostics, the bounce's strength (0 none)
+layout(push_constant) uniform Add { vec4 a; } pc;  // strength, diagnostics, the bounce's strength (0 none), world-space light (signed)
 // The bounced light at this pixel: the half-size result's 3 x 3 round it,
 // those at about this depth (not across an outline).
 vec3 Bounced(ivec2 ip, float d) {
@@ -7174,6 +7453,18 @@ void main() {
   add /= 1.0 + dot(add, vec3(0.3, 0.59, 0.11));
   // The light bounced onto it, by its own color (the albedo the lighting
   // had: a rider in front fails the depth test above).
+  if (pc.a.z > 0.0 && pc.a.w > 0.5) {
+    // World-space light: signed (the sky's light taken off where it's
+    // blocked, what's there put on).
+    vec3 alb = texelFetch(albedo, ip, 0).rgb;
+    vec3 g = Bounced(ip, d);
+    if (pc.a.y < -0.5) {
+      o = vec4(0.5 + g * 1.5, 1.0);  // (diagnostics: grey none, darker taken off, lighter put on)
+      return;
+    }
+    o = vec4(max(c.rgb + add * (1.0 - 0.6 * clamp(c.rgb, 0.0, 1.0)) + alb * g * pc.a.z, 0.0), c.a);
+    return;
+  }
   if (pc.a.z > 0.0) {
     vec3 alb = texelFetch(albedo, ip, 0).rgb;
     vec3 b = alb * Bounced(ip, d) * pc.a.z;
@@ -10833,6 +11124,11 @@ void Renderer::Impl::DrawSunShadows(const Draw& d, const GpuState& st) {
     // The rays whose sunward side is in view at the end of an update (with
     // the world drawn into the maps): what casts on them has been drawn.
     const bool update_done = sun_phase_ == 2 || sun_phase_ == 3;
+    if (gi_ > 0.0f && !Diag("nogi")) {
+      MarkPart("lighting: sun maps");
+      GiVoxelize(env, sun_phase_ == 0 || sun_phase_ == 3, update_done);
+      MarkPart("world light: voxelise");
+    }
     // (Held until a whole update's drawn since the step.)
     if (sun_hold_on_ && frame_number_ != sun_hold_frame_) {
       if (sun_phase_ == 0 || sun_phase_ == 3) sun_hold_phase0_ = true;
@@ -12280,7 +12576,7 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   // (The sheen, and the far-off scenery lit for the hour: both or either.)
   const bool sheen = specular_ > 0.0f && !Diag("nospec");
   const bool backdrop = !Diag("nobackdrop");
-  const bool bounce = bounce_ > 0.0f && !Diag("nobounce");
+  const bool bounce = (bounce_ > 0.0f && !Diag("nobounce")) || GiReady();
   bounce_ok_ = false;
   if (!(sheen || backdrop || bounce) || !TodOn() || !tod_normal_) return;
   std::string n0;
@@ -12429,6 +12725,184 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
 }
 
 // The sun's sheen added (builtin_spec_add), after the scene.
+// World-space light, 1: the world voxelised (see gi_). At each sun map
+// update's start the cascades' boxes are put round the camera and their
+// maps cleared; each part of the update draws its share of the world into
+// them; at its end the occupancy is built from them, merged with what was
+// there (shifted to the new box).
+void Renderer::Impl::GiVoxelize(std::vector<CasterDraw>& env, bool start, bool done) {
+  if (Diag("gidbg")) std::fprintf(stderr, "gi: voxelize %zu draws start %d done %d\n", env.size(), start, done);
+  const VkFormat fmt = sun_env_.format;
+  for (int k = 0; k < 2; ++k) {
+    GiCascade& g = gi_c_[k];
+    g.voxel = k == 0 ? 1.0 : 4.0;
+    for (int m = 0; m < 5; ++m) {
+      Image& im = g.maps[m];
+      if (!im.image || im.width != kGiMap || im.format != fmt) {
+        if (im.image) Retire(im);
+        im = gpu_.CreateImage(kGiMap, kGiMap, fmt, true, "gi_map");
+        ToGeneral(cb_, im);
+        g.ok = false;
+        g.drawing = false;
+      }
+    }
+    for (Image& im : g.occ) {
+      if (!im.image || im.width != kGiN) {
+        if (im.image) Retire(im);
+        im = gpu_.CreateImage(kGiN, kGiN, VK_FORMAT_R32G32B32A32_UINT, false, "gi_occupancy");
+        ToGeneral(cb_, im);
+        g.ok = false;
+      }
+    }
+    if (start || !g.drawing) {
+      // Round the camera (a little more of it below: the ground), whole voxels.
+      int64_t want[3];
+      for (int i = 0; i < 3; ++i) {
+        const double c = std::floor(cam_pos_[i] / g.voxel);
+        want[i] = int64_t(c) - int64_t(i == 1 ? kGiN * 5 / 8 : kGiN / 2);
+      }
+      // (Only once the camera's an eighth of the box from where it was put:
+      // each update draws the world five times a cascade.)
+      int64_t moved = 0;
+      for (int i = 0; i < 3; ++i) moved = std::max<int64_t>(moved, std::llabs(want[i] - g.org[i]));
+      g.skip = g.ok && moved < int64_t(kGiN / 8) && !Diag("gievery");
+      if (g.skip) {
+        g.drawing = true;
+        continue;
+      }
+      std::memcpy(g.pending, want, sizeof(want));
+      const float zero[4] = {0, 0, 0, 0};
+      for (Image& im : g.maps) ClearImage(&im, zero, 1.0f, 0, false, true, true);
+      FlushPendingClears();
+      g.drawing = true;
+    }
+    if (g.skip) {
+      if (done) g.drawing = false;
+      continue;
+    }
+    const double S = double(kGiN) * g.voxel;
+    const double B[3] = {double(g.pending[0]) * g.voxel, double(g.pending[1]) * g.voxel,
+                         double(g.pending[2]) * g.voxel};
+    // Rows world -> clip: (u, v, depth) for each view: from above (u x,
+    // v z), from +x and -x (u z, v y), from +z and -z (u x, v y).
+    for (int m = 0; m < 5; ++m) {
+      double O[16] = {};
+      const int ua = m == 0 ? 0 : (m <= 2 ? 2 : 0);
+      const int va = m == 0 ? 2 : 1;
+      const int da = m == 0 ? 1 : (m <= 2 ? 0 : 2);
+      const bool from_max = m == 0 || m == 1 || m == 3;
+      O[0 * 4 + ua] = 2.0 / S;
+      O[0 * 4 + 3] = -2.0 * B[ua] / S - 1.0;
+      O[1 * 4 + va] = 2.0 / S;
+      O[1 * 4 + 3] = -2.0 * B[va] / S - 1.0;
+      if (from_max) {
+        O[2 * 4 + da] = -1.0 / S;
+        O[2 * 4 + 3] = (B[da] + S) / S;
+      } else {
+        O[2 * 4 + da] = 1.0 / S;
+        O[2 * 4 + 3] = -B[da] / S;
+      }
+      O[15] = 1.0;
+      DrawIntoSunMap(env, &g.maps[m], O);
+    }
+    if (done) {
+      const int nxt = 1 - g.cur;
+      float pc[8] = {float(kGiN), float(kGiMap),
+                     float(g.pending[0] - g.org[0]), float(g.pending[1] - g.org[1]),
+                     float(g.pending[2] - g.org[2]), g.ok ? 1.0f : 0.0f, 0, 0};
+      Barrier();
+      // (Five maps and the occupancy before: the sixth input.)
+      FullscreenPass(CopyKind::kGiOcc, &g.occ[nxt], &g.maps[0], &g.maps[1], &g.maps[2], false, pc, 8,
+                     nullptr, &g.maps[3], &g.maps[4], &g.occ[g.cur]);
+      Barrier();
+      g.cur = nxt;
+      for (int i = 0; i < 3; ++i) g.org[i] = g.pending[i];
+      g.ok = true;
+      g.drawing = false;
+      ++stats_.gi_updates;
+    }
+  }
+  dyn_ = DynState{};
+}
+
+// World-space light, 2 (half size, into bounce_img_ for the bounce's
+// upsizing and adding): each pixel's rays (cosine-weighted round its
+// normal) traced through the cascades. What a ray hits: lit as the screen
+// shows it, where it's on screen and the depth there agrees; else its
+// light worked out (a guess at its color from which way it faces, the
+// sky's light from the lighting's own spherical harmonics, the sun's where
+// a ray toward it gets out). Each hit takes off the sky's light the game
+// gave from that way and puts its own on.
+void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
+  if (Diag("gidbg")) std::fprintf(stderr, "gi: trace\n");
+  const uint32_t* blk = lm_on_ ? tod_new_ : tod_ref_;
+  float f[22 * 4] = {};
+  f[20 * 4] = Diag("giview") ? 1.0f : 0.0f;
+  double vp[16];
+  if (!Invert4(inv_vp_, vp)) return;
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 4; ++r) {
+      f[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // texels 0-3: columns
+      f[16 + c * 4 + r] = float(vp[r * 4 + c]);   // 4-7
+    }
+  }
+  for (int k = 0; k < 2; ++k) {
+    const GiCascade& g = gi_c_[k];
+    for (int i = 0; i < 3; ++i) f[(8 + k) * 4 + i] = float(double(g.org[i]) * g.voxel);
+    f[(8 + k) * 4 + 3] = float(g.voxel);
+  }
+  // Toward the sun (the lighting's c14), how bright its light is on a
+  // surface facing it (about what lit snow shows).
+  for (int i = 0; i < 3; ++i) std::memcpy(&f[10 * 4 + i], &blk[i], 4);
+  const tod::Vec3 ls = lm_light_scale_;
+  f[10 * 4 + 3] = float(0.9 * (ls.x + ls.y + ls.z) / 3.0);
+  for (int i = 0; i < 3; ++i) f[11 * 4 + i] = float(cam_pos_[i]);
+  f[11 * 4 + 3] = 600.0f;
+  // The sky's light: the lighting's spherical harmonics (its first set):
+  // cAr, cAg, cAb (c15, c19, c23), cBr, cBg, cBb (c27, c31, c35), cC (c39).
+  const int regs[7] = {15, 19, 23, 27, 31, 35, 39};
+  for (int j = 0; j < 7; ++j) std::memcpy(&f[(12 + j) * 4], &blk[(regs[j] - 14) * 4], 16);
+  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : 12.0f;  // rays
+  f[19 * 4 + 1] = Diag("ginosky") ? 0.0f : 1.0f;    // the sky's light taken off
+  f[19 * 4 + 2] = Diag("ginoput") ? 0.0f : 1.0f;    // the hits' light put on
+  f[19 * 4 + 3] = float(frame_number_ % 64);
+  if (!gi_params_.image) {
+    gi_params_ = gpu_.CreateImage(22, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "gi_params");
+    ToGeneral(cb_, gi_params_);
+  }
+  Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+  std::memcpy(staging.mapped, f, sizeof(f));
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {22, 1, 1};
+  Barrier();
+  vk::vkCmdCopyBufferToImage(cb_, staging.buffer, gi_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  staging_.push_back(staging);
+  Barrier();
+  const GiCascade& c0 = gi_c_[0];
+  const GiCascade& c1 = gi_c_[1];
+  float pc[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), 0};
+  FullscreenPass(CopyKind::kGiTrace, &bounce_img_, scene, depth, tod_normal_, true, pc, 4, nullptr,
+                 const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]), &gi_params_);
+  if (!Diag("ginoblur") && !Diag("giview")) {
+    if (!gi_blur_.image || gi_blur_.width != bounce_img_.width || gi_blur_.height != bounce_img_.height) {
+      if (gi_blur_.image) Retire(gi_blur_);
+      gi_blur_ = gpu_.CreateImage(bounce_img_.width, bounce_img_.height, bounce_img_.format, false, "gi_blur");
+      ToGeneral(cb_, gi_blur_);
+    }
+    // (Twice each way, the second wider.)
+    for (int pass = 0; pass < 2; ++pass) {
+      const float st = pass == 0 ? 1.0f : 3.0f;
+      float h[4] = {st, 0, 0, 0}, v[4] = {0, st, 0, 0};
+      Barrier();
+      FullscreenPass(CopyKind::kGiBlur, &gi_blur_, &bounce_img_, nullptr, nullptr, false, h, 4);
+      Barrier();
+      FullscreenPass(CopyKind::kGiBlur, &bounce_img_, &gi_blur_, nullptr, nullptr, false, v, 4);
+    }
+  }
+  ++stats_.gi_traces;
+}
+
 Image* Renderer::Impl::SpecularScene(Image* scene) {
   if (!spec_ok_) return nullptr;
   spec_ok_ = false;
@@ -12499,11 +12973,21 @@ Image* Renderer::Impl::SpecularScene(Image* scene) {
     bp[24] = float(frame_number_ % 64);
     bp[25] = 0.12f * float(scene->height);
     Barrier();
-    FullscreenPass(CopyKind::kBounce, &bounce_img_, scene, &dit->second, tod_normal_, true, bp, 28);
+    if (GiReady()) {
+      MarkPart("effect: sun sheen (before the world light)");
+      GiTrace(scene, &dit->second);
+      MarkPart("world light: trace");
+    } else {
+      FullscreenPass(CopyKind::kBounce, &bounce_img_, scene, &dit->second, tod_normal_, true, bp, 28);
+    }
     Barrier();
   }
-  float pc[4] = {specular_, Diag("specdbg") || Diag("specshow") ? 1.0f : Diag("bounceshow") ? -1.0f : 0.0f,
-                 bounce ? bounce_ : 0.0f, 0};
+  const bool gi = bounce && GiReady();
+  float pc[4] = {specular_,
+                 Diag("specdbg") || Diag("specshow") ? 1.0f
+                 : Diag("bounceshow") || Diag("gishow") ? -1.0f
+                                                       : 0.0f,
+                 bounce ? (gi ? gi_ : bounce_) : 0.0f, gi ? 1.0f : 0.0f};
   Barrier();
   FullscreenPass(CopyKind::kSpecAdd, &spec_out_, &spec_img_, scene, &dit->second, false, pc, 4, nullptr,
                  bounce ? &bounce_img_ : &dummy_, bounce ? &bounce_albedo_ : &dummy_);
@@ -17114,6 +17598,12 @@ Renderer::Impl::~Impl() {
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_, &relight_params_, &tod_params_, &spec_stencil_dummy_}) {
     gpu_.DestroyImage(*im);
   }
+  gpu_.DestroyImage(gi_params_);
+  gpu_.DestroyImage(gi_blur_);
+  for (GiCascade& g : gi_c_) {
+    for (Image& im : g.maps) gpu_.DestroyImage(im);
+    for (Image& im : g.occ) gpu_.DestroyImage(im);
+  }
   gpu_.DestroyImage(fog_color_img_[0]);
   gpu_.DestroyImage(fog_color_img_[1]);
   gpu_.DestroyImage(ray_mask_img_);
@@ -17697,6 +18187,7 @@ void Renderer::SetDiamondDust(float strength) { impl_->dust_ = std::clamp(streng
 void Renderer::SetLensDirt(float strength) { impl_->lens_dirt_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetGi(float strength) { impl_->gi_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetRiderShine(float shine) { impl_->rider_shine_ = std::clamp(shine, 0.0f, 2.0f); }
 void Renderer::StartSurfacePick() {
   impl_->pick_state_ = 1;

@@ -312,6 +312,12 @@ REXCVAR_DEFINE_DOUBLE(native_ice_halo, 1.0, "GPU",
 REXCVAR_DEFINE_BOOL(native_drifting_snow, true, "GPU",
                     "Time of day: in a strong wind (a blizzard), loose snow streaming along the "
                     "slopes in low wisps, moving with the wind");
+REXCVAR_DEFINE_DOUBLE(native_world_light, 0.0, "GPU",
+                      "World light (experimental), 0..2: the world round the camera voxelised and "
+                      "each point's light from round it traced through it: the sky's light taken "
+                      "off where the world blocks it, the light of what's there (from the screen, "
+                      "or worked out) put on. Replaces Light bounce while on. Needs World shadows "
+                      "(their draws). 0: off. Native renderer only.");
 REXCVAR_DEFINE_DOUBLE(native_rider_shine, 0.35, "GPU",
                       "Riders' and characters' highlight, 0..2: 1 as the game has it (a broad, "
                       "plastic-looking sheen on cloth and skin); lower is dimmer and tighter. "
@@ -2625,6 +2631,7 @@ void WorkerMain() {
           renderer->SetSnowTracks(on * float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(on * float(REXCVAR_GET(native_sun_sheen)));
           renderer->SetRiderShine(revamped ? float(REXCVAR_GET(native_rider_shine)) : 1.0f);
+          renderer->SetGi(revamped ? float(REXCVAR_GET(native_world_light)) : 0.0f);
           renderer->SetLightBounce(on * float(REXCVAR_GET(native_light_bounce)));
           renderer->SetDriftingSnow(revamped && REXCVAR_GET(native_drifting_snow));
           renderer->SetIceHalo(on * float(REXCVAR_GET(native_ice_halo)));

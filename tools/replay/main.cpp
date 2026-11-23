@@ -473,7 +473,8 @@ int main(int argc, char** argv) {
   int volumetric_quality = 1;  // --volumetric-quality
   float bounce = 0.0f;    // --bounce
   float specular = 0.0f;
-  float rider_shine = 1.0f;  // --specular  // --bloom strength
+  float rider_shine = 1.0f;
+  float gi = 0.0f;  // --specular  // --bloom strength
   bool test_lights = false;  // --test-lights: a few night lights ahead of the camera  // --tod hour [--tod-moon phase] [--tod-clouds cover]
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
   fs::path rewrite;  // write the loaded frame back out in capture format (tests the writer)
@@ -560,6 +561,8 @@ int main(int argc, char** argv) {
       tod.overcast = std::stof(argv[++i]);
     } else if (a == "--bounce" && i + 1 < argc) {
       bounce = std::stof(argv[++i]);
+    } else if (a == "--gi" && i + 1 < argc) {
+      gi = std::stof(argv[++i]);
     } else if (a == "--rider-shine" && i + 1 < argc) {
       rider_shine = std::stof(argv[++i]);
     } else if (a == "--specular" && i + 1 < argc) {
@@ -914,6 +917,7 @@ int main(int argc, char** argv) {
   renderer.SetVolumetric(volumetric, volumetric_quality);
   renderer.SetSpecular(specular);
   renderer.SetRiderShine(rider_shine);
+  renderer.SetGi(gi);
   renderer.SetLightBounce(bounce);
   renderer.SetDriftingSnow(true);
     renderer.SetCollectInstances(test_lights);
@@ -1100,6 +1104,7 @@ int main(int argc, char** argv) {
     for (const auto& n : stats.notices) std::cout << "Notice: " << n << "\n";
     if (stats.speed_blurred) std::cout << "Speed blur applied\n";
     if (stats.fogged) std::cout << "Fog applied\n";
+    if (stats.gi_updates || stats.gi_traces) std::cout << "World-space light: " << stats.gi_updates << " occupancy builds, " << stats.gi_traces << " traces\n";
     if (stats.god_rays) std::cout << "God rays applied\n";
     if (stats.ambient_occlusion) std::cout << "Ambient occlusion applied\n";
     std::printf("Nearest character to the camera: %.1f\n", stats.nearest_character);

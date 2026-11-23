@@ -443,6 +443,13 @@ const std::vector<Tab>& Tabs() {
                         "tones down in glare, easing over a second or two like eyes "
                         "adjusting. 0: off. Part of Revamped Graphics. Native renderer only.",
                         "%.1f", 0.0, 1.0),
+                SliderF("native_world_light", "World light (experimental)",
+                        "The world round the camera turned into voxels (1 m near, 4 m farther), "
+                        "and each point's light from round it traced through them: shade under "
+                        "trees, eaves and in gullies from the sky they block, and light off "
+                        "sunlit snow and walls onto what faces them, even from off screen. "
+                        "Replaces Light bounce while on. Needs World shadows. Costly: 0 is off.",
+                        "%.1f", 0.0, 2.0),
                 SliderF("native_rider_shine", "Rider shine",
                         "The riders' and characters' own highlight: 1 as the game has it (a "
                         "broad sheen that makes cloth and skin look plastic); lower is dimmer and "
