@@ -615,7 +615,9 @@ that rule against a save that has the pass.
   depth), the painted light taken as the mountain's own sun and sky, and the
   hour's sun, sky and moon put in their place, with the clouds' shadows and
   the far shadows below. At the mountain's own hour it looks as the game has
-  it.
+  it. What the lighting pass leaves unlit is found by its own stencil test
+  (so the far-off trees drawn over the playable slopes are relit too, not
+  left glowing at night); without a stencil, by the missing normals.
 - Far shadows: the slopes' shadows were only baked within about 145 m of
   where you've been (80% of the sun maps' reach), and the game fades its
   shadow map out with distance, so with time of day on the far slopes had
@@ -623,7 +625,9 @@ that rule against a save that has the pass.
   painted shadows are used, as the game has them. As the sun moves away from
   there, they ease into shadows found by marching toward the sun through the
   depth on screen: steps from a few metres out to most of a kilometre, so
-  ridges and peaks shade the slopes behind them. The game's fade of its
+  ridges and peaks shade the slopes behind them. It takes several steps in
+  shadow (as a ridge gives) to count, so the trees along the way don't
+  speckle the far slopes; the sun maps shade those nearer. The game's fade of its
   shadow map is left out (the time of day's mask holds the shadows all over
   the screen), so the clouds' shadows now drift across the far slopes too.
 - Fewer passes for the sun's shadow mask: the clouds' shadows, the tracks'

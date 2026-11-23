@@ -1982,7 +1982,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2073,7 +2073,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[61] = {};  // by CopyKind
+  VkShaderModule copy_fs_[62] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2418,7 +2418,8 @@ struct Renderer::Impl {
   void PickProbe(const Draw& d, const GpuState& st);
   void PickRead();
   Image spec_img_, spec_out_;
-  Image relight_params_;  // the far-off scenery's light (SunSpecular)
+  Image relight_params_;  // the sheen's settings: the sky, the far-off scenery's light (SunSpecular)
+  Image spec_stencil_dummy_;  // (its stencil when the lighting has none)
   bool spec_ok_ = false;
   void SunSpecular(const Draw& d, const GpuState& st);
   Image* SpecularScene(Image* scene);
@@ -6415,8 +6416,11 @@ layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the game's material (foliage > 0)
 layout(set = 0, binding = 2) uniform sampler2D depth;
 layout(set = 0, binding = 3) uniform sampler2D mask;     // the sun's shadows (1 lit)
-layout(set = 0, binding = 4) uniform sampler2D sky;      // 4 x 1: zenith, horizon (the hour's)
-layout(set = 0, binding = 5) uniform sampler2D relight;  // 4 x 1: the backdrop's light (SunSpecular)
+// 12 x 1: 0-3 the hour's sky (zenith, horizon), 4-7 the backdrop's light,
+// 8 the lighting's stencil test (SunSpecular).
+layout(set = 0, binding = 4) uniform sampler2D sky;
+layout(set = 0, binding = 5) uniform usampler2D stencil;  // the lighting's depth target's
+#define relight sky
 layout(push_constant) uniform Spec {
   mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
   vec4 L;    // toward the light, -
@@ -6463,17 +6467,31 @@ void main() {
   // depth (each way, the nearer side's: not across an outline), the painted
   // light taken as the mountain's sun and sky, and the hour's put in their
   // place. Out: that factor, the depth negated (the add multiplies).
-  // (The clear: not a normal, and its alpha whole - the game's material 3
-  // with our tag 7, which no surface is given; an edge's average isn't.)
-  if (abs(length(nw.xyz * 2.0 - 1.0) - 1.0) > 0.2 && nw.w > 254.5 / 255.0) {
-    vec4 r1 = texelFetch(relight, ivec2(1, 0), 0);
+  // Not lit by the lighting pass: where its stencil test fails (as the
+  // lighting will find it); without one, where there's no normal (the
+  // clear: not a normal, its alpha whole - the game's material 3 with our
+  // tag 7, which no surface is given; an edge's average isn't).
+  vec4 stt = texelFetch(relight, ivec2(8, 0), 0);
+  bool unlit;
+  if (stt.w > 0.5) {
+    uint sv = texelFetch(stencil, ip, 0).r & 0xFFu;
+    uint ref = uint(stt.x) & 0xFFu, msk = uint(stt.y) & 0xFFu, fn = uint(stt.z);
+    uint a = ref & msk, b = sv & msk;
+    bool pass = fn == 0u ? false : fn == 1u ? a < b : fn == 2u ? a == b : fn == 3u ? a <= b
+              : fn == 4u ? a > b : fn == 5u ? a != b : fn == 6u ? a >= b : true;
+    unlit = !pass;
+  } else {
+    unlit = abs(length(nw.xyz * 2.0 - 1.0) - 1.0) > 0.2 && nw.w > 254.5 / 255.0;
+  }
+  if (unlit) {
+    vec4 r1 = texelFetch(relight, ivec2(5, 0), 0);
     if (r1.w < 0.5) {
       o = vec4(0.0);
       return;
     }
-    vec4 r0 = texelFetch(relight, ivec2(0, 0), 0);
-    vec4 r2 = texelFetch(relight, ivec2(2, 0), 0);
-    vec4 r3 = texelFetch(relight, ivec2(3, 0), 0);
+    vec4 r0 = texelFetch(relight, ivec2(4, 0), 0);
+    vec4 r2 = texelFetch(relight, ivec2(6, 0), 0);
+    vec4 r3 = texelFetch(relight, ivec2(7, 0), 0);
     vec3 side[4];
     float dist[4];
     const ivec2 kOff[4] = ivec2[4](ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
@@ -6499,7 +6517,190 @@ void main() {
     o = vec4(clamp(e1 / max(e0, 0.25), vec3(0.0), vec3(4.0)), -d);
     return;
   }
-  if (texelFetch(relight, ivec2(3, 0), 0).w < 0.5) {
+  if (texelFetch(relight, ivec2(7, 0), 0).w < 0.5) {
+    o = vec4(0.0);  // (the sheen's off: the backdrop only)
+    return;
+  }
+  vec3 N = normalize(nw.xyz * 2.0 - 1.0);
+  vec3 L = pc.L.xyz;
+  float nl = dot(N, L), nv = dot(N, V);
+  if (nv <= 0.0) {
+    o = vec4(0.0, 0.0, 0.0, d);
+    return;
+  }
+  float lit = pc.cam.w > 0.5 ? texelFetch(mask, ip, 0).r : 1.0;
+  if (nl <= 0.0) lit = 0.0;  // (facing away: the sky's reflection only)
+  nl = max(nl, 1e-4);
+  vec3 alb = texelFetch(albedo, ip, 0).rgb;
+  float lum = dot(alb, vec3(0.3, 0.59, 0.11));
+  float sat = max(alb.r, max(alb.g, alb.b)) - min(alb.r, min(alb.g, alb.b));
+  // The normals' alpha: the game's material in its low bits (3: foliage;
+  // it reads them mod 4), our surface tag in the top three.
+  uint mb = uint(nw.w * 255.0 + 0.5);
+  bool foliage = (mb & 3u) == 3u;
+  uint tag = mb >> 5u;
+  // Snow: tagged, or by its color (fresh snow over anything).
+  float snow = foliage ? 0.0 : max(tag == 1u ? 1.0 : 0.0, smoothstep(0.5, 0.7, lum) * smoothstep(0.2, 0.08, sat));
+  // Roughness and reflectance by surface: snow glossier toward a low sun's
+  // glare; metal (tinted by its color) and paint shinier; wood, rock and
+  // cloth dull; foliage waxy, faint.
+  float rough = 0.55, f0 = 0.04, metal = 0.0;
+  if (foliage) { rough = 0.6; f0 = 0.03; }
+  else if (tag == 2u) { rough = 0.32; f0 = 0.5; metal = 1.0; }
+  else if (tag == 3u) { rough = 0.75; }
+  else if (tag == 4u) { rough = 0.7; }
+  else if (tag == 5u) { rough = 0.35; f0 = 0.05; }
+  else if (tag == 6u) { rough = 0.9; f0 = 0.03; }
+  rough = mix(rough, 0.3, snow);
+  f0 = mix(f0, 0.03, snow);
+  metal *= 1.0 - snow;
+  vec3 H = normalize(L + V);
+  float nh = max(dot(N, H), 0.0), vh = max(dot(V, H), 0.0);
+  float a = rough * rough;
+  float fr = pow(1.0 - vh, 5.0);
+  vec3 F = mix(vec3(f0 + (1.0 - f0) * fr), mix(alb, vec3(1.0), fr), metal);
+  float spec = D_GGX(nh, a) * G_Smith(nv, nl, a) / (4.0 * nv * nl) * nl;
+  spec = min(spec, 6.0);
+  vec3 c = pc.col.rgb * F * spec * lit * (foliage ? 0.35 : 1.0);
+  // The sky in it (what the game's ambient leaves out: a mirror's worth of
+  // it), by how smooth: metal and paint show it, snow a faint sheen at a
+  // glancing angle, the rough rest none. Below the horizon, the snow.
+  if (pc.env.x > 0.0 && !foliage) {
+    vec3 R = reflect(-V, N);
+    vec3 zen = texelFetch(sky, ivec2(0, 0), 0).rgb, hor = texelFetch(sky, ivec2(1, 0), 0).rgb;
+    vec3 env = R.y >= 0.0 ? mix(hor, zen, smoothstep(0.0, 0.6, R.y)) : hor * 0.8;
+    float fv = pow(1.0 - nv, 5.0);
+    float gloss = (1.0 - rough) * (1.0 - rough);
+    vec3 Fe = mix(vec3(f0 + (max(1.0 - rough, f0) - f0) * fv), mix(alb, vec3(1.0), fv), metal);
+    // (Out of the sun, less of it: in a shadow, under trees, indoors.)
+    c += env * Fe * gloss * mix(0.5, 1.0, lit) * pc.env.x * mix(1.0, 0.35, snow);
+  }
+  // Glints in the sunlit snow: crystals catching it, changing as the view
+  // moves (fewer far off: they'd shimmer).
+  if (snow > 0.0) {
+    float dist = length(pc.cam.xyz - P);
+    ivec3 cell = ivec3(floor(P * 30.0));
+    ivec3 hb = ivec3(floor(H * 7.0));
+    float g = step(0.995, Hash3(cell, hb.x * 31 + hb.y * 17 + hb.z * 7));
+    c += pc.col.rgb * g * snow * lit * nl * 2.5 * smoothstep(35.0, 8.0, dist);
+  }
+  if (pc.L.w > 0.5) {
+    // (Diagnostics: the surfaces: snow white, metal blue, wood brown, rock
+    // grey, paint magenta, cloth green, foliage dark green, unknown black.)
+    const vec3 kTag[7] = vec3[7](vec3(0.0), vec3(1.0), vec3(0.2, 0.4, 1.0), vec3(0.55, 0.3, 0.1),
+                                 vec3(0.45), vec3(1.0, 0.1, 0.8), vec3(0.1, 0.9, 0.2));
+    c = foliage ? vec3(0.0, 0.3, 0.0) : kTag[min(tag, 6u)];
+  }
+  o = vec4(c, d);
+}
+)", true);
+  copy_fs_[61] = CompileBuiltin("builtin_sun_spec_ms", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D albedo;
+layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the game's material (foliage > 0)
+layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(set = 0, binding = 3) uniform sampler2D mask;     // the sun's shadows (1 lit)
+// 12 x 1: 0-3 the hour's sky (zenith, horizon), 4-7 the backdrop's light,
+// 8 the lighting's stencil test (SunSpecular).
+layout(set = 0, binding = 4) uniform sampler2D sky;
+layout(set = 0, binding = 5) uniform usampler2DMS stencil;  // the lighting's depth target's
+#define relight sky
+layout(push_constant) uniform Spec {
+  mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
+  vec4 L;    // toward the light, -
+  vec4 col;  // its color (exposed), -
+  vec4 cam;  // camera, mask on (0/1)
+  vec4 env;  // the sky's reflection: strength (exposure; 0 none), -
+} pc;
+layout(location = 0) out vec4 o;
+// (An integer hash: a cell's own, far from the origin too.)
+float Hash3(ivec3 c, int k) {
+  uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u ^ uint(k) * 2654435761u;
+  h ^= h >> 16;
+  h *= 0x7feb352du;
+  h ^= h >> 15;
+  h *= 0x846ca68bu;
+  h ^= h >> 16;
+  return float(h & 0xFFFFFFu) / 16777216.0;
+}
+float D_GGX(float nh, float a) {
+  float a2 = a * a;
+  float dd = nh * nh * (a2 - 1.0) + 1.0;
+  return a2 / (3.14159 * dd * dd);
+}
+float G_Smith(float nv, float nl, float a) {
+  float k = a * 0.5;
+  return (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  ivec2 sz = textureSize(depth, 0);
+  float d = texelFetch(depth, ip, 0).r;
+  if (d <= 0.0) {
+    o = vec4(0.0);
+    return;
+  }
+  vec2 uv = (gl_FragCoord.xy) / vec2(sz);
+  vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
+  vec3 P = wp.xyz / wp.w;
+  vec3 V = normalize(pc.cam.xyz - P);
+  vec4 nw = texelFetch(normals, ip, 0);
+  // No normal there (the lighting's clear): the far-off scenery beyond the
+  // slopes, drawn with its light painted in and never lit by the lighting
+  // pass. Lit again for the hour instead: its surface's facing from the
+  // depth (each way, the nearer side's: not across an outline), the painted
+  // light taken as the mountain's sun and sky, and the hour's put in their
+  // place. Out: that factor, the depth negated (the add multiplies).
+  // Not lit by the lighting pass: where its stencil test fails (as the
+  // lighting will find it); without one, where there's no normal (the
+  // clear: not a normal, its alpha whole - the game's material 3 with our
+  // tag 7, which no surface is given; an edge's average isn't).
+  vec4 stt = texelFetch(relight, ivec2(8, 0), 0);
+  bool unlit;
+  if (stt.w > 0.5) {
+    uint sv = texelFetch(stencil, ip, 0).r & 0xFFu;
+    uint ref = uint(stt.x) & 0xFFu, msk = uint(stt.y) & 0xFFu, fn = uint(stt.z);
+    uint a = ref & msk, b = sv & msk;
+    bool pass = fn == 0u ? false : fn == 1u ? a < b : fn == 2u ? a == b : fn == 3u ? a <= b
+              : fn == 4u ? a > b : fn == 5u ? a != b : fn == 6u ? a >= b : true;
+    unlit = !pass;
+  } else {
+    unlit = abs(length(nw.xyz * 2.0 - 1.0) - 1.0) > 0.2 && nw.w > 254.5 / 255.0;
+  }
+  if (unlit) {
+    vec4 r1 = texelFetch(relight, ivec2(5, 0), 0);
+    if (r1.w < 0.5) {
+      o = vec4(0.0);
+      return;
+    }
+    vec4 r0 = texelFetch(relight, ivec2(4, 0), 0);
+    vec4 r2 = texelFetch(relight, ivec2(6, 0), 0);
+    vec4 r3 = texelFetch(relight, ivec2(7, 0), 0);
+    vec3 side[4];
+    float dist[4];
+    const ivec2 kOff[4] = ivec2[4](ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
+    for (int k = 0; k < 4; ++k) {
+      ivec2 q = clamp(ip + kOff[k], ivec2(0), sz - 1);
+      float dq = texelFetch(depth, q, 0).r;
+      vec4 wq = pc.m * vec4((vec2(q) + 0.5) / vec2(sz) * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 1.0 - max(dq, 1e-7), 1.0);
+      side[k] = wq.xyz / wq.w - P;
+      dist[k] = dq <= 0.0 ? 1e9 : abs(dot(side[k], V));
+    }
+    vec3 dx = dist[0] < dist[1] ? side[0] : -side[1];
+    vec3 dy = dist[2] < dist[3] ? side[2] : -side[3];
+    vec3 Nb = cross(dx, dy);
+    float nlen = length(Nb);
+    Nb = nlen > 1e-6 ? Nb / nlen : V;
+    if (dot(Nb, V) < 0.0) Nb = -Nb;
+    float amb = r0.w;
+    float e0 = amb + (1.0 - amb) * max(dot(Nb, r0.xyz), 0.0);
+    // (The hour's sun through the mask: the clouds' shadows, the far
+    // shadows; not at the mountain's own hour, its painted shade is in.)
+    float sh = pc.cam.w > 0.5 ? mix(1.0, texelFetch(mask, ip, 0).r, r2.w) : 1.0;
+    vec3 e1 = amb * r1.rgb + (1.0 - amb) * r2.rgb * max(dot(Nb, r3.xyz), 0.0) * sh;
+    o = vec4(clamp(e1 / max(e0, 0.25), vec3(0.0), vec3(4.0)), -d);
+    return;
+  }
+  if (texelFetch(relight, ivec2(7, 0), 0).w < 0.5) {
     o = vec4(0.0);  // (the sheen's off: the backdrop only)
     return;
   }
@@ -7200,10 +7401,13 @@ void main() {
           float behind = cw - dot(R3, vec4(World(quv, ds), 1.0));
           float bias = 0.5 + cw * 0.004 + t * 0.02;
           float thick = 12.0 + 0.3 * t;
-          occ = max(occ, smoothstep(bias, bias * 2.0 + 2.0, behind) * (1.0 - smoothstep(thick, thick * 1.4, behind)));
-          if (occ > 0.99) break;
+          occ += smoothstep(bias, bias * 2.0 + 2.0, behind) * (1.0 - smoothstep(thick, thick * 1.4, behind));
+          if (occ > 2.5) break;
         }
-        ml = 1.0 - occ;
+        // (Several steps behind for a shadow: a ridge holds many, a tree's
+        // crown on the way one or two - left to the sun maps nearer, and
+        // only speckle this far off.)
+        ml = 1.0 - smoothstep(0.8, 2.5, occ);
       }
       lit *= mix(1.0, mix(pl, ml, away), k);
     }
@@ -11656,8 +11860,28 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   // sky's share of that light (the rest the sun's); the hour's sky and sun,
   // as the lighting has them (scaled per color), its direction; how far the
   // sun is from the mountain's (its shadows then from the mask).
+  // (The lighting's depth target, for its stencil: which pixels it lights.)
+  Image* zt = nullptr;
+  float stt[4] = {};
   {
-    float f[16] = {};
+    const uint32_t depth_ctl = st.reg(0x2200), srm = st.reg(0x210D);
+    if ((depth_ctl & 1) && !Diag("nostenciltest")) {
+      zt = GetTarget(DepthKey(st.reg(0x2000), st.reg(0x2002)));
+      if (zt && (!zt->depth || !zt->stencil_view || zt->width != a3->width || zt->height != a3->height)) zt = nullptr;
+    }
+    if (zt) {
+      stt[0] = float(srm & 0xFF);
+      stt[1] = float((srm >> 8) & 0xFF);
+      stt[2] = float((depth_ctl >> 8) & 7);
+      stt[3] = 1.0f;
+    }
+    if (Diag("sun")) {
+      std::fprintf(stderr, "spec: lighting stencil %s ref %u mask %u func %u\n", zt ? "on" : "off", srm & 0xFF,
+                   (srm >> 8) & 0xFF, (depth_ctl >> 8) & 7);
+    }
+  }
+  {
+    float f[20] = {};
     for (int i = 0; i < 3; ++i) f[i] = tod_game_light_[i];
     f[3] = 0.4f;
     f[4] = float(lm_ambient_scale_.x);
@@ -11675,18 +11899,29 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
     if (!lm_set_dir_) {
       for (int i = 0; i < 3; ++i) f[12 + i] = tod_game_light_[i];
     }
+    for (int i = 0; i < 4; ++i) f[16 + i] = stt[i];
+    // One row: the sky's colors (texels 0-3, copied), these (4-8).
     if (!relight_params_.image) {
-      relight_params_ = gpu_.CreateImage(4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "backdrop_light");
+      relight_params_ = gpu_.CreateImage(12, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "sheen_settings");
       ToGeneral(cb_, relight_params_);
     }
     Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     std::memcpy(staging.mapped, f, sizeof(f));
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {4, 1, 1};
+    region.imageOffset = {4, 0, 0};
+    region.imageExtent = {5, 1, 1};
     Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, relight_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     staging_.push_back(staging);
+    if (tod_colors_.image && tod_colors_.width >= 4) {
+      VkImageCopy ic{};
+      ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      ic.extent = {4, 1, 1};
+      vk::vkCmdCopyImage(cb_, tod_colors_.image, VK_IMAGE_LAYOUT_GENERAL, relight_params_.image,
+                         VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+    }
+    Barrier();
   }
   if (!spec_img_.image || spec_img_.width != a3->width || spec_img_.height != a3->height) {
     if (spec_img_.image) Retire(spec_img_);
@@ -11709,9 +11944,13 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   Barrier();
   // (Its depth: a copy-sized float would lose nothing; R16F alpha keeps the
   // match test's tolerance relative.)
-  FullscreenPass(CopyKind::kSunSpec, &spec_img_, albedo, tod_normal_, &dit->second, false, pc, 32, nullptr,
-                 tod_mask_ok_ ? &tod_mask_ : &tod_white_, tod_colors_.image ? &tod_colors_ : &tod_white_,
-                 &relight_params_);
+  // (The stencil read as the depth target's stencil aspect; without one, a
+  // stand-in the shader doesn't read.)
+  Image stencil_in = zt ? *zt : spec_stencil_dummy_;
+  if (zt) stencil_in.sample_view = zt->stencil_view;
+  FullscreenPass(zt && zt->samples > 1 ? CopyKind::kSunSpecMs : CopyKind::kSunSpec, &spec_img_, albedo, tod_normal_,
+                 &dit->second, false, pc, 32, nullptr, tod_mask_ok_ ? &tod_mask_ : &tod_white_, &relight_params_,
+                 &stencil_in);
   Barrier();
   dyn_ = DynState{};
   spec_ok_ = true;
@@ -12405,6 +12644,11 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
     for (float& v : one.float32) v = 1.0f;
     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vk::vkCmdClearColorImage(cb_, tod_white_.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+  }
+  if (ensure(spec_stencil_dummy_, 1, 1, VK_FORMAT_R8_UINT, "sheen_stencil_none")) {
+    VkClearColorValue zero{};
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk::vkCmdClearColorImage(cb_, spec_stencil_dummy_.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
   }
   TodShadows();
   SunSpecular(d, st);
@@ -16227,7 +16471,7 @@ Renderer::Impl::~Impl() {
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
                     &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &icons_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
-                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_, &relight_params_, &tod_params_}) {
+                    &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_, &relight_params_, &tod_params_, &spec_stencil_dummy_}) {
     gpu_.DestroyImage(*im);
   }
   gpu_.DestroyImage(fog_color_img_[0]);
