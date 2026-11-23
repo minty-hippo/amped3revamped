@@ -628,6 +628,31 @@ that rule against a save that has the pass.
     a load from the menus: coming back to riding from a story scene (game
     state 20, or one in the few seconds before the dark) goes straight on.
     The log names the game states the load went through.
+  - **World light (experimental prototype)** (Graphics > Lighting,
+    `native_world_light`, 0 = off; needs World shadows): the world that
+    stays put is turned into voxels round the camera in two cascades
+    (128 a side: 1 m blocks out to about 64 m, 4 m out to about 256 m),
+    from the draws the sun maps already redraw, seen orthographically from
+    above and from either side along x and z (five depth maps a cascade,
+    each column of voxels a 128-bit texel). The cascades are rebuilt with
+    the sun maps' updates once the camera is an eighth of a box from where
+    it was, and merged with what was there, so what's been seen stays.
+    Each half-size pixel then traces 12 rays (cosine-weighted) through
+    them, cell by cell. A ray that hits something takes off the sky light
+    the game gave from that way (its ambient is the lighting's own
+    spherical harmonics, which assume an open sky) and puts on the light
+    of what it hit: as lit on screen where the hit shows there (so lamps
+    and the sun's shadows come for free), else worked out (a colour guess
+    from which way it faces, the sky's light, the sun's if a ray toward it
+    gets out). Blurred twice each way across like depths, then added the
+    way Light bounce is (which it replaces while on). In the replays: the
+    snow under a lift station's roof darkens and turns bluer, the roof's
+    underside, benches and tree trunks pick up light off the snow, the
+    foot of a kicker's shaded face darkens; on an open slope it's subtle.
+    The GPU timer splits it as "world light: voxelise" and "world light:
+    trace". Diagnostics: `gishow` (grey none, darker taken off, lighter put
+    on), `giview` (the voxels seen from the camera), `ginosky`, `ginoput`,
+    `gimany` (32 rays), `ginoblur`, `gievery`, `nogi`. Replay: `--gi 1`.
   - **Rider shine** (Graphics > Lighting, `native_rider_shine`, 0.35; 1 the
     game's): the riders' and characters' own pixel shaders add a broad
     Phong highlight (an exponent of 7, the full strength of their specular
