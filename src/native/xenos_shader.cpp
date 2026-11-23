@@ -283,10 +283,12 @@ class Translator {
  private:
   bool vs() const { return stage_ == ShaderStage::kVertex; }
 
-  // Plainer forms of a vertex shader (TranslateOptions::safe_level), for a
-  // driver whose compiler crashed on the normal one: 1 without precise /
-  // invariant, 2 also trunc() as floor() of the magnitude. (3, also no
-  // fragment shader with no color targets, is the renderer's.)
+  // A plainer form of a vertex shader (TranslateOptions::safe_level), for a
+  // driver whose compiler crashed on the normal one: the shader as it was
+  // before the wind (no wind, no instance placement) with XeSystem cut back
+  // to the members it had then (no wind matrices, no material) - testing
+  // whether Turnip (Mesa 26.3, the Odin 3) trips over the larger uniform
+  // block in the instanced vertex shaders.
   std::string SafeGlsl(std::string g) const {
     if (!vs() || options_.safe_level < 1) return g;
     auto replace_all = [&](const std::string& from, const std::string& to) {
@@ -294,17 +296,31 @@ class Translator {
         g.replace(at, from.size(), to);
       }
     };
-    replace_all("invariant gl_Position;\n", "");
-    replace_all("precise ", "");
-    if (options_.safe_level >= 2) {
-      replace_all("trunc(", "xe_trunc(");
-      const size_t at = g.find('\n') + 1;  // after #version
-      g.insert(at,
-               "float xe_trunc(float x) { return x < 0.0 ? -floor(-x) : floor(x); }\n"
-               "vec2 xe_trunc(vec2 x) { return sign(x) * floor(abs(x)); }\n"
-               "vec3 xe_trunc(vec3 x) { return sign(x) * floor(abs(x)); }\n"
-               "vec4 xe_trunc(vec4 x) { return sign(x) * floor(abs(x)); }\n");
+    // The wind function: a stub.
+    const size_t w0 = g.find("vec4 xe_wind(vec4 p, float t) {");
+    if (w0 != std::string::npos) {
+      const size_t w1 = g.find("\n}\n", w0);
+      if (w1 != std::string::npos) g.replace(w0, w1 + 3 - w0, "vec4 xe_wind(vec4 p, float t) { return p; }\n");
     }
+    // Lines that capture the placement, and XeSystem's later members.
+    std::string out;
+    bool cut = false;
+    size_t at = 0;
+    while (at < g.size()) {
+      size_t nl = g.find('\n', at);
+      if (nl == std::string::npos) nl = g.size() - 1;
+      const std::string line = g.substr(at, nl + 1 - at);
+      at = nl + 1;
+      if (line.find("  mat4 wind_m;") == 0) cut = true;
+      const bool drop = cut || line.find("xe_wind_org[") != std::string::npos ||
+                        line.find("xe_wind_rows |=") != std::string::npos;
+      if (cut && line.find("  uvec4 material;") == 0) cut = false;
+      if (!drop) out += line;
+    }
+    g = std::move(out);
+    replace_all("uintBitsToFloat(xe_sys.material.w)", "0.0");
+    replace_all("xe_sys.wind.w - xe_sys.wind2.w", "0.0");
+    replace_all("xe_sys.wind.w", "0.0");
     return g;
   }
 

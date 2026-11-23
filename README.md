@@ -632,14 +632,11 @@ that rule against a save that has the pass.
     the Odin 3's Turnip driver): the crash report now says what the crashing
     thread was building ("while: pipeline vs ... ps ..." or "built-in pass
     N"), and the same line goes into `logs\native_pipelines\crashed_pipelines.txt`.
-    On the next start it is left out (not precompiled, its draws skipped,
-    named once in the log). (A ladder of plainer vertex shaders is in the
-    code, switched off - kPlainerSteps - since on the Odin 3 none helped:
-    each crash made it one step plainer, until one built (it then stays at that step; the log names it,
-    "vertex shader ... made plainer (level N)"): 1 without precise /
-    invariant, 2 also trunc() spelled with floor(), 3 also no fragment
-    shader where there are no color targets (depth alone: no alpha test).
-    Past 3 the pipeline was left out.) Records carry the shader translation's version (" tv4"), so an update
+    On the next start its vertex shader is translated as it was before the
+    wind (no wind, the uniform block without its later members - the
+    25 October form), named in the log ("made plainer (level 1)"); if that
+    crashes too, the pipeline is left out (not precompiled, its draws
+    skipped). Records carry the shader translation's version (" tv5"), so an update
     that may fix a crash tries again by itself; delete the file to start
     over. (The Odin 3, Turnip / Mesa 26.3: the instanced trees drawn into
     a depth target alone - the game's shadow map - vertex shader

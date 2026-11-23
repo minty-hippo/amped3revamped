@@ -90,9 +90,8 @@ struct TranslateOptions {
   // variant's, so a depth-EQUAL pass matches the scene.
   bool velocity = false;
   // A plainer vertex shader, for a driver that crashed building the normal
-  // one (renderer.cpp: crashed_pipelines.txt): 1 without precise /
-  // invariant, 2 also trunc() spelled with floor() (3: the renderer leaves
-  // out the fragment shader of a pipeline with no color targets).
+  // one (renderer.cpp: crashed_pipelines.txt): 1 as before the wind - no
+  // wind, and the uniform block without its later members.
   int safe_level = 0;
 };
 

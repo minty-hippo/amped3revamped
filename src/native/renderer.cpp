@@ -2049,8 +2049,8 @@ struct Renderer::Impl {
   // Per vertex shader (its microcode hash) that crashed the driver: the
   // plainer translation to try next (TranslateOptions::safe_level).
   std::unordered_map<uint64_t, int> safe_level_;
-  static constexpr int kSafeLevels = 3;
-  static constexpr bool kPlainerSteps = false;  // the plainest (TranslateOptions::safe_level)
+  static constexpr int kSafeLevels = 1;
+  static constexpr bool kPlainerSteps = true;  // the plainest (TranslateOptions::safe_level)
   // Game pixel shaders as drawn into a depth target alone (one sample): no
   // color outputs, no sample mask (DepthOnlyPs).
   std::unordered_map<const Shader*, Shader> depth_only_ps_;
@@ -4024,7 +4024,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   char pipe_id[112];
   // (" tv<N>": the shader translation's version, bumped when a change may
   // fix a driver crash, so what crashed an older one is tried again.)
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv4",
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv5",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
                 reactive ? " reactive" : "", caster ? " caster" : "",
@@ -4174,9 +4174,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   pr.stencilAttachmentFormat = depth ? depth->format : VK_FORMAT_UNDEFINED;
   auto& pci = build->pci;
   pci.pNext = &pr;
-  // (The plainest form for a driver that crashed: depth alone, no fragment
-  // shader - no alpha test, so cut-out leaves cast solid cards.)
-  pci.stageCount = vs.safe_level >= kSafeLevels && colors.empty() ? 1 : 2;
+  pci.stageCount = 2;
   pci.pStages = stages;
   pci.pVertexInputState = &vi;
   pci.pInputAssemblyState = &ia;
@@ -4279,10 +4277,11 @@ void Renderer::Impl::ReadCrashed() {
       // (Only this translation's crashes: see pipe_id's " tv".)
       const size_t bar0 = line.find(" | ");
       const std::string head = line.substr(0, bar0);
-      if (head.size() < 4 || (head.compare(head.size() - 4, 4, " tv4") != 0 &&
-                               head.compare(head.size() - 4, 4, " tv3") != 0)) {
-        continue;  // (tv3's shaders are tv4's at level 0)
+      if (head.size() < 4 || (head.compare(head.size() - 4, 4, " tv5") != 0 &&
+                               head.compare(head.size() - 4, 4, " tv4") != 0)) {
+        continue;  // (tv4's level-0 shaders are tv5's; its plainer ones aren't)
       }
+      if (head.compare(head.size() - 4, 4, " tv4") == 0 && head.find(" safe") != std::string::npos) continue;
     }
     const size_t bar = line.find(" | ");
     const std::string id = line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9);
