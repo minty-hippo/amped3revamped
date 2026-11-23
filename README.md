@@ -628,6 +628,13 @@ that rule against a save that has the pass.
     a load from the menus: coming back to riding from a story scene (game
     state 20, or one in the few seconds before the dark) goes straight on.
     The log names the game states the load went through.
+  - **Pipelines built one at a time on Adreno (Turnip)**: the Odin 3's
+    driver (Mesa 26.3) crashed in its shader compiler with many different
+    shaders, always on the background builders, since pipelines started
+    being built on several threads at once (17 November: background builds,
+    precompiling); now every pipeline build there takes a lock (one at a
+    time, one precompile thread). Diagnostics `serialpipes` /
+    `parallelpipes` force it either way.
   - **A pipeline that crashes the graphics driver** as it's built (seen on
     the Odin 3's Turnip driver): the crash report now says what the crashing
     thread was building ("while: pipeline vs ... ps ..." or "built-in pass
@@ -636,7 +643,7 @@ that rule against a save that has the pass.
     wind (no wind, the uniform block without its later members - the
     25 October form), named in the log ("made plainer (level 1)"); if that
     crashes too, the pipeline is left out (not precompiled, its draws
-    skipped). Records carry the shader translation's version (" tv5"), so an update
+    skipped). Records carry the shader translation's version (" tv6"), so an update
     that may fix a crash tries again by itself; delete the file to start
     over. (The Odin 3, Turnip / Mesa 26.3: the instanced trees drawn into
     a depth target alone - the game's shadow map - vertex shader

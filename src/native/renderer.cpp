@@ -1239,6 +1239,13 @@ struct Renderer::Impl {
         precompile_dir_ = pcp.substr(0, slash) + "/native_pipelines";
       }
     }
+    serial_pipes_ = (gpu_.device_name.find("Adreno") != std::string::npos ||
+                     gpu_.device_name.find("Turnip") != std::string::npos || Diag("serialpipes")) &&
+                    !Diag("parallelpipes");
+    if (serial_pipes_) {
+      pending_notices_.push_back("pipelines built one at a time (" + gpu_.device_name +
+                                 ": its driver crashes building several at once)");
+    }
     ReadCrashed();
     LoadCloudSprite();
     if (options_.texture_pack || options_.hd_fonts || options_.upscaled_textures) {
@@ -2097,7 +2104,17 @@ struct Renderer::Impl {
                     bool mask, bool reactive, bool caster);
   Shader* PrecompileShader(uint8_t recipe, uint64_t hash);
   void PrecompileStep(double budget_ms);
+  // Pipelines built one at a time (all threads): Turnip (Mesa 26.3, the
+  // Odin 3's Adreno) crashes in its shader compiler when several are built
+  // at once - the crashes came with many different shaders, always on the
+  // background builders, since builds went parallel (17 November).
+  bool serial_pipes_ = false;
+  std::mutex pipe_build_mutex_;
+  std::unique_lock<std::mutex> PipeLock() {
+    return serial_pipes_ ? std::unique_lock<std::mutex>(pipe_build_mutex_) : std::unique_lock<std::mutex>();
+  }
   size_t PrecompileThreads() const {
+    if (serial_pipes_) return 1;
     const unsigned n = std::thread::hardware_concurrency();
     return std::clamp<size_t>(n > 4 ? n - 3 : 2, 2, 8);
   }
@@ -4024,7 +4041,7 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   char pipe_id[112];
   // (" tv<N>": the shader translation's version, bumped when a change may
   // fix a driver crash, so what crashed an older one is tried again.)
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv5",
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv6",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
                 reactive ? " reactive" : "", caster ? " caster" : "",
@@ -4215,7 +4232,11 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   // frame's first, rather than only once the frame's budget is spent.
   if (deferrable && gpu_.cache_control && frame_number_ >= 120 && !Diag("nocachetry")) {
     pci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
-    const VkResult r = vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p);
+    VkResult r;
+    {
+      const auto lock = PipeLock();
+      r = vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p);
+    }
     pci.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
     if (r != VK_SUCCESS || p == VK_NULL_HANDLE) {
       if (p != VK_NULL_HANDLE) vk::vkDestroyPipeline(gpu_.device, p, nullptr);
@@ -4225,9 +4246,11 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
       last_pipeline_pending_ = true;
       return VK_NULL_HANDLE;
     }
-  } else if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p) !=
-             VK_SUCCESS) {
-    p = VK_NULL_HANDLE;
+  } else {
+    const auto lock = PipeLock();
+    if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p) != VK_SUCCESS) {
+      p = VK_NULL_HANDLE;
+    }
   }
   const double took = MsSince(t_pipe);
   // (Slow ones that couldn't wait, told in the log: what they were for.)
@@ -4277,11 +4300,9 @@ void Renderer::Impl::ReadCrashed() {
       // (Only this translation's crashes: see pipe_id's " tv".)
       const size_t bar0 = line.find(" | ");
       const std::string head = line.substr(0, bar0);
-      if (head.size() < 4 || (head.compare(head.size() - 4, 4, " tv5") != 0 &&
-                               head.compare(head.size() - 4, 4, " tv4") != 0)) {
-        continue;  // (tv4's level-0 shaders are tv5's; its plainer ones aren't)
+      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv6") != 0) {
+        continue;  // (crashes before pipelines were built one at a time: tried again)
       }
-      if (head.compare(head.size() - 4, 4, " tv4") == 0 && head.find(" safe") != std::string::npos) continue;
     }
     const size_t bar = line.find(" | ");
     const std::string id = line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9);
@@ -4555,6 +4576,7 @@ void Renderer::Impl::SpawnBuilder() {
           VkPipeline p = VK_NULL_HANDLE;
           {
             const amped3::crash_note::Scope note(b->note.c_str());
+            const auto lock = PipeLock();
             if (vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &b->pci, nullptr,
                                               &p) != VK_SUCCESS) {
               p = VK_NULL_HANDLE;
@@ -9633,6 +9655,7 @@ VkPipeline Renderer::Impl::CopyPipeline(CopyKind kind, VkFormat format) {
     char what[64];
     std::snprintf(what, sizeof(what), "built-in pass %d (format %d)", int(kind), int(format));
     const amped3::crash_note::Scope note(what);
+    const auto lock = PipeLock();
     vk::Check(vk::vkCreateGraphicsPipelines(gpu_.device, gpu_.pipeline_cache, 1, &pci, nullptr, &p),
               "copy pipeline");
   }
