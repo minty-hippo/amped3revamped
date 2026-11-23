@@ -4284,14 +4284,16 @@ void Renderer::Impl::ReadCrashed() {
     // crash; past the last, the pipeline's left out.)
     unsigned long long vsh = 0;
     int lvl = 0;
-    if (std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
+    // (Off for now: the Odin 3's crash came with and without wind, so a
+    // crash leaves the pipeline out at once rather than after three more.)
+    if (false && std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
       const size_t at = id.find(" safe");
       if (at != std::string::npos) lvl = std::atoi(id.c_str() + at + 5);
       int& l = safe_level_[uint64_t(vsh)];
       l = std::max(l, lvl + 1);
     }
     // (The list's line only once the plainest has crashed too.)
-    if (bar != std::string::npos && lvl >= 2) crashed_lines_.insert(line.substr(bar + 3));
+    if (bar != std::string::npos) crashed_lines_.insert(line.substr(bar + 3));
   }
   if (!crashed_ids_.empty()) {
     pending_notices_.push_back(std::to_string(crashed_ids_.size()) +
