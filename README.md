@@ -873,13 +873,20 @@ that rule against a save that has the pass.
   | Kind (lamp, floodlight, window / panel, campfire, street light: a 7.5 m pole standing where aimed, caged light) | X | J |
   | What the D-pad changes (shown on the controls bar): turn and tilt; width and height; reach and spread; color and brightness | R3 | K |
   | Turn / tilt (a floodlight's aim, a lamp's arm, a window's slope, a caged light's axis) | D-pad left right / up down | , . / [ ] |
-  | Width / height (a window or panel; 12% a press, 0.1 to 30 m) | D-pad left right / up down | , . / [ ] |
+  | Width / height (a window or panel; 4% a press, 0.1 to 30 m) | D-pad left right / up down | , . / [ ] |
   | Reach (how far its light goes, 20% a press) / spread (how wide its light is cast: a floodlight's beam, a street light's spread, a window's out of its face, a lamp's down, a caged light's along its axis; all round at the widest) | D-pad left right / up down | , . / [ ] |
   | Color (warm, daylight, cool, amber, red, green, blue, purple, pink) / brightness | D-pad left right / up down | , . / [ ] |
   | Pick a placed light, object by object (it pulses gold) | LB / RB | Page Up / Down |
   | Delete the picked light (all copies when it's on every copy) | X | Delete |
   | Undo | Start | Ctrl+Z |
   | Unpick, then leave the editor | B | Backspace |
+  Holding a D-pad direction repeats it (after 0.4 s, 12 a second; not for
+  colors). Objects stretched unevenly (up to 8:1, like a long building) now
+  count as objects for "on every copy". One drawn in place (its points
+  already in the world, so no copies of its own) gets one light instead, and
+  says so; one whose placement isn't recognised does too, and its draw goes
+  in the log ("object placement not recognised: vs ... c0 ...") so it can
+  be added.
   The preview takes the size, reach, spread and brightness set; the picked
   light (or all its copies) changes as you press. The object for "on every
   copy" is the one actually drawn at the cross: each object drawn in the

@@ -655,7 +655,21 @@ std::string PlaceOnEveryCopy() {
       if (in.key == hit.key && std::memcmp(in.m, hit.m, sizeof(in.m)) == 0) best = &in;
     }
   } else if (picked == 2) {
-    return "Night lights: that's part of the mountain itself, not an object (place one light instead)";
+    if (hit.why == 0) {
+      return "Night lights: that's part of the mountain itself, not an object (place one light instead)";
+    }
+    // Drawn where it stands (its points already in the world: no
+    // placement, so no copies to find), or a placement not recognised
+    // (logged: "object placement not recognised"): one light there.
+    Remember();
+    g_s.lights.push_back(l);
+    Changed();
+    Publish();
+    return hit.why == 1
+               ? std::string("Placed one ") + kKinds[g_kind].name +
+                     ": that object is drawn in place, with no copies of its own"
+               : std::string("Placed one ") + kKinds[g_kind].name +
+                     ": that object's copies can't be told apart yet (its draw is in the log)";
   }
   float best_s = best ? -1.0f : 1e9f;
   for (const Instance& in : g_instances) {
@@ -731,7 +745,7 @@ int Mode() {
 
 std::string Resize(int wider, int taller) {
   std::lock_guard lock(g_mutex);
-  const float fw = std::pow(1.12f, float(wider)), fh = std::pow(1.12f, float(taller));
+  const float fw = std::pow(1.04f, float(wider)), fh = std::pow(1.04f, float(taller));
   auto apply = [&](float* sz) {
     sz[0] = std::clamp(sz[0] * fw, 0.1f, 30.0f);
     sz[1] = std::clamp(sz[1] * fh, 0.1f, 30.0f);

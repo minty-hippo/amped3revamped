@@ -385,6 +385,9 @@ class Renderer {
   struct Instance {
     uint64_t key = 0;
     float m[12] = {};
+    // (PickedObject's, when it returns 2: 1 drawn in world space - it has
+    // no placement, so no copies; 2 a placement not recognised.)
+    int why = 0;
   };
   void SetCollectInstances(bool on);
   const std::vector<Instance>& Instances() const;

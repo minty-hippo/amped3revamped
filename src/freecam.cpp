@@ -550,10 +550,27 @@ void OnPad(const pad::Snapshot& pad) {
     if (keys.ed_kind) say = night_lights::NextKind(1);
     if (keys.ed_delete) say = night_lights::DeleteSelected();
     // The D-pad: left / right and up / down, for what it changes now.
-    const int lr = keys.ed_turn + ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) -
-                   ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
-    const int ud = keys.ed_tilt + ((pressed & X_INPUT_GAMEPAD_DPAD_UP) ? 1 : 0) -
-                   ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) ? 1 : 0);
+    // (Held, it repeats - after 0.4 s, 12 a second - except for colors.)
+    uint16_t dpad = pressed;
+    {
+      constexpr uint16_t kDpad = X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_DPAD_DOWN |
+                                 X_INPUT_GAMEPAD_DPAD_LEFT | X_INPUT_GAMEPAD_DPAD_RIGHT;
+      static uint16_t held = 0;
+      static std::chrono::steady_clock::time_point next{};
+      const auto now = std::chrono::steady_clock::now();
+      const uint16_t h = uint16_t(pad.buttons & kDpad);
+      if (h != held) {
+        held = h;
+        next = now + std::chrono::milliseconds(400);
+      } else if (h && night_lights::Mode() != 3 && now >= next) {
+        dpad |= h;
+        next = now + std::chrono::milliseconds(83);
+      }
+    }
+    const int lr = keys.ed_turn + ((dpad & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) -
+                   ((dpad & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
+    const int ud = keys.ed_tilt + ((dpad & X_INPUT_GAMEPAD_DPAD_UP) ? 1 : 0) -
+                   ((dpad & X_INPUT_GAMEPAD_DPAD_DOWN) ? 1 : 0);
     switch (night_lights::Mode()) {
       case 0:
         if (lr) say = night_lights::Rotate(15.0f * float(lr));

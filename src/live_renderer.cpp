@@ -3039,7 +3039,7 @@ uint64_t MountainKey() {
 }
 int PickedObject(native::Renderer::Instance* out) {
   std::lock_guard lock(g_game_camera_mutex);
-  if (g_picked_state == 1 && out) *out = g_picked;
+  if (g_picked_state != 0 && out) *out = g_picked;
   return g_picked_state;
 }
 bool CenterPoint(float out[3], float normal[3]) {

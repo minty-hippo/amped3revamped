@@ -1315,6 +1315,7 @@ struct Renderer::Impl {
     // The light editor's object under the cross (pick_pool_): the object
     // each query's draw placed (key 0: the world itself), how many queries.
     std::vector<Renderer::Instance> pick_objs;
+    std::vector<std::string> pick_why;  // (an object whose placement wasn't recognised: its draw)
     uint32_t pick_count = 0;
   };
   // Texture uploads of the frame being recorded: their own command buffer,
@@ -1695,6 +1696,7 @@ struct Renderer::Impl {
     double zs, zo;
     bool has_world;
     double world[12];  // object -> world found in its constants (has_world)
+    uint64_t vs = 0;  // (its vertex shader: logged when a pick can't place it)
   };
   std::vector<PendingInstance> pending_instances_;
   // The object under the cross (the light editor): each scene draw drawn
@@ -1708,6 +1710,7 @@ struct Renderer::Impl {
   int pick_q_ = -1;  // the current draw's
   Renderer::Instance picked_{};
   int picked_state_ = 0;  // 0 nothing (or not known), 1 an object, 2 the world itself
+  std::string picked_why_;  // (the last unrecognised one logged)
   std::vector<Renderer::Instance> instances_;
   void ResolveInstances();
   // The middle of the screen's depth, read back 4 frames later (CenterPoint).
@@ -13588,6 +13591,29 @@ void Renderer::Impl::ResolveInstances() {
     } else if (p.has_world) {
       for (int i = 0; i < 12; ++i) in.m[i] = float(p.world[i]);
     } else {
+      // (For the pick: why it has no copies.)
+      if (p.query >= 0 && cur_slot_ && size_t(p.query) < cur_slot_->pick_objs.size()) {
+        Renderer::Instance& o = cur_slot_->pick_objs[size_t(p.query)];
+        o.why = std::fabs(w) > 1e-9 ? 1 : 2;
+        if (o.why == 1) {
+          bool ident = true;
+          for (int r = 0; r < 3 && ident; ++r) {
+            for (int c = 0; c < 4; ++c) ident = ident && std::fabs(W[r * 4 + c] / w - (r == c ? 1.0 : 0.0)) < 1e-2;
+          }
+          if (!ident) o.why = 2;
+        }
+        if (o.why == 2) {
+          char buf[512];
+          std::snprintf(buf, sizeof(buf),
+                        "vs %016llX key %016llX c0 %.3g %.3g %.3g %.3g c1 %.3g %.3g %.3g %.3g c2 %.3g %.3g %.3g "
+                        "%.3g c3 %.3g %.3g %.3g %.3g",
+                        (unsigned long long)p.vs, (unsigned long long)p.key, p.m[0], p.m[1], p.m[2], p.m[3],
+                        p.m[4], p.m[5], p.m[6], p.m[7], p.m[8], p.m[9], p.m[10], p.m[11], p.m[12], p.m[13],
+                        p.m[14], p.m[15]);
+          if (cur_slot_->pick_why.size() < cur_slot_->pick_objs.size()) cur_slot_->pick_why.resize(cur_slot_->pick_objs.size());
+          cur_slot_->pick_why[size_t(p.query)] = buf;
+        }
+      }
       continue;
     }
     if (p.query >= 0 && cur_slot_ && size_t(p.query) < cur_slot_->pick_objs.size()) {
@@ -15696,6 +15722,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       pi.m[i] = f;
     }
     pi.query = pick_q_;
+    pi.vs = vs->info.ucode_hash;
     pi.zs = sys.ndc_scale[2];
     pi.zo = sys.ndc_offset[2];
     pi.has_world = false;
@@ -15719,7 +15746,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
         bool ok = true;
         for (int j = 0; j < 3 && ok; ++j) {
           len[j] = std::sqrt(row[0][j] * row[0][j] + row[1][j] * row[1][j] + row[2][j] * row[2][j]);
-          ok = len[j] > 0.05 && len[j] < 50.0;
+          ok = len[j] > 0.02 && len[j] < 200.0;
         }
         if (!ok) continue;
         for (int a = 0; a < 3 && ok; ++a) {
@@ -15728,7 +15755,8 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
             ok = std::fabs(dt) < 0.02 * len[a] * len[b];
           }
         }
-        if (!ok || std::fabs(len[0] - len[1]) > 0.2 * len[0] || std::fabs(len[0] - len[2]) > 0.2 * len[0]) continue;
+        // (Scaled unevenly too - a stretched building or panel - up to 8:1.)
+        if (!ok || std::max({len[0], len[1], len[2]}) > 8.0 * std::min({len[0], len[1], len[2]})) continue;
         for (int i = 0; i < 3 && ok; ++i) ok = std::isfinite(row[i][3]) && std::fabs(row[i][3]) < 1e5;
         // (A matrix with no translation is a rotation for normals: not the placement.)
         if (!ok || std::fabs(row[0][3]) + std::fabs(row[1][3]) + std::fabs(row[2][3]) < 1e-3) continue;
@@ -17299,11 +17327,18 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
           picked_state_ = 1;
         } else {
           picked_state_ = 2;
+          picked_ = size_t(last) < fs->pick_objs.size() ? fs->pick_objs[size_t(last)] : Renderer::Instance{};
+          // (One the light editor can't place on every copy, named once.)
+          if (picked_.why == 2 && size_t(last) < fs->pick_why.size() && fs->pick_why[size_t(last)] != picked_why_) {
+            picked_why_ = fs->pick_why[size_t(last)];
+            pending_notices_.push_back("light editor: object placement not recognised: " + picked_why_);
+          }
         }
       }
     }
     fs->pick_count = 0;
     fs->pick_objs.clear();
+    fs->pick_why.clear();
     if (collect_instances_ && center_probe_ && !Diag("nopick")) {
       if (!pick_pool_) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -17601,7 +17636,7 @@ uint64_t Renderer::MountainKey() const {
 void Renderer::SetCollectInstances(bool on) { impl_->collect_instances_ = on; }
 void Renderer::SetCenterProbe(bool on) { impl_->center_probe_ = on; }
 int Renderer::PickedObject(Instance* out) const {
-  if (impl_->picked_state_ == 1 && out) *out = impl_->picked_;
+  if (impl_->picked_state_ != 0 && out) *out = impl_->picked_;
   return impl_->picked_state_;
 }
 const std::vector<Renderer::Instance>& Renderer::Instances() const { return impl_->instances_; }
