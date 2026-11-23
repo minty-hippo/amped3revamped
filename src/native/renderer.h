@@ -304,6 +304,11 @@ class Renderer {
   void SetShadowSoftness(float softness);
   // Foliage camera fade for the following frames (RendererOptions::foliage_fade).
   void SetFoliageFade(bool on);
+  // Revamped Graphics: off, none of the port's own looks that are set when
+  // the renderer starts (replaced textures and fonts, smoothed foliage
+  // edges) - the textures replaced are dropped from the cache and loaded
+  // again as the game has them (and back again when it's turned on).
+  void SetRevamped(bool on);
   // Cartoon clouds that part when the view cuts to or from the trail map
   // (the fog fading with them).
   void SetMapClouds(bool on);

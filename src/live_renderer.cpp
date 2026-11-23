@@ -2359,7 +2359,8 @@ void WorkerMain() {
           rex::cvar::GetFlagByName("async_shader_compilation") != "false";
       const bool smooth_foliage = REXCVAR_GET(native_smooth_foliage);
       // Sharp fonts and upscaled textures: only when turned on themselves
-      // (off by default, not part of Revamped Graphics).
+      // (off by default). With Revamped Graphics off, none of these is used
+      // (SetRevamped: no restart).
       const bool sharp_fonts = REXCVAR_GET(native_sharp_fonts);
       const bool texture_pack = REXCVAR_GET(native_texture_pack);
       const bool upscaled_textures = REXCVAR_GET(native_upscaled_textures);
@@ -2473,6 +2474,8 @@ void WorkerMain() {
           if (++quality_tick % 6 == 0) amped3::quality::Apply();
         }
         const bool revamped = REXCVAR_GET(revamped_graphics);
+        // (Off: the game's own textures and fonts, its hard-edged foliage.)
+        renderer->SetRevamped(revamped);
         const bool camera = revamped && REXCVAR_GET(native_camera_motion_blur);
         const bool objects = revamped && REXCVAR_GET(native_object_motion_blur);
         if ((camera || objects) && dt > 0.001 && dt < 0.25) {
@@ -2530,7 +2533,7 @@ void WorkerMain() {
             }
           }
           native::Renderer::TimeOfDay tod;
-          tod.on = REXCVAR_GET(native_time_of_day) && !locked && tod_hour >= 0.0;
+          tod.on = revamped && REXCVAR_GET(native_time_of_day) && !locked && tod_hour >= 0.0;
           tod.hour = float(std::max(tod_hour, 0.0));
           // (Off: its effects alone, at the mountain's own hour.)
           const bool tod_passive = !tod.on && revamped && REXCVAR_GET(native_tod_effects) &&
@@ -2586,18 +2589,20 @@ void WorkerMain() {
               g_lights_changed = false;
             }
           }
-          renderer->SetLightShadows(int(REXCVAR_GET(native_night_light_shadows)),
+          // (Revamped Graphics off: each of these off too.)
+          const float on = revamped ? 1.0f : 0.0f;
+          renderer->SetLightShadows(revamped ? int(REXCVAR_GET(native_night_light_shadows)) : 0,
                                     int(REXCVAR_GET(native_night_light_shadow_lamps)));
-          renderer->SetBloom(float(REXCVAR_GET(native_bloom)));
-          renderer->SetLensFlare(float(REXCVAR_GET(native_lens_flare)));
-          renderer->SetLensDirt(float(REXCVAR_GET(native_lens_dirt)));
-          renderer->SetDiamondDust(float(REXCVAR_GET(native_diamond_dust)));
-          renderer->SetContactShadows(float(REXCVAR_GET(native_contact_shadows)));
-          renderer->SetCloudShadows(float(REXCVAR_GET(native_cloud_shadows)));
-          renderer->SetSnowTracks(float(REXCVAR_GET(native_snow_tracks)));
-          renderer->SetSpecular(float(REXCVAR_GET(native_sun_sheen)));
-          renderer->SetDriftingSnow(REXCVAR_GET(native_drifting_snow));
-          renderer->SetIceHalo(float(REXCVAR_GET(native_ice_halo)));
+          renderer->SetBloom(on * float(REXCVAR_GET(native_bloom)));
+          renderer->SetLensFlare(on * float(REXCVAR_GET(native_lens_flare)));
+          renderer->SetLensDirt(on * float(REXCVAR_GET(native_lens_dirt)));
+          renderer->SetDiamondDust(on * float(REXCVAR_GET(native_diamond_dust)));
+          renderer->SetContactShadows(on * float(REXCVAR_GET(native_contact_shadows)));
+          renderer->SetCloudShadows(on * float(REXCVAR_GET(native_cloud_shadows)));
+          renderer->SetSnowTracks(on * float(REXCVAR_GET(native_snow_tracks)));
+          renderer->SetSpecular(on * float(REXCVAR_GET(native_sun_sheen)));
+          renderer->SetDriftingSnow(revamped && REXCVAR_GET(native_drifting_snow));
+          renderer->SetIceHalo(on * float(REXCVAR_GET(native_ice_halo)));
           // The surface picker.
           if (g_pick_request.exchange(false)) {
             renderer->StartSurfacePick();
@@ -2614,7 +2619,7 @@ void WorkerMain() {
               g_pick_guess = g;
             }
           }
-          renderer->SetVolumetric(float(REXCVAR_GET(native_volumetric)),
+          renderer->SetVolumetric(on * float(REXCVAR_GET(native_volumetric)),
                                   int(REXCVAR_GET(native_volumetric_quality)));
           {
             // (Read again only when it changes.)

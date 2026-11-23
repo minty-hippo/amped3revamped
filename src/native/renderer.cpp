@@ -1841,6 +1841,8 @@ struct Renderer::Impl {
     std::string note;
     size_t bytes = 0;
     uint64_t hash = 0;  // TextureHash
+    bool replaced = false;     // a replacement's (texture pack, fonts, upscaled)
+    bool may_replace = false;  // the game's own, one a replacement could be for
     // Its base level's ContentHash (as replacements are named; the same
     // in every session), worked out when first asked (DrawContentHash).
     uint64_t content = 0;
@@ -2433,6 +2435,9 @@ struct Renderer::Impl {
   // Anti-aliased alpha test / alpha to coverage on multisampled targets
   // (RendererOptions::smooth_alpha).
   bool smooth_alpha_ = true;
+  // Revamped Graphics (SetRevamped): replacements on; changed: the cache's
+  // replaced textures dropped at the frame's end.
+  bool replace_on_ = true, drop_replaced_ = false;
   bool foliage_fade_ = true;  // RendererOptions::foliage_fade (with smooth_alpha_)
   Image* fog_result_ = nullptr;  // this frame's fogged / rayed scene
   // Ambient occlusion (SetAmbientOcclusion): strength (0 = off), the
@@ -3625,7 +3630,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
     return &it->second.image;
   }
   // A replacement (texture pack, sharper fonts)?
-  if (replacer_ && replacer_->MayReplace(tf)) {
+  if (replacer_ && replace_on_ && replacer_->MayReplace(tf)) {
     auto bytes = res_->Read(data + ".base");
     auto rep = replacer_->Find(tf, bytes.data(), bytes.size());
     for (auto& line : replacer_->TakeMessages()) {
@@ -3729,6 +3734,7 @@ Image* Renderer::Impl::TextureFor(const Draw& draw, uint32_t fc, const GpuState&
   cached.note = *note;
   cached.bytes = total;
   cached.hash = TextureHash(data, tf);
+  cached.may_replace = replacer_ && replacer_->MayReplace(tf);
   known_textures_.insert(cached.hash);
   texture_bytes_ += total;
   ++stats_.new_textures;
@@ -3800,6 +3806,7 @@ Image* Renderer::Impl::UploadReplacement(const std::string& key, const std::stri
   cached.note = *note;
   cached.bytes = total;
   cached.hash = TextureHash(data, tf);
+  cached.replaced = true;
   known_textures_.insert(cached.hash);
   texture_bytes_ += total;
   ++stats_.new_textures;
@@ -9067,10 +9074,14 @@ void Renderer::Impl::EndFrame() {
   // back. Over the budget, the least recently used go first; any unused for
   // texture_keep_frames go anyway. None used by a frame still in flight.
   {
+    // Revamped Graphics turned on or off: the replaced textures (off) or
+    // those a replacement could be for (on) loaded again.
+    const bool drop = drop_replaced_;
+    drop_replaced_ = false;
     std::vector<std::pair<uint64_t, std::string>> idle;
     for (auto it = textures_.begin(); it != textures_.end();) {
       const uint64_t unused = frame_number_ - it->second.last_used;
-      if (unused > options_.texture_keep_frames) {
+      if (unused > options_.texture_keep_frames || (drop && (it->second.replaced || (replace_on_ && it->second.may_replace)))) {
         texture_bytes_ -= std::min<uint64_t>(texture_bytes_, it->second.bytes);
         known_textures_.erase(it->second.hash);
         Retire(it->second.image);
@@ -17065,6 +17076,17 @@ void Renderer::SetTrailMapOpen(bool open) {
   impl_->map_open_ = open;
 }
 
+void Renderer::SetRevamped(bool on) {
+  auto& im = *impl_;
+  im.smooth_alpha_ = on && im.options_.smooth_alpha && !im.Diag("hardalpha");
+  if (on != im.replace_on_) {
+    im.replace_on_ = on;
+    // (Only if there's anything to replace with.)
+    if (im.replacer_) {
+      im.drop_replaced_ = true;
+    }
+  }
+}
 void Renderer::SetFoliageFade(bool on) {
   impl_->foliage_fade_ = on && !impl_->Diag("nofade");
 }

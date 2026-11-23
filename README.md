@@ -91,7 +91,7 @@ executable. On top of the plain recompile it adds:
   see-through foliage are reproduced). With FSR or XeSS, MSAA is off by default
   and has its own setting, MSAA with the upscaler.
 - FSR: snow and other particles no longer leave trails (reactive mask).
-- Sharp Fonts and Upscaled Textures are opt-in, separate from Revamped Graphics.
+- Sharp Fonts and Upscaled Textures are opt-in (and also off with Revamped Graphics off).
 
 **Diagnostics**
 - F11 performance trace: per-zone times, per-thread CPU, kernel share and page
@@ -361,11 +361,20 @@ emulation mid-game still works (shaders compile as it goes, at 1x); restart
 for the full setup, or turn off **Lean emulation** (`emulated_gpu_lean`) if
 you switch often.
 
-**Revamped Graphics** turns all the visual enhancements on or off at once:
-motion blur, speed blur, ambient occlusion, distance fog, god rays, branch
-fade and the trail map clouds. Each keeps its own setting for when the switch is back on. Sharp
-fonts and upscaled textures aren't part of it: they're off until you turn them
-on yourself.
+**Revamped Graphics** turns all the visual enhancements on or off at once.
+Off, the game looks as it did: none of the port's changes to its lighting,
+shadows, textures or effects. That covers the time of day (and the weather,
+night lights and the effects kept with it off), eye adaptation, the sharper
+and farther shadows, world shadows, contact and cloud shadows, ambient
+occlusion, god rays and volumetric light, distance fog, bloom, lens flare and
+lens dirt, sun sheen, ice halo, diamond dust, drifting snow, snow tracks,
+motion and speed blur, branch fade, smoothed foliage edges, the trail map
+clouds, and the texture pack, sharp fonts and upscaled textures. Each keeps
+its own setting for when the switch is back on. F2 switches it without
+restarting the renderer: replaced textures are dropped and loaded again as
+the game has them. Sharp fonts and upscaled textures also stay off until you
+turn them on yourself. Display settings (resolution, render scale, MSAA,
+upscaler, anisotropic filtering, frame rate) aren't part of it.
 
 All of it is also in the game's own menu: **Pause > Options > Graphics** (the
 row that was the unused "Cheat Codes") opens the port's Graphics panel. The
