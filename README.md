@@ -643,7 +643,14 @@ that rule against a save that has the pass.
     35-57 ms on the GPU; this one about a fortieth of that in the
     replays), hits nearer than two voxels left out (the voxels' steps
     along a slope were lighting the snow beside itself), the sun's ray
-    from an off-screen hit traced through the coarse cascade only. A ray that hits something takes off the sky light
+    from an off-screen hit traced through the coarse cascade only.
+    Then (6-9 ms on an Intel Arc iGPU) halved again: each frame traces
+    half the pixels (a checkerboard turned each frame) with 6 rays, and
+    blends them into a history kept from frame to frame, reprojected
+    through last frame's camera and taken only where it lands on the same
+    surface (about the same depth); the untraced half uses the history, or
+    its traced neighbours where there's none (diagnostic `ginotemporal`
+    traces every pixel each frame instead). A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps

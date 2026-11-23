@@ -2020,7 +2020,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2148,7 +2148,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[66] = {};  // by CopyKind
+  VkShaderModule copy_fs_[67] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2525,6 +2525,14 @@ struct Renderer::Impl {
   };
   GiCascade gi_c_[2];
   Image gi_params_, gi_blur_, gi_img_;  // (gi_img_: quarter size)
+  // Kept from frame to frame (quarter size, its depth in alpha), each new
+  // frame's half of the pixels traced blended in where the last frame's
+  // result lands on the same surface.
+  Image gi_hist_[2];
+  int gi_hist_cur_ = 0;
+  bool gi_hist_ok_ = false;
+  double gi_prev_vp_[16] = {};
+  uint64_t gi_prev_frame_ = 0;
   bool GiReady() const { return gi_ > 0.0f && gi_c_[0].ok && gi_c_[1].ok && !Diag("nogi"); }
   void GiVoxelize(std::vector<CasterDraw>& env, bool start, bool done);
   void GiTrace(Image* scene, Image* depth);
@@ -7346,7 +7354,7 @@ vec3 Radiance(vec3 H, vec3 n, float vs) {
   float nl = dot(n, kSun.xyz);
   if (nl > 0.0) {
     vec3 nn;
-    if (Trace(H + n * kBox[1].w * 1.01, kSun.xyz, 0.0, 300.0, 1, ivec2(0, 40), nn) < 0.0) e += vec3(kSun.w * nl);
+    if (Trace(H + n * kBox[1].w * 1.01, kSun.xyz, 0.0, 300.0, 1, ivec2(0, 24), nn) < 0.0) e += vec3(kSun.w * nl);
   }
   return alb * e;
 }
@@ -7380,6 +7388,12 @@ void main() {
     return;
   }
   if (d <= 0.0) return;
+  // (Half the pixels a frame, a checkerboard turned each frame: the others
+  // from the frames before.)
+  if (Param(20).y > 0.5 && ((int(gl_FragCoord.x) + int(gl_FragCoord.y) + int(kSet.w)) & 1) != 0) {
+    o = vec4(0.0, 0.0, 1.0, -d);
+    return;
+  }
   vec3 P = World(uv, d);
   float dist = length(P - kCam.xyz);
   if (dist > kCam.w) return;
@@ -7405,7 +7419,7 @@ void main() {
     vec3 D = normalize(T * (r * cos(ph)) + Bt * (r * sin(ph)) + Nn * sqrt(max(1.0 - u1, 0.0)));
     vec3 n;
     // (Not the surface it starts from: the voxels' steps along a slope.)
-    float t = Trace(O, D, vs * 2.0, 400.0, 0, ivec2(96, 64), n);
+    float t = Trace(O, D, vs * 2.0, 400.0, 0, ivec2(80, 48), n);
     if (t < 0.0) continue;
     vec3 H = O + D * t;
     float hv = t < float(N) * kBox[0].w * 0.5 ? kBox[0].w : kBox[1].w;
@@ -7440,6 +7454,67 @@ void main() {
     wsum += w;
   }
   o = vec4(wsum > 1e-5 ? sum / wsum : c.rgb, c.a);
+}
+)", true);
+  // World-space light, 4: this frame's (half the pixels traced: the rest
+  // marked, negative depth) blended into the history, which is reprojected:
+  // each pixel's point (its depth in alpha) seen by last frame's camera,
+  // taken where the history there has about that depth.
+  copy_fs_[66] = CompileBuiltin("builtin_gi_temporal", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D cur;   // this frame's (quarter size)
+layout(set = 0, binding = 1) uniform sampler2D hist;  // last frame's blended
+layout(push_constant) uniform T {
+  mat4 m;     // ndc (x, y, 1 - depth, 1) -> world (now)
+  mat4 prev;  // world -> last frame's ndc (z: 1 - depth); [3][3] 0: no history
+} pc;
+layout(location = 0) out vec4 o;
+void main() {
+  ivec2 sz = textureSize(cur, 0);
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(cur, p, 0);
+  bool traced = c.a >= 0.0;
+  float d = abs(c.a);
+  if (d <= 0.0) {
+    o = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  // This one untraced: its traced neighbours (same depth) meanwhile.
+  vec3 near = c.rgb;
+  if (!traced) {
+    vec3 sum = vec3(0.0);
+    float ws = 0.0;
+    for (int k = 0; k < 4; ++k) {
+      ivec2 q = clamp(p + ivec2(k == 0 ? 1 : k == 1 ? -1 : 0, k == 2 ? 1 : k == 3 ? -1 : 0), ivec2(0), sz - 1);
+      vec4 n = texelFetch(cur, q, 0);
+      if (n.a <= 0.0) continue;
+      float w = exp(-abs(n.a - d) / max(d * 0.02, 1e-6));
+      sum += n.rgb * w;
+      ws += w;
+    }
+    near = ws > 1e-4 ? sum / ws : vec3(0.0);
+  }
+  vec3 h = vec3(0.0);
+  bool have = false;
+  if (pc.prev[3][3] > 0.5) {
+    vec2 uv = (vec2(p) + 0.5) / vec2(sz);
+    vec4 w = pc.m * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 1.0 - d, 1.0);
+    vec3 P = w.xyz / w.w;
+    vec4 q = pc.prev * vec4(P, 1.0);
+    if (q.w > 0.0) {
+      vec3 ndc = q.xyz / q.w;
+      vec2 pu = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+      if (all(greaterThan(pu, vec2(0.0))) && all(lessThan(pu, vec2(1.0)))) {
+        vec4 hv = texelFetch(hist, ivec2(pu * vec2(sz)), 0);
+        float dp = 1.0 - ndc.z;
+        if (hv.a > 0.0 && abs(hv.a - dp) < dp * 0.03 + 1e-6) {
+          h = hv.rgb;
+          have = true;
+        }
+      }
+    }
+  }
+  vec3 r = !have ? near : traced ? mix(h, c.rgb, 0.25) : h;
+  o = vec4(r, d);
 }
 )", true);
   copy_fs_[50] = CompileBuiltin("builtin_spec_add", R"(#version 450
@@ -12873,7 +12948,7 @@ void Renderer::Impl::GiVoxelize(std::vector<CasterDraw>& env, bool start, bool d
 void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   if (Diag("gidbg")) std::fprintf(stderr, "gi: trace\n");
   const uint32_t* blk = lm_on_ ? tod_new_ : tod_ref_;
-  float f[22 * 4] = {};
+  float f[26 * 4] = {};
   f[20 * 4] = Diag("giview") ? 1.0f : 0.0f;
   double vp[16];
   if (!Invert4(inv_vp_, vp)) return;
@@ -12899,19 +12974,22 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   // cAr, cAg, cAb (c15, c19, c23), cBr, cBg, cBb (c27, c31, c35), cC (c39).
   const int regs[7] = {15, 19, 23, 27, 31, 35, 39};
   for (int j = 0; j < 7; ++j) std::memcpy(&f[(12 + j) * 4], &blk[(regs[j] - 14) * 4], 16);
-  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : 8.0f;  // rays
+  // (With the frames before: half the pixels, fewer rays each, blended.)
+  const bool temporal = !Diag("ginotemporal") && !Diag("giview");
+  f[20 * 4 + 1] = temporal ? 1.0f : 0.0f;
+  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : temporal ? 6.0f : 8.0f;  // rays
   f[19 * 4 + 1] = Diag("ginosky") ? 0.0f : 1.0f;    // the sky's light taken off
   f[19 * 4 + 2] = Diag("ginoput") ? 0.0f : 1.0f;    // the hits' light put on
   f[19 * 4 + 3] = float(frame_number_ % 64);
   if (!gi_params_.image) {
-    gi_params_ = gpu_.CreateImage(22, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "gi_params");
+    gi_params_ = gpu_.CreateImage(26, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "gi_params");
     ToGeneral(cb_, gi_params_);
   }
   Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
   std::memcpy(staging.mapped, f, sizeof(f));
   VkBufferImageCopy region{};
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {22, 1, 1};
+  region.imageExtent = {26, 1, 1};
   Barrier();
   vk::vkCmdCopyBufferToImage(cb_, staging.buffer, gi_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
   staging_.push_back(staging);
@@ -12930,14 +13008,54 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   float pc[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), float(qs)};
   FullscreenPass(CopyKind::kGiTrace, &gi_img_, scene, depth, tod_normal_, true, pc, 4, nullptr,
                  const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]), &gi_params_);
+  if (temporal) {
+    for (Image& im : gi_hist_) {
+      if (!im.image || im.width != qw || im.height != qh) {
+        if (im.image) Retire(im);
+        im = gpu_.CreateImage(qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, false, "world_light_history");
+        ToGeneral(cb_, im);
+        gi_hist_ok_ = false;
+      }
+    }
+    // (Only straight after the frame before: not over a jump or a pause.)
+    const bool valid = gi_hist_ok_ && frame_number_ == gi_prev_frame_ + 1;
+    const int nxt = 1 - gi_hist_cur_;
+    float tp[32];
+    for (int c = 0; c < 4; ++c) {
+      for (int r = 0; r < 4; ++r) {
+        tp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+        tp[16 + c * 4 + r] = float(gi_prev_vp_[r * 4 + c]);
+      }
+    }
+    // (The history's validity rides in the last matrix's unused corner:
+    // prev vp's [3][3] stays 1 for a valid one, 0 otherwise.)
+    if (!valid) tp[31] = 0.0f;
+    Barrier();
+    FullscreenPass(CopyKind::kGiTemporal, &gi_hist_[nxt], &gi_img_, &gi_hist_[gi_hist_cur_], nullptr, false, tp,
+                   32);
+    Barrier();
+    gi_hist_cur_ = nxt;
+    gi_hist_ok_ = true;
+    // (Blurred from the history into gi_img_, the history kept unblurred.)
+    VkImageCopy all{};
+    all.srcSubresource = all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    all.extent = {qw, qh, 1};
+    vk::vkCmdCopyImage(cb_, gi_hist_[nxt].image, VK_IMAGE_LAYOUT_GENERAL, gi_img_.image, VK_IMAGE_LAYOUT_GENERAL,
+                       1, &all);
+    Barrier();
+  } else {
+    gi_hist_ok_ = false;
+  }
+  std::memcpy(gi_prev_vp_, vp, sizeof(vp));
+  gi_prev_frame_ = frame_number_;
   if (!Diag("ginoblur") && !Diag("giview")) {
     if (!gi_blur_.image || gi_blur_.width != gi_img_.width || gi_blur_.height != gi_img_.height) {
       if (gi_blur_.image) Retire(gi_blur_);
       gi_blur_ = gpu_.CreateImage(gi_img_.width, gi_img_.height, gi_img_.format, false, "gi_blur");
       ToGeneral(cb_, gi_blur_);
     }
-    // (Twice each way, the second wider.)
-    for (int pass = 0; pass < 2; ++pass) {
+    // (Twice each way, the second wider; once with the frames before.)
+    for (int pass = 0; pass < (temporal ? 1 : 2); ++pass) {
       const float st = pass == 0 ? 1.0f : 2.0f;
       float h[4] = {st, 0, 0, 0}, v[4] = {0, st, 0, 0};
       Barrier();
@@ -17647,6 +17765,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(gi_params_);
   gpu_.DestroyImage(gi_blur_);
   gpu_.DestroyImage(gi_img_);
+  for (Image& im : gi_hist_) gpu_.DestroyImage(im);
   for (GiCascade& g : gi_c_) {
     for (Image& im : g.maps) gpu_.DestroyImage(im);
     for (Image& im : g.occ) gpu_.DestroyImage(im);
