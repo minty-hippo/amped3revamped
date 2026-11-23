@@ -872,7 +872,15 @@ uint xe_vertex_index() {
   g += "void main() {\n";
   g += Fmt("  for (int i = 0; i < %u; ++i) r[i] = vec4(0.0);\n", regs);
   if (vs()) {
-    g += "  for (int i = 0; i < 16; ++i) xe_o[i] = vec4(0.0);\n";
+    // (A vertex shader that writes no interpolators - only the position -
+    // starts them at a zero the compiler can't see is one: Turnip (Mesa
+    // 26.3, the Odin 3) crashes building a pipeline whose vertex outputs
+    // are all constant while the pixel shader reads them.)
+    if (body_.find("xe_o[") == std::string::npos) {
+      g += "  for (int i = 0; i < 16; ++i) xe_o[i] = vec4(uintBitsToFloat(xe_sys.material.w));\n";
+    } else {
+      g += "  for (int i = 0; i < 16; ++i) xe_o[i] = vec4(0.0);\n";
+    }
     g += "  r[0].x = float(xe_vertex_index());\n";
     g += "  xe_program();\n";
     g += R"(  precise vec4 p = xe_pos;

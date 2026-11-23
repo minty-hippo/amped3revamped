@@ -3971,7 +3971,9 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   // Which it is, the same from run to run (for the crash report, and to
   // leave out one that crashed the driver before).
   char pipe_id[112];
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s",
+  // (" tv<N>": the shader translation's version, bumped when a change may
+  // fix a driver crash, so what crashed an older one is tried again.)
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv2",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
                 reactive ? " reactive" : "", caster ? " caster" : "",
@@ -4220,6 +4222,12 @@ void Renderer::Impl::ReadCrashed() {
   while (std::getline(in, line)) {
     // "pipeline <id>[ | <the list's line>]"
     if (line.rfind("pipeline ", 0) != 0) continue;
+    {
+      // (Only this translation's crashes: see pipe_id's " tv".)
+      const size_t bar0 = line.find(" | ");
+      const std::string head = line.substr(0, bar0);
+      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv2") != 0) continue;
+    }
     const size_t bar = line.find(" | ");
     const std::string id = line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9);
     crashed_ids_.insert(id);

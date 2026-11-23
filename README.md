@@ -637,8 +637,13 @@ that rule against a save that has the pass.
     wind), then without wind at all; only if the plainest crashes too is
     the pipeline left out (not precompiled, its draws skipped). Each step is
     named in the log ("vertex shader ... made plainer (level N)"); delete
-    the file to try the full shaders again. (The Odin 3's crash: the
-    instanced trees' and foliage's vertex shader, 0B81497C6E3B216A.)
+    the file to try the full shaders again. Records carry the shader
+    translation's version (" tv2"), so an update that may fix a crash tries
+    again by itself. (The Odin 3's crash: an instanced vertex shader,
+    0B81497C6E3B216A, that writes only the position - it crashed with and
+    without wind; vertex shaders like it now start their interpolators at a
+    zero the driver's compiler can't fold, on the guess that Turnip trips
+    over a pipeline whose vertex outputs are all constant.)
 - Fewer hitches from pipeline builds: a pipeline the driver has to compile
   (not in its cache; 150-800 ms each on an Arc) is now built in the
   background at once, even the first one in a frame, the draw left out for
