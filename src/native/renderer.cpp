@@ -2471,6 +2471,7 @@ struct Renderer::Impl {
   // riders yet: its depth kept in alpha) and added after (where the depth
   // still matches: not over the riders).
   float specular_ = 0.0f;
+  float rider_shine_ = 1.0f;  // SetRiderShine (1: the game's)
   std::unordered_map<uint64_t, uint8_t> material_overrides_;  // content hash -> surface
   bool surfaces_on_ = true;  // (diag nosurfaces: none tagged; read once a frame)
   // The surface picker (StartSurfacePick): which texture is at the screen's
@@ -15260,6 +15261,39 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     std::memcpy(out + 10 * 16, c10, 16);
     std::memcpy(out + 11 * 16, c11, 16);
   }
+  // Riders' and characters' shine (SetRiderShine): the game's character
+  // pixel shaders add a broad Phong highlight, pow(R.L, c32.x) with L in c31
+  // and an exponent of about 7, which reads as plastic on cloth and skin.
+  // Scaled by s and tightened by moving the constants alone: the exponent
+  // raised to p', L shortened to s^(1/p') (so the highlight is s times
+  // as bright). (Told by what they read: c29 / c30 as relative bases, c31,
+  // c32; nothing else of the game's reads that set.)
+  if (rider_shine_ != 1.0f && ps->info.dynamic_constants && !Diag("ridershine")) {
+    auto reads = [&](uint32_t r) { return (ps->info.float_constants[r >> 5] >> (r & 31)) & 1u; };
+    if (reads(29) && reads(30) && reads(31) && reads(32) && ConstBytes(*ps) >= 33 * 16) {
+      const size_t n = ConstBytes(*ps);
+      const uint8_t* src = uniforms_.mapped + offsets[2];
+      uint8_t* out;
+      const uint32_t off = ReserveConstants(n, &out);
+      std::memmove(out, src, n);
+      float L[4], P[4];
+      std::memcpy(L, out + 31 * 16, 16);
+      std::memcpy(P, out + 32 * 16, 16);
+      if (P[0] > 0.5f && P[0] < 200.0f) {
+        const float sh = std::max(rider_shine_, 1e-4f);
+        // (Tighter as it's turned down: rough cloth, not a plastic coat.)
+        const float p2 = P[0] * (sh < 1.0f ? 1.0f + 1.5f * (1.0f - sh) : 1.0f);
+        const float k = std::pow(sh, 1.0f / p2);
+        for (int i = 0; i < 3; ++i) L[i] *= k;
+        P[0] = p2;
+        std::memcpy(out + 31 * 16, L, 16);
+        std::memcpy(out + 32 * 16, P, 16);
+        offsets[2] = off;
+      } else {
+        uniform_used_ -= n;  // (not that shader after all: handed back)
+      }
+    }
+  }
   if (st.bool_loop.version() != bool_loop_version_) {
     bool_loop_version_ = st.bool_loop.version();
     bool_loop_offset_ = WriteUniform(st.bool_loop.data(), 160);
@@ -17663,6 +17697,7 @@ void Renderer::SetDiamondDust(float strength) { impl_->dust_ = std::clamp(streng
 void Renderer::SetLensDirt(float strength) { impl_->lens_dirt_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetIceHalo(float strength) { impl_->halo_ = std::clamp(strength, 0.0f, 2.0f); }
 void Renderer::SetSpecular(float strength) { impl_->specular_ = std::clamp(strength, 0.0f, 2.0f); }
+void Renderer::SetRiderShine(float shine) { impl_->rider_shine_ = std::clamp(shine, 0.0f, 2.0f); }
 void Renderer::StartSurfacePick() {
   impl_->pick_state_ = 1;
   impl_->pick_frames_ = 0;

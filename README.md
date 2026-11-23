@@ -628,6 +628,24 @@ that rule against a save that has the pass.
     a load from the menus: coming back to riding from a story scene (game
     state 20, or one in the few seconds before the dark) goes straight on.
     The log names the game states the load went through.
+  - **Rider shine** (Graphics > Lighting, `native_rider_shine`, 0.35; 1 the
+    game's): the riders' and characters' own pixel shaders add a broad
+    Phong highlight (an exponent of 7, the full strength of their specular
+    mask) that makes cloth and skin look like plastic. Turned down, it's
+    dimmer and tighter: done through their constants alone (the exponent
+    in c32.x raised, the light direction in c31 shortened so the highlight
+    is that much fainter), for the shaders that read c29 to c32 as the
+    game's character shaders do. Part of Revamped Graphics (off: the game's).
+  - **Graphics menu tabs**: Quality, Effects (blur, fog, god rays,
+    volumetric light, light glow, lens flare and dirt, diamond dust, snow
+    tracks, branch fade, map clouds), Lighting (ambient occlusion, sun
+    sheen, light bounce, rider shine, eye adaptation, contact shadows,
+    night light shadows, the sun's shadows), Time of Day (only what needs
+    the clock: the hour, moon, clouds and cloud shadows, ice halo, weather,
+    snow settling, drifting snow, wind) and Display. The tab row slides
+    when they don't all fit. The F1 options list the same way: the effects
+    that work at each mountain's own hour with the rest, and a Time of day
+    group of their own.
   - **Odin 3 crash found: Turnip can't compile the Direct3D 9 multiply**.
     With `IR3_SHADER_DEBUG=disasm,vs` the driver printed "Unhandled ALU op:
     fmadz" just before crashing: Mesa 26.3 recognises the shaders' "0 times

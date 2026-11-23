@@ -443,73 +443,23 @@ const std::vector<Tab>& Tabs() {
                         "tones down in glare, easing over a second or two like eyes "
                         "adjusting. 0: off. Part of Revamped Graphics. Native renderer only.",
                         "%.1f", 0.0, 1.0),
-                Toggle("native_dynamic_time_of_day", "Dynamic time of day (experimental)",
-                       "Off (the default): each mountain stays at the hour the game set it "
-                       "at, with the Revamped lighting and effects lit for that hour. On: the "
-                       "sun and moon move across the sky: the mountain's light, its "
-                       "colors, the sky, stars and drifting clouds follow the hour, from "
-                       "sunrise through dusk to a moonlit night. Each mountain starts at the "
-                       "hour it was made for and looks as the game has it then. Shadows follow "
-                       "the sun and moon (riders and objects always; the world's with World "
-                       "shadows baked). Native renderer only."),
-                Toggle("native_tod_effects", "Effects with time of day off",
-                       "With dynamic time of day off, its effects still on for each "
-                       "mountain's own hour: the sharper shadows near you, the sun's sheen, "
-                       "lens flare, light glow, diamond dust and contact shadows (as their "
-                       "settings have them). The light and sky stay as the game has them. "
-                       "Native renderer only."),
-                // (Northstar waits for the Night Pass: off for now, night_pass.cpp.)
-                SliderF("native_tod_start_hour", "Set the hour",
-                        "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
-                        -1.0, 24.0),
-                SliderF("native_tod_day_minutes", "Minutes per day",
-                        "How many real minutes a whole day takes (0: the clock stands still).",
-                        "%.0f min", 0.0, 240.0),
-                SliderF("native_tod_moon_phase", "Moon phase",
-                        "0 new, 0.25 first quarter, 0.5 full, 0.75 last quarter.", "%.2f", 0.0,
-                        1.0),
-                SliderF("native_tod_clouds", "Cloud cover",
-                        "How much of the sky the drifting clouds cover.", "%.2f", 0.0, 1.0),
-                SliderF("native_tod_night_light", "Night brightness",
-                        "How light the night is (1: moonlit snow you can ride by).", "%.1f",
-                        0.2, 3.0),
-                Choices("native_weather", "Weather",
-                        "With time of day on: grey skies (soft light, faint shadows), snow falling "
-                        "(lit by the lamps at night) and blizzards (wind and the fog closing in). "
-                        "Changing: each spell lasts a few minutes and eases into the next.",
-                        {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"},
-                         {"5", "Blizzard"}}),
-                Toggle("native_snow_cover", "Snow settles",
-                       "With time of day on: falling snow settles on tree boughs, roofs, rocks and "
-                       "props, patchy at first, building over a few minutes, melting once it stops."),
-                SliderF("native_ice_halo", "Ice halo",
-                        "With time of day on: a ring round the sun (22 degrees out) and the sun "
-                        "dogs either side of it, when thin high cloud drifts over an otherwise "
-                        "clear sky with the sun low to middling. Also a sun pillar with the sun "
-                        "at the horizon in still air. 0: never.",
-                        "%.1f", 0.0, 2.0),
+                SliderF("native_rider_shine", "Rider shine",
+                        "The riders' and characters' own highlight: 1 as the game has it (a "
+                        "broad sheen that makes cloth and skin look plastic); lower is dimmer and "
+                        "tighter, like cloth. Part of Revamped Graphics (off: the game's). Native "
+                        "renderer only.",
+                        "%.2f", 0.0, 2.0),
                 SliderF("native_contact_shadows", "Contact shadows",
-                        "With time of day and the sun's shadows on: the shadows of small things "
+                        "With the sun's shadows on: the shadows of small things "
                         "and fine relief the shadow maps miss, where a rock, a rail or a boot "
                         "meets the snow, found from the depth. Part of Sun shadows Medium and up. "
                         "0: off.",
                         "%.1f", 0.0, 1.0),
                 SliderF("native_diamond_dust", "Diamond dust",
-                        "With time of day on: tiny ice crystals adrift in the air that glint as "
+                        "Tiny ice crystals adrift in the air that glint as "
                         "they catch the sun (brightest looking toward it), on clear, calm days "
                         "without falling snow, the most with the sun low. 0: never.",
                         "%.1f", 0.0, 2.0),
-                Toggle("native_drifting_snow", "Drifting snow",
-                       "With time of day on: in a strong wind (a blizzard), loose snow streams "
-                       "along the slopes in low wisps, moving with the wind."),
-                Toggle("native_wind_sway", "Wind in the trees",
-                       "With time of day on: the trees and their foliage sway in the wind, gently "
-                       "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "
-                       "across)."),
-                SliderF("native_wind_strength", "Wind strength",
-                        "How hard the wind blows, times the weather's own: the trees and "
-                        "banners swaying, loose snow drifting, the tracks worn away. 0: still "
-                        "air.", "%.1f", 0.0, 3.0),
                 Choices("native_night_light_shadows", "Night light shadows",
                         "Shadows from the lamps, floodlights and fires: riders, trees, posts "
                         "and buildings each cast one from every light near them. Traced "
@@ -518,20 +468,12 @@ const std::vector<Tab>& Tabs() {
                 Choices("native_night_light_shadow_lamps", "Lamps casting shadows",
                         "How many lamps cast shadows at each spot (the nearest).",
                         {{"0", "All"}, {"1", "1"}, {"2", "2"}, {"4", "4"}}),
-                Choices("native_volumetric_quality", "Volumetric detail",
-                        "Quarter size is fastest; half size sharper; fine adds steps.",
-                        {{"0", "Quarter"}, {"1", "Half"}, {"2", "Half, fine"}}),
-                SliderF("native_cloud_shadows", "Cloud shadows",
-                        "With time of day on: the clouds' shadows drift across the slopes "
-                        "with the wind (the sky's own clouds, where they are). Needs the sun's "
-                        "shadows (Revamped Graphics). 0: off.",
-                        "%.1f", 0.0, 1.0),
                 SliderF("native_bloom", "Light glow",
-                        "With time of day on: a soft glow around lamps, fires and other small "
+                        "A soft glow around lamps, fires and other small "
                         "bright things, strongest at night (broad lit snow doesn't glow). 0: off.",
                         "%.1f", 0.0, 2.0),
                 SliderF("native_lens_flare", "Lens flare",
-                        "With time of day on: the sun's flare when it's in view (glare, a "
+                        "The sun's flare when it's in view (glare, a "
                         "starburst and the lens's ghosts, cut by hills, trees and cloud), and the "
                         "moon's, fainter, at night. 0: off, 1: natural.",
                         "%.1f", 0.0, 2.0),
@@ -539,6 +481,9 @@ const std::vector<Tab>& Tabs() {
                         "With the lens flare on: dust and smudges on the lens that catch the "
                         "light when the sun is in view. 0: a clean lens.",
                         "%.1f", 0.0, 2.0),
+                Choices("native_volumetric_quality", "Volumetric detail",
+                        "Quarter size is fastest; half size sharper; fine adds steps.",
+                        {{"0", "Quarter"}, {"1", "Half"}, {"2", "Half, fine"}}),
                 Choices("native_shadow_resolution", "Shadow resolution",
                         "The sun's shadow map (riders, rails, jumps and objects, and the trees "
                         "with Tree shadows; the mountains' shadows are painted into the slopes), "
@@ -623,6 +568,71 @@ const std::vector<Tab>& Tabs() {
                        "Copies the game's vertex buffers only when the game has written to "
                        "them, instead of every frame. Turn off if geometry ever looks stale "
                        "or out of place."),
+            }},
+           // What needs the clock: the sky, weather and wind (the rest of the
+           // Revamped effects are above, lit for each mountain's own hour).
+           {"Time of day",
+            {
+                Toggle("native_dynamic_time_of_day", "Dynamic time of day (experimental)",
+                       "Off (the default): each mountain stays at the hour the game set it "
+                       "at, with the Revamped lighting and effects lit for that hour. On: the "
+                       "sun and moon move across the sky: the mountain's light, its "
+                       "colors, the sky, stars and drifting clouds follow the hour, from "
+                       "sunrise through dusk to a moonlit night. Each mountain starts at the "
+                       "hour it was made for and looks as the game has it then. Shadows follow "
+                       "the sun and moon (riders and objects always; the world's with World "
+                       "shadows baked). Native renderer only."),
+                Toggle("native_tod_effects", "Effects with time of day off",
+                       "With dynamic time of day off, its effects still on for each "
+                       "mountain's own hour: the sharper shadows near you, the sun's sheen, "
+                       "lens flare, light glow, diamond dust and contact shadows (as their "
+                       "settings have them). The light and sky stay as the game has them. "
+                       "Native renderer only."),
+                SliderF("native_tod_start_hour", "Set the hour",
+                        "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
+                        -1.0, 24.0),
+                SliderF("native_tod_day_minutes", "Minutes per day",
+                        "How many real minutes a whole day takes (0: the clock stands still).",
+                        "%.0f min", 0.0, 240.0),
+                SliderF("native_tod_moon_phase", "Moon phase",
+                        "0 new, 0.25 first quarter, 0.5 full, 0.75 last quarter.", "%.2f", 0.0,
+                        1.0),
+                SliderF("native_tod_clouds", "Cloud cover",
+                        "How much of the sky the drifting clouds cover.", "%.2f", 0.0, 1.0),
+                SliderF("native_tod_night_light", "Night brightness",
+                        "How light the night is (1: moonlit snow you can ride by).", "%.1f",
+                        0.2, 3.0),
+                Choices("native_weather", "Weather",
+                        "With time of day on: grey skies (soft light, faint shadows), snow falling "
+                        "(lit by the lamps at night) and blizzards (wind and the fog closing in). "
+                        "Changing: each spell lasts a few minutes and eases into the next.",
+                        {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"},
+                         {"5", "Blizzard"}}),
+                Toggle("native_snow_cover", "Snow settles",
+                       "With time of day on: falling snow settles on tree boughs, roofs, rocks and "
+                       "props, patchy at first, building over a few minutes, melting once it stops."),
+                SliderF("native_ice_halo", "Ice halo",
+                        "With time of day on: a ring round the sun (22 degrees out) and the sun "
+                        "dogs either side of it, when thin high cloud drifts over an otherwise "
+                        "clear sky with the sun low to middling. Also a sun pillar with the sun "
+                        "at the horizon in still air. 0: never.",
+                        "%.1f", 0.0, 2.0),
+                Toggle("native_drifting_snow", "Drifting snow",
+                       "With time of day on: in a strong wind (a blizzard), loose snow streams "
+                       "along the slopes in low wisps, moving with the wind."),
+                Toggle("native_wind_sway", "Wind in the trees",
+                       "With time of day on: the trees and their foliage sway in the wind, gently "
+                       "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "
+                       "across)."),
+                SliderF("native_wind_strength", "Wind strength",
+                        "How hard the wind blows, times the weather's own: the trees and "
+                        "banners swaying, loose snow drifting, the tracks worn away. 0: still "
+                        "air.", "%.1f", 0.0, 3.0),
+                SliderF("native_cloud_shadows", "Cloud shadows",
+                        "With time of day on: the clouds' shadows drift across the slopes "
+                        "with the wind (the sky's own clouds, where they are). Needs the sun's "
+                        "shadows (Revamped Graphics). 0: off.",
+                        "%.1f", 0.0, 1.0),
             }},
            // Collapsed until opened: every blur effect in one place.
            {"Blur",

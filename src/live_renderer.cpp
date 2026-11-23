@@ -312,6 +312,10 @@ REXCVAR_DEFINE_DOUBLE(native_ice_halo, 1.0, "GPU",
 REXCVAR_DEFINE_BOOL(native_drifting_snow, true, "GPU",
                     "Time of day: in a strong wind (a blizzard), loose snow streaming along the "
                     "slopes in low wisps, moving with the wind");
+REXCVAR_DEFINE_DOUBLE(native_rider_shine, 0.35, "GPU",
+                      "Riders' and characters' highlight, 0..2: 1 as the game has it (a broad, "
+                      "plastic-looking sheen on cloth and skin); lower is dimmer and tighter. "
+                      "Part of Revamped Graphics (off: the game's). Native renderer only.");
 REXCVAR_DEFINE_DOUBLE(native_sun_sheen, 1.0, "GPU",
                       "Time of day: the sun's (and moon's) sheen on the world, which the game's "
                       "lighting leaves out: a glossy highlight by surface (snow glinting in the "
@@ -2620,6 +2624,7 @@ void WorkerMain() {
           renderer->SetCloudShadows(on * float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(on * float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(on * float(REXCVAR_GET(native_sun_sheen)));
+          renderer->SetRiderShine(revamped ? float(REXCVAR_GET(native_rider_shine)) : 1.0f);
           renderer->SetLightBounce(on * float(REXCVAR_GET(native_light_bounce)));
           renderer->SetDriftingSnow(revamped && REXCVAR_GET(native_drifting_snow));
           renderer->SetIceHalo(on * float(REXCVAR_GET(native_ice_halo)));

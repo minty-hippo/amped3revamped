@@ -83,13 +83,26 @@ const std::vector<Tab>& Tabs() {
            {"native_camera_motion_blur_strength", "Motion Blur Strength", Kind::kSlider, 0.0, 3.0, 0.1},
            {"native_speed_blur", "Speed Blur"},
            {"native_fog", "Distance Fog"},
-           {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_god_rays", "God Rays"},
            {"native_volumetric", "Volumetric Light", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_bloom", "Light Glow", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_lens_flare", "Lens Flare", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_lens_dirt", "Lens Dirt", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_diamond_dust", "Diamond Dust", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_snow_tracks", "Snow Tracks", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_foliage_fade", "Branch Fade"},
+           {"native_map_clouds", "Trail Map Clouds"},
+       }},
+      {"Lighting",
+       {
+           {"native_ambient_occlusion", "Ambient Occlusion"},
            {"native_sun_sheen", "Sun Sheen", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_light_bounce", "Light Bounce", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_rider_shine", "Rider Shine", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_eye_adaptation", "Eye Adaptation", Kind::kSlider, 0.0, 1.0, 0.1},
-           {"native_snow_tracks", "Snow Tracks", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_contact_shadows", "Contact Shadows", Kind::kSlider, 0.0, 1.0, 0.1},
+           {"native_night_light_shadows", "Night Light Shadows", Kind::kStops, 0, 0, 0,
+            {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}},
            {"native_shadow_resolution", "Shadow Resolution", Kind::kStops, 0, 0, 0,
             {{"100", "1x"}, {"150", "1.5x"}, {"200", "2x"}, {"300", "3x"}, {"400", "4x"}}},
            {"native_shadow_distance", "Shadow Distance", Kind::kStops, 0, 0, 0,
@@ -100,9 +113,8 @@ const std::vector<Tab>& Tabs() {
            {"native_world_shadows", "World Shadows", Kind::kStops, 0, 0, 0,
             {{"0", "Painted"}, {"2", "Baked 2x"}, {"4", "Baked 4x"}}},
            {"native_world_shadows_saved", "Saved Shadows Only"},
-           {"native_foliage_fade", "Branch Fade"},
-           {"native_map_clouds", "Trail Map Clouds"},
        }},
+      // (What needs the clock running: the sky, weather and wind.)
       {"Time of Day",
        {
            {"native_dynamic_time_of_day", "Dynamic Time of Day (experimental)"},
@@ -113,25 +125,18 @@ const std::vector<Tab>& Tabs() {
              {"120", "2 hours"}, {"1440", "Real time"}}},
            {"native_tod_moon_phase", "Moon Phase", Kind::kStops, 0, 0, 0,
             {{"0", "New"}, {"0.25", "First quarter"}, {"0.5", "Full"}, {"0.75", "Last quarter"}}},
+           {"native_tod_night_light", "Night Brightness", Kind::kSlider, 0.2, 3.0, 0.1},
            {"native_tod_clouds", "Cloud Cover", Kind::kSlider, 0.0, 1.0, 0.05},
            {"native_cloud_shadows", "Cloud Shadows", Kind::kSlider, 0.0, 1.0, 0.1},
-           {"native_tod_night_light", "Night Brightness", Kind::kSlider, 0.2, 3.0, 0.1},
+           {"native_ice_halo", "Ice Halo", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_weather", "Weather", Kind::kStops, 0, 0, 0,
             {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"}, {"5", "Blizzard"}}},
-           {"native_wind_sway", "Wind in the Trees"},
-           {"native_wind_strength", "Wind Strength", Kind::kSlider, 0.0, 3.0, 0.1},
-           {"native_snow_cover", "Snow Settles"},
-           {"native_drifting_snow", "Drifting Snow"},
-           {"native_ice_halo", "Ice Halo", Kind::kSlider, 0.0, 2.0, 0.1},
-           {"native_diamond_dust", "Diamond Dust", Kind::kSlider, 0.0, 2.0, 0.1},
-           {"native_contact_shadows", "Contact Shadows", Kind::kSlider, 0.0, 1.0, 0.1},
            {"native_weather_minutes", "Weather Spells", Kind::kStops, 0, 0, 0,
             {{"2", "2 min"}, {"6", "6 min"}, {"15", "15 min"}, {"40", "40 min"}}},
-           {"native_night_light_shadows", "Night Light Shadows", Kind::kStops, 0, 0, 0,
-            {{"0", "Off"}, {"1", "On"}, {"2", "Fine"}}},
-           {"native_bloom", "Light Glow", Kind::kSlider, 0.0, 2.0, 0.1},
-           {"native_lens_flare", "Lens Flare", Kind::kSlider, 0.0, 2.0, 0.1},
-           {"native_lens_dirt", "Lens Dirt", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_snow_cover", "Snow Settles"},
+           {"native_drifting_snow", "Drifting Snow"},
+           {"native_wind_sway", "Wind in the Trees"},
+           {"native_wind_strength", "Wind Strength", Kind::kSlider, 0.0, 3.0, 0.1},
        }},
       {"Display",
        {
@@ -522,18 +527,39 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     dl->AddText(tab_font, tab_px, ImVec2(x, ty), kDim, "LB");
     x += text_w("LB") + 12.0f * unit;
     const std::vector<Tab>& tabs = Tabs();
-    for (int i = 0; i < int(tabs.size()); ++i) {
-      std::string upper = tabs[i].name;
+    // (More than fit: the row slides so the current one is in view, RB kept
+    // at the right edge.)
+    const float rb_w = text_w("RB");
+    const float x0 = x, x1 = end.x - pad - rb_w - 8.0f * unit;
+    std::vector<std::string> names;
+    std::vector<float> starts;
+    float total = 0.0f;
+    for (const Tab& t : tabs) {
+      std::string upper = t.name;
       for (char& c : upper) c = char(std::toupper(static_cast<unsigned char>(c)));
-      const float w = text_w(upper.c_str());
+      starts.push_back(total);
+      total += text_w(upper.c_str()) + 16.0f * unit;
+      names.push_back(std::move(upper));
+    }
+    float shift = 0.0f;
+    if (total - 16.0f * unit > x1 - x0) {
+      const float cur_end = starts[size_t(tab_)] + text_w(names[size_t(tab_)].c_str());
+      shift = std::clamp(cur_end - (x1 - x0) * 0.75f, 0.0f, total - 16.0f * unit - (x1 - x0));
+      shift = std::min(shift, starts[size_t(tab_)]);
+    }
+    dl->PushClipRect(ImVec2(x0, ty - tab_px), ImVec2(x1, ty + tab_px * 2.0f), true);
+    for (int i = 0; i < int(tabs.size()); ++i) {
+      const float tx = x0 + starts[size_t(i)] - shift;
+      const float w = text_w(names[size_t(i)].c_str());
       const bool current = i == tab_;
-      dl->AddText(tab_font, tab_px, ImVec2(x, ty), current ? kGold : kDim, upper.c_str());
+      dl->AddText(tab_font, tab_px, ImVec2(tx, ty), current ? kGold : kDim, names[size_t(i)].c_str());
       if (current) {
-        dl->AddRectFilled(ImVec2(x, ty + tab_px * 1.15f), ImVec2(x + w, ty + tab_px * 1.15f + 2.0f * unit),
+        dl->AddRectFilled(ImVec2(tx, ty + tab_px * 1.15f), ImVec2(tx + w, ty + tab_px * 1.15f + 2.0f * unit),
                           kGold);
       }
-      x += w + 16.0f * unit;
     }
+    dl->PopClipRect();
+    x = std::min(x0 + total - shift, x1 + 8.0f * unit);
     dl->AddText(tab_font, tab_px, ImVec2(x - 4.0f * unit, ty), kDim, "RB");
     y += tab_px * 2.0f;
     dl->AddLine(ImVec2(at.x + pad, y), ImVec2(end.x - pad, y), kEdge, 1.5f * unit);

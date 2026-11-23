@@ -434,6 +434,9 @@ class Renderer {
   // The sun's (or moon's) sheen on the world (the game's lighting has none):
   // glossy by surface, snow glinting; shadowed by the sun's. 0: off .. 2.
   void SetSpecular(float strength);
+  // Riders' and characters' highlight (their own shaders'), 0..2: 1 as
+  // the game has it, below that dimmer and tighter (cloth, not plastic).
+  void SetRiderShine(float shine);
   // In a strong wind, loose snow streaming along the slopes in low wisps.
   void SetDriftingSnow(bool on);
   // Lens flare: the sun's (ghosts, a starburst, glare, as much as the sun is
