@@ -411,6 +411,10 @@ class Renderer {
   // Time of day: bloom (0 off .. 2): the lamps, fires and the sun on snow
   // glowing out over what's round them (stronger at night).
   void SetBloom(float strength);
+  // Time of day: light bounce (0 off .. 2): the light off lit surfaces
+  // nearby onto what's round them (snow lighting a wall or trunk from below,
+  // a lamp's pool spilling onto what's beside it), from the scene as drawn.
+  void SetLightBounce(float strength);
   // The clouds' shadows drifting over the slopes (time of day; 0: none, 1:
   // darkest).
   void SetCloudShadows(float darkness);

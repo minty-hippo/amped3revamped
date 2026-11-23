@@ -315,6 +315,12 @@ REXCVAR_DEFINE_DOUBLE(native_sun_sheen, 1.0, "GPU",
                       "sun, a glare off it toward a low sun), shadowed by the sun's shadows. "
                       "0: off, up to 2")
     .range(0.0, 2.0);
+REXCVAR_DEFINE_DOUBLE(native_light_bounce, 1.0, "GPU",
+                      "Time of day: light bounce: the light off lit surfaces nearby onto what's "
+                      "round them, tinted by both (sunlit snow lighting a wall, a trunk or a "
+                      "rail from below, a lamp's pool spilling onto what's beside it), from the "
+                      "scene as drawn. 0: off, up to 2")
+    .range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(native_volumetric, 1.0, "GPU",
                       "Time of day: volumetric light: the air lit by the sun or moon where it "
                       "reaches (shafts through the trees, past ridges and under clouds; strongest "
@@ -2611,6 +2617,7 @@ void WorkerMain() {
           renderer->SetCloudShadows(on * float(REXCVAR_GET(native_cloud_shadows)));
           renderer->SetSnowTracks(on * float(REXCVAR_GET(native_snow_tracks)));
           renderer->SetSpecular(on * float(REXCVAR_GET(native_sun_sheen)));
+          renderer->SetLightBounce(on * float(REXCVAR_GET(native_light_bounce)));
           renderer->SetDriftingSnow(revamped && REXCVAR_GET(native_drifting_snow));
           renderer->SetIceHalo(on * float(REXCVAR_GET(native_ice_halo)));
           // The surface picker.

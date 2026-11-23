@@ -2002,7 +2002,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2093,7 +2093,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[62] = {};  // by CopyKind
+  VkShaderModule copy_fs_[63] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2438,6 +2438,11 @@ struct Renderer::Impl {
   void PickProbe(const Draw& d, const GpuState& st);
   void PickRead();
   Image spec_img_, spec_out_;
+  // Light bounce (SetLightBounce): the albedo kept at the lighting pass, the
+  // light bounced onto each half-size pixel from what's lit round it.
+  float bounce_ = 0.0f;
+  bool bounce_ok_ = false;
+  Image bounce_albedo_, bounce_img_;
   Image relight_params_;  // the sheen's settings: the sky, the far-off scenery's light (SunSpecular)
   Image spec_stencil_dummy_;  // (its stencil when the lighting has none)
   bool spec_ok_ = false;
@@ -6568,7 +6573,8 @@ void main() {
     return;
   }
   if (texelFetch(relight, ivec2(7, 0), 0).w < 0.5) {
-    o = vec4(0.0);  // (the sheen's off: the backdrop only)
+    // (The sheen's off: the backdrop only; the depth kept for the bounce.)
+    o = texelFetch(relight, ivec2(9, 0), 0).x > 0.5 ? vec4(0.0, 0.0, 0.0, d) : vec4(0.0);
     return;
   }
   vec3 N = normalize(nw.xyz * 2.0 - 1.0);
@@ -6757,7 +6763,8 @@ void main() {
     return;
   }
   if (texelFetch(relight, ivec2(7, 0), 0).w < 0.5) {
-    o = vec4(0.0);  // (the sheen's off: the backdrop only)
+    // (The sheen's off: the backdrop only; the depth kept for the bounce.)
+    o = texelFetch(relight, ivec2(9, 0), 0).x > 0.5 ? vec4(0.0, 0.0, 0.0, d) : vec4(0.0);
     return;
   }
   vec3 N = normalize(nw.xyz * 2.0 - 1.0);
@@ -6841,11 +6848,108 @@ void main() {
 )", true);
   // The sun's sheen, 2: added to the scene where the depth still matches
   // (not over what was drawn after the lighting: riders, effects).
+  // Light bounce (half size): the light from the lit surfaces round each
+  // point (as the scene shows them: the sun's, the sky's, the lamps') onto
+  // it - each of a spiral of points a few metres out, seen through the depth
+  // on screen, facing it and in front of its surface, by how squarely they
+  // face each other and how near. Its depth kept in alpha (the upsizing).
+  copy_fs_[62] = CompileBuiltin("builtin_bounce", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;    // lit (linear)
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2) uniform sampler2D normals;  // the lighting's
+layout(push_constant) uniform Bounce {
+  mat4 m;    // ndc (x, y, 1 - depth, 1) -> world
+  vec4 cam;  // camera, radius (m)
+  vec4 a;    // 1 / width, 1 / height (full size), pixels a metre 1 m away, farthest
+  vec4 b;    // the frame (a turn of the spiral), largest radius (pixels), -, -
+} pc;
+layout(location = 0) out vec4 o;
+ivec2 kSize;
+vec3 World(ivec2 t, out float d) {
+  d = texelFetch(depth, t, 0).r;
+  vec2 uv = (vec2(t) + 0.5) * pc.a.xy;
+  vec4 p = pc.m * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 1.0 - max(d, 1e-7), 1.0);
+  return p.xyz / p.w;
+}
+vec3 Normal(ivec2 t, out bool ok) {
+  vec3 n = texelFetch(normals, t, 0).xyz * 2.0 - 1.0;
+  float l = length(n);
+  ok = abs(l - 1.0) < 0.2;
+  return ok ? n / l : vec3(0.0, 1.0, 0.0);
+}
+void main() {
+  kSize = textureSize(depth, 0);
+  ivec2 c = min(ivec2(gl_FragCoord.xy) * 2, kSize - 1);
+  float d;
+  vec3 P = World(c, d);
+  o = vec4(0.0, 0.0, 0.0, d);
+  if (d <= 0.0) return;
+  float dist = length(P - pc.cam.xyz);
+  if (dist > pc.a.w) return;
+  bool ok;
+  vec3 N = Normal(c, ok);
+  if (!ok) return;
+  float R = pc.cam.w;
+  float rpx = min(R * pc.a.z / dist, pc.b.y);
+  if (rpx < 3.0) return;
+  float spin = fract(52.9829189 * fract(dot(gl_FragCoord.xy + pc.b.x * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
+  const int kTaps = 12;
+  vec3 sum = vec3(0.0);
+  for (int i = 0; i < kTaps; ++i) {
+    float f = (float(i) + 0.5) / float(kTaps);
+    float ang = (f * 7.0 + spin) * 6.2831853;
+    // (Out to the radius, more of them farther: the area grows.)
+    vec2 off = vec2(cos(ang), sin(ang)) * (sqrt(f) * rpx);
+    ivec2 t = clamp(c + ivec2(round(off)), ivec2(0), kSize - 1);
+    float dq;
+    vec3 Q = World(t, dq);
+    if (dq <= 0.0) continue;
+    vec3 D = Q - P;
+    float dl = length(D);
+    if (dl < 0.05 || dl > R * 1.6) continue;
+    vec3 w = D / dl;
+    float cr = dot(N, w);           // facing it, here
+    if (cr <= 0.08) continue;
+    bool okq;
+    vec3 Nq = Normal(t, okq);
+    float ce = okq ? dot(Nq, -w) : 0.5;  // and it, here
+    if (ce <= 0.0) continue;
+    vec3 rad = textureLod(scene, (vec2(t) + 0.5) * pc.a.xy, 0.0).rgb;
+    // (Fading out toward the radius, and not too much from right beside.)
+    float fall = (1.0 - smoothstep(R * 0.6, R * 1.6, dl)) * smoothstep(0.0, 0.5, dl);
+    sum += rad * cr * ce * fall;
+  }
+  // (Six over the taps: a wall beside a sunlit field gets about half its
+  // light, a gentle slope beside it a little.)
+  vec3 e = sum * (6.0 / float(kTaps));
+  e *= 1.0 - smoothstep(pc.a.w * 0.6, pc.a.w, dist);
+  o = vec4(e, d);
+}
+)", true);
   copy_fs_[50] = CompileBuiltin("builtin_spec_add", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D spec;
 layout(set = 0, binding = 1) uniform sampler2D scene;
 layout(set = 0, binding = 2) uniform sampler2D depth;
-layout(push_constant) uniform Add { vec4 a; } pc;  // strength
+layout(set = 0, binding = 3) uniform sampler2D bounce;  // half size: the light bounced here, its depth
+layout(set = 0, binding = 4) uniform sampler2D albedo;  // as the lighting had it
+layout(push_constant) uniform Add { vec4 a; } pc;  // strength, diagnostics, the bounce's strength (0 none)
+// The bounced light at this pixel: the half-size result's 3 x 3 round it,
+// those at about this depth (not across an outline).
+vec3 Bounced(ivec2 ip, float d) {
+  ivec2 hs = textureSize(bounce, 0);
+  ivec2 h = ip / 2;
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      vec4 b = texelFetch(bounce, clamp(h + ivec2(x, y), ivec2(0), hs - 1), 0);
+      float w = (x == 0 && y == 0 ? 2.0 : 1.0) * exp(-abs(b.a - d) / max(d * 0.02, 1e-6));
+      sum += b.rgb * w;
+      wsum += w;
+    }
+  }
+  return wsum > 1e-4 ? sum / wsum : vec3(0.0);
+}
 layout(location = 0) out vec4 o;
 void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
@@ -6868,6 +6972,17 @@ void main() {
     return;
   }
   add /= 1.0 + dot(add, vec3(0.3, 0.59, 0.11));
+  // The light bounced onto it, by its own color (the albedo the lighting
+  // had: a rider in front fails the depth test above).
+  if (pc.a.z > 0.0) {
+    vec3 alb = texelFetch(albedo, ip, 0).rgb;
+    vec3 b = alb * Bounced(ip, d) * pc.a.z;
+    if (pc.a.y < -0.5) {
+      o = vec4(Bounced(ip, d) * 3.0, 1.0);  // (diagnostics: the bounced light)
+      return;
+    }
+    add += b / (1.0 + dot(b, vec3(0.3, 0.59, 0.11)) * 0.5);
+  }
   o = vec4(c.rgb + add * (1.0 - 0.6 * clamp(c.rgb, 0.0, 1.0)), c.a);
 }
 )", true);
@@ -11961,7 +12076,9 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
   // (The sheen, and the far-off scenery lit for the hour: both or either.)
   const bool sheen = specular_ > 0.0f && !Diag("nospec");
   const bool backdrop = !Diag("nobackdrop");
-  if (!(sheen || backdrop) || !TodOn() || !tod_normal_) return;
+  const bool bounce = bounce_ > 0.0f && !Diag("nobounce");
+  bounce_ok_ = false;
+  if (!(sheen || backdrop || bounce) || !TodOn() || !tod_normal_) return;
   std::string n0;
   Image* a3 = TextureFor(d, 3, st, &n0);
   auto dit = resolved_.find(depth_base_);
@@ -11986,8 +12103,26 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
                    t.sun_color.y * day + t.moon_color.y * t.night * t.moon_bright * 0.12,
                    t.sun_color.z * day + t.moon_color.z * t.night * t.moon_bright * 0.14};
   for (double& c : col) c *= dim * e * 0.9;
-  if (col[0] + col[1] + col[2] < 0.002 && !backdrop) return;
+  if (col[0] + col[1] + col[2] < 0.002 && !backdrop && !bounce) return;
   EndRendering();
+  // The albedo as the lighting has it, kept for the light bounced onto it
+  // later (SpecularScene).
+  if (bounce && albedo->samples == 1 && !albedo->depth) {
+    if (!bounce_albedo_.image || bounce_albedo_.width != albedo->width || bounce_albedo_.height != albedo->height ||
+        bounce_albedo_.format != albedo->format) {
+      if (bounce_albedo_.image) Retire(bounce_albedo_);
+      bounce_albedo_ = gpu_.CreateImage(albedo->width, albedo->height, albedo->format, false, "bounce_albedo");
+      ToGeneral(cb_, bounce_albedo_);
+    }
+    Barrier();
+    VkImageCopy ic{};
+    ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    ic.extent = {albedo->width, albedo->height, 1};
+    vk::vkCmdCopyImage(cb_, albedo->image, VK_IMAGE_LAYOUT_GENERAL, bounce_albedo_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                       &ic);
+    Barrier();
+    bounce_ok_ = true;
+  }
   // The backdrop's light: the mountain's sun it was painted with and the
   // sky's share of that light (the rest the sun's); the hour's sky and sun,
   // as the lighting has them (scaled per color), its direction; how far the
@@ -12013,7 +12148,7 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
     }
   }
   {
-    float f[20] = {};
+    float f[24] = {};
     for (int i = 0; i < 3; ++i) f[i] = tod_game_light_[i];
     f[3] = 0.4f;
     f[4] = float(lm_ambient_scale_.x);
@@ -12032,6 +12167,7 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
       for (int i = 0; i < 3; ++i) f[12 + i] = tod_game_light_[i];
     }
     for (int i = 0; i < 4; ++i) f[16 + i] = stt[i];
+    f[20] = bounce ? 1.0f : 0.0f;  // (texel 9: the bounce on: the depth kept where there's no sheen)
     // One row: the sky's colors (texels 0-3, copied), these (4-8).
     if (!relight_params_.image) {
       relight_params_ = gpu_.CreateImage(12, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "sheen_settings");
@@ -12042,7 +12178,7 @@ void Renderer::Impl::SunSpecular(const Draw& d, const GpuState& st) {
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageOffset = {4, 0, 0};
-    region.imageExtent = {5, 1, 1};
+    region.imageExtent = {6, 1, 1};
     Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, relight_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     staging_.push_back(staging);
@@ -12108,9 +12244,65 @@ Image* Renderer::Impl::SpecularScene(Image* scene) {
   }
   spec_out_.scaled = scene->scaled;
   spec_out_.scale = scene->scale;
-  float pc[4] = {specular_, Diag("specdbg") || Diag("specshow") ? 1.0f : 0.0f, 0, 0};
+  // The light bounced onto the world (half size), from the scene as lit.
+  const bool bounce = bounce_ok_ && bounce_albedo_.width == scene->width && bounce_albedo_.height == scene->height &&
+                      tod_normal_ && tod_normal_->width == scene->width && tod_normal_->height == scene->height &&
+                      tod_normal_->samples == 1 && !tod_normal_->depth;
+  bounce_ok_ = false;
+  if (bounce) {
+    const uint32_t hw = std::max(scene->width / 2, 1u), hh = std::max(scene->height / 2, 1u);
+    if (!bounce_img_.image || bounce_img_.width != hw || bounce_img_.height != hh) {
+      if (bounce_img_.image) Retire(bounce_img_);
+      bounce_img_ = gpu_.CreateImage(hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, false, "light_bounce");
+      ToGeneral(cb_, bounce_img_);
+    }
+    // Pixels a metre, a metre away (the vertical field of view).
+    float px_per_unit = 0.0f;
+    {
+      double mid[3], top[3];
+      bool okv = true;
+      for (int k = 0; k < 2 && okv; ++k) {
+        const double ndc[4] = {0.0, k ? 1.0 : 0.0, 0.5, 1.0};
+        double wp[4];
+        for (int r = 0; r < 4; ++r) {
+          wp[r] = 0;
+          for (int c = 0; c < 4; ++c) wp[r] += inv_vp_[r * 4 + c] * ndc[c];
+        }
+        okv = std::fabs(wp[3]) > 1e-12;
+        double* out = k ? top : mid;
+        for (int r = 0; r < 3 && okv; ++r) out[r] = wp[r] / wp[3] - cam_pos_[r];
+      }
+      const double dm = okv ? std::sqrt(mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]) : 0.0;
+      const double dt = okv ? std::sqrt(top[0] * top[0] + top[1] * top[1] + top[2] * top[2]) : 0.0;
+      if (dm > 1e-9 && dt > 1e-9) {
+        const double ca = std::clamp((mid[0] * top[0] + mid[1] * top[1] + mid[2] * top[2]) / (dm * dt), -1.0, 1.0);
+        const double th = std::tan(std::acos(ca));
+        if (th > 1e-4 && std::isfinite(th)) px_per_unit = float(0.5 * double(scene->height) / th);
+      }
+    }
+    float bp[28] = {};
+    for (int c = 0; c < 4; ++c) {
+      for (int r = 0; r < 4; ++r) bp[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+    }
+    bp[16] = cam_pos_[0];
+    bp[17] = cam_pos_[1];
+    bp[18] = cam_pos_[2];
+    bp[19] = 3.0f;  // a few metres round
+    bp[20] = 1.0f / float(scene->width);
+    bp[21] = 1.0f / float(scene->height);
+    bp[22] = px_per_unit;
+    bp[23] = 120.0f;
+    bp[24] = float(frame_number_ % 64);
+    bp[25] = 0.12f * float(scene->height);
+    Barrier();
+    FullscreenPass(CopyKind::kBounce, &bounce_img_, scene, &dit->second, tod_normal_, true, bp, 28);
+    Barrier();
+  }
+  float pc[4] = {specular_, Diag("specdbg") || Diag("specshow") ? 1.0f : Diag("bounceshow") ? -1.0f : 0.0f,
+                 bounce ? bounce_ : 0.0f, 0};
   Barrier();
-  FullscreenPass(CopyKind::kSpecAdd, &spec_out_, &spec_img_, scene, &dit->second, false, pc, 4);
+  FullscreenPass(CopyKind::kSpecAdd, &spec_out_, &spec_img_, scene, &dit->second, false, pc, 4, nullptr,
+                 bounce ? &bounce_img_ : &dummy_, bounce ? &bounce_albedo_ : &dummy_);
   Barrier();
   dyn_ = DynState{};
   return &spec_out_;
@@ -17325,6 +17517,7 @@ void Renderer::SetAmbientOcclusion(float strength, bool debug) {
   impl_->ao_debug_ = debug && strength > 0.0f;
 }
 
+void Renderer::SetLightBounce(float strength) { impl_->bounce_ = std::max(strength, 0.0f); }
 void Renderer::SetFog(float density, float start, float most) {
   impl_->fog_density_ = std::max(density, 0.0f);
   impl_->fog_start_ = std::max(start, 0.0f);

@@ -605,6 +605,11 @@ const std::vector<Tab>& Tabs() {
                         "lighting leaves out: snow glinting in the sun, a glare off it toward a "
                         "low sun, a dull gloss on the rest. 0: off.",
                         "%.1f", 0.0, 2.0),
+                SliderF("native_light_bounce", "Light bounce",
+                        "With time of day on: light bouncing off lit surfaces onto what's "
+                        "near them: sunlit snow brightening a wall, a trunk or a rail from "
+                        "below, a lamp's pool spilling onto what's beside it. 0: off.",
+                        "%.1f", 0.0, 2.0),
                 SliderF("native_volumetric", "Volumetric light",
                         "With time of day on: the air itself lit by the sun or moon where it "
                         "reaches: real shafts through the trees, past ridges and under the "

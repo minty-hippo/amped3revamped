@@ -347,7 +347,7 @@ lighting, each setting the detailed options under it:
 | Sun shadows | Game's (its painted shadows) / Low / Medium / High (world shadows 2x-4x, sharper, farther) |
 | Lamp shadows | Off / Low (two nearest lamps) / Medium (every lamp) / High (every lamp, finer) |
 | Atmosphere | Fog / God rays / Volumetric low (quarter size) / high (half) / ultra (finer steps) |
-| Ambient occlusion | Off / On |
+| Ambient occlusion | Off / On (with light bounce) |
 | Surface detail | Low / High (settling snow, snow tracks, cloud shadows, sun sheen, drifting snow) |
 
 The detailed options stay adjustable; a part whose options match none of
@@ -367,7 +367,7 @@ shadows, textures or effects. That covers the time of day (and the weather,
 night lights and the effects kept with it off), eye adaptation, the sharper
 and farther shadows, world shadows, contact and cloud shadows, ambient
 occlusion, god rays and volumetric light, distance fog, bloom, lens flare and
-lens dirt, sun sheen, ice halo, diamond dust, drifting snow, snow tracks,
+lens dirt, sun sheen, light bounce, ice halo, diamond dust, drifting snow, snow tracks,
 motion and speed blur, branch fade, smoothed foliage edges, the trail map
 clouds, and the texture pack, sharp fonts and upscaled textures. Each keeps
 its own setting for when the switch is back on. F2 switches it without
@@ -550,6 +550,22 @@ that rule against a save that has the pass.
   picker finds the texture through the same tags: a frame listing the
   textures drawn, then one frame per digit of its place in that list, read
   back from the middle of the screen; the sheen pauses for those frames.)
+  Light bounce (Light Bounce, `native_light_bounce`, 1, up to 2): one bounce
+  of light, in screen space: each point (at half size) gathers the light
+  of the lit surfaces within a few metres that face it, from the finished
+  scene as drawn (sun, sky, lamps, the lit fronts of banners and rails),
+  weighted by how squarely the two face each other and how near, through
+  the lighting's own depth and normals; the result is lifted to full size
+  across matching depths only and added by each surface's own albedo (kept
+  from the lighting pass), so it never bleeds across an outline or onto
+  a rider in front. Sunlit snow lifts the shaded side of a wall, a jump's
+  inner face, a trunk or a rail from below; a red banner tints the snow
+  under it; a lamp's pool spills onto what's beside it. Flat open slopes
+  get next to nothing (as they should: they barely see each other). It
+  runs with the sheen's passes (no extra full-size pass of its own: 12
+  taps at half size and a 3 x 3 upsample in the sheen's composite), and
+  goes with ambient occlusion in the quality presets. Diagnostics:
+  `nobounce`, `bounceshow` (the bounced light alone, x3).
   An ice halo (Ice Halo, `native_ice_halo`, 1): with thin high cloud over an
   otherwise clear sky and the sun low to middling, a ring round it 22 degrees
   out (reddish inside, the sky a shade darker within it) and the sun dogs

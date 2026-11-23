@@ -134,8 +134,21 @@ int MatchAtmosphere() {
   return q >= 0 && q <= 2 ? 2 + q : -1;
 }
 
-void SetAo(int l) { SetBool("native_ambient_occlusion", l == 1); }
-int MatchAo() { return Num("native_ambient_occlusion") > 0.5 ? 1 : 0; }
+// (Light bounce goes with it: both how light gathers round the world.)
+void SetAo(int l) {
+  SetBool("native_ambient_occlusion", l == 1);
+  if (l == 0) {
+    SetNum("native_light_bounce", 0.0);
+  } else if (Num("native_light_bounce") <= 0.0) {
+    SetNum("native_light_bounce", 1.0);
+  }
+}
+int MatchAo() {
+  const bool ao = Num("native_ambient_occlusion") > 0.5, bounce = Num("native_light_bounce") > 0.0;
+  if (ao && bounce) return 1;
+  if (!ao && !bounce) return 0;
+  return -1;
+}
 
 void SetSurface(int l) {
   SetBool("native_snow_cover", l == 1);

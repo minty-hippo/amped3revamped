@@ -471,6 +471,7 @@ int main(int argc, char** argv) {
   float tracks = 0.0f;  // --tracks
   float volumetric = 0.0f;  // --volumetric
   int volumetric_quality = 1;  // --volumetric-quality
+  float bounce = 0.0f;    // --bounce
   float specular = 0.0f;  // --specular  // --bloom strength
   bool test_lights = false;  // --test-lights: a few night lights ahead of the camera  // --tod hour [--tod-moon phase] [--tod-clouds cover]
   float god_rays = 0.0f;  // --god-rays strength  // --fog density [--fog-start metres]  // --speed-blur amount (0..1): speed blur as at that speed
@@ -556,6 +557,8 @@ int main(int argc, char** argv) {
       tod.night_light = std::stof(argv[++i]);
     } else if (a == "--tod-overcast" && i + 1 < argc) {
       tod.overcast = std::stof(argv[++i]);
+    } else if (a == "--bounce" && i + 1 < argc) {
+      bounce = std::stof(argv[++i]);
     } else if (a == "--specular" && i + 1 < argc) {
       specular = std::stof(argv[++i]);
     } else if (a == "--volumetric-quality" && i + 1 < argc) {
@@ -907,6 +910,7 @@ int main(int argc, char** argv) {
   renderer.SetSnowTracks(tracks);
   renderer.SetVolumetric(volumetric, volumetric_quality);
   renderer.SetSpecular(specular);
+  renderer.SetLightBounce(bounce);
   renderer.SetDriftingSnow(true);
     renderer.SetCollectInstances(test_lights);
     if (god_rays > 0.0f) renderer.SetGodRays(god_rays);
