@@ -13898,7 +13898,7 @@ void Renderer::Impl::TodShadows() {
   // aren't left lit all over.
   const bool painted = baked_ok_ && baked_src_ && baked_tod_ && !tod_.passive && bake_c5_[0] != 0.0f &&
                        !Diag("nopainted");
-  const bool far = !tod_.passive && sun_r_ > 0.0 && !Diag("nofar");
+  const bool far_off = !tod_.passive && sun_r_ > 0.0 && !Diag("nofar");
   // Eased (after a step of the sun) or smoothed (always) against last frame's.
   const uint64_t since = frame_number_ - sun_turn_frame_;
   const double jump = std::hypot(cam_pos_[0] - tod_mask_prev_cam_[0], cam_pos_[1] - tod_mask_prev_cam_[1],
@@ -13908,7 +13908,7 @@ void Renderer::Impl::TodShadows() {
   double prev_vp[16];
   const bool ease = (sun_turned_ || steady) && prev_fresh && jump < 5.0 && !Diag("noease") &&
                     Invert4(tod_mask_prev_inv_vp_, prev_vp);
-  const bool finish = clouds || tracks || contact || far;
+  const bool finish = clouds || tracks || contact || far_off;
   // sun -> (finish ->) (ease ->) tod_mask_
   Image* finished = ease ? &tod_mask_raw_ : &tod_mask_;
   Image* sun_out = finish ? (ease ? &tod_mask_ : &tod_mask_raw_) : finished;
@@ -13984,7 +13984,7 @@ void Renderer::Impl::TodShadows() {
       f[44] = 0.06f * tracks_;  // 11: groove depth, heap height
       f[45] = 0.22f * tracks_;
     }
-    if (far) {
+    if (far_off) {
       for (int i = 0; i < 3; ++i) f[48 + i] = float(cam_pos_[i]);  // 12: camera, from (m)
       f[51] = float(0.8 * sun_r_);
       f[52] = float(0.2 * sun_r_);  // 13: over (m), how far the sun's from the mountain's, painted, jitter
