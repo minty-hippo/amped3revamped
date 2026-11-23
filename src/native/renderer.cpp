@@ -2049,6 +2049,7 @@ struct Renderer::Impl {
   // Per vertex shader (its microcode hash) that crashed the driver: the
   // plainer translation to try next (TranslateOptions::safe_level).
   std::unordered_map<uint64_t, int> safe_level_;
+  static constexpr int kSafeLevels = 3;  // the plainest (TranslateOptions::safe_level)
   // Game pixel shaders as drawn into a depth target alone (one sample): no
   // color outputs, no sample mask (DepthOnlyPs).
   std::unordered_map<const Shader*, Shader> depth_only_ps_;
@@ -4022,11 +4023,11 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   char pipe_id[112];
   // (" tv<N>": the shader translation's version, bumped when a change may
   // fix a driver crash, so what crashed an older one is tried again.)
-  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv3",
+  std::snprintf(pipe_id, sizeof(pipe_id), "vs %016llX ps %016llX t%u m%08X s%u%s%s%s%s%s tv4",
                 (unsigned long long)vs.info.ucode_hash, (unsigned long long)ps.info.ucode_hash,
                 unsigned(topology), mode & 0x201807, host_samples, velocity ? " vel" : "", mask ? " mask" : "",
                 reactive ? " reactive" : "", caster ? " caster" : "",
-                vs.safe_level == 1 ? " safe1" : vs.safe_level >= 2 ? " safe2" : "");
+                vs.safe_level ? (" safe" + std::to_string(std::min(vs.safe_level, kSafeLevels))).c_str() : "");
   if (!crashed_ids_.empty() && crashed_ids_.count(pipe_id)) {
     if (crashed_told_.insert(pipe_id).second) {
       pending_notices_.push_back(std::string("left out a pipeline that crashed the driver before: ") + pipe_id);
@@ -4172,7 +4173,9 @@ VkPipeline Renderer::Impl::PipelineFor(const Draw& d, const GpuState& st, const 
   pr.stencilAttachmentFormat = depth ? depth->format : VK_FORMAT_UNDEFINED;
   auto& pci = build->pci;
   pci.pNext = &pr;
-  pci.stageCount = 2;
+  // (The plainest form for a driver that crashed: depth alone, no fragment
+  // shader - no alpha test, so cut-out leaves cast solid cards.)
+  pci.stageCount = vs.safe_level >= kSafeLevels && colors.empty() ? 1 : 2;
   pci.pStages = stages;
   pci.pVertexInputState = &vi;
   pci.pInputAssemblyState = &ia;
@@ -4275,7 +4278,10 @@ void Renderer::Impl::ReadCrashed() {
       // (Only this translation's crashes: see pipe_id's " tv".)
       const size_t bar0 = line.find(" | ");
       const std::string head = line.substr(0, bar0);
-      if (head.size() < 4 || head.compare(head.size() - 4, 4, " tv3") != 0) continue;
+      if (head.size() < 4 || (head.compare(head.size() - 4, 4, " tv4") != 0 &&
+                               head.compare(head.size() - 4, 4, " tv3") != 0)) {
+        continue;  // (tv3's shaders are tv4's at level 0)
+      }
     }
     const size_t bar = line.find(" | ");
     const std::string id = line.substr(9, bar == std::string::npos ? std::string::npos : bar - 9);
@@ -4284,20 +4290,18 @@ void Renderer::Impl::ReadCrashed() {
     // crash; past the last, the pipeline's left out.)
     unsigned long long vsh = 0;
     int lvl = 0;
-    // (Off for now: the Odin 3's crash came with and without wind, so a
-    // crash leaves the pipeline out at once rather than after three more.)
-    if (false && std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
+    if (std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
       const size_t at = id.find(" safe");
       if (at != std::string::npos) lvl = std::atoi(id.c_str() + at + 5);
       int& l = safe_level_[uint64_t(vsh)];
-      l = std::max(l, lvl + 1);
+      l = std::max(l, std::min(lvl + 1, kSafeLevels));
     }
     // (The list's line only once the plainest has crashed too.)
-    if (bar != std::string::npos) crashed_lines_.insert(line.substr(bar + 3));
+    if (bar != std::string::npos && lvl >= kSafeLevels) crashed_lines_.insert(line.substr(bar + 3));
   }
   if (!crashed_ids_.empty()) {
     pending_notices_.push_back(std::to_string(crashed_ids_.size()) +
-                               " pipeline(s) crashed the graphics driver before: left out (" + path +
+                               " pipeline(s) crashed the graphics driver before: plainer shaders tried, the plainest left out (" + path +
                                "; delete it to try them again)");
   }
 }

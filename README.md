@@ -632,21 +632,20 @@ that rule against a save that has the pass.
     the Odin 3's Turnip driver): the crash report now says what the crashing
     thread was building ("while: pipeline vs ... ps ..." or "built-in pass
     N"), and the same line goes into `logs\native_pipelines\crashed_pipelines.txt`.
-    (For now a crash leaves the pipeline out on the next start at once; the
-    stepping below is switched off.) The next start can make its vertex shader plainer instead, one step
-    per crash: first without an instance's placement (the trunk-bending
-    wind), then without wind at all; only if the plainest crashes too is
-    the pipeline left out (not precompiled, its draws skipped). Each step is
-    named in the log ("vertex shader ... made plainer (level N)"); delete
-    the file to try the full shaders again. Records carry the shader
-    translation's version (" tv3"), so an update that may fix a crash tries
-    again by itself. (The Odin 3's crash: the instanced trees drawn into a
-    depth target alone - the game's shadow map - vertex shader
-    0B81497C6E3B216A; it crashed with and without wind, and with its
-    interpolators made non-constant. Pipelines with no color targets and
-    one sample now get the pixel shader without its color outputs and
-    sample mask, which go nowhere there; the picture is unchanged.
-    Diagnostic `nodepthps` turns that off.)
+    On the next start its vertex shader is made plainer, one step per
+    crash, until one builds (it then stays at that step; the log names it,
+    "vertex shader ... made plainer (level N)"): 1 without precise /
+    invariant, 2 also trunc() spelled with floor(), 3 also no fragment
+    shader where there are no color targets (depth alone: no alpha test).
+    Past 3 the pipeline is left out (not precompiled, its draws skipped).
+    Records carry the shader translation's version (" tv4"), so an update
+    that may fix a crash tries again by itself; delete the file to start
+    over. (The Odin 3, Turnip / Mesa 26.3: the instanced trees drawn into
+    a depth target alone - the game's shadow map - vertex shader
+    0B81497C6E3B216A. Not the wind, the constant interpolators, or the
+    pixel shader's color / sample mask outputs: it crashed without each.
+    Depth-only single-sample pipelines still use the pixel shader without
+    those outputs; diagnostic `nodepthps` turns that off.)
 - Fewer hitches from pipeline builds: a pipeline the driver has to compile
   (not in its cache; 150-800 ms each on an Arc) is now built in the
   background at once, even the first one in a frame, the draw left out for

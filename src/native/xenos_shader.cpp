@@ -283,6 +283,31 @@ class Translator {
  private:
   bool vs() const { return stage_ == ShaderStage::kVertex; }
 
+  // Plainer forms of a vertex shader (TranslateOptions::safe_level), for a
+  // driver whose compiler crashed on the normal one: 1 without precise /
+  // invariant, 2 also trunc() as floor() of the magnitude. (3, also no
+  // fragment shader with no color targets, is the renderer's.)
+  std::string SafeGlsl(std::string g) const {
+    if (!vs() || options_.safe_level < 1) return g;
+    auto replace_all = [&](const std::string& from, const std::string& to) {
+      for (size_t at = 0; (at = g.find(from, at)) != std::string::npos; at += to.size()) {
+        g.replace(at, from.size(), to);
+      }
+    };
+    replace_all("invariant gl_Position;\n", "");
+    replace_all("precise ", "");
+    if (options_.safe_level >= 2) {
+      replace_all("trunc(", "xe_trunc(");
+      const size_t at = g.find('\n') + 1;  // after #version
+      g.insert(at,
+               "float xe_trunc(float x) { return x < 0.0 ? -floor(-x) : floor(x); }\n"
+               "vec2 xe_trunc(vec2 x) { return sign(x) * floor(abs(x)); }\n"
+               "vec3 xe_trunc(vec3 x) { return sign(x) * floor(abs(x)); }\n"
+               "vec4 xe_trunc(vec4 x) { return sign(x) * floor(abs(x)); }\n");
+    }
+    return g;
+  }
+
   bool Fail(const std::string& message) {
     if (error_.empty()) error_ = message;
     return false;
@@ -750,7 +775,6 @@ uint xe_vertex_index() {
     // Wind (docs/native-shaders.md): the vertex moved in the space the draw's
     // c0..c3 take it from (the world, or the object's own), so it moves with
     // whatever placed it.
-    if (options_.safe_level >= 2) g += "vec4 xe_wind(vec4 p, float t) { return p; }\n#if 0\n";
     g += R"(vec4 xe_wind(vec4 p, float t) {
   if (xe_sys.wind2.x <= 0.0) return p;
   vec4 q = xe_sys.wind_minv * p;
@@ -814,7 +838,6 @@ uint xe_vertex_index() {
 }
 
 )";
-    if (options_.safe_level >= 2) g += "#endif\n";
   }
   if (options_.velocity && vs()) {
     // The same program reading last frame's constants.
@@ -862,7 +885,7 @@ uint xe_vertex_index() {
          "  xe_vprev = xe_clip();\n"
          "  gl_PointSize = xe_sys.point_size * xe_sys.res_scale;\n"
          "}\n";
-    out.glsl = std::move(g);
+    out.glsl = SafeGlsl(std::move(g));
     out.disasm = std::move(disasm_);
     out.info = std::move(info_);
     out.ok = true;
@@ -1059,7 +1082,7 @@ uint xe_vertex_index() {
   }
   g += "}\n";
 
-  out.glsl = std::move(g);
+  out.glsl = SafeGlsl(std::move(g));
   out.disasm = std::move(disasm_);
   out.info = std::move(info_);
   out.ok = true;
@@ -1760,8 +1783,7 @@ bool Translator::EmitVertexFetch(const Fetch& f) {
     // An instance's placement (the world's instanced meshes: trees, their
     // foliage): three rows of four floats from vf94, their w where it
     // stands - for the wind to bend it from its foot.
-    if (vs() && vf == 94 && format == kVf_32_32_32_32_FLOAT && (off == 0 || off == 4 || off == 8) &&
-        options_.safe_level < 1) {
+    if (vs() && vf == 94 && format == kVf_32_32_32_32_FLOAT && (off == 0 || off == 4 || off == 8)) {
       Line(Fmt("xe_wind_org[%d] = xe_t0.w;", off / 4));
       Line(Fmt("xe_wind_rows |= %d;", 1 << (off / 4)));
     }
