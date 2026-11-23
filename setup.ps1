@@ -95,6 +95,22 @@ function Invoke-Logged([string]$Name, [scriptblock]$Command, [switch]$AllowFail)
   if ($AllowFail) { return $true }
 }
 
+# A build that fails only because its precompiled headers were made by an
+# older compiler (Visual Studio / its C++ tools updated since: "precompiled
+# file ... was compiled for the target ...msvc19.44.35229 but ... 35230"):
+# the stale headers deleted and the build run once more.
+function Invoke-Build([string]$Name, [string]$BuildDir, [scriptblock]$Command) {
+  if (Invoke-Logged $Name $Command -AllowFail) { return }
+  $stale = Select-String -LiteralPath $script:LastLog -SimpleMatch -Quiet -Pattern @(
+    'differs in precompiled file', 'precompiled file', 'was compiled for the target')
+  if (-not $stale -or -not (Test-Path $BuildDir)) { Fail "$Name failed. See $($script:LastLog)" }
+  Write-Host '    The compiler was updated since the last build: rebuilding its precompiled headers.' -ForegroundColor Yellow
+  Get-ChildItem -LiteralPath $BuildDir -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'cmake_pch*.pch' -or $_.Name -like 'cmake_pch*.obj' -or $_.Name -like 'cmake_pch*.pdb' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+  Invoke-Logged "$Name-retry" $Command
+}
+
 function Get-ClangMajor([string]$clangExe) {
   if (-not (Test-Path $clangExe)) { return 0 }
   $line = (& $clangExe --version 2>$null | Select-Object -First 1)
@@ -327,9 +343,10 @@ if (-not $SkipSdk -or -not (Test-Path $Rexglue)) {
     Invoke-Logged 'sdk-configure' { cmake --preset win-amd64 -DREXGLUE_USE_D3D12=ON -DREXGLUE_USE_VULKAN=ON }
     # The rexglue codegen tool is installed for Release only (other configs map
     # to it), so Release is always installed; then the chosen config's libraries.
-    Invoke-Logged 'sdk-build-release' { cmake --build out/build/win-amd64 --config Release --target install }
+    $sdkBuild = Join-Path $SdkDir 'out\build\win-amd64'
+    Invoke-Build 'sdk-build-release' $sdkBuild { cmake --build out/build/win-amd64 --config Release --target install }
     if ($Config -ne 'Release') {
-      Invoke-Logged 'sdk-build' { cmake --build out/build/win-amd64 --config $Config --target install }
+      Invoke-Build 'sdk-build' $sdkBuild { cmake --build out/build/win-amd64 --config $Config --target install }
     }
   } finally {
     Pop-Location
@@ -617,7 +634,7 @@ function Build-Game([string]$Tag) {
   if (-not (Test-Path $sources)) { Fail "Recompiler finished but $sources is missing." }
   Step "Building amped3.exe ($Preset) - compiling the recompiled game takes a while"
   Invoke-Logged "$Tag-reconfigure" { cmake --preset $Preset @ConfigureArgs }
-  Invoke-Logged "$Tag-build" { cmake --build --preset $Preset }
+  Invoke-Build "$Tag-build" (Join-Path $ProjectDir 'out') { cmake --build --preset $Preset }
   if (-not (Test-Path $Exe)) { Fail "Build finished but $Exe is missing." }
   Install-UpscalerRuntimes
   # The subtitle maker (not part of the normal build; the game doesn't need it).
