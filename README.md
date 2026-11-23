@@ -637,8 +637,13 @@ that rule against a save that has the pass.
     each column of voxels a 128-bit texel). The cascades are rebuilt with
     the sun maps' updates once the camera is an eighth of a box from where
     it was, and merged with what was there, so what's been seen stays.
-    Each half-size pixel then traces 12 rays (cosine-weighted) through
-    them, cell by cell. A ray that hits something takes off the sky light
+    Each quarter-size pixel then traces 8 rays (cosine-weighted) through
+    them, cell by cell, a column's empty 32 voxels of y crossed in one
+    step (the first version, half size, 12 rays, every voxel, took
+    35-57 ms on the GPU; this one about a fortieth of that in the
+    replays), hits nearer than two voxels left out (the voxels' steps
+    along a slope were lighting the snow beside itself), the sun's ray
+    from an off-screen hit traced through the coarse cascade only. A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps

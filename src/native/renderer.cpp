@@ -2524,7 +2524,7 @@ struct Renderer::Impl {
     bool skip = false;  // this update: still near enough its box
   };
   GiCascade gi_c_[2];
-  Image gi_params_, gi_blur_;
+  Image gi_params_, gi_blur_, gi_img_;  // (gi_img_: quarter size)
   bool GiReady() const { return gi_ > 0.0f && gi_c_[0].ok && gi_c_[1].ok && !Diag("nogi"); }
   void GiVoxelize(std::vector<CasterDraw>& env, bool start, bool done);
   void GiTrace(Image* scene, Image* depth);
@@ -7224,7 +7224,7 @@ layout(set = 0, binding = 2) uniform sampler2D normals;  // the lighting's
 layout(set = 0, binding = 3) uniform usampler2D occ0;    // 1 m voxels
 layout(set = 0, binding = 4) uniform usampler2D occ1;    // 4 m
 layout(set = 0, binding = 5) uniform sampler2D params;
-layout(push_constant) uniform Gi { vec4 a; } pc;  // 1 / width, 1 / height (full size), voxels a side
+layout(push_constant) uniform Gi { vec4 a; } pc;  // 1 / width, 1 / height (full size), voxels a side, pixels a texel
 layout(location = 0) out vec4 o;
 mat4 M, VP;
 vec4 kBox[2], kSun, kCam, kSh[7], kSet;
@@ -7245,15 +7245,17 @@ vec3 Sky(vec3 n) {
   return max(r, vec3(0.0));
 }
 // Along P + t D through the cascades (the fine one, then on in the coarse
-// one), at most tmax and budget voxels each: t of the first occupied voxel
-// (-1: none), the face it was entered by.
-float Trace(vec3 P, vec3 D, float tmax, int budget, out vec3 n) {
+// one; from k0), at most tmax and budget[k] voxels in each: t of the first
+// occupied voxel past tmin (-1: none), the face it was entered by. A
+// column's 32 voxels of y that are all empty are crossed in one step (to
+// where the ray leaves them, or leaves the column).
+float Trace(vec3 P, vec3 D, float tmin, float tmax, int k0, ivec2 budget, out vec3 n) {
   n = vec3(0.0, 1.0, 0.0);
   vec3 Ds = D + vec3(equal(D, vec3(0.0))) * 1e-6;
   vec3 inv = 1.0 / Ds;
   ivec3 st = ivec3(sign(Ds));
   float t = 0.0;
-  for (int k = 0; k < 2; ++k) {
+  for (int k = k0; k < 2; ++k) {
     float vs = kBox[k].w;
     vec3 B = kBox[k].xyz;
     float S = float(N) * vs;
@@ -7268,8 +7270,40 @@ float Trace(vec3 P, vec3 D, float tmax, int budget, out vec3 n) {
     vec3 tMax = ((vec3(v) + max(vec3(st), vec3(0.0))) * vs + B - P) * inv;
     int axis = -1;
     float tc = tin;
-    for (int i = 0; i < budget; ++i) {
-      if (Occ(k, v)) {
+    ivec2 col = ivec2(-1);
+    uvec4 cw = uvec4(0u);
+    for (int i = 0; i < budget[k]; ++i) {
+      if (v.xz != col) {
+        col = v.xz;
+        cw = k == 0 ? texelFetch(occ0, col, 0) : texelFetch(occ1, col, 0);
+      }
+      uint w = cw[v.y >> 5];
+      if (w == 0u) {
+        // (Empty to the end of these 32: on to where the ray leaves them or
+        // the column, whichever first.)
+        float ty = ((st.y > 0 ? float((v.y | 31) + 1) : float(v.y & ~31)) * vs + B.y - P.y) * inv.y;
+        float txz = min(tMax.x, tMax.z);
+        if (ty < txz) {
+          tc = ty;
+          if (tc > tout) break;
+          v.y = st.y > 0 ? (v.y | 31) + 1 : (v.y & ~31) - 1;
+          if (v.y < 0 || v.y >= N) break;
+          tMax.y = ty + tDelta.y;
+          axis = 1;
+          continue;
+        }
+        axis = tMax.x < tMax.z ? 0 : 2;
+        tc = tMax[axis];
+        if (tc > tout) break;
+        v[axis] += st[axis];
+        tMax[axis] += tDelta[axis];
+        // (Where y is at that point.)
+        v.y = clamp(int(floor((P.y + D.y * tc - B.y) / vs)), 0, N - 1);
+        tMax.y = ((float(v.y) + (st.y > 0 ? 1.0 : 0.0)) * vs + B.y - P.y) * inv.y;
+        if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, ivec3(N)))) break;
+        continue;
+      }
+      if (((w >> uint(v.y & 31)) & 1u) != 0u && tc >= tmin) {
         if (axis >= 0) {
           n = vec3(0.0);
           n[axis] = -float(st[axis]);
@@ -7283,6 +7317,7 @@ float Trace(vec3 P, vec3 D, float tmax, int budget, out vec3 n) {
       if (tc > tout) break;
       v[axis] += st[axis];
       tMax[axis] += tDelta[axis];
+      if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, ivec3(N)))) break;
     }
     t = tout;
     if (t >= tmax) break;
@@ -7311,7 +7346,7 @@ vec3 Radiance(vec3 H, vec3 n, float vs) {
   float nl = dot(n, kSun.xyz);
   if (nl > 0.0) {
     vec3 nn;
-    if (Trace(H + n * vs * 1.01, kSun.xyz, 300.0, 64, nn) < 0.0) e += vec3(kSun.w * nl);
+    if (Trace(H + n * kBox[1].w * 1.01, kSun.xyz, 0.0, 300.0, 1, ivec2(0, 40), nn) < 0.0) e += vec3(kSun.w * nl);
   }
   return alb * e;
 }
@@ -7328,7 +7363,8 @@ void main() {
   kCam = Param(11);
   for (int i = 0; i < 7; ++i) kSh[i] = Param(12 + i);
   kSet = Param(19);
-  ivec2 c = min(ivec2(gl_FragCoord.xy) * 2, kSize - 1);
+  int sc = int(pc.a.w);
+  ivec2 c = min(ivec2(gl_FragCoord.xy) * sc + sc / 2, kSize - 1);
   float d = texelFetch(depth, c, 0).r;
   o = vec4(0.0, 0.0, 0.0, d);
   vec2 uv = (vec2(c) + 0.5) * pc.a.xy;
@@ -7338,7 +7374,7 @@ void main() {
     vec3 Pf = World(uv, 0.5);
     vec3 D = normalize(Pf - kCam.xyz);
     vec3 n;
-    float t = Trace(kCam.xyz, D, 600.0, 400, n);
+    float t = Trace(kCam.xyz, D, 0.0, 600.0, 0, ivec2(400, 400), n);
     vec3 col = t < 0.0 ? vec3(0.2, 0.2, 0.5) : (n * 0.5 + 0.5) * (1.0 - 0.7 * clamp(t / 300.0, 0.0, 1.0));
     o = vec4((col - 0.5) / 1.5, d);
     return;
@@ -7355,7 +7391,7 @@ void main() {
   vec3 rel = P - kBox[0].xyz;
   bool fine = all(greaterThanEqual(rel, vec3(0.0))) && all(lessThan(rel, vec3(float(N) * kBox[0].w)));
   float vs = fine ? kBox[0].w : kBox[1].w;
-  vec3 O = P + Nn * vs * 1.5;
+  vec3 O = P + Nn * vs * 2.0;
   vec3 T = abs(Nn.y) < 0.9 ? normalize(cross(Nn, vec3(0.0, 1.0, 0.0))) : normalize(cross(Nn, vec3(1.0, 0.0, 0.0)));
   vec3 Bt = cross(Nn, T);
   float rnd = fract(52.9829189 * fract(dot(gl_FragCoord.xy + kSet.w * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
@@ -7368,7 +7404,8 @@ void main() {
     float r = sqrt(u1);
     vec3 D = normalize(T * (r * cos(ph)) + Bt * (r * sin(ph)) + Nn * sqrt(max(1.0 - u1, 0.0)));
     vec3 n;
-    float t = Trace(O, D, 400.0, 160, n);
+    // (Not the surface it starts from: the voxels' steps along a slope.)
+    float t = Trace(O, D, vs * 2.0, 400.0, 0, ivec2(96, 64), n);
     if (t < 0.0) continue;
     vec3 H = O + D * t;
     float hv = t < float(N) * kBox[0].w * 0.5 ? kBox[0].w : kBox[1].w;
@@ -7416,7 +7453,7 @@ layout(push_constant) uniform Add { vec4 a; } pc;  // strength, diagnostics, the
 // those at about this depth (not across an outline).
 vec3 Bounced(ivec2 ip, float d) {
   ivec2 hs = textureSize(bounce, 0);
-  ivec2 h = ip / 2;
+  ivec2 h = ip * hs / textureSize(scene, 0);
   vec3 sum = vec3(0.0);
   float wsum = 0.0;
   for (int y = -1; y <= 1; ++y) {
@@ -12862,7 +12899,7 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   // cAr, cAg, cAb (c15, c19, c23), cBr, cBg, cBb (c27, c31, c35), cC (c39).
   const int regs[7] = {15, 19, 23, 27, 31, 35, 39};
   for (int j = 0; j < 7; ++j) std::memcpy(&f[(12 + j) * 4], &blk[(regs[j] - 14) * 4], 16);
-  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : 12.0f;  // rays
+  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : 8.0f;  // rays
   f[19 * 4 + 1] = Diag("ginosky") ? 0.0f : 1.0f;    // the sky's light taken off
   f[19 * 4 + 2] = Diag("ginoput") ? 0.0f : 1.0f;    // the hits' light put on
   f[19 * 4 + 3] = float(frame_number_ % 64);
@@ -12881,23 +12918,32 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   Barrier();
   const GiCascade& c0 = gi_c_[0];
   const GiCascade& c1 = gi_c_[1];
-  float pc[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), 0};
-  FullscreenPass(CopyKind::kGiTrace, &bounce_img_, scene, depth, tod_normal_, true, pc, 4, nullptr,
+  // (A quarter of the size each way: the light round a point changes slowly;
+  // blurred, then read with its depth when added.)
+  const uint32_t qs = Diag("gihalf") ? 2u : 4u;
+  const uint32_t qw = std::max(scene->width / qs, 1u), qh = std::max(scene->height / qs, 1u);
+  if (!gi_img_.image || gi_img_.width != qw || gi_img_.height != qh) {
+    if (gi_img_.image) Retire(gi_img_);
+    gi_img_ = gpu_.CreateImage(qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, false, "world_light");
+    ToGeneral(cb_, gi_img_);
+  }
+  float pc[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), float(qs)};
+  FullscreenPass(CopyKind::kGiTrace, &gi_img_, scene, depth, tod_normal_, true, pc, 4, nullptr,
                  const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]), &gi_params_);
   if (!Diag("ginoblur") && !Diag("giview")) {
-    if (!gi_blur_.image || gi_blur_.width != bounce_img_.width || gi_blur_.height != bounce_img_.height) {
+    if (!gi_blur_.image || gi_blur_.width != gi_img_.width || gi_blur_.height != gi_img_.height) {
       if (gi_blur_.image) Retire(gi_blur_);
-      gi_blur_ = gpu_.CreateImage(bounce_img_.width, bounce_img_.height, bounce_img_.format, false, "gi_blur");
+      gi_blur_ = gpu_.CreateImage(gi_img_.width, gi_img_.height, gi_img_.format, false, "gi_blur");
       ToGeneral(cb_, gi_blur_);
     }
     // (Twice each way, the second wider.)
     for (int pass = 0; pass < 2; ++pass) {
-      const float st = pass == 0 ? 1.0f : 3.0f;
+      const float st = pass == 0 ? 1.0f : 2.0f;
       float h[4] = {st, 0, 0, 0}, v[4] = {0, st, 0, 0};
       Barrier();
-      FullscreenPass(CopyKind::kGiBlur, &gi_blur_, &bounce_img_, nullptr, nullptr, false, h, 4);
+      FullscreenPass(CopyKind::kGiBlur, &gi_blur_, &gi_img_, nullptr, nullptr, false, h, 4);
       Barrier();
-      FullscreenPass(CopyKind::kGiBlur, &bounce_img_, &gi_blur_, nullptr, nullptr, false, v, 4);
+      FullscreenPass(CopyKind::kGiBlur, &gi_img_, &gi_blur_, nullptr, nullptr, false, v, 4);
     }
   }
   ++stats_.gi_traces;
@@ -12990,7 +13036,7 @@ Image* Renderer::Impl::SpecularScene(Image* scene) {
                  bounce ? (gi ? gi_ : bounce_) : 0.0f, gi ? 1.0f : 0.0f};
   Barrier();
   FullscreenPass(CopyKind::kSpecAdd, &spec_out_, &spec_img_, scene, &dit->second, false, pc, 4, nullptr,
-                 bounce ? &bounce_img_ : &dummy_, bounce ? &bounce_albedo_ : &dummy_);
+                 gi ? &gi_img_ : bounce ? &bounce_img_ : &dummy_, bounce ? &bounce_albedo_ : &dummy_);
   Barrier();
   dyn_ = DynState{};
   return &spec_out_;
@@ -17600,6 +17646,7 @@ Renderer::Impl::~Impl() {
   }
   gpu_.DestroyImage(gi_params_);
   gpu_.DestroyImage(gi_blur_);
+  gpu_.DestroyImage(gi_img_);
   for (GiCascade& g : gi_c_) {
     for (Image& im : g.maps) gpu_.DestroyImage(im);
     for (Image& im : g.occ) gpu_.DestroyImage(im);
