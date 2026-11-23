@@ -2049,7 +2049,8 @@ struct Renderer::Impl {
   // Per vertex shader (its microcode hash) that crashed the driver: the
   // plainer translation to try next (TranslateOptions::safe_level).
   std::unordered_map<uint64_t, int> safe_level_;
-  static constexpr int kSafeLevels = 3;  // the plainest (TranslateOptions::safe_level)
+  static constexpr int kSafeLevels = 3;
+  static constexpr bool kPlainerSteps = false;  // the plainest (TranslateOptions::safe_level)
   // Game pixel shaders as drawn into a depth target alone (one sample): no
   // color outputs, no sample mask (DepthOnlyPs).
   std::unordered_map<const Shader*, Shader> depth_only_ps_;
@@ -4290,18 +4291,22 @@ void Renderer::Impl::ReadCrashed() {
     // crash; past the last, the pipeline's left out.)
     unsigned long long vsh = 0;
     int lvl = 0;
-    if (std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
+    // (The plainer steps are off: on the Odin 3 none of them helped, so a
+    // crash leaves the pipeline out at once. kPlainerSteps re-enables them.)
+    if (kPlainerSteps && std::sscanf(id.c_str(), "vs %llX", &vsh) == 1) {
       const size_t at = id.find(" safe");
       if (at != std::string::npos) lvl = std::atoi(id.c_str() + at + 5);
       int& l = safe_level_[uint64_t(vsh)];
       l = std::max(l, std::min(lvl + 1, kSafeLevels));
     }
     // (The list's line only once the plainest has crashed too.)
-    if (bar != std::string::npos && lvl >= kSafeLevels) crashed_lines_.insert(line.substr(bar + 3));
+    if (bar != std::string::npos && (!kPlainerSteps || lvl >= kSafeLevels)) {
+      crashed_lines_.insert(line.substr(bar + 3));
+    }
   }
   if (!crashed_ids_.empty()) {
     pending_notices_.push_back(std::to_string(crashed_ids_.size()) +
-                               " pipeline(s) crashed the graphics driver before: plainer shaders tried, the plainest left out (" + path +
+                               " pipeline(s) crashed the graphics driver before: left out (" + path +
                                "; delete it to try them again)");
   }
 }
