@@ -639,6 +639,22 @@ that rule against a save that has the pass.
   speckle the far slopes; the sun maps shade those nearer. The game's fade of its
   shadow map is left out (the time of day's mask holds the shadows all over
   the screen), so the clouds' shadows now drift across the far slopes too.
+- Snow's sheen: a soft, wide one (it read as plastic: too glossy, and too
+  much of the sky in it), and its sparkle finer: crystals in about half of
+  the centimetre cells, each tilted its own way and flashing as its face
+  meets the light (they come and go smoothly as the view moves), each a
+  small round dot, fading out where they'd be smaller than a pixel instead
+  of shimmering. Low toward the sun, the snow glares softly. The night
+  lights' sparkle is the same.
+- Weather closing in round the rider: falling snow thins the view to a few
+  hundred metres, a blizzard to a few dozen, in gusts that close in and lift
+  again, from a few metres off; in a blizzard it can white out almost
+  completely (the fog otherwise never hides the far mountains).
+- Trees sway as a whole: each tree is bent from where it stands, its trunk
+  and its needles alike (the same bend at the same height, more the higher,
+  in gusts the same over the tree), so the trunk no longer stands still
+  while its branches move; the needles flutter on it too. (Trunks are told
+  by sharing their tree's texture; diagnostic `notrunks` keeps them still.)
 - Fewer passes for the sun's shadow mask: the clouds' shadows, the tracks'
   shadows toward a low sun, the contact shadows and the new far shadows are
   one full-screen pass, where they were three, each with a full-size copy
@@ -766,7 +782,12 @@ that rule against a save that has the pass.
   sunset, so at the mountain's own hour they match the game's.
 - Night lights: lamps (a bulb on an arm off a wall or tower, on a post off
   the ground), floodlights (a housing shining a cone out and down from where
-  it's mounted), lit windows (the wall's own texture lit up and tinted) and
+  it's mounted), windows and panels (the wall's own texture lit up and
+  tinted, sized to fit: any width and height, so it can match a window, a
+  sign or a light fitting it's added to, its light cast out of its face from
+  the nearest point of it), caged lights (a glass cylinder in a yellow metal
+  cage of bars and rings, like a work or alarm light, the bars striping the
+  light it throws round it) and
   campfires (stones, logs and flickering flames) that come on as it gets
   dark, lighting the snow and slopes around them, and riders and characters
   passing by, with a glow round each. Each light casts shadows (riders, trees,
@@ -774,7 +795,8 @@ that rule against a save that has the pass.
   toward it through the depth on screen; something out of view casts none.
   Time of Day tab: Night Light Shadows (Off, On, Fine). The snow catches a
   sheen toward the camera from each light, with the odd crystal glinting as
-  the view moves, and a floodlight's beam shows in the night air. Far off (past 150 m,
+  the view moves (fine round crystals, each flashing as its face meets the
+  light), and a floodlight's beam shows in the night air. Far off (past 150 m,
   out to 2.5 km) each light is a point of light instead, fading in as its
   glow up close fades out, hidden behind slopes and trees in front of it.
   The lights come on one by one as it gets dark, each stuttering on as it
@@ -787,17 +809,26 @@ that rule against a save that has the pass.
   | Editor | Controller | Keyboard |
   |---|---|---|
   | Place one | A | Enter |
-  | On every copy of the object (each lift tower, post, chair, building: copies light up as they come into view and follow objects that move) | Y | O |
-  | Kind (lamp, floodlight, window, campfire, street light: a 7.5 m pole standing where aimed) | X | J |
-  | Turn (the preview or the picked light) | D-pad left / right | , . |
-  | Tilt up / down (a floodlight's aim, a lamp's arm, a window's slope) | D-pad up / down | [ ] |
-  | Color (warm, daylight, cool, amber, red, green, blue, purple, pink) | R3 | K |
+  | On every copy of the object (each lift tower, post, chair, building, sign: any object drawn at the cross, however big and wherever its own origin is; copies light up as they come into view and follow objects that move) | Y | O |
+  | Kind (lamp, floodlight, window / panel, campfire, street light: a 7.5 m pole standing where aimed, caged light) | X | J |
+  | What the D-pad changes (shown on the controls bar): turn and tilt; width and height; reach and spread; color and brightness | R3 | K |
+  | Turn / tilt (a floodlight's aim, a lamp's arm, a window's slope, a caged light's axis) | D-pad left right / up down | , . / [ ] |
+  | Width / height (a window or panel; 12% a press, 0.1 to 30 m) | D-pad left right / up down | , . / [ ] |
+  | Reach (how far its light goes, 20% a press) / spread (how wide its light is cast: a floodlight's beam, a street light's spread, a window's out of its face, a lamp's down, a caged light's along its axis; all round at the widest) | D-pad left right / up down | , . / [ ] |
+  | Color (warm, daylight, cool, amber, red, green, blue, purple, pink) / brightness | D-pad left right / up down | , . / [ ] |
   | Pick a placed light, object by object (it pulses gold) | LB / RB | Page Up / Down |
   | Delete the picked light (all copies when it's on every copy) | X | Delete |
   | Undo | Start | Ctrl+Z |
   | Unpick, then leave the editor | B | Backspace |
+  The preview takes the size, reach, spread and brightness set; the picked
+  light (or all its copies) changes as you press. The object for "on every
+  copy" is the one actually drawn at the cross: each object drawn in the
+  editor is drawn once more over the middle pixel alone, and the last one
+  seen there is it (the mountain itself isn't an object: place one light
+  there instead).
   Kept per mountain in `lights\<id>.txt` next to the logs folder, so they can
-  be shared.
+  be shared (older files still load: their windows as before, each kind's
+  own reach and spread).
 
 ## Subtitles
 

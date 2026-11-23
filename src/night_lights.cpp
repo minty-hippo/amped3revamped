@@ -28,14 +28,16 @@ struct Kind {
   float color[3];
   float radius;
   float intensity;
+  float spread;  // half its cone (degrees; 180 all round)
 };
 // (In the renderer's order: NightLight::kind.)
 constexpr Kind kKinds[] = {
-    {"Lamp", {1.0f, 0.78f, 0.5f}, 14.0f, 1.0f},
-    {"Floodlight", {0.86f, 0.92f, 1.0f}, 34.0f, 1.6f},
-    {"Window", {1.0f, 0.66f, 0.32f}, 5.0f, 0.6f},
-    {"Campfire", {1.0f, 0.52f, 0.2f}, 10.0f, 1.2f},
-    {"Street light", {1.0f, 0.84f, 0.62f}, 22.0f, 1.7f},
+    {"Lamp", {1.0f, 0.78f, 0.5f}, 14.0f, 1.0f, 180.0f},
+    {"Floodlight", {0.86f, 0.92f, 1.0f}, 34.0f, 1.6f, 35.0f},
+    {"Window / panel", {1.0f, 0.66f, 0.32f}, 5.0f, 0.6f, 75.0f},
+    {"Campfire", {1.0f, 0.52f, 0.2f}, 10.0f, 1.2f, 180.0f},
+    {"Street light", {1.0f, 0.84f, 0.62f}, 22.0f, 1.7f, 90.0f},
+    {"Caged light", {1.0f, 0.42f, 0.12f}, 10.0f, 1.3f, 180.0f},
 };
 constexpr int kKindCount = int(sizeof(kKinds) / sizeof(kKinds[0]));
 
@@ -86,6 +88,13 @@ bool g_editor = false;
 float g_yaw = 0.0f;    // the preview's turn (degrees)
 float g_pitch = 0.0f;  // and tilt (degrees, up)
 int g_tint = -1;       // its color (kTints; -1: the kind's own)
+// What the D-pad changes (NextMode): 0 turn / tilt, 1 width / height (a
+// window or panel), 2 reach / spread, 3 color / brightness.
+int g_mode = 0;
+// The preview's size (a window or panel), and its reach, spread and
+// brightness against its kind's own (1: as the kind has it).
+float g_size[2] = {1.3f, 1.1f};
+float g_reach = 1.0f, g_spread = 1.0f, g_bright = 1.0f;
 // The picked light: one placed (index), or a template's copy (template, the
 // copy's position: copies come and go).
 struct Pick {
@@ -119,6 +128,13 @@ bool ReadLight(std::istringstream& ss, Light* l) {
   if (ss >> kind >> d[0] >> d[1] >> d[2]) {
     l->kind = std::clamp(kind, 0, kKindCount - 1);
     std::memcpy(l->dir, d, sizeof(d));
+    // (Then: a panel's size, its spread.)
+    float w, h, sp;
+    if (ss >> w >> h >> sp) {
+      l->size[0] = std::clamp(w, 0.1f, 30.0f);
+      l->size[1] = std::clamp(h, 0.1f, 30.0f);
+      l->spread = std::clamp(sp, 0.0f, 180.0f);
+    }
   }
   return true;
 }
@@ -141,6 +157,12 @@ void Load(uint64_t key) {
         int kind;
         if (ss >> kind >> t.local_dir[0] >> t.local_dir[1] >> t.local_dir[2]) {
           t.light.kind = std::clamp(kind, 0, kKindCount - 1);
+          float w, h, sp;
+          if (ss >> w >> h >> sp) {
+            t.light.size[0] = std::clamp(w, 0.1f, 30.0f);
+            t.light.size[1] = std::clamp(h, 0.1f, 30.0f);
+            t.light.spread = std::clamp(sp, 0.0f, 180.0f);
+          }
         }
         g_s.templates.push_back(t);
       }
@@ -161,10 +183,10 @@ void Load(uint64_t key) {
 }
 
 void WriteLight(std::ofstream& out, const Light& l) {
-  char b[200];
-  std::snprintf(b, sizeof(b), "%.3f %.3f %.3f  %.3f %.3f %.3f  %.2f %.2f  %d %.3f %.3f %.3f\n",
+  char b[240];
+  std::snprintf(b, sizeof(b), "%.3f %.3f %.3f  %.3f %.3f %.3f  %.2f %.2f  %d %.3f %.3f %.3f  %.2f %.2f %.1f\n",
                 l.pos[0], l.pos[1], l.pos[2], l.color[0], l.color[1], l.color[2], l.radius,
-                l.intensity, l.kind, l.dir[0], l.dir[1], l.dir[2]);
+                l.intensity, l.kind, l.dir[0], l.dir[1], l.dir[2], l.size[0], l.size[1], l.spread);
   out << b;
 }
 
@@ -174,18 +196,21 @@ void Save() {
   std::filesystem::create_directories(g_folder, ec);
   std::ofstream out(FileFor(g_key));
   out << "# Amped 3 Revamped night lights. A light a line: x y z  r g b  radius intensity  "
-         "kind dx dy dz\n"
-         "# (kind: 0 lamp, 1 floodlight, 2 window, 3 campfire; d: its mounting or aim)\n"
+         "kind dx dy dz  width height spread\n"
+         "# (kind: 0 lamp, 1 floodlight, 2 window or panel, 3 campfire, 4 street light, 5 caged light;\n"
+         "#  d: its mounting or aim; width height: a window or panel's (m); spread: half its cone,\n"
+         "#  degrees, 0 the kind's own)\n"
          "# T mesh  lx ly lz  r g b  radius intensity  kind ldx ldy ldz: one on every copy of an object\n"
          "# A template  x y z ...: found on a copy so far\n";
   for (const Light& l : g_s.lights) WriteLight(out, l);
   for (const Template& t : g_s.templates) {
-    char b[200];
+    char b[260];
     std::snprintf(b, sizeof(b),
-                  "T %016llx  %.3f %.3f %.3f  %.3f %.3f %.3f  %.2f %.2f  %d %.3f %.3f %.3f\n",
+                  "T %016llx  %.3f %.3f %.3f  %.3f %.3f %.3f  %.2f %.2f  %d %.3f %.3f %.3f  %.2f %.2f %.1f\n",
                   (unsigned long long)t.mesh, t.local[0], t.local[1], t.local[2], t.light.color[0],
                   t.light.color[1], t.light.color[2], t.light.radius, t.light.intensity,
-                  t.light.kind, t.local_dir[0], t.local_dir[1], t.local_dir[2]);
+                  t.light.kind, t.local_dir[0], t.local_dir[1], t.local_dir[2], t.light.size[0],
+                  t.light.size[1], t.light.spread);
     out << b;
   }
   for (const Found& f : g_s.found) {
@@ -339,9 +364,12 @@ bool AimedLight(Light* l) {
   Camera(cpos, fwd);
   const bool ground = n[1] > 0.7f;
   for (int i = 0; i < 3; ++i) l->color[i] = g_tint >= 0 ? kTints[g_tint].color[i] : k.color[i];
-  l->radius = k.radius;
-  l->intensity = k.intensity;
+  l->radius = k.radius * g_reach;
+  l->intensity = k.intensity * g_bright;
   l->kind = g_kind;
+  l->size[0] = g_size[0];
+  l->size[1] = g_size[1];
+  l->spread = g_spread == 1.0f ? 0.0f : std::clamp(k.spread * g_spread, 3.0f, 180.0f);
   // Level "out": the surface's (a wall), or back toward the camera (the ground).
   float out[3] = {n[0], 0.0f, n[2]};
   float ol = std::sqrt(out[0] * out[0] + out[2] * out[2]);
@@ -395,6 +423,14 @@ bool AimedLight(Light* l) {
       l->dir[0] = out[0] * 1.3f;
       l->dir[1] = 7.5f;
       l->dir[2] = out[2] * 1.3f;
+      for (int i = 0; i < 3; ++i) l->pos[i] = p[i] + l->dir[i];
+      break;
+    }
+    case 5: {
+      // A caged light: on its base, out from the surface (up off the
+      // ground, out from a wall), its axis along that (tilted with it).
+      for (int i = 0; i < 3; ++i) l->dir[i] = n[i] * 0.16f;
+      Tilt(l->dir, g_pitch);
       for (int i = 0; i < 3; ++i) l->pos[i] = p[i] + l->dir[i];
       break;
     }
@@ -608,8 +644,22 @@ std::string PlaceOnEveryCopy() {
   // across, and not far above or below.
   live::Instances(&g_instances, ~0ull);  // (the latest, whatever version)
   const Instance* best = nullptr;
-  float best_s = 1e9f;
+  // What's drawn at the cross (any object, however big, wherever its
+  // origin): the renderer's pick; failing that, a guess by origins.
+  Instance hit;
+  const int picked = live::PickedObject(&hit);
+  if (picked == 1) {
+    // (The same object in this frame's list, if it's there: its copies.)
+    best = &hit;
+    for (const Instance& in : g_instances) {
+      if (in.key == hit.key && std::memcmp(in.m, hit.m, sizeof(in.m)) == 0) best = &in;
+    }
+  } else if (picked == 2) {
+    return "Night lights: that's part of the mountain itself, not an object (place one light instead)";
+  }
+  float best_s = best ? -1.0f : 1e9f;
   for (const Instance& in : g_instances) {
+    if (best_s < 0.0f) break;
     const float dy = p[1] - in.m[7];
     const float dx = p[0] - in.m[3], dz = p[2] - in.m[11];
     const float across = std::sqrt(dx * dx + dz * dz);
@@ -644,6 +694,118 @@ std::string NextKind(int step) {
   return std::string("Placing: ") + kKinds[g_kind].name;
 }
 
+namespace {
+// The picked light changed: alone, or on every copy (the template and each
+// copy found).
+template <typename F>
+void EditPicked(F&& f) {
+  if (!g_pick.every) {
+    if (g_pick.index >= 0 && g_pick.index < int(g_s.lights.size())) f(g_s.lights[g_pick.index]);
+    return;
+  }
+  if (g_pick.index < 0 || g_pick.index >= int(g_s.templates.size())) return;
+  f(g_s.templates[g_pick.index].light);
+  for (Found& fd : g_s.found) {
+    if (fd.tmpl == g_pick.index) f(fd.light);
+  }
+}
+const char* kModeNames[] = {"turn / tilt", "width / height", "reach / spread", "color / brightness"};
+std::string Fmt(const char* f, double a, double b = 0.0) {
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), f, a, b);
+  return buf;
+}
+float SpreadOf(const Light& l) { return l.spread > 0.0f ? l.spread : kKinds[std::clamp(l.kind, 0, kKindCount - 1)].spread; }
+}  // namespace
+
+std::string NextMode(int step) {
+  std::lock_guard lock(g_mutex);
+  g_mode = ((g_mode + step) % 4 + 4) % 4;
+  return std::string("D-pad: ") + kModeNames[g_mode];
+}
+
+int Mode() {
+  std::lock_guard lock(g_mutex);
+  return g_mode;
+}
+
+std::string Resize(int wider, int taller) {
+  std::lock_guard lock(g_mutex);
+  const float fw = std::pow(1.12f, float(wider)), fh = std::pow(1.12f, float(taller));
+  auto apply = [&](float* sz) {
+    sz[0] = std::clamp(sz[0] * fw, 0.1f, 30.0f);
+    sz[1] = std::clamp(sz[1] * fh, 0.1f, 30.0f);
+  };
+  if (!g_pick.on) {
+    apply(g_size);
+    return Fmt("Panel %.2f x %.2f m", g_size[0], g_size[1]) + (g_kind == 2 ? "" : " (for windows and panels)");
+  }
+  Remember();
+  float shown[2] = {};
+  EditPicked([&](Light& l) {
+    apply(l.size);
+    std::memcpy(shown, l.size, sizeof(shown));
+  });
+  Changed();
+  Publish();
+  return Fmt("Panel %.2f x %.2f m", shown[0], shown[1]);
+}
+
+std::string Reach(int step) {
+  std::lock_guard lock(g_mutex);
+  const float f = std::pow(1.2f, float(step));
+  if (!g_pick.on) {
+    g_reach = std::clamp(g_reach * f, 0.1f, 10.0f);
+    return Fmt("Reach %.0f m", kKinds[g_kind].radius * g_reach);
+  }
+  Remember();
+  float r = 0.0f;
+  EditPicked([&](Light& l) {
+    l.radius = std::clamp(l.radius * f, 1.0f, 150.0f);
+    r = l.radius;
+  });
+  Changed();
+  Publish();
+  return Fmt("Reach %.0f m", r);
+}
+
+std::string Spread(int step) {
+  std::lock_guard lock(g_mutex);
+  const float f = std::pow(1.15f, float(step));
+  if (!g_pick.on) {
+    g_spread = std::clamp(g_spread * f, 0.05f, 6.0f);
+    const float sp = std::clamp(kKinds[g_kind].spread * g_spread, 3.0f, 180.0f);
+    return sp >= 179.5f ? std::string("Spread: all round") : Fmt("Spread %.0f degrees", sp * 2.0f);
+  }
+  Remember();
+  float sp = 0.0f;
+  EditPicked([&](Light& l) {
+    l.spread = std::clamp(SpreadOf(l) * f, 3.0f, 180.0f);
+    sp = l.spread;
+  });
+  Changed();
+  Publish();
+  return sp >= 179.5f ? std::string("Spread: all round") : Fmt("Spread %.0f degrees", sp * 2.0f);
+}
+
+std::string Brightness(int step) {
+  std::lock_guard lock(g_mutex);
+  const float f = std::pow(1.2f, float(step));
+  if (!g_pick.on) {
+    g_bright = std::clamp(g_bright * f, 0.05f, 8.0f);
+    return Fmt("Brightness %.0f%%", g_bright * 100.0f);
+  }
+  Remember();
+  float b = 0.0f;
+  EditPicked([&](Light& l) {
+    l.intensity = std::clamp(l.intensity * f, 0.02f, 12.0f);
+    b = l.intensity / std::max(kKinds[std::clamp(l.kind, 0, kKindCount - 1)].intensity, 0.01f);
+  });
+  Changed();
+  Publish();
+  return Fmt("Brightness %.0f%%", b * 100.0f);
+}
+
 std::string Rotate(float degrees) {
   std::lock_guard lock(g_mutex);
   if (!g_pick.on) {
@@ -653,9 +815,9 @@ std::string Rotate(float degrees) {
   Remember();
   if (!g_pick.every) {
     Light& l = g_s.lights[g_pick.index];
-    if (l.kind == 0 || l.kind == 4) {
+    if (l.kind == 0 || l.kind == 4 || l.kind == 5) {
       // A bulb: its arm swings round where it's mounted (a street light's
-      // head round its pole).
+      // head round its pole; a caged light round its base).
       float base[3];
       for (int i = 0; i < 3; ++i) base[i] = l.pos[i] - l.dir[i];
       TurnY(l.dir, degrees);
@@ -667,7 +829,7 @@ std::string Rotate(float degrees) {
   } else {
     // Every copy: turned in the object's own space (about its up).
     Template& t = g_s.templates[g_pick.index];
-    if (t.light.kind == 0 || t.light.kind == 4) {
+    if (t.light.kind == 0 || t.light.kind == 4 || t.light.kind == 5) {
       float base[3];
       for (int i = 0; i < 3; ++i) base[i] = t.local[i] - t.local_dir[i];
       TurnY(t.local_dir, degrees);
@@ -700,7 +862,7 @@ std::string TiltBy(float degrees) {
   Remember();
   auto tilt = [&](float pos[3], float dir[3], int kind) {
     if (kind == 3) return;  // (a fire stays level)
-    if (kind == 0) {
+    if (kind == 0 || kind == 5) {
       float base[3];
       for (int i = 0; i < 3; ++i) base[i] = pos[i] - dir[i];
       Tilt(dir, degrees);
@@ -874,10 +1036,14 @@ std::string KindName() {
 
 std::string PreviewDetails() {
   std::lock_guard lock(g_mutex);
-  char b[96];
-  std::snprintf(b, sizeof(b), "%s, turned %d, tilted %d",
+  char b[200];
+  const Kind& k = kKinds[g_kind];
+  const float sp = std::clamp(k.spread * g_spread, 3.0f, 180.0f);
+  std::snprintf(b, sizeof(b), "%s, turned %d, tilted %d, reach %.0f m, %s%s",
                 g_tint < 0 ? "its own color" : kTints[g_tint].name, int(std::lround(g_yaw)),
-                int(std::lround(g_pitch)));
+                int(std::lround(g_pitch)), double(k.radius * g_reach),
+                sp >= 179.5f ? std::string("all round").c_str() : (std::to_string(int(sp * 2.0f)) + " deg").c_str(),
+                g_kind == 2 ? (", " + Fmt("%.2f x %.2f m", g_size[0], g_size[1])).c_str() : "");
   return b;
 }
 

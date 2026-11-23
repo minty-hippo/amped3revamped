@@ -891,7 +891,7 @@ int main(int argc, char** argv) {
     };
     if (reactive_debug) renderer.SetUpscaleParams(16.7f, 0.0f, true);
     if (speed_blur >= 0.0f) renderer.SetSpeedBlur(1.0f, 1.0f / 60.0f, speed_blur);
-    if (fog > 0.0f) renderer.SetFog(fog, fog_start);
+    if (fog > 0.0f) renderer.SetFog(fog, fog_start, std::getenv("A3_FOG_MOST") ? float(std::atof(std::getenv("A3_FOG_MOST"))) : 0.75f);
     renderer.SetTimeOfDay(tod);
     renderer.SetEyeAdaptation(eye);
     renderer.SetBloom(bloom);
@@ -1031,6 +1031,27 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 3; ++i) w.dir[i] = -g[6 + i] * 0.4f;
         w.dir[1] = 0.0f;
         if (!only) lights.push_back(w);
+        // A caged light on the ground ahead (its axis up), and a panel lying
+        // on the snow (2 x 0.6 m, facing up).
+        amped3::native::Renderer::NightLight cg;
+        for (int i = 0; i < 3; ++i) cg.pos[i] = g[i] + g[3 + i] * 4.0f + g[6 + i] * 0.4f;
+        cg.pos[1] = g[1] - 1.2f;
+        cg.kind = 5;
+        cg.dir[0] = 0.0f; cg.dir[1] = 0.15f; cg.dir[2] = 0.0f;
+        cg.color[0] = 1.0f; cg.color[1] = 0.45f; cg.color[2] = 0.15f;
+        cg.radius = 10.0f;
+        cg.intensity = 1.4f;
+        if (!only || only[0] == '5') lights.push_back(cg);
+        if (std::getenv("A3_TEST_PANEL")) {
+          amped3::native::Renderer::NightLight pn;
+          for (int i = 0; i < 3; ++i) pn.pos[i] = g[i] + g[3 + i] * 9.0f;
+          pn.pos[1] = g[1] - 3.0f;
+          pn.kind = 2;
+          pn.dir[0] = 0.0f; pn.dir[1] = 1.0f; pn.dir[2] = 0.0f;
+          pn.size[0] = 2.0f; pn.size[1] = 0.6f;
+          pn.radius = 6.0f;
+          lights.push_back(pn);
+        }
       }
       if (const char* mk = std::getenv("A3_TEST_MESH")) {
         // Lights on every copy of a mesh (8 m up its own y): the copies found.
@@ -1045,6 +1066,13 @@ int main(int argc, char** argv) {
         }
       }
       renderer.SetNightLights(lights);
+      {
+        amped3::native::Renderer::Instance pk;
+        const int ps = renderer.PickedObject(&pk);
+        std::cout << "Picked at the middle: " << (ps == 1 ? "an object" : ps == 2 ? "the world" : "nothing");
+        if (ps == 1) std::cout << " mesh " << std::hex << pk.key << std::dec << " at " << pk.m[3] << " " << pk.m[7] << " " << pk.m[11];
+        std::cout << "\n";
+      }
       std::map<uint64_t, int> counts;
       for (const auto& in : renderer.Instances()) ++counts[in.key];
       std::cout << "Instances " << renderer.Instances().size() << " of " << counts.size() << " meshes\n";

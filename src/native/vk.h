@@ -35,6 +35,8 @@
   X(vkCreateQueryPool)                     \
   X(vkDestroyQueryPool)                    \
   X(vkCmdResetQueryPool)                   \
+  X(vkCmdBeginQuery)                       \
+  X(vkCmdEndQuery)                         \
   X(vkCmdWriteTimestamp)                   \
   X(vkGetQueryPoolResults)                 \
   X(vkDestroyPipelineCache)                \

@@ -621,6 +621,8 @@ bool Translator::Run(TranslateResult& out) {
   if (vs()) {
     g += "int xe_vfa = 0;          // vfetch_full address in dwords\n"
          "vec4 xe_pos = vec4(0.0, 0.0, 0.0, 1.0);\n"
+         "vec3 xe_wind_org = vec3(0.0);  // an instance's placement (vf94's rows' w): where it stands\n"
+         "int xe_wind_rows = 0;          // (which of them were fetched)\n"
          "vec4 xe_misc = vec4(-1.0, 0.0, 0.0, 0.0);  // point size, edge flag, kill vertex\n"
          "vec4 xe_o[16];\n";
   } else {
@@ -764,7 +766,28 @@ uint xe_vertex_index() {
   // Gusts: slow swells, the same over a stretch of the mountain.
   float gust = 0.6 + 0.4 * sin(t * 0.83 + dot(m.xz, vec2(0.021, 0.017)) + seed * 0.1) *
                      sin(t * 0.37 + 1.3);
-  if (mode == 1) {
+  if ((mode == 1 || mode == 5) && xe_wind_rows == 7) {
+    // A tree drawn from its own copy (its placement fetched: where it
+    // stands): bent from its foot as a whole, the trunk (5) and its leaves
+    // and needles (1) alike - the same bend at the same height, so they
+    // stay together - more the higher, in gusts the same over the tree; the
+    // leaves fluttering on it too.
+    vec3 rel = v - xe_wind_org;
+    float h = max(rel.y / u, 0.0);
+    float tseed = dot(xe_wind_org.xz / u, vec2(0.37, 0.53));
+    float g2 = 0.6 + 0.4 * sin(t * 0.83 + dot(xe_wind_org.xz / u, vec2(0.021, 0.017)) + seed * 0.1) *
+                     sin(t * 0.37 + 1.3);
+    float bend = h * h * 0.0028 * min(k, 3.0) * g2;
+    off.xz = dir * bend + bend * 0.25 * vec2(sin(t * 1.4 + tseed), cos(t * 1.1 + tseed));
+    off.y = -0.15 * bend * bend / max(h, 0.5);
+    if (mode == 1) {
+      float kk = min(k, 2.0);
+      off.xz += kk * 0.02 * min(h, 6.0) / 6.0 * vec2(sin(t * 2.3 + ph * 3.1), cos(t * 1.9 + ph * 2.7));
+      off.y += kk * 0.01 * sin(t * 2.9 + ph * 4.3);
+    }
+  } else if (mode == 5) {
+    // (A trunk without its placement: still.)
+  } else if (mode == 1) {
     // Leaves and needles (and a bare tree's twigs): their trunks stay still
     // (drawn as the world's meshes), so only a little sway with the wind,
     // kept short of breaking away from them, and a quick flutter.
@@ -1724,6 +1747,13 @@ bool Translator::EmitVertexFetch(const Fetch& f) {
       value = Fmt("(%s) * %.9g", value.c_str(), double(std::ldexp(1.0f, f.vf_exp_adjust())));
     }
     Line("xe_t0 = " + value + ";");
+    // An instance's placement (the world's instanced meshes: trees, their
+    // foliage): three rows of four floats from vf94, their w where it
+    // stands - for the wind to bend it from its foot.
+    if (vs() && vf == 94 && format == kVf_32_32_32_32_FLOAT && (off == 0 || off == 4 || off == 8)) {
+      Line(Fmt("xe_wind_org[%d] = xe_t0.w;", off / 4));
+      Line(Fmt("xe_wind_rows |= %d;", 1 << (off / 4)));
+    }
     std::string dest = Reg(f.dst(), f.dst_rel());
     std::string m, v;
     for (uint32_t c = 0; c < 4; ++c) {

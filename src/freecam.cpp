@@ -90,6 +90,10 @@ bool g_boost = false;
 
 // The keyboard and mouse, from the overlay (UI thread), for OnPad.
 std::mutex g_keys_mutex;
+// What the light editor's D-pad changes (night_lights::Mode).
+const char* const kDpadModes[] = {"turn, tilt", "width, height (windows, panels)", "reach, spread",
+                                  "color, brightness"};
+
 struct Keys {
   float move[3] = {};
   float look[2] = {};
@@ -168,9 +172,8 @@ class Overlay final : public rex::ui::ImGuiDialog {
           "A / Enter: place a " + night_lights::KindName(),
           "Y / O: on every copy of the object",
           picked ? "X / Delete: delete it" : "X / J: kind",
-          "D-pad left right / , .: turn",
-          "D-pad up down / [ ]: tilt",
-          "R3 / K: color",
+          std::string("D-pad / , . [ ]: ") + kDpadModes[night_lights::Mode()],
+          "R3 / K: what the D-pad changes",
           "LB RB / Page Up Down: pick a placed light",
           "Start / Ctrl+Z: undo",
           "M: the surface under the cross (again: change it)",
@@ -546,16 +549,31 @@ void OnPad(const pad::Snapshot& pad) {
     }
     if (keys.ed_kind) say = night_lights::NextKind(1);
     if (keys.ed_delete) say = night_lights::DeleteSelected();
-    int turn = keys.ed_turn + ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) -
-               ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
-    if (turn) say = night_lights::Rotate(15.0f * float(turn));
-    const int tilt = keys.ed_tilt + ((pressed & X_INPUT_GAMEPAD_DPAD_UP) ? 1 : 0) -
-                     ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) ? 1 : 0);
-    if (tilt) say = night_lights::TiltBy(10.0f * float(tilt));
+    // The D-pad: left / right and up / down, for what it changes now.
+    const int lr = keys.ed_turn + ((pressed & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) -
+                   ((pressed & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
+    const int ud = keys.ed_tilt + ((pressed & X_INPUT_GAMEPAD_DPAD_UP) ? 1 : 0) -
+                   ((pressed & X_INPUT_GAMEPAD_DPAD_DOWN) ? 1 : 0);
+    switch (night_lights::Mode()) {
+      case 0:
+        if (lr) say = night_lights::Rotate(15.0f * float(lr));
+        if (ud) say = night_lights::TiltBy(10.0f * float(ud));
+        break;
+      case 1:
+        if (lr || ud) say = night_lights::Resize(lr, ud);
+        break;
+      case 2:
+        if (lr) say = night_lights::Reach(lr);
+        if (ud) say = night_lights::Spread(ud);
+        break;
+      default:
+        if (lr) say = night_lights::NextColor(lr);
+        if (ud) say = night_lights::Brightness(ud);
+    }
     // (R3 alone: with L3 it's the freecam's own.)
     if (((pressed & X_INPUT_GAMEPAD_RIGHT_THUMB) && !(pad.buttons & X_INPUT_GAMEPAD_LEFT_THUMB)) ||
         keys.ed_color) {
-      say = night_lights::NextColor(1);
+      say = night_lights::NextMode(1);
     }
     const int pick = keys.ed_pick + ((pressed & X_INPUT_GAMEPAD_RIGHT_SHOULDER) ? 1 : 0) -
                      ((pressed & X_INPUT_GAMEPAD_LEFT_SHOULDER) ? 1 : 0);

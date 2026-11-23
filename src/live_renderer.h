@@ -111,6 +111,9 @@ uint64_t Instances(std::vector<native::Renderer::Instance>* out, uint64_t since)
 // The world point at the middle of the screen (false: sky, or not known).
 // normal: the surface's there, facing the camera (when asked for).
 bool CenterPoint(float out[3], float normal[3] = nullptr);
+// The object drawn at the screen's middle (the light editor on): 1 an object
+// (out: which), 2 the world itself, 0 nothing / not known yet.
+int PickedObject(native::Renderer::Instance* out);
 
 // Instant replay: the last seconds of riding kept (setting replay_seconds),
 // played again in place of the game's frames (pause the game first: the

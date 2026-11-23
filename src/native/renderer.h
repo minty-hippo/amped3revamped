@@ -270,7 +270,9 @@ class Renderer {
   // Distance fog for the following frames: height fog in the sky's color,
   // lit toward the sun, from `start` world units (metres) away; `density`
   // scales it (0 = off). Fades out without a rider near the camera.
-  void SetFog(float density, float start);
+  // most: how opaque it gets at the most (far mountains stay visible: 0.75;
+  // up to 0.98 in a whiteout).
+  void SetFog(float density, float start, float most = 0.75f);
   // God rays for the following frames: light shafts from the sky around the
   // sun (or moon) while it's in or near view, blocked by the scenery;
   // `strength` scales them (0 = off). Fade out without a rider nearby.
@@ -361,9 +363,16 @@ class Renderer {
     float intensity = 1.0f;
     // 0 a lamp (a hanging bulb), 1 a floodlight (shining along dir), 2 a
     // window (the wall's own texture lit up, facing dir), 3 a campfire, 4 a
-    // street light (a pole: dir from its foot up to the head, lighting down).
+    // street light (a pole: dir from its foot up to the head, lighting down),
+    // 5 a caged light (a glass cylinder in a metal cage: dir from its mount
+    // out along its axis).
     int kind = 0;
     float dir[3] = {0.0f, -1.0f, 0.0f};
+    float size[2] = {1.3f, 1.1f};  // a window or panel's width and height (m)
+    // How wide its light is cast: half its cone (degrees; 0 the kind's own,
+    // 180 all round): a floodlight's beam, a street light's spread down, a
+    // window's out from its face, a lamp's down, a caged light's along its axis.
+    float spread = 0.0f;
     bool preview = false;   // where one would go (the light editor): ghostly, lit by day too
     bool selected = false;  // picked in the light editor: pulsing
   };
@@ -386,6 +395,10 @@ class Renderer {
   // Whether to read the screen's middle back each frame (for CenterPoint:
   // the light editor); off saves a copy and two barriers a frame.
   void SetCenterProbe(bool on);
+  // The object drawn at the screen's middle (with SetCollectInstances and
+  // SetCenterProbe on), a frame or two back: 1 an object (out: which, as in
+  // Instances), 2 the world itself (not an object), 0 nothing or not known.
+  int PickedObject(Instance* out) const;
   // Eye adaptation (HDR-style): the lighting brightened in the dark and
   // toned down in glare, easing over a second or two like eyes adjusting,
   // from the scene's average brightness. strength 0 off .. 1 full.

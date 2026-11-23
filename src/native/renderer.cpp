@@ -1116,9 +1116,11 @@ bool IsShadowCaster(uint64_t vs_hash) {
 }
 // Wind (time of day): how a draw's vertices move, by its vertex shader.
 // 1: leaves and needles in world space (c0..c3 the view-projection: the
-// trees' foliage cards; their trunks stay); 2: a whole tree placed by
-// c0..c3 (object -> clip: the clustered and distant trees), bending from its
-// foot. 0: not moved.
+// trees' foliage cards, each tree an instance: bent from where it stands,
+// with its trunk); 2: a whole tree placed by c0..c3 (object -> clip: the
+// clustered and distant trees), bending from its foot. 5: a tree's trunk
+// (the world's instanced meshes with a tree's texture: told in the draw).
+// 0: not moved.
 int WindMode(uint64_t vs_hash) {
   if (vs_hash == 0x9BAF953BF548C874ull) return 1;
   if (vs_hash == 0x8D6CC76801E89D1Aull) return 2;
@@ -1295,6 +1297,10 @@ struct Renderer::Impl {
     // GPU time by part (part_pool_): the name of what ended at each timestamp
     // after the first.
     std::vector<std::string> part_names;
+    // The light editor's object under the cross (pick_pool_): the object
+    // each query's draw placed (key 0: the world itself), how many queries.
+    std::vector<Renderer::Instance> pick_objs;
+    uint32_t pick_count = 0;
   };
   // Texture uploads of the frame being recorded: their own command buffer,
   // submitted before the frame's, so an upload never ends a render pass.
@@ -1668,6 +1674,7 @@ struct Renderer::Impl {
   // what's drawn in the camera's own space).
   bool collect_instances_ = false;
   struct PendingInstance {
+    int query = -1;  // its draw's pick query (pick_pool_), if any
     uint64_t key;
     double m[16];
     double zs, zo;
@@ -1675,6 +1682,17 @@ struct Renderer::Impl {
     double world[12];  // object -> world found in its constants (has_world)
   };
   std::vector<PendingInstance> pending_instances_;
+  // The object under the cross (the light editor): each scene draw drawn
+  // again over the middle pixel alone, in an occlusion query; the last
+  // whose samples passed is what's seen there (read when its frame's slot
+  // comes round again).
+  static constexpr uint32_t kPickMax = 4096;
+  VkQueryPool pick_pool_ = VK_NULL_HANDLE;
+  bool pick_queries_ = false;  // this frame's
+  uint32_t pick_used_ = 0;
+  int pick_q_ = -1;  // the current draw's
+  Renderer::Instance picked_{};
+  int picked_state_ = 0;  // 0 nothing (or not known), 1 an object, 2 the world itself
   std::vector<Renderer::Instance> instances_;
   void ResolveInstances();
   // The middle of the screen's depth, read back 4 frames later (CenterPoint).
@@ -2263,7 +2281,7 @@ struct Renderer::Impl {
   // Distance fog (SetFog): settings, the light direction from the lighting
   // pass (c14), the fog's color (the sky's average, over time: two 1x1
   // images in turn) and the fogged scene.
-  float fog_density_ = 0.0f, fog_start_ = 150.0f;
+  float fog_density_ = 0.0f, fog_start_ = 150.0f, fog_most_ = 0.75f;
   float fog_presence_ = 1.0f;  // 0..1: fades out without a rider close by
   float sun_dir_[3] = {};
   bool sun_valid_ = false;
@@ -2435,6 +2453,7 @@ struct Renderer::Impl {
   // Anti-aliased alpha test / alpha to coverage on multisampled targets
   // (RendererOptions::smooth_alpha).
   bool smooth_alpha_ = true;
+  std::unordered_set<uint64_t> tree_textures_;  // the trees' foliage's (their trunks share them)
   // Revamped Graphics (SetRevamped): replacements on; changed: the cache's
   // replaced textures dropped at the frame's end.
   bool replace_on_ = true, drop_replaced_ = false;
@@ -2895,6 +2914,30 @@ uint32_t Renderer::Impl::WriteUniform(const void* data, size_t size) {
 // of snow lying on the heaps a board pushed up, round and a few to a dozen
 // cm across, in cells of 3 texels (15 cm); their height over the heap (m,
 // times the heap's full height), as much as there's heap.
+static const std::string kSnowGlint = R"(
+// Crystals in the snow: tiny mirrors in about half of the centimetre
+// cells, each tilted its own way, flashing where its face meets the half-
+// way vector h (so they come and go smoothly as the view or light moves),
+// each a soft dot on the surface; fading out where a cell is smaller than a
+// pixel (foot: a pixel's width there, metres) rather than shimmering.
+// (Needs Hash3.)
+float SnowGlint(vec3 P, vec3 N, vec3 h, float foot) {
+  const float k = 85.0;
+  float fade = clamp(1.8 / (k * max(foot, 1e-5)), 0.0, 1.0);
+  if (fade <= 0.03) return 0.0;
+  vec3 q = P * k;
+  ivec3 c = ivec3(floor(q));
+  if (Hash3(c, 1) > 0.5) return 0.0;
+  vec3 off = fract(q) - vec3(Hash3(c, 2), Hash3(c, 3), Hash3(c, 4));
+  off -= N * dot(off, N);  // (on the surface)
+  float dotr = smoothstep(0.42, 0.06, length(off));
+  if (dotr <= 0.0) return 0.0;
+  vec3 n = normalize(N + (vec3(Hash3(c, 5), Hash3(c, 6), Hash3(c, 7)) * 2.0 - 1.0) * 0.38);
+  float flash = pow(max(dot(n, h), 0.0), 900.0);
+  return flash * dotr * fade * fade;
+}
+)";
+
 static const std::string kTracksClumps = R"(
 float ClumpHash(vec2 c) {
   uvec2 q = uvec2(ivec2(c) + 65536);
@@ -6418,7 +6461,7 @@ void main() {
   // The sun's sheen, 1 (at the lighting pass): GGX by surface, from the
   // albedo (snow told by its color), the normals (their w: foliage), the
   // sun's shadow mask. rgb the sheen, a the depth it was made at.
-  copy_fs_[49] = CompileBuiltin("builtin_sun_spec", R"(#version 450
+  copy_fs_[49] = CompileBuiltin("builtin_sun_spec", std::string(R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the game's material (foliage > 0)
 layout(set = 0, binding = 2) uniform sampler2D depth;
@@ -6446,7 +6489,7 @@ float Hash3(ivec3 c, int k) {
   h ^= h >> 16;
   return float(h & 0xFFFFFFu) / 16777216.0;
 }
-float D_GGX(float nh, float a) {
+)") + kSnowGlint + R"(float D_GGX(float nh, float a) {
   float a2 = a * a;
   float dd = nh * nh * (a2 - 1.0) + 1.0;
   return a2 / (3.14159 * dd * dd);
@@ -6558,8 +6601,10 @@ void main() {
   else if (tag == 4u) { rough = 0.7; }
   else if (tag == 5u) { rough = 0.35; f0 = 0.05; }
   else if (tag == 6u) { rough = 0.9; f0 = 0.03; }
-  rough = mix(rough, 0.3, snow);
-  f0 = mix(f0, 0.03, snow);
+  // Snow: mostly a soft, wide sheen (not a gloss: it isn't plastic), its
+  // sparkle the crystals' below.
+  rough = mix(rough, 0.62, snow);
+  f0 = mix(f0, 0.02, snow);
   metal *= 1.0 - snow;
   vec3 H = normalize(L + V);
   float nh = max(dot(N, H), 0.0), vh = max(dot(V, H), 0.0);
@@ -6580,16 +6625,20 @@ void main() {
     float gloss = (1.0 - rough) * (1.0 - rough);
     vec3 Fe = mix(vec3(f0 + (max(1.0 - rough, f0) - f0) * fv), mix(alb, vec3(1.0), fv), metal);
     // (Out of the sun, less of it: in a shadow, under trees, indoors.)
-    c += env * Fe * gloss * mix(0.5, 1.0, lit) * pc.env.x * mix(1.0, 0.35, snow);
+    c += env * Fe * gloss * mix(0.5, 1.0, lit) * pc.env.x * mix(1.0, 0.5, snow);
   }
-  // Glints in the sunlit snow: crystals catching it, changing as the view
-  // moves (fewer far off: they'd shimmer).
+  // Snow toward a low sun: its glare, light scattered on through the
+  // crystals (looking toward the sun across it), soft.
   if (snow > 0.0) {
-    float dist = length(pc.cam.xyz - P);
-    ivec3 cell = ivec3(floor(P * 30.0));
-    ivec3 hb = ivec3(floor(H * 7.0));
-    float g = step(0.995, Hash3(cell, hb.x * 31 + hb.y * 17 + hb.z * 7));
-    c += pc.col.rgb * g * snow * lit * nl * 2.5 * smoothstep(35.0, 8.0, dist);
+    float toward = max(dot(-V, L), 0.0);
+    c += pc.col.rgb * snow * lit * pow(toward, 6.0) * pow(1.0 - nv, 2.0) * 0.12;
+  }
+  // The crystals in the sunlit snow: fine, round, coming and going.
+  if (snow > 0.0 && lit > 0.0) {
+    vec2 uv1 = (gl_FragCoord.xy + vec2(1.0, 0.0)) / vec2(sz);
+    vec4 w1 = pc.m * vec4(uv1.x * 2.0 - 1.0, 1.0 - uv1.y * 2.0, 1.0 - d, 1.0);
+    float foot = length(w1.xyz / w1.w - P);
+    c += pc.col.rgb * SnowGlint(P, N, H, foot) * snow * lit * nl * 6.0;
   }
   if (pc.L.w > 0.5) {
     // (Diagnostics: the surfaces: snow white, metal blue, wood brown, rock
@@ -6601,7 +6650,7 @@ void main() {
   o = vec4(c, d);
 }
 )", true);
-  copy_fs_[61] = CompileBuiltin("builtin_sun_spec_ms", R"(#version 450
+  copy_fs_[61] = CompileBuiltin("builtin_sun_spec_ms", std::string(R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D normals;  // xyz * 2 - 1, w the game's material (foliage > 0)
 layout(set = 0, binding = 2) uniform sampler2D depth;
@@ -6629,7 +6678,7 @@ float Hash3(ivec3 c, int k) {
   h ^= h >> 16;
   return float(h & 0xFFFFFFu) / 16777216.0;
 }
-float D_GGX(float nh, float a) {
+)") + kSnowGlint + R"(float D_GGX(float nh, float a) {
   float a2 = a * a;
   float dd = nh * nh * (a2 - 1.0) + 1.0;
   return a2 / (3.14159 * dd * dd);
@@ -6741,8 +6790,10 @@ void main() {
   else if (tag == 4u) { rough = 0.7; }
   else if (tag == 5u) { rough = 0.35; f0 = 0.05; }
   else if (tag == 6u) { rough = 0.9; f0 = 0.03; }
-  rough = mix(rough, 0.3, snow);
-  f0 = mix(f0, 0.03, snow);
+  // Snow: mostly a soft, wide sheen (not a gloss: it isn't plastic), its
+  // sparkle the crystals' below.
+  rough = mix(rough, 0.62, snow);
+  f0 = mix(f0, 0.02, snow);
   metal *= 1.0 - snow;
   vec3 H = normalize(L + V);
   float nh = max(dot(N, H), 0.0), vh = max(dot(V, H), 0.0);
@@ -6763,16 +6814,20 @@ void main() {
     float gloss = (1.0 - rough) * (1.0 - rough);
     vec3 Fe = mix(vec3(f0 + (max(1.0 - rough, f0) - f0) * fv), mix(alb, vec3(1.0), fv), metal);
     // (Out of the sun, less of it: in a shadow, under trees, indoors.)
-    c += env * Fe * gloss * mix(0.5, 1.0, lit) * pc.env.x * mix(1.0, 0.35, snow);
+    c += env * Fe * gloss * mix(0.5, 1.0, lit) * pc.env.x * mix(1.0, 0.5, snow);
   }
-  // Glints in the sunlit snow: crystals catching it, changing as the view
-  // moves (fewer far off: they'd shimmer).
+  // Snow toward a low sun: its glare, light scattered on through the
+  // crystals (looking toward the sun across it), soft.
   if (snow > 0.0) {
-    float dist = length(pc.cam.xyz - P);
-    ivec3 cell = ivec3(floor(P * 30.0));
-    ivec3 hb = ivec3(floor(H * 7.0));
-    float g = step(0.995, Hash3(cell, hb.x * 31 + hb.y * 17 + hb.z * 7));
-    c += pc.col.rgb * g * snow * lit * nl * 2.5 * smoothstep(35.0, 8.0, dist);
+    float toward = max(dot(-V, L), 0.0);
+    c += pc.col.rgb * snow * lit * pow(toward, 6.0) * pow(1.0 - nv, 2.0) * 0.12;
+  }
+  // The crystals in the sunlit snow: fine, round, coming and going.
+  if (snow > 0.0 && lit > 0.0) {
+    vec2 uv1 = (gl_FragCoord.xy + vec2(1.0, 0.0)) / vec2(sz);
+    vec4 w1 = pc.m * vec4(uv1.x * 2.0 - 1.0, 1.0 - uv1.y * 2.0, 1.0 - d, 1.0);
+    float foot = length(w1.xyz / w1.w - P);
+    c += pc.col.rgb * SnowGlint(P, N, H, foot) * snow * lit * nl * 6.0;
   }
   if (pc.L.w > 0.5) {
     // (Diagnostics: the surfaces: snow white, metal blue, wood brown, rock
@@ -7505,7 +7560,7 @@ void main() {
   // normals: as the game lights it) and on the riders (drawn after the
   // lighting: their surface from the depth, their color from the scene), a
   // glow round each lamp in the air.
-  copy_fs_[38] = CompileBuiltin("builtin_night_lights", R"(#version 450
+  copy_fs_[38] = CompileBuiltin("builtin_night_lights", std::string(R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D world_depth;  // at the lighting (0: nothing)
 layout(set = 0, binding = 2) uniform sampler2D lights;       // n x 3: pos, radius; color, intensity; dir, kind
@@ -7613,7 +7668,7 @@ float Hash3(ivec3 c, int k) {
   h ^= h >> 16;
   return float(h & 0xFFFFFFu) / 16777216.0;
 }
-vec3 g_arm;  // a bulb: from it back to where it's mounted (world axes)
+)") + kSnowGlint + R"(vec3 g_arm;  // a bulb: from it back to where it's mounted (world axes)
 vec2 Model(int kind, vec3 p) {
   if (kind == 0) {
     // The bulb: round, with its neck into a ribbed socket.
@@ -7666,6 +7721,31 @@ vec2 Model(int kind, vec3 p) {
     d = opU(d, vec2(sdTaper(p, foot + vec3(0.0, 0.35, 0.0), top + vec3(0.0, 0.1, 0.0), 0.1, 0.06), 6.0));
     d = opU(d, vec2(length(p - top - vec3(0.0, 0.1, 0.0)) - 0.07, 0.0));
     d = opU(d, vec2(sdCylY(p - foot, -0.1, 0.35, 0.22), 3.0));
+    return d;
+  }
+  if (kind == 5) {
+    // A caged work / alarm light: a glass cylinder (its light) with a domed
+    // cap, inside a metal cage of bars and rings, on a round base back to
+    // where it's mounted (y: its axis, out from the mount).
+    vec2 d = vec2(sdCylY(p, -0.085, 0.085, 0.062), 1.0);
+    d = opU(d, vec2(length(p - vec3(0.0, 0.085, 0.0)) - 0.062, 1.0));
+    d.x = smin(d.x, length(p - vec3(0.0, 0.085, 0.0)) - 0.062, 0.01);
+    // The base: a collar and a plate on the mount.
+    d = opU(d, vec2(sdCylY(p, -0.13, -0.085, 0.075), 0.0));
+    d = opU(d, vec2(sdCylY(p, -0.16, -0.13, 0.1), 0.0));
+    // The bars: six round it, out from the glass, meeting over the top.
+    float a = atan(p.z, p.x);
+    float seg = 6.2831853 / 6.0;
+    float aa = mod(a + seg * 0.5, seg) - seg * 0.5;
+    float rr = length(p.xz);
+    vec3 b = vec3(rr * cos(aa), p.y, rr * sin(aa));
+    float bars = sdCapsule(b, vec3(0.088, -0.09, 0.0), vec3(0.088, 0.09, 0.0), 0.0055);
+    bars = min(bars, sdCapsule(b, vec3(0.088, 0.09, 0.0), vec3(0.0, 0.165, 0.0), 0.0055));
+    d = opU(d, vec2(bars, 6.0));
+    // The rings: round the middle and near the base.
+    vec2 ring1 = vec2(rr - 0.09, p.y - 0.01);
+    vec2 ring2 = vec2(rr - 0.09, p.y + 0.075);
+    d = opU(d, vec2(min(length(ring1), length(ring2)) - 0.0065, 6.0));
     return d;
   }
   if (kind == 1) {
@@ -7824,8 +7904,13 @@ void main() {
     vec4 lp = texelFetch(lights, ivec2(i, 0), 0);
     vec4 lc = texelFetch(lights, ivec2(i, 1), 0);
     vec4 ld = texelFetch(lights, ivec2(i, 2), 0);
+    // Its panel's width and height (a window or panel), how wide its light
+    // is cast (half the cone, degrees: 0 the kind's own; 180 all round).
+    vec4 lx = texelFetch(lights, ivec2(i, 6), 0);
     int code = int(ld.w + 0.5);
     int kind = code & 7;
+    float spread = lx.z > 0.0 ? lx.z : (kind == 1 ? 35.0 : kind == 4 ? 90.0 : kind == 2 ? 75.0 : 180.0);
+    vec2 panel = vec2(lx.x > 0.0 ? lx.x : 1.3, lx.y > 0.0 ? lx.y : 1.1) * 0.5;
     bool preview = (code & 8) != 0, selected = (code & 16) != 0;
     // How lit: after dark, each coming on at its own moment as it gets dark
     // (stuttering on as it warms up); a preview shows its light by day too.
@@ -7848,19 +7933,31 @@ void main() {
     if (d > 0.0 && kk > 0.001) {
       vec3 dl = lp.xyz - P;
       float dist = length(dl);
-      if (kind == 2 && !rider) {
-        // A window: the wall's own texture lit up within it (its color
-        // tinted, glowing), facing the way it was placed.
-        vec3 nrm = normalize(vec3(axis.x, 0.0, axis.z) + vec3(0.0, 1e-4, 0.0));
-        vec3 rt = normalize(cross(vec3(0.0, 1.0, 0.0), nrm));
+      // A window or panel: its own frame (facing the way it was placed,
+      // tilted with it), the light from the nearest point of it.
+      vec3 nrm = axis, rt = vec3(1.0, 0.0, 0.0), up = vec3(0.0, 1.0, 0.0);
+      if (kind == 2) {
+        rt = normalize(cross(abs(nrm.y) < 0.98 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), nrm));
+        up = cross(nrm, rt);
         vec3 rel = P - lp.xyz;
-        vec3 l3 = vec3(dot(rel, rt), rel.y, dot(rel, nrm));
-        if (abs(l3.x) < 0.65 && abs(l3.y) < 0.55 && abs(l3.z) < 0.4) {
-          float edge = smoothstep(0.65, 0.58, abs(l3.x)) * smoothstep(0.55, 0.48, abs(l3.y));
+        vec2 pl = vec2(dot(rel, rt), dot(rel, up));
+        dl = lp.xyz + rt * clamp(pl.x, -panel.x, panel.x) + up * clamp(pl.y, -panel.y, panel.y) - P;
+        dist = length(dl);
+      }
+      if (kind == 2 && !rider) {
+        // The wall's own texture lit up within it (its color tinted,
+        // glowing): as wide and high as it was sized.
+        vec3 rel = P - lp.xyz;
+        vec3 l3 = vec3(dot(rel, rt), dot(rel, up), dot(rel, nrm));
+        vec2 soft = min(panel * 0.1, vec2(0.07));
+        if (abs(l3.x) < panel.x + soft.x && abs(l3.y) < panel.y + soft.y && abs(l3.z) < 0.4) {
+          float edge = smoothstep(panel.x + soft.x, panel.x - soft.x, abs(l3.x)) *
+                       smoothstep(panel.y + soft.y, panel.y - soft.y, abs(l3.y));
           surf += (alb * col * 2.4 + col * 0.18) * edge;
           // (The panel's outline while previewed or picked.)
           if (preview || selected) {
-            float rim = max(smoothstep(0.55, 0.65, abs(l3.x)), smoothstep(0.45, 0.55, abs(l3.y)));
+            float rim = max(smoothstep(panel.x - soft.x * 1.5, panel.x + soft.x, abs(l3.x)),
+                            smoothstep(panel.y - soft.y * 1.5, panel.y + soft.y, abs(l3.y)));
             surf += (preview ? vec3(0.3, 0.8, 1.0) : vec3(1.0, 0.85, 0.2)) * rim *
                    (0.35 + 0.2 * sin(pc.b.x * 6.0));
           }
@@ -7870,11 +7967,29 @@ void main() {
         float x = dist / lp.w;
         float fall = (1.0 - x * x) * (1.0 - x * x) / (1.0 + dist * dist * 0.06);
         float ndl = max(dot(N, dl / max(dist, 1e-3)), 0.0) * 0.8 + 0.2;
+        vec3 out_dir = -dl / max(dist, 1e-3);  // (from the light to here)
         if (kind == 4) {  // a street light: down and round from its head
-          fall *= smoothstep(-0.35, 0.25, dot(-dl / max(dist, 1e-3), vec3(0.0, -1.0, 0.0))) * 1.25 + 0.04;
+          fall *= smoothstep(cos(radians(min(spread + 20.0, 179.0))), cos(radians(max(spread - 15.0, 1.0))),
+                             dot(out_dir, vec3(0.0, -1.0, 0.0))) * 1.25 + 0.04;
+        } else if (kind == 1) {  // a floodlight: a cone along its direction
+          fall *= smoothstep(cos(radians(min(spread, 179.0))), cos(radians(spread * 0.6)), dot(out_dir, axis)) * 1.4 +
+                  0.04;
+        } else if (kind == 2) {  // a window: out of it, spread from its face
+          fall *= smoothstep(cos(radians(min(spread + 15.0, 179.0))), cos(radians(max(spread - 10.0, 1.0))),
+                             dot(out_dir, nrm)) * (dot(P - lp.xyz, nrm) > -0.05 ? 1.0 : 0.0);
+        } else if (spread < 179.0) {
+          // A lamp: down from it; a caged light: along its axis.
+          vec3 cone = kind == 5 ? axis : vec3(0.0, -1.0, 0.0);
+          fall *= smoothstep(cos(radians(min(spread + 15.0, 179.0))), cos(radians(max(spread - 15.0, 1.0))),
+                             dot(out_dir, cone)) * 1.2 + 0.03;
         }
-        if (kind == 1) {  // a floodlight: a cone along its direction
-          fall *= smoothstep(0.82, 0.93, dot(-dl / max(dist, 1e-3), axis)) * 1.4 + 0.04;
+        if (kind == 5) {
+          // The cage's bars striping the light thrown round it.
+          vec3 bx = normalize(cross(abs(axis.y) < 0.98 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), axis));
+          vec3 bz = cross(axis, bx);
+          float ang = atan(dot(out_dir, bz), dot(out_dir, bx));
+          float side = 1.0 - abs(dot(out_dir, axis));
+          fall *= 1.0 - 0.45 * side * smoothstep(0.9, 0.985, cos(ang * 6.0));
         }
         vec3 lit = alb * col * fall * ndl * 1.6;
         // A sheen toward the camera (snow and ice catch it), and on the snow
@@ -7884,17 +7999,16 @@ void main() {
         float facing = max(dot(N, L), 0.0);
         if (facing > 0.0) {
           float snow = rider ? 0.0 : smoothstep(0.45, 0.7, dot(alb, vec3(0.333)));
-          float sheen = pow(max(dot(N, hv), 0.0), 28.0) * (0.12 + 0.3 * snow);
+          float sheen = pow(max(dot(N, hv), 0.0), 16.0) * (0.12 + 0.12 * snow);
           if (snow < 0.5 && surf_tag == 2u) {
             // Metal: a tighter, brighter highlight, tinted by its color.
             lit += col * fall * facing * pow(max(dot(N, hv), 0.0), 70.0) * 1.6 * (alb + 0.25);
           } else if (snow < 0.5 && surf_tag == 5u) {
             sheen += pow(max(dot(N, hv), 0.0), 50.0) * 0.5;
           }
-          ivec3 hb = ivec3(floor(hv * 6.0));
-          float glint = step(0.993, Hash3(ivec3(floor(P * 28.0)), hb.x * 31 + hb.y * 17 + hb.z * 7)) *
-                        snow * smoothstep(40.0, 10.0, pix_dist);
-          lit += col * fall * facing * (sheen + glint * 3.0);
+          vec4 w1 = pc.m * vec4(ndc + vec2(pc.a.x * 2.0, 0.0), 1.0 - d, 1.0);
+          float glint = SnowGlint(P, N, hv, length(w1.xyz / w1.w - P)) * snow;
+          lit += col * fall * facing * (sheen + glint * 5.0);
         }
         // Its shadows (what's lit enough to show one).
         if (shadow_steps > 0 && dot(lit, vec3(1.0)) > 0.004 &&
@@ -7917,7 +8031,7 @@ void main() {
     float t = dot(to, dir);
     if (kk > 0.001 && t > 0.3 && t < min(pix_dist, hit_t) + 0.5 && kind != 2) {
       float perp = length(to - dir * t);
-      float size = (kind == 1 ? 0.18 : 0.12) + 0.004 * t;
+      float size = (kind == 1 ? 0.18 : kind == 5 ? 0.1 : 0.12) + 0.004 * t;
       float g = size * size / (perp * perp + size * size);
       float facing = kind == 1 ? 0.25 + 0.75 * smoothstep(0.2, 0.9, dot(-dir, axis)) : 1.0;
       add += col * (0.55 * g * g + 0.12 * g) * facing * smoothstep(400.0, 150.0, t);
@@ -7975,15 +8089,20 @@ void main() {
     }
     // The fitting itself (by day too), when the ray passes near it.
     // (How far the fitting reaches from its light: a lamp post down to the ground.)
-    float reach = kind == 0 || kind == 4 ? max(0.5, length(g_arm) + 0.3) : (kind == 3 ? 0.8 : 0.6);
+    float reach = kind == 0 || kind == 4 ? max(0.5, length(g_arm) + 0.3) : (kind == 3 ? 0.8 : kind == 5 ? 0.35 : 0.6);
     if (kind != 2 && t > 0.2 && t < 150.0) {
       float perp = length(to - dir * t);
       if (perp < reach) {
-        // Its frame: z along the axis for a floodlight.
+        // Its frame: z along the axis for a floodlight; y along it for a
+        // caged light.
         vec3 fz = kind == 1 ? axis : vec3(0.0, 0.0, 1.0);
         vec3 fx = normalize(cross(abs(fz.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), fz));
         vec3 fy = cross(fz, fx);
-        if (kind != 1) {
+        if (kind == 5) {
+          fy = axis;
+          fx = normalize(cross(fy, abs(fy.y) < 0.98 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+          fz = cross(fx, fy);
+        } else if (kind != 1) {
           fx = vec3(1.0, 0.0, 0.0);
           fy = vec3(0.0, 1.0, 0.0);
           fz = vec3(0.0, 0.0, 1.0);
@@ -8012,7 +8131,9 @@ void main() {
               float sheen = (mat == 0 || mat == 6) ? pow(max(dot(reflect(dir, nw), vec3(0.0, 1.0, 0.0)), 0.0), 12.0) : 0.0;
               vec3 cc = base * amb + vec3(sheen * (mat == 6 ? 0.35 : 0.15)) * pc.b.y;
               // The inside of a shade or housing catches its own light.
-              if (kind <= 1 && (mat == 0 || mat == 6)) cc += base * col * 0.9 * clamp(0.25 - length(q) , 0.0, 0.25) * 4.0;
+              if ((kind <= 1 || kind == 5) && (mat == 0 || mat == 6)) cc += base * col * 0.9 * clamp(0.25 - length(q) , 0.0, 0.25) * 4.0;
+              // (A caged light's bars painted: yellow, like a work light's.)
+              if (kind == 5 && mat == 6) cc *= vec3(1.3, 1.1, 0.35);
               // Lit by its own light (the fire's logs and stones), glowing
               // where it's the light (the bulb, the lens, the embers).
               if (kind == 3 && mat != 4) cc += base * col * 0.8 * clamp(1.0 - length(q + vec3(0.0, 0.2, 0.0)) * 1.5, 0.0, 1.0);
@@ -11699,7 +11820,7 @@ Image* Renderer::Impl::FoggedScene(Image* scene) {
     pc[25] = fog_start_;
     pc[26] = 0.003f;
     pc[27] = cam_pos_[1] - 50.0f;
-    pc[28] = 0.75f;  // never opaque: far mountains stay visible
+    pc[28] = fog_most_;  // never opaque (far mountains stay visible), but in a whiteout
     pc[29] = 1.0f / float(w);
     pc[30] = 1.0f / float(h);
     if (VolumeOn() && VolumeReady(scene, depth) && !Diag("nofogmerge")) {
@@ -13047,6 +13168,8 @@ void Renderer::Impl::ResolveInstances() {
   }
   instances_.clear();
   size_t affine = 0;
+  // (The pick's queries: each one's object, none for the world itself.)
+  if (cur_slot_ && cur_slot_->pick_count) cur_slot_->pick_objs.assign(cur_slot_->pick_count, Renderer::Instance{});
   for (const PendingInstance& p : pend) {
     const double K[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -p.zs, 1.0 - p.zo, 0, 0, 0, 1};
     double KM[16], W[16];
@@ -13074,6 +13197,9 @@ void Renderer::Impl::ResolveInstances() {
       for (int i = 0; i < 12; ++i) in.m[i] = float(p.world[i]);
     } else {
       continue;
+    }
+    if (p.query >= 0 && cur_slot_ && size_t(p.query) < cur_slot_->pick_objs.size()) {
+      cur_slot_->pick_objs[size_t(p.query)] = in;
     }
     // (Each object once: some are drawn in several parts.)
     bool dup = false;
@@ -13285,7 +13411,8 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
     const double dist = std::sqrt(double(nearby[j].first));
     // What it reaches: its light; its glow, fitting (a lamp post's pole).
     const double arm = std::sqrt(double(l.dir[0] * l.dir[0] + l.dir[1] * l.dir[1] + l.dir[2] * l.dir[2]));
-    const double R = std::max({double(std::max(l.radius, 0.5f)), 4.0 * (0.18 + 0.004 * dist), arm + 1.0});
+    const double R = std::max({double(std::max(l.radius, 0.5f)), 4.0 * (0.18 + 0.004 * dist), arm + 1.0}) +
+                     0.5 * std::max(l.size[0], l.size[1]) * (l.kind == 2 ? 1.0 : 0.0);
     double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
     bool whole = dist < R * 1.2;
     for (int c = 0; c < 8 && !whole; ++c) {
@@ -13381,6 +13508,11 @@ Image* Renderer::Impl::NightLights(Image* scene, Image* depth) {
       c[1] = l.dir[1];
       c[2] = l.dir[2];
       c[3] = float((l.kind & 7) | (l.preview ? 8 : 0) | (l.selected ? 16 : 0));
+      // Row 6: a panel's size, its spread.
+      float* x = f + 6 * row + j * 4;
+      x[0] = l.size[0];
+      x[1] = l.size[1];
+      x[2] = l.spread;
     }
     // Rows 4, 5: the points afar (ndc x, y, depth, radius in pixels; color).
     for (size_t n = 0; n < sprites.size(); ++n) {
@@ -14445,6 +14577,15 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   if (wind_on_) {
     int wm = WindMode(vs->info.ucode_hash);
     const uint64_t vh = vs->info.ucode_hash;
+    if (wm == 1) {
+      // (The trees' textures: their trunks are drawn from the same.)
+      const uint64_t th = DrawTextureHash(d, st, 0);
+      if (th && tree_textures_.size() < 256) tree_textures_.insert(th);
+    }
+    if (!wm && vh == kWorldMeshVs && !tree_textures_.empty() && tree_textures_.count(DrawTextureHash(d, st, 0)) &&
+        !Diag("notrunks")) {
+      wm = 5;  // a trunk: bent with its leaves
+    }
     if (!wm && (vh == kWorldMeshVs || vh == kPropVs) && IsCloth(DrawContentHash(d, st, 0), cloth_extra_)) {
       wm = vh == kWorldMeshVs ? 3 : 4;
     }
@@ -14957,6 +15098,30 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   } else {
     vk::vkCmdDraw(cb_, d.count, 1, 0, 0);
   }
+  // The light editor's pick: the same again over the middle pixel alone, in
+  // an occlusion query (passing: in front there, so far) - what the scene
+  // pass's objects are kept for (the same draws as below).
+  pick_q_ = -1;
+  if (pick_queries_ && cur_slot_ && pick_used_ < kPickMax && collect_instances_ && !light_seen_ && tiling_.width &&
+      depth && (st.reg(0x2200) & 6) == 6 && max_draws_ == UINT32_MAX && pending_instances_.size() < 8192) {
+    const int32_t cx = int32_t(rt_w / 2), cy = int32_t(rt_h / 2);
+    if (cx >= sc.offset.x && cy >= sc.offset.y && cx < sc.offset.x + int32_t(sc.extent.width) &&
+        cy < sc.offset.y + int32_t(sc.extent.height)) {
+      const uint32_t q = uint32_t(cur_slot_ - slots_) * kPickMax + pick_used_;
+      const VkRect2D one{{cx, cy}, {1, 1}};
+      vk::vkCmdSetScissor(cb_, 0, 1, &one);
+      vk::vkCmdBeginQuery(cb_, pick_pool_, q, 0);
+      if (indexed) {
+        vk::vkCmdDrawIndexed(cb_, index_count, 1, first_index, 0, 0);
+      } else {
+        vk::vkCmdDraw(cb_, d.count, 1, 0, 0);
+      }
+      vk::vkCmdEndQuery(cb_, pick_pool_, q);
+      vk::vkCmdSetScissor(cb_, 0, 1, &sc);
+      pick_q_ = int(pick_used_++);
+      cur_slot_->pick_count = pick_used_;
+    }
+  }
   ds.valid = true;
   if (!colors.empty()) last_color_ = colors[0];
   ++stats_.draws_done;
@@ -15138,6 +15303,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       std::memcpy(&f, &st.vs_consts[i], 4);
       pi.m[i] = f;
     }
+    pi.query = pick_q_;
     pi.zs = sys.ndc_scale[2];
     pi.zo = sys.ndc_offset[2];
     pi.has_world = false;
@@ -16562,6 +16728,7 @@ Renderer::Impl::~Impl() {
   }
   if (copy_set_layout_) vk::vkDestroyDescriptorSetLayout(dev, copy_set_layout_, nullptr);
   if (ts_pool_) vk::vkDestroyQueryPool(dev, ts_pool_, nullptr);
+  if (pick_pool_) vk::vkDestroyQueryPool(dev, pick_pool_, nullptr);
   g_phase = "closing the old renderer: its Vulkan device";
   gpu_.Shutdown();
 }
@@ -16708,6 +16875,47 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
       const uint32_t q = uint32_t(fs - slots_) * kMaxParts;
       vk::vkCmdResetQueryPool(cb_, part_pool_, q, kMaxParts);
       vk::vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, part_pool_, q);
+    }
+  }
+  // The light editor's pick: the slot's last results (its frame is done),
+  // then its queries reset for this frame.
+  pick_queries_ = false;
+  pick_used_ = 0;
+  if (fs) {
+    const uint32_t base = uint32_t(fs - slots_) * kPickMax;
+    if (pick_pool_ && fs->pick_count) {
+      std::vector<uint32_t> r(fs->pick_count, 0);
+      if (vk::vkGetQueryPoolResults(gpu_.device, pick_pool_, base, fs->pick_count, r.size() * 4, r.data(), 4, 0) ==
+          VK_SUCCESS) {
+        int last = -1;
+        for (int q = 0; q < int(r.size()); ++q) {
+          if (r[size_t(q)]) last = q;
+        }
+        if (last < 0) {
+          picked_state_ = 0;
+        } else if (size_t(last) < fs->pick_objs.size() && fs->pick_objs[size_t(last)].key) {
+          picked_ = fs->pick_objs[size_t(last)];
+          picked_state_ = 1;
+        } else {
+          picked_state_ = 2;
+        }
+      }
+    }
+    fs->pick_count = 0;
+    fs->pick_objs.clear();
+    if (collect_instances_ && center_probe_ && !Diag("nopick")) {
+      if (!pick_pool_) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qi.queryCount = kPickMax * 2;
+        if (vk::vkCreateQueryPool(gpu_.device, &qi, nullptr, &pick_pool_) != VK_SUCCESS) pick_pool_ = VK_NULL_HANDLE;
+      }
+      if (pick_pool_) {
+        vk::vkCmdResetQueryPool(cb_, pick_pool_, base, kPickMax);
+        pick_queries_ = true;
+      }
+    } else {
+      picked_state_ = 0;
     }
   }
   cur_slot_ = fs;
@@ -16991,6 +17199,10 @@ uint64_t Renderer::MountainKey() const {
 }
 void Renderer::SetCollectInstances(bool on) { impl_->collect_instances_ = on; }
 void Renderer::SetCenterProbe(bool on) { impl_->center_probe_ = on; }
+int Renderer::PickedObject(Instance* out) const {
+  if (impl_->picked_state_ == 1 && out) *out = impl_->picked_;
+  return impl_->picked_state_;
+}
 const std::vector<Renderer::Instance>& Renderer::Instances() const { return impl_->instances_; }
 bool Renderer::CenterPoint(float out[3], float normal[3]) const {
   if (!impl_->center_ok_) return false;
@@ -17113,9 +17325,10 @@ void Renderer::SetAmbientOcclusion(float strength, bool debug) {
   impl_->ao_debug_ = debug && strength > 0.0f;
 }
 
-void Renderer::SetFog(float density, float start) {
+void Renderer::SetFog(float density, float start, float most) {
   impl_->fog_density_ = std::max(density, 0.0f);
   impl_->fog_start_ = std::max(start, 0.0f);
+  impl_->fog_most_ = std::clamp(most, 0.0f, 0.98f);
 }
 
 void Renderer::SetSpeedBlur(float strength, float dt, float force_amount) {

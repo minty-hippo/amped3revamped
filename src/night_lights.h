@@ -34,6 +34,14 @@ std::string NextKind(int step);  // the kind to place
 std::string Rotate(float degrees);  // the preview, or the picked light (all copies)
 std::string TiltBy(float degrees);  // up (+) or down, the same
 std::string NextColor(int step);    // the preview's or the picked light's color
+// What the D-pad changes: 0 turn / tilt, 1 width / height (a window or
+// panel), 2 reach / spread, 3 color / brightness.
+std::string NextMode(int step);
+int Mode();
+std::string Resize(int wider, int taller);  // a window or panel's size, by steps
+std::string Reach(int step);       // how far its light goes
+std::string Spread(int step);      // how wide its light is cast
+std::string Brightness(int step);
 std::string Select(int step);    // pick the next / previous placed light (by object)
 bool HasSelection();
 std::string Deselect();

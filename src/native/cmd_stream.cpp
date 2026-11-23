@@ -21,7 +21,7 @@ struct Real {
   X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdBeginRendering) X(vkCmdEndRendering)                 \
   X(vkCmdPipelineBarrier) X(vkCmdCopyImage) X(vkCmdCopyBufferToImage)                         \
   X(vkCmdCopyImageToBuffer) X(vkCmdClearColorImage) X(vkCmdClearAttachments)                  \
-  X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp)
+  X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkCmdBeginQuery) X(vkCmdEndQuery)
 #define AMPED3_CMD_REAL(name) PFN_##name name = nullptr;
   AMPED3_CMD_FUNCS(AMPED3_CMD_REAL)
 #undef AMPED3_CMD_REAL
@@ -316,6 +316,23 @@ VKAPI_ATTR void VKAPI_CALL ResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, 
   }
 }
 
+VKAPI_ATTR void VKAPI_CALL BeginQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query,
+                                       VkQueryControlFlags flags) {
+  if (Stream* s = For(cb)) {
+    s->Push([=](VkCommandBuffer c) { real.vkCmdBeginQuery(c, pool, query, flags); });
+  } else {
+    real.vkCmdBeginQuery(cb, pool, query, flags);
+  }
+}
+
+VKAPI_ATTR void VKAPI_CALL EndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query) {
+  if (Stream* s = For(cb)) {
+    s->Push([=](VkCommandBuffer c) { real.vkCmdEndQuery(c, pool, query); });
+  } else {
+    real.vkCmdEndQuery(cb, pool, query);
+  }
+}
+
 VKAPI_ATTR void VKAPI_CALL WriteTimestamp(VkCommandBuffer cb, VkPipelineStageFlagBits stage,
                                            VkQueryPool pool, uint32_t query) {
   if (Stream* s = For(cb)) {
@@ -364,6 +381,8 @@ void Install() {
     vk::vkCmdClearAttachments = ClearAttachments;
     vk::vkCmdResetQueryPool = ResetQueryPool;
     vk::vkCmdWriteTimestamp = WriteTimestamp;
+    vk::vkCmdBeginQuery = BeginQuery;
+    vk::vkCmdEndQuery = EndQuery;
   }
 }
 

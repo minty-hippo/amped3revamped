@@ -941,6 +941,8 @@ void WeatherStep(WeatherNow& w, int setting, double t, double dt, double minutes
 }
 float g_center_normal[3] = {0.0f, 1.0f, 0.0f};
 bool g_center_valid = false;
+native::Renderer::Instance g_picked;  // the object at the screen's middle (PickedObject)
+int g_picked_state = 0;
 uint64_t g_mountain_key = 0;
 std::mutex g_lights_mutex;
 std::vector<native::Renderer::NightLight> g_lights;  // SetNightLights
@@ -2559,13 +2561,21 @@ void WorkerMain() {
               static double cloud_clock = 1.0;
               if (running) cloud_clock += dt * (0.5 + wind / 3.0);
               tod.cloud_clock = float(std::fmod(cloud_clock, 100000.0) + 1.0);
-              // The fog closing in: heavy snow a few hundred metres, a
-              // blizzard a few dozen.
+              // The fog closing in round the rider: falling snow a few
+              // hundred metres, a blizzard a few dozen (whiting out, in
+              // gusts that close in and lift again); from a few metres
+              // off in the thick of it.
               if (g_weather.mist > 0.002f) {
                 const double base = revamped && REXCVAR_GET(native_fog) ? REXCVAR_GET(native_fog_density) : 0.0;
                 const double fog_start = revamped && REXCVAR_GET(native_fog) ? REXCVAR_GET(native_fog_start) : 300.0;
-                renderer->SetFog(float(base + 28.0 * g_weather.mist * g_weather.mist + 3.0 * g_weather.mist),
-                                 float(fog_start + (12.0 - fog_start) * std::min(1.0, g_weather.mist * 1.5)));
+                const double m = g_weather.mist;
+                const double t = tod_seconds;
+                const double gust =
+                    0.5 + 0.5 * std::sin(t * 0.37 + 0.6 * std::sin(t * 0.11)) * std::sin(t * 0.13 + 1.7);
+                const double thick = 62.0 * std::pow(m, 1.6) * (0.75 + 0.5 * gust * std::min(1.0, m * 1.4));
+                renderer->SetFog(float(base + thick + 3.0 * m),
+                                 float(fog_start + (2.5 - fog_start) * std::min(1.0, m * 1.6)),
+                                 float(0.75 + 0.22 * std::pow(m, 1.5)));
               }
             } else {
               g_weather_kind = -1;
@@ -2847,6 +2857,7 @@ void WorkerMain() {
         g_freecam_pose_valid = have;
         if (have) std::memcpy(g_freecam_pose, pose, sizeof(pose));
         g_center_valid = renderer->CenterPoint(g_center, g_center_normal);
+        g_picked_state = renderer->PickedObject(&g_picked);
         g_mountain_key = renderer->MountainKey();
         if (!renderer->Instances().empty() || !g_instances.empty()) {
           g_instances = renderer->Instances();
@@ -2989,6 +3000,11 @@ const char* WeatherName() {
 uint64_t MountainKey() {
   std::lock_guard lock(g_game_camera_mutex);
   return g_mountain_key;
+}
+int PickedObject(native::Renderer::Instance* out) {
+  std::lock_guard lock(g_game_camera_mutex);
+  if (g_picked_state == 1 && out) *out = g_picked;
+  return g_picked_state;
 }
 bool CenterPoint(float out[3], float normal[3]) {
   std::lock_guard lock(g_game_camera_mutex);
