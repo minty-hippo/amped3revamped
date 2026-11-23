@@ -2020,7 +2020,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2148,7 +2148,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[67] = {};  // by CopyKind
+  VkShaderModule copy_fs_[69] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2529,6 +2529,16 @@ struct Renderer::Impl {
   // frame's half of the pixels traced blended in where the last frame's
   // result lands on the same surface.
   Image gi_hist_[2];
+  // The probe grid (the default; diagnostic "gipixel": every quarter-size
+  // pixel traced instead): 32 x 16 x 32 probes 4 m apart round the camera,
+  // world-aligned and kept as it moves (each slot the probe whose world
+  // index matches it, modulo the grid), each probe six faces (the light onto
+  // a surface facing +x, -x, +y, -y, +z, -z), an eighth of them traced
+  // again each frame and blended in. Texture: 6 x 32 wide, 16 x 32 high.
+  static constexpr int kProbeDims[3] = {32, 16, 32};
+  static constexpr double kProbeSpacing = 4.0;
+  Image gi_probe_[2];
+  int gi_probe_cur_ = 0;
   int gi_hist_cur_ = 0;
   bool gi_hist_ok_ = false;
   double gi_prev_vp_[16] = {};
@@ -7225,14 +7235,14 @@ void main() {
 )", true);
   // World-space light, 2 (half size): see GiTrace. Out: the light to add
   // (times the albedo; negative where the sky's is taken off), its depth.
-  copy_fs_[64] = CompileBuiltin("builtin_gi_trace", R"(#version 450
+  static const std::string kGiCommon = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D scene;    // lit (linear)
 layout(set = 0, binding = 1) uniform sampler2D depth;
-layout(set = 0, binding = 2) uniform sampler2D normals;  // the lighting's
+layout(set = 0, binding = 2) uniform sampler2D b2;  // trace: the lighting's normals; probes: the probes before
 layout(set = 0, binding = 3) uniform usampler2D occ0;    // 1 m voxels
 layout(set = 0, binding = 4) uniform usampler2D occ1;    // 4 m
 layout(set = 0, binding = 5) uniform sampler2D params;
-layout(push_constant) uniform Gi { vec4 a; } pc;  // 1 / width, 1 / height (full size), voxels a side, pixels a texel
+layout(push_constant) uniform Gi { vec4 a; vec4 b; } pc;  // 1 / width, 1 / height (full size), voxels a side, pixels a texel
 layout(location = 0) out vec4 o;
 mat4 M, VP;
 vec4 kBox[2], kSun, kCam, kSh[7], kSet;
@@ -7244,6 +7254,7 @@ bool Occ(int k, ivec3 v) {
   uvec4 c = k == 0 ? texelFetch(occ0, v.xz, 0) : texelFetch(occ1, v.xz, 0);
   return ((c[v.y >> 5] >> uint(v.y & 31)) & 1u) != 0u;
 }
+uvec4 k0Col(ivec2 c) { return texelFetch(occ0, c, 0); }
 // The sky's light from (or onto a surface facing) n: the lighting's own.
 vec3 Sky(vec3 n) {
   vec4 n4 = vec4(n, 1.0);
@@ -7358,7 +7369,8 @@ vec3 Radiance(vec3 H, vec3 n, float vs) {
   }
   return alb * e;
 }
-void main() {
+)";
+  copy_fs_[64] = CompileBuiltin("builtin_gi_trace", kGiCommon + R"(void main() {
   N = int(pc.a.z);
   kSize = textureSize(depth, 0);
   for (int i = 0; i < 4; ++i) {
@@ -7397,7 +7409,7 @@ void main() {
   vec3 P = World(uv, d);
   float dist = length(P - kCam.xyz);
   if (dist > kCam.w) return;
-  vec3 Nn = texelFetch(normals, c, 0).xyz * 2.0 - 1.0;
+  vec3 Nn = texelFetch(b2, c, 0).xyz * 2.0 - 1.0;
   float nl = length(Nn);
   if (abs(nl - 1.0) > 0.2) return;
   Nn /= nl;
@@ -7428,6 +7440,73 @@ void main() {
   vec3 e = sum / float(rays);
   e *= 1.0 - smoothstep(kCam.w * 0.7, kCam.w, dist);
   o = vec4(e, d);
+}
+)", true);
+  copy_fs_[67] = CompileBuiltin("builtin_gi_probes", kGiCommon + R"(// The probe grid (see GiProbes): each texel one face (+x -x +y -y +z -z)
+// of a probe, the light onto a surface facing that way there, traced again
+// for an eighth of them a frame and blended into what it had.
+void main() {
+  N = int(pc.a.z);
+  kSize = textureSize(depth, 0);
+  for (int i = 0; i < 4; ++i) {
+    M[i] = Param(i);
+    VP[i] = Param(4 + i);
+  }
+  kBox[0] = Param(8);
+  kBox[1] = Param(9);
+  kSun = Param(10);
+  kCam = Param(11);
+  for (int i = 0; i < 7; ++i) kSh[i] = Param(12 + i);
+  kSet = Param(19);
+  vec4 g = Param(21);  // the grid's lowest probe (world index), spacing (m)
+  ivec3 dims = ivec3(Param(22).xyz);
+  int frame = int(Param(22).w);
+  ivec2 t = ivec2(gl_FragCoord.xy);
+  int face = t.x % 6;
+  ivec3 slot = ivec3(t.x / 6, t.y / dims.z, t.y % dims.z);
+  ivec3 lo = ivec3(g.xyz);
+  ivec3 wi = lo + ((slot - lo) % dims + dims) % dims;
+  // (Which probe this slot holds: tagged in alpha, so one scrolled in is
+  // started afresh.)
+  float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
+  vec4 old = texelFetch(b2, t, 0);
+  bool same = abs(abs(old.a) - tag) < 0.25;
+  bool due = !same || ((wi.x + wi.y * 3 + wi.z * 5 + face) & 7) == (frame & 7);
+  if (!due) {
+    o = old;
+    return;
+  }
+  vec3 P = (vec3(wi) + 0.5) * g.w;
+  vec3 Nn = vec3(0.0);
+  Nn[face >> 1] = (face & 1) == 0 ? 1.0 : -1.0;
+  // Inside something (its fine voxel occupied): no light of its own.
+  vec3 rel = (P - kBox[0].xyz) / kBox[0].w;
+  ivec3 v = ivec3(floor(rel));
+  bool inside = all(greaterThanEqual(v, ivec3(0))) && all(lessThan(v, ivec3(N))) &&
+                (((k0Col(v.xz)[v.y >> 5]) >> uint(v.y & 31)) & 1u) != 0u;
+  if (inside) {
+    o = vec4(0.0, 0.0, 0.0, -tag);
+    return;
+  }
+  vec3 T = abs(Nn.y) < 0.9 ? normalize(cross(Nn, vec3(0.0, 1.0, 0.0))) : vec3(1.0, 0.0, 0.0);
+  vec3 Bt = cross(Nn, T);
+  float rnd = fract(52.9829189 * fract(dot(vec2(t) + float(frame) * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
+  int rays = int(kSet.x);
+  vec3 sum = vec3(0.0);
+  for (int i = 0; i < rays; ++i) {
+    float u1 = fract((float(i) + 0.5) / float(rays) + rnd * 0.37);
+    float ph = 6.2831853 * fract(float(i) * 0.618034 + rnd);
+    float r = sqrt(u1);
+    vec3 D = normalize(T * (r * cos(ph)) + Bt * (r * sin(ph)) + Nn * sqrt(max(1.0 - u1, 0.0)));
+    vec3 n;
+    float tt = Trace(P, D, 0.0, 400.0, 0, ivec2(80, 48), n);
+    if (tt < 0.0) continue;
+    vec3 H = P + D * tt;
+    float hv = tt < float(N) * kBox[0].w * 0.5 ? kBox[0].w : kBox[1].w;
+    sum += Radiance(H, n, hv) * kSet.z - Sky(D) * kSet.y;
+  }
+  vec3 e = sum / float(rays);
+  o = vec4(same && old.a > 0.0 ? mix(old.rgb, e, 0.2) : e, tag);
 }
 )", true);
   // World-space light, 3: its half-size result blurred one way (9 taps,
@@ -7515,6 +7594,71 @@ void main() {
   }
   vec3 r = !have ? near : traced ? mix(h, c.rgb, 0.25) : h;
   o = vec4(r, d);
+}
+)", true);
+  // World-space light, 5: the probes read at each quarter-size pixel
+  // (trilinear, the six faces by its normal, probes behind its surface
+  // weighed less, those inside something or not yet traced left out).
+  copy_fs_[68] = CompileBuiltin("builtin_gi_apply", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D depth;
+layout(set = 0, binding = 1) uniform sampler2D normals;
+layout(set = 0, binding = 2) uniform sampler2D probes;
+layout(set = 0, binding = 5) uniform sampler2D params;
+layout(push_constant) uniform A { vec4 a; } pc;  // 1 / width, 1 / height (full size), pixels a texel
+layout(location = 0) out vec4 o;
+vec4 Param(int i) { return texelFetch(params, ivec2(i, 0), 0); }
+void main() {
+  mat4 M;
+  for (int i = 0; i < 4; ++i) M[i] = Param(i);
+  vec4 cam = Param(11);
+  vec4 g = Param(21);
+  ivec3 dims = ivec3(Param(22).xyz);
+  ivec2 sz = textureSize(depth, 0);
+  int sc = int(pc.a.z);
+  ivec2 c = min(ivec2(gl_FragCoord.xy) * sc + sc / 2, sz - 1);
+  float d = texelFetch(depth, c, 0).r;
+  o = vec4(0.0, 0.0, 0.0, d);
+  if (d <= 0.0) return;
+  vec2 uv = (vec2(c) + 0.5) * pc.a.xy;
+  vec4 w4 = M * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 1.0 - max(d, 1e-7), 1.0);
+  vec3 P = w4.xyz / w4.w;
+  vec3 Nn = texelFetch(normals, c, 0).xyz * 2.0 - 1.0;
+  float nl = length(Nn);
+  if (abs(nl - 1.0) > 0.2) return;
+  Nn /= nl;
+  ivec3 lo = ivec3(g.xyz);
+  vec3 q = P / g.w - 0.5;
+  ivec3 base = ivec3(floor(q));
+  vec3 f = q - vec3(base);
+  vec3 n2 = Nn * Nn;
+  ivec3 fc = ivec3(Nn.x >= 0.0 ? 0 : 1, Nn.y >= 0.0 ? 2 : 3, Nn.z >= 0.0 ? 4 : 5);
+  vec3 sum = vec3(0.0);
+  float ws = 0.0;
+  for (int k = 0; k < 8; ++k) {
+    ivec3 o3 = ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+    ivec3 wi = base + o3;
+    if (any(lessThan(wi, lo)) || any(greaterThanEqual(wi, lo + dims))) continue;
+    ivec3 slot = ((wi % dims) + dims) % dims;
+    ivec2 t0 = ivec2(slot.x * 6, slot.y * dims.z + slot.z);
+    float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
+    vec4 a = texelFetch(probes, t0 + ivec2(fc.x, 0), 0);
+    if (a.a < 0.0 || abs(a.a - tag) > 0.25) continue;
+    vec4 b = texelFetch(probes, t0 + ivec2(fc.y, 0), 0);
+    vec4 cz = texelFetch(probes, t0 + ivec2(fc.z, 0), 0);
+    vec3 val = a.rgb * n2.x + b.rgb * n2.y + cz.rgb * n2.z;
+    vec3 tw = mix(1.0 - f, f, vec3(o3));
+    float w = tw.x * tw.y * tw.z;
+    vec3 dir = (vec3(wi) + 0.5) * g.w - P;
+    float dl = length(dir);
+    float facing = dl > 1e-3 ? dot(dir / dl, Nn) * 0.5 + 0.5 : 1.0;
+    w *= max(0.05, facing * facing);
+    sum += val * w;
+    ws += w;
+  }
+  vec3 e = ws > 1e-4 ? sum / ws : vec3(0.0);
+  float dist = length(P - cam.xyz);
+  e *= 1.0 - smoothstep(float(dims.x) * g.w * 0.35, float(dims.x) * g.w * 0.5, dist);
+  o = vec4(e, d);
 }
 )", true);
   copy_fs_[50] = CompileBuiltin("builtin_spec_add", R"(#version 450
@@ -12975,9 +13119,18 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   const int regs[7] = {15, 19, 23, 27, 31, 35, 39};
   for (int j = 0; j < 7; ++j) std::memcpy(&f[(12 + j) * 4], &blk[(regs[j] - 14) * 4], 16);
   // (With the frames before: half the pixels, fewer rays each, blended.)
-  const bool temporal = !Diag("ginotemporal") && !Diag("giview");
+  const bool probes = !Diag("gipixel") && !Diag("giview");
+  const bool temporal = !probes && !Diag("ginotemporal") && !Diag("giview");
+  int64_t plo[3];
+  for (int i = 0; i < 3; ++i) {
+    plo[i] = int64_t(std::floor(cam_pos_[i] / kProbeSpacing)) - (i == 1 ? kProbeDims[i] * 3 / 8 : kProbeDims[i] / 2);
+    f[21 * 4 + i] = float(plo[i]);
+    f[22 * 4 + i] = float(kProbeDims[i]);
+  }
+  f[21 * 4 + 3] = float(kProbeSpacing);
+  f[22 * 4 + 3] = float(frame_number_ % 4096);
   f[20 * 4 + 1] = temporal ? 1.0f : 0.0f;
-  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : temporal ? 6.0f : 8.0f;  // rays
+  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : probes ? 12.0f : temporal ? 6.0f : 8.0f;  // rays
   f[19 * 4 + 1] = Diag("ginosky") ? 0.0f : 1.0f;    // the sky's light taken off
   f[19 * 4 + 2] = Diag("ginoput") ? 0.0f : 1.0f;    // the hits' light put on
   f[19 * 4 + 3] = float(frame_number_ % 64);
@@ -13004,6 +13157,36 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     if (gi_img_.image) Retire(gi_img_);
     gi_img_ = gpu_.CreateImage(qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, false, "world_light");
     ToGeneral(cb_, gi_img_);
+  }
+  if (probes) {
+    const uint32_t pw = uint32_t(6 * kProbeDims[0]), ph = uint32_t(kProbeDims[1] * kProbeDims[2]);
+    for (Image& im : gi_probe_) {
+      if (!im.image || im.width != pw || im.height != ph) {
+        if (im.image) Retire(im);
+        im = gpu_.CreateImage(pw, ph, VK_FORMAT_R16G16B16A16_SFLOAT, false, "world_light_probes");
+        ToGeneral(cb_, im);
+        const float zero[4] = {0, 0, 0, 0};
+        ClearImage(&im, zero, 1.0f, 0, true, false, false);
+        FlushPendingClears();
+      }
+    }
+    const int nxt = 1 - gi_probe_cur_;
+    float pp[8] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), 1.0f, 0, 0, 0, 0};
+    Barrier();
+    FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
+                   nullptr, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
+                   &gi_params_);
+    Barrier();
+    gi_probe_cur_ = nxt;
+    MarkPart("world light: probes");
+    float ap[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(qs), 0};
+    FullscreenPass(CopyKind::kGiApply, &gi_img_, depth, tod_normal_, &gi_probe_[nxt], false, ap, 4, nullptr,
+                   nullptr, nullptr, &gi_params_);
+    Barrier();
+    std::memcpy(gi_prev_vp_, vp, sizeof(vp));
+    gi_prev_frame_ = frame_number_;
+    ++stats_.gi_traces;
+    return;
   }
   float pc[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), float(qs)};
   FullscreenPass(CopyKind::kGiTrace, &gi_img_, scene, depth, tod_normal_, true, pc, 4, nullptr,
@@ -17766,6 +17949,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(gi_blur_);
   gpu_.DestroyImage(gi_img_);
   for (Image& im : gi_hist_) gpu_.DestroyImage(im);
+  for (Image& im : gi_probe_) gpu_.DestroyImage(im);
   for (GiCascade& g : gi_c_) {
     for (Image& im : g.maps) gpu_.DestroyImage(im);
     for (Image& im : g.occ) gpu_.DestroyImage(im);

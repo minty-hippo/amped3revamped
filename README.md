@@ -650,7 +650,18 @@ that rule against a save that has the pass.
     through last frame's camera and taken only where it lands on the same
     surface (about the same depth); the untraced half uses the history, or
     its traced neighbours where there's none (diagnostic `ginotemporal`
-    traces every pixel each frame instead). A ray that hits something takes off the sky light
+    traces every pixel each frame instead). That was 4.5 ms there, and
+    flickered on the trees and looked splotchy, so now (the default) the
+    rays are traced from a grid of probes instead of from the pixels:
+    32 x 16 x 32 probes 4 m apart round the camera, kept world-aligned as
+    it moves (each slot holds the probe whose world index matches it,
+    tagged, so one scrolled in starts afresh), each with six faces (the
+    light onto a surface facing +x, -x, +y, -y, +z, -z), 12 rays a face,
+    an eighth of them traced again each frame and blended in (a fifth new).
+    Each quarter-size pixel reads the eight probes round it by its normal,
+    probes behind its surface and those inside something left out or
+    weighed less. A quarter of the rays per frame of the pixel version,
+    and smooth and steady by construction (`gipixel`: the pixel version). A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps
