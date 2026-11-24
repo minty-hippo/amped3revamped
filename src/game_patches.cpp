@@ -945,10 +945,58 @@ float LoadF32(uint8_t* base, uint32_t address) {
 
 // The game's controller poll, after it stored the triggers as 0..1 floats at
 // controller + 160 (left) and + 164 (right).
+// ---- Spin stick grace (setting spin_stick_grace) --------------------------
+//
+// A spin lasts while the left stick is held: let it fall inside the dead
+// zone for a single poll (rolling the stick round, or easing off) and the
+// game ends the spin there, snapping to a clean 180, then starts it again
+// from a standstill. While the local rider spins or flips, a dip that short
+// is bridged: the controller's left stick (+ 80 / + 84, after the poll's
+// dead zone) keeps its last firm direction for up to the grace period.
+
+REXCVAR_DEFINE_INT32(spin_stick_grace, 70, "Amped 3/Tuning",
+                     "Milliseconds a spin or flip keeps going when the left stick dips into "
+                     "its dead zone (rolling the stick, easing off): the game ended it at once, "
+                     "snapping to a clean turn. 0 keeps the game's");
+
+namespace {
+std::atomic<int64_t> g_spin_active_ms{0};  // when the local rider last spun (steady ms)
+struct StickHold {
+  uint32_t controller = 0;
+  float x = 0, y = 0;
+  int64_t at = 0;
+} g_stick_hold;
+std::mutex g_stick_mutex;
+int64_t SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+void BridgeStick(uint8_t* base, uint32_t controller) {
+  const int grace = REXCVAR_GET(spin_stick_grace);
+  if (grace <= 0) return;
+  const int64_t now = SteadyMs();
+  const float x = LoadF32(base, controller + 80), y = LoadF32(base, controller + 84);
+  if (!std::isfinite(x) || !std::isfinite(y)) return;
+  const float m = std::sqrt(x * x + y * y);
+  std::lock_guard lock(g_stick_mutex);
+  auto& h = g_stick_hold;
+  if (m >= 0.6f) {
+    h = {controller, x, y, now};
+    return;
+  }
+  // (Spinning now, firmly held moments ago, and on the same controller.)
+  if (now - g_spin_active_ms.load() > 50 || h.controller != controller || now - h.at > grace) return;
+  StoreGuestF32(base, controller + 80, h.x);
+  StoreGuestF32(base, controller + 84, h.y);
+}
+}  // namespace
+
 void Amped3_TuckTriggers(PPCRegister& r31) {
   auto* kernel = rex::system::kernel_state();
   if (!kernel || !r31.u32) return;
   auto* memory = kernel->memory();
+  BridgeStick(memory->virtual_membase(), r31.u32);
   const float lt = LoadGuestF32(memory, r31.u32 + 160);
   const float rt = LoadGuestF32(memory, r31.u32 + 164);
   const float strongest = std::isfinite(lt) && std::isfinite(rt) ? std::max(lt, rt) : 0.0f;
@@ -1205,8 +1253,18 @@ void Amped3_SpinUpdate(PPCRegister& r3, PPCRegister& f1) {
   // A spin / flip's start: its blend in (+ 140 left of + 144) shortened,
   // the time left kept in proportion. (The game's is 0.4 s: the spin
   // gathers pace over that long before it turns at its rate.)
+  const int32_t now_phase = int32_t(Load32(base, s + 100));
+  {
+    const uint32_t local = g_tuck_rider.load();
+    if (local && (now_phase == 0 || now_phase == 1) &&
+        (Load32(base, s + 8) == local || Load32(base, s + 12) == local)) {
+      g_spin_active_ms.store(SteadyMs());
+    }
+  }
+  // (Spins go straight to the cycle, phase 1, with the same blend; flips
+  // blend in phase 0 first.)
   const double start_blend = REXCVAR_GET(spin_start_blend);
-  if (start_blend > 0.0 && int32_t(Load32(base, s + 100)) == 0) {
+  if (start_blend > 0.0 && (now_phase == 0 || now_phase == 1)) {
     const float of = LoadF32(base, s + 144), left = LoadF32(base, s + 140);
     const float to = float(start_blend);
     if (of > to + 1e-4f && of < 2.0f && left >= 0.0f) {

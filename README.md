@@ -919,7 +919,18 @@ that rule against a save that has the pass.
 - Spins start sooner (`spin_start_blend`, 0.2 s): a spin or flip blended in
   over the game's BeginningBlendDuration (0.4 s, the substate's + 140 / +
   144), gathering pace that long before turning at its rate; the blend is
-  now shortened as it starts (0 keeps the game's).
+  now shortened as it starts (0 keeps the game's). Spins go straight to
+  their cycle (phase 1) with that blend, flips through phase 0 first; both
+  are shortened.
+- Spins no longer snap short when the stick wobbles (`spin_stick_grace`,
+  70 ms): the trace showed a spin lasts exactly while the left stick is
+  held, and a single poll inside the dead zone (rolling the stick round,
+  easing off) ended it at a clean 180, often starting it again a frame
+  later from a standstill. While the local rider spins or flips, the
+  controller's left stick (+ 80 / + 84 after the poll's dead zone, set in
+  the poll's hook at 0x82377E00) keeps its last firm direction through a
+  dip that short; letting go for longer ends the spin as before. The local
+  rider is learned from the tuck, so it applies once you've tucked.
 - Branch flicker with XeSS: a tree's faded branches close to the camera
   (the branch fade) are drawn as a dither when MSAA is off, and the dither's
   pattern stepped every frame for the upscaler to average. Over a large
