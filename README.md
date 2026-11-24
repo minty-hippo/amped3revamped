@@ -931,6 +931,26 @@ that rule against a save that has the pass.
   the poll's hook at 0x82377E00) keeps its last firm direction through a
   dip that short; letting go for longer ends the spin as before. The local
   rider is learned from the tuck, so it applies once you've tucked.
+- Dynamic spins, flips and rolls (`dynamic_spins`, on; Options >
+  Enhancements > Riding): the game turns a rider in the air by animation,
+  each spin or flip a trick in phases at a fixed rate, ended by an
+  animation to a clean 180 / 360, and with no trick it eases the rider back
+  upright. Now the left stick turns the rider directly: the tilt sets the
+  rate (full tilt the game's own, `dynamic_spin_speed`), left / right spins
+  and up / down flips, both at once on a diagonal (corks, rodeos); letting
+  go coasts to a stop (`dynamic_spin_coast`, 0.35 s). Turning slowly with
+  the stick let go and within 45 degrees of a clean landing (upright, a
+  whole number of 180s, or the pose the game's trick ends on), it eases in;
+  beyond that the game decides the landing. How: the rotate substate's
+  update writes its rotation as a matrix (+ 224, base-relative, from
+  sub_82228FE0), composed onto the rider's base frame ([[+ 8] + 20] + 144);
+  a hook right after (0x82246C94) writes ours over it, kept in world space
+  so the base turning under the rider (its stance flipping as a trick ends)
+  doesn't move it. The game still runs its tricks underneath (scoring, trick
+  names): the spin's axis (in the base frame), the flip's (in the rider's
+  own), their senses and rates are learned from those animations as they
+  play, so the first spin of a session may start the wrong way round for a
+  moment. `trace_dynamic_spins` logs what's learned and each jump's turn.
 - Branch flicker with XeSS: a tree's faded branches close to the camera
   (the branch fade) are drawn as a dither when MSAA is off, and the dither's
   pattern stepped every frame for the upscaler to average. Over a large

@@ -799,6 +799,31 @@ const std::vector<Tab>& Tabs() {
            // "Game patches" is filled at draw time from cvars in the "Amped 3/Patches"
            // category (see README: Adding an enhancement).
            {"Game patches", {}},
+           {"Riding",
+            {
+                Toggle("dynamic_spins", "Dynamic spins, flips and rolls",
+                       "In the air the left stick turns your rider directly: how far you tilt "
+                       "sets the speed, diagonals mix a spin with a flip (corks, rodeos), and "
+                       "letting go coasts to a stop instead of snapping to a clean 180 / 360. "
+                       "Landing within 45 degrees of clean straightens out. Tuck once after "
+                       "loading in so it knows which rider is yours. Off: the game's own "
+                       "fixed tricks."),
+                SliderF("dynamic_spin_speed", "Dynamic spin speed",
+                        "Top rotation speed at full tilt, against the game's own spin and flip "
+                        "rates (1 = the same).",
+                        "%.2f", 0.25, 2.0),
+                SliderF("dynamic_spin_coast", "Dynamic spin coast",
+                        "How long the rotation takes to slow after you let go (seconds).", "%.2f",
+                        0.05, 1.5),
+                SliderF("spin_start_blend", "Trick start blend",
+                        "Seconds the game's spins and flips take to blend in (the game's own: "
+                        "0.4).",
+                        "%.2f", 0.0, 0.4),
+                SliderI("spin_stick_grace", "Spin stick grace",
+                        "A spin keeps going through a dip of the stick into its dead zone this "
+                        "short (rolling the stick round).",
+                        0, 200, "%d ms"),
+            }},
            {"Frame rate tuning",
             {
                 SliderF("sled_crash_score_compensation", "Sled crash score compensation",

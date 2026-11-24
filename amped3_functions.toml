@@ -247,6 +247,13 @@ registers = ["r31"]
 # --- Diagnostics (src/game_patches.cpp, trace_spin): the rotate substate's
 # update (sub_82246AB0, at its start: r3 = the substate, f1 = the time step)
 # and its trick ending (sub_82246580, after "mflr r12": r12 = the caller) ----
+# The same update, right after it writes the substate's rotation (+ 224, from
+# its quaternion by sub_82228FE0): dynamic spins write theirs over it.
+[[midasm_hook]]
+name = "Amped3_DynamicSpin"
+address = 0x82246C94
+registers = ["r31", "f30"]
+
 [[midasm_hook]]
 name = "Amped3_SpinUpdate"
 address = 0x82246AB0
