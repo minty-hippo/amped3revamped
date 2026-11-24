@@ -981,6 +981,10 @@ uint xe_vertex_index() {
              std::min(regs, 16u));
     g += "  for (int i = 0; i < 4; ++i) xe_oC[i] = vec4(0.0);\n";
     g += "  xe_program();\n";
+    // (Set where the camera fade's dither leaves a fragment, one sample per
+    // pixel: tagged into the normals for the upscaler's input to be
+    // smoothed there; see builtin_dedither.)
+    g += "  bool xe_fade_mark = false;\n";
     if (info_.colors_written & 1) {
       const char* kill = info_.kills ? "demote;" : "discard;";
       g += Fmt(R"(  // Multisampled: alpha test and alpha to coverage (RB_COLORCONTROL) as
@@ -1062,6 +1066,7 @@ uint xe_vertex_index() {
         uint k = uint(clamp(floor(cov * float(n) + dither), 0.0, float(n)));
         bits = (k >= 32u) ? 0xFFFFFFFFu : ((1u << k) - 1u);
         bits = ((bits << rot) | (bits >> ((n - rot) %% 32u))) & full;
+        xe_fade_mark = n == 1u && (vis < 0.999 || soft > 0.0);
       }
     } else {
       // Dithered alpha to mask: each sample its own threshold (guest sample
@@ -1075,6 +1080,7 @@ uint xe_vertex_index() {
         uint k = uint(clamp(floor(vis * float(n) + dither), 0.0, float(n)));
         uint m = (k >= 32u) ? 0xFFFFFFFFu : ((1u << k) - 1u);
         bits &= ((m << rot) | (m >> ((n - rot) %% 32u))) & full;
+        xe_fade_mark = n == 1u;
       }
     }
     if (bits == 0u) %s
@@ -1099,6 +1105,13 @@ uint xe_vertex_index() {
     // bits, ours in the top three: multiples of 32, so the samples' average
     // at an edge (MSAA) leaves the game's reading mod 4 as it was).
     if (info_.colors_written & 2u) {
+      // The fade's dither: bit 4 of the normals' alpha (the game reads its
+      // material mod 4; our surface tag is the top three bits).
+      g += "  if (xe_fade_mark) {\n"
+           "    float fw = clamp(xe_oC[1].w, 0.0, 1.0) * 255.0;\n"
+           "    if (fw < 15.5 && abs(fw - floor(fw + 0.5)) < 0.01)\n"
+           "      xe_oC[1].w = float(uint(fw + 0.5) | 16u) / 255.0;\n"
+           "  }\n";
       g += "  if (xe_sys.material.x != 0u) {\n"
            "    // (Only over the game's small material numbers: not a value of its own.)\n"
            "    float gw = clamp(xe_oC[1].w, 0.0, 1.0) * 255.0;\n"

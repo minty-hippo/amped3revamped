@@ -938,7 +938,16 @@ that rule against a save that has the pass.
   it: its output swapped between the stipple and a haze every other frame.
   A setting holds the pattern still (Graphics > Effects: Branch Dither
   Cycles, `native_dither_cycle`); it stays on by default (the cycling
-  pattern looked better; the flicker remains with XeSS and FSR).
+  pattern looked better). The flicker itself: the fade's fragments are
+  tagged (bit 4 of the normals' alpha; the game reads its material mod 4,
+  our surface tag is the top three bits), and before the upscaler a pass
+  (builtin_dedither) replaces each pixel whose 4 x 4 window holds one with
+  the window's mean. Every 4 x 4 window holds each of the dither's 16
+  thresholds once, so that mean is the coverage, the same every frame: the
+  translucent haze multisampling gives, with nothing left for XeSS or FSR
+  to swap. In the replay (stretch upscaler) the change from one frame to
+  the next fell from 18.6 to 2.4 grey levels on average. Diagnostic
+  `nodedither`.
 - Low latency (Graphics > Display: Low Latency, `native_low_latency`, on):
   input felt delayed (jumps late off the lip, spins starting late), and
   worse at 30 fps: the delay was the frames in the pipeline. Each frame was

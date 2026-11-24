@@ -2021,7 +2021,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68, kGiMovers = 69, kGiSun = 70
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68, kGiMovers = 69, kGiSun = 70, kDedither = 71
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2149,7 +2149,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[71] = {};  // by CopyKind
+  VkShaderModule copy_fs_[72] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2596,6 +2596,14 @@ struct Renderer::Impl {
   bool replace_on_ = true, drop_replaced_ = false;
   bool foliage_fade_ = true;  // RendererOptions::foliage_fade (with smooth_alpha_)
   bool dither_cycle_ = false;  // SetDitherCycle: the one-sample dither's phase steps each frame
+  // The camera fade's dither with one sample per pixel (tagged into the
+  // normals, bit 4 of their alpha): smoothed in the upscaler's input
+  // (builtin_dedither). This frame's: any drawn, the normals the lighting
+  // read, the smoothed scene.
+  bool fade_marked_ = false;
+  Image* fade_normals_ = nullptr;
+  Image dedither_img_;
+  Image* DeditheredScene(Image* src);
   Image* fog_result_ = nullptr;  // this frame's fogged / rayed scene
   // Ambient occlusion (SetAmbientOcclusion): strength (0 = off), the
   // occlusion at half size (two images: the estimate and its blur, R = the
@@ -7733,6 +7741,39 @@ void main() {
   // Binding 0 (scene): the mask so far; 5 (params): the mask's settings
   // (builtin_mask_finish's), with 16, 17 the cascades and 18 strength,
   // frame.
+  // The camera fade's dither (one sample per pixel, its pattern stepping
+  // every frame) smoothed for the upscaler: where a 4 x 4 window holds a
+  // fragment it left (bit 4 of the normals' alpha), the window's mean.
+  // Every 4 x 4 window holds each of the dither's 16 thresholds once, so
+  // the mean is the coverage, the same every frame (the haze the console's
+  // multisampling gives).
+  copy_fs_[71] = CompileBuiltin("builtin_dedither", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D normals;
+layout(location = 0) out vec4 o;
+bool Marked(ivec2 p) {
+  return (uint(texelFetch(normals, p, 0).a * 255.0 + 0.5) & 16u) != 0u;
+}
+void main() {
+  ivec2 size = textureSize(scene, 0);
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  bool any = false;
+  for (int y = -2; y <= 1 && !any; ++y) {
+    for (int x = -2; x <= 1; ++x) {
+      if (Marked(clamp(c + ivec2(x, y), ivec2(0), size - 1))) { any = true; break; }
+    }
+  }
+  if (!any) {
+    o = texelFetch(scene, c, 0);
+    return;
+  }
+  vec4 sum = vec4(0.0);
+  for (int y = -2; y <= 1; ++y) {
+    for (int x = -2; x <= 1; ++x) sum += texelFetch(scene, clamp(c + ivec2(x, y), ivec2(0), size - 1), 0);
+  }
+  o = sum / 16.0;
+}
+)", true);
   copy_fs_[70] = CompileBuiltin("builtin_gi_sun", kGiCommon + R"(void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
   float lit = texelFetch(scene, ip, 0).r;
@@ -14698,7 +14739,8 @@ void Renderer::Impl::TodLightingInputs(const Draw& d, const GpuState& st) {
       }
       dyn_ = DynState{};
     }
-    tod_normal_ = TodOn() ? TextureFor(d, 4, st, &n0) : nullptr;
+    fade_normals_ = TextureFor(d, 4, st, &n0);
+    tod_normal_ = TodOn() ? fade_normals_ : nullptr;
     if (tod_normal_ && tracks_ok_ && tod_normal_ == tracks_normal_src_) tod_normal_ = &tracks_normal_;
   }
   if (!LightModOn()) return;
@@ -15726,6 +15768,24 @@ Image* Renderer::Impl::RadialScene(Image* scene) {
   return &radial_img_;
 }
 
+Image* Renderer::Impl::DeditheredScene(Image* src) {
+  if (!fade_marked_ || !fade_normals_ || Diag("nodedither")) return nullptr;
+  Image* n = fade_normals_;
+  if (n->samples != 1 || n->depth || n->width != src->width || n->height != src->height) return nullptr;
+  if (!dedither_img_.image || dedither_img_.width != src->width || dedither_img_.height != src->height ||
+      dedither_img_.format != src->format) {
+    if (dedither_img_.image) Retire(dedither_img_);
+    dedither_img_ = gpu_.CreateImage(src->width, src->height, src->format, false, "dedithered");
+    ToGeneral(cb_, dedither_img_);
+  }
+  dedither_img_.scaled = src->scaled;
+  dedither_img_.scale = src->scale;
+  Barrier();
+  FullscreenPass(CopyKind::kDedither, &dedither_img_, src, n, nullptr, false, nullptr, 0);
+  if (Diag("dedithershow")) std::fprintf(stderr, "dedither: %ux%u\n", src->width, src->height);
+  return &dedither_img_;
+}
+
 Image* Renderer::Impl::UpscaledScene(Image* src) {
   if (up_done_) return up_result_;
   up_done_ = true;
@@ -15847,6 +15907,9 @@ Image* Renderer::Impl::UpscaledScene(Image* src) {
     return amped3::native::UpscaleImage{im.image, im.sample_view, im.format, im.width, im.height,
                                         im.usage};
   };
+  // (The camera fade's dither, changing every frame, smoothed first: the
+  // upscalers don't settle it, swapping between the stipple and a haze.)
+  if (Image* dd = DeditheredScene(src)) src = dd;
   in.color = image(*src);
   in.depth = image(*depth);
   in.motion = image(mv_img_);
@@ -16561,6 +16624,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // its output swaps between the stipple and a haze from one frame to the
     // next. Held still, the jitter spreads it instead.
     if (att0->samples == 1 && dither_cycle_) sys.flags |= uint32_t(frame_number_ & 3) << 30;
+    if (att0->samples == 1 && (sys.flags & (1u << 29))) fade_marked_ = true;
   }
   // Freecam: the scene's depth-tested geometry (on the scene's depth target:
   // not the shadow maps, the lighting pass or other full-screen passes)
@@ -18960,6 +19024,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   final_ = nullptr;
   tiling_ = {};
   light_seen_ = false;
+  fade_marked_ = false;
+  fade_normals_ = nullptr;
   scene_begun_ = false;
   last_resolve_.clear();
   blur_done_ = false;
