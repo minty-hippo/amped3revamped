@@ -942,7 +942,21 @@ that rule against a save that has the pass.
   rodeos); letting go coasts to a stop (`dynamic_spin_coast`, 0.35 s).
   Turning slowly with the stick let go and within 45 degrees of a clean
   landing (upright, facing either way), it eases in; beyond that the game
-  decides the landing. The local rider is learned from the tuck.
+  decides the landing (upside down crashes). Holding LB turns left /
+  right into barrel rolls about the rider's own X (diagonals roll and flip
+  together). Each axis has a small dead zone of its own
+  (`dynamic_spin_axis_deadzone`, 0.25 of full tilt) so a spin held slightly
+  off straight doesn't flip; past it the axis ramps in from zero, so real
+  diagonals still combine. The local rider is learned from the tuck.
+  - The heading: + 224 is relative to a matrix at + 160 in the substate
+    (world = heading R; the game's stance switch, sub_82246A28, turns the
+    heading 180 degrees about its up and R back by as much). The second
+    version estimated the heading from the world rotation and took all of
+    R into it when a trick ended, so R read upright to the game afterwards
+    and upside-down landings only sometimes crashed (the game's revert
+    crashes past CrashThreshold 0.71, 45 degrees); now + 160 is read
+    directly. Flips were the wrong way round (up on the stick is a front
+    flip now).
   - How (from `trace_air_rotation`, which logs each update in the air: the
     stick, the trick, how fast the rider's world rotation and the trick's
     turn and about what): the trick's rotation is a matrix at + 224 (from
@@ -951,8 +965,7 @@ that rule against a save that has the pass.
     together at the same rate about the same axis); when a trick ends the
     game folds R into H and restarts R upright in the same update. A hook
     right after the game writes + 224 (0x82246C94) writes R = H^T W for the
-    rotation W wanted, H being B R_last^T (B itself the update a trick
-    ends). Spins are about + Y (the game's trick 23, left on the stick
+    rotation W wanted. Spins are about + Y (the game's trick 23, left on the stick
     positive), flips about the rider's + Z (trick 13 up on the stick
     negative, trick 2 down positive).
   - First try (kept in world space against B as if it were the heading

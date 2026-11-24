@@ -803,7 +803,8 @@ const std::vector<Tab>& Tabs() {
             {
                 Toggle("dynamic_spins", "Dynamic spins, flips and rolls",
                        "In the air the left stick turns your rider directly: how far you tilt "
-                       "sets the speed, diagonals mix a spin with a flip (corks, rodeos), and "
+                       "sets the speed, diagonals mix a spin with a flip (corks, rodeos), LB "
+                       "turns spins into barrel rolls, and "
                        "letting go coasts to a stop instead of snapping to a clean 180 / 360. "
                        "Landing within 45 degrees of clean straightens out. Tuck once after "
                        "loading in so it knows which rider is yours. Off: the game's own "
@@ -812,6 +813,10 @@ const std::vector<Tab>& Tabs() {
                         "Top rotation speed at full tilt, against the game's own spin and flip "
                         "rates (1 = the same).",
                         "%.2f", 0.25, 2.0),
+                SliderF("dynamic_spin_axis_deadzone", "Dynamic spin axis dead zone",
+                        "How far off straight the stick can be before a spin also flips (or a "
+                        "flip also spins). Diagonals past it still combine.",
+                        "%.2f", 0.0, 0.6),
                 SliderF("dynamic_spin_coast", "Dynamic spin coast",
                         "How long the rotation takes to slow after you let go (seconds).", "%.2f",
                         0.05, 1.5),
