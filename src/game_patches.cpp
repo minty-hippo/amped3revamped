@@ -1311,26 +1311,26 @@ void Amped3_SpinOut(PPCRegister& r3, PPCRegister& r12) {
 // ---- Dynamic spins (setting dynamic_spins) ----------------------------------
 //
 // The game turns a rider in the air by animation: each spin / flip is a
-// trick played in phases, a fixed rate while the stick is held, then an
-// ending animation to a clean 180 / 360, and with no trick the rotation
-// eases back upright (RevertRotationSlerpSpeed). Here the left stick turns
-// the rider directly instead: its tilt sets the rate (full tilt about the
-// game's own top rate), left / right spinning and up / down flipping, both
-// at once on a diagonal (corks, rodeos); let go and the rotation coasts to a
-// stop. Within 45 degrees of a clean landing (upright, a whole number of
-// 180s, or the pose the game's own trick ends at) and turning slowly, it
-// eases in; beyond that the game decides the landing.
+// trick played in phases at a fixed rate (about 245 degrees a second), on
+// for a while after the stick's let go, and when it ends the rotation is
+// folded into the rider's heading. Here the left stick turns the rider
+// directly instead: its tilt sets the rate (full tilt the game's), left /
+// right spinning about the heading's up and up / down flipping about the
+// rider's own axis, both at once on a diagonal (corks, rodeos); let go and
+// the rotation coasts to a stop. Within 45 degrees of a clean landing
+// (upright, facing either way) and turning slowly, it eases in; beyond
+// that the game decides the landing.
 //
-// The substate keeps its rotation as a matrix at + 224 (base-relative, from
-// sub_82228FE0's quaternion), composed onto the rider's base frame
-// ([[+ 8] + 20] + 144). The hook runs right after the game writes it each
-// update (0x82246C94) and writes ours over it; the game's own next update
-// then starts from ours. The orientation is kept in world space, so the
-// base turning under the rider (its stance flipping as a trick ends) leaves
-// the rider where it is. The axes and the game's rates are learned from the
-// game's own tricks as they play (the game still runs them underneath).
+// From trace_air_rotation: the trick's rotation is a matrix at + 224
+// (from sub_82228FE0's quaternion) and the rider's world rotation at
+// [[+ 8] + 20] + 144 is its heading composed with it, a frame behind
+// (B = H R); a trick's end folds R into H and restarts R upright. The hook
+// runs right after the game writes + 224 each update (0x82246C94) and
+// writes R = H^T W for the rotation W we want, H from B and the R written
+// last update (or B itself the update a trick ends). The game still plays
+// its tricks underneath (scoring, trick names).
 
-REXCVAR_DEFINE_BOOL(dynamic_spins, false, "Amped 3/Tuning",
+REXCVAR_DEFINE_BOOL(dynamic_spins, true, "Amped 3/Tuning",
                     "Spins, flips and rolls follow the left stick freely: tilt sets the speed, "
                     "diagonals combine a spin and a flip, letting go coasts to a stop, and a "
                     "landing within 45 degrees of clean straightens out. Off: the game's fixed "
@@ -1447,18 +1447,11 @@ bool Finite(const M3& r) {
 struct DynSpin {
   uint32_t substate = 0;
   int64_t last_ms = 0;
-  M3 world = Ident();     // the rider's rotation in the world (base * ours)
-  M3 game_prev = Ident(); // the game's own rotation last update (base-relative)
-  bool game_prev_ok = false;
+  M3 world = Ident();   // the rider's rotation we want in the world
+  M3 r_last = Ident();  // what + 224 held after the last update (ours)
+  int32_t trick_last = -1;
   double spin = 0, flip = 0;  // rates now (radians a second)
-  // Learned from the game's tricks: the spin's axis in the base frame, the
-  // flip's in the rider's own, their senses for the stick (+1 / -1) and the
-  // game's rates.
-  double spin_axis[3] = {0, 1, 0}, flip_axis[3] = {1, 0, 0};
-  double spin_sense = 1, flip_sense = 1;
-  double spin_rate = 9.4, flip_rate = 7.9;  // ~540, ~450 degrees a second
-  int spin_samples = 0, flip_samples = 0;
-  double turned = 0;  // this jump's total turn (radians)
+  double turned = 0;          // this jump's total turn (radians)
 } g_dyn;
 std::mutex g_dyn_mutex;
 
@@ -1546,92 +1539,49 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
     TraceAir(base, s, phys, game, b, dt);
   }
   if (!REXCVAR_GET(dynamic_spins)) return;
-  const int32_t phase = int32_t(Load32(base, s + 100)), trick = int32_t(Load32(base, s + 104));
-  const bool blending = LoadF32(base, s + 140) > 0.0f || base[s + 345] != 0;
+  const int32_t trick = int32_t(Load32(base, s + 104));
   const bool trace = REXCVAR_GET(trace_dynamic_spins);
 
+  // What the air trace showed: the rider's world rotation (+ 144) is its
+  // heading frame H composed with the trick's rotation (+ 224) from the
+  // update before, B = H R (a frame behind), and when a trick ends the game
+  // folds the rotation into the heading (H' = H R) and starts + 224 over
+  // from upright, the same update. So the heading is B R_last^T, or B
+  // itself on the update a trick ends; ours is written as R = H^T W.
   std::lock_guard lock(g_dyn_mutex);
   auto& d = g_dyn;
   const int64_t now = SteadyMs();
-  // A new jump (or another substate): from where the game has the rider.
-  if (d.substate != s || now - d.last_ms > 150) {
+  const bool fresh = d.substate != s || now - d.last_ms > 150;
+  if (fresh) {
     if (trace && d.substate) {
       REXLOG_INFO("dynamic spins: landed after turning {:.0f} degrees", d.turned * 57.2958);
     }
     d.substate = s;
-    d.world = Mul(b, game);
+    d.world = b;  // (where the rider is now, near enough)
+    d.r_last = game;
     d.spin = d.flip = 0;
-    d.game_prev_ok = false;
     d.turned = 0;
+    d.trick_last = trick;
   }
   d.last_ms = now;
+  const bool folded = !fresh && trick == -1 && d.trick_last >= 0;
+  d.trick_last = trick;
+  const M3 h = Ortho(folded ? b : Mul(b, T(d.r_last)));
+  if (fresh) d.world = Mul(h, game);
+  if (trace && folded) REXLOG_INFO("dynamic spins: the game's trick ended (heading re-based)");
 
-  // Learning from the game's own trick (its rotation is pure animation in
-  // the cycle, once blended in): its turn this update.
+  // The stick, past a dead zone; its tilt the rate. Full tilt is the
+  // game's own rate (about 245 degrees a second both ways). Left on the
+  // stick spins about the heading's up (+ Y), up flips about the rider's
+  // own + Z the other way (as the game's tricks 23 / 13 / 2 turn).
   const auto pad = amped3::pad::Latest();
   const double sx = pad.lx / 32767.0, sy = pad.ly / 32767.0;
-  if (d.game_prev_ok && phase == 1 && !blending && trick >= 0 && dt > 0.001) {
-    double ax[3];
-    if (std::fabs(sx) > 0.6 && std::fabs(sy) < 0.4) {
-      // A spin: about the base's axis.
-      const double a = ToAxisAngle(Mul(game, T(d.game_prev)), ax);
-      if (a > 0.01 && a < 0.5) {
-        if (d.spin_samples == 0 || ax[0] * d.spin_axis[0] + ax[1] * d.spin_axis[1] + ax[2] * d.spin_axis[2] < 0) {
-          for (double& v : ax) v = -v;  // (one sense of the axis; the stick's in the sense)
-        }
-        const double w = std::min(d.spin_samples, 30) / 31.0;
-        for (int k = 0; k < 3; ++k) d.spin_axis[k] = d.spin_axis[k] * w + ax[k] * (1 - w);
-        double n = std::sqrt(d.spin_axis[0] * d.spin_axis[0] + d.spin_axis[1] * d.spin_axis[1] +
-                             d.spin_axis[2] * d.spin_axis[2]);
-        for (double& v : d.spin_axis) v /= std::max(n, 1e-9);
-        // (Which way it turned against the learned axis, for the stick's sense.)
-        double a2[3];
-        const double signed_a = ToAxisAngle(Mul(game, T(d.game_prev)), a2) *
-                                ((a2[0] * d.spin_axis[0] + a2[1] * d.spin_axis[1] + a2[2] * d.spin_axis[2]) < 0 ? -1 : 1);
-        d.spin_sense = (signed_a > 0) == (sx > 0) ? 1 : -1;
-        d.spin_rate = d.spin_rate * w + (a / dt) * (1 - w);
-        if (++d.spin_samples == 20 && trace) {
-          REXLOG_INFO("dynamic spins: the game's spin: axis {:+.2f} {:+.2f} {:+.2f}, {:.0f} degrees a second, "
-                      "sense {:+.0f}",
-                      d.spin_axis[0], d.spin_axis[1], d.spin_axis[2], d.spin_rate * 57.2958, d.spin_sense);
-        }
-      }
-    } else if (std::fabs(sy) > 0.6 && std::fabs(sx) < 0.4) {
-      // A flip: about the rider's own axis.
-      const double a = ToAxisAngle(Mul(T(d.game_prev), game), ax);
-      if (a > 0.01 && a < 0.5) {
-        if (d.flip_samples == 0 || ax[0] * d.flip_axis[0] + ax[1] * d.flip_axis[1] + ax[2] * d.flip_axis[2] < 0) {
-          for (double& v : ax) v = -v;
-        }
-        const double w = std::min(d.flip_samples, 30) / 31.0;
-        for (int k = 0; k < 3; ++k) d.flip_axis[k] = d.flip_axis[k] * w + ax[k] * (1 - w);
-        double n = std::sqrt(d.flip_axis[0] * d.flip_axis[0] + d.flip_axis[1] * d.flip_axis[1] +
-                             d.flip_axis[2] * d.flip_axis[2]);
-        for (double& v : d.flip_axis) v /= std::max(n, 1e-9);
-        double a2[3];
-        const double signed_a = ToAxisAngle(Mul(T(d.game_prev), game), a2) *
-                                ((a2[0] * d.flip_axis[0] + a2[1] * d.flip_axis[1] + a2[2] * d.flip_axis[2]) < 0 ? -1 : 1);
-        d.flip_sense = (signed_a > 0) == (sy > 0) ? 1 : -1;
-        d.flip_rate = d.flip_rate * w + (a / dt) * (1 - w);
-        if (++d.flip_samples == 20 && trace) {
-          REXLOG_INFO("dynamic spins: the game's flip: axis {:+.2f} {:+.2f} {:+.2f}, {:.0f} degrees a second, "
-                      "sense {:+.0f}",
-                      d.flip_axis[0], d.flip_axis[1], d.flip_axis[2], d.flip_rate * 57.2958, d.flip_sense);
-        }
-      }
-    }
-  }
-  d.game_prev = game;
-  d.game_prev_ok = true;
-
-  // The stick: past a dead zone, its tilt the rate (full tilt the game's).
   const double mag = std::sqrt(sx * sx + sy * sy);
   const double dead = 0.24;
   const bool held = mag > dead;
   const double k = held ? std::min((mag - dead) / (1 - dead), 1.0) / mag : 0.0;
-  const double speed = std::max(REXCVAR_GET(dynamic_spin_speed), 0.0);
-  const double spin_target = sx * k * d.spin_rate * speed * d.spin_sense;
-  const double flip_target = sy * k * d.flip_rate * speed * d.flip_sense;
+  const double rate = 4.28 * std::max(REXCVAR_GET(dynamic_spin_speed), 0.0);
+  const double spin_target = -sx * k * rate, flip_target = -sy * k * rate;
   if (held) {
     const double e = 1 - std::exp(-dt / 0.06);
     d.spin += (spin_target - d.spin) * e;
@@ -1641,29 +1591,24 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
     d.spin *= e;
     d.flip *= e;
   }
-
-  // Turned: ours relative to the base, the spin about the base's axis, the
-  // flip about the rider's own.
-  M3 r = Mul(T(b), d.world);
-  r = Mul(AxisAngle(d.spin_axis, d.spin * dt), r);
-  r = Mul(r, AxisAngle(d.flip_axis, d.flip * dt));
+  static const double kY[3] = {0, 1, 0}, kZ[3] = {0, 0, 1};
+  // Relative to the heading: the spin on the left (about its up), the flip
+  // on the right (the rider's own axis).
+  M3 r = Mul(T(h), d.world);
+  r = Mul(AxisAngle(kY, d.spin * dt), r);
+  r = Mul(r, AxisAngle(kZ, d.flip * dt));
   d.turned += (std::fabs(d.spin) + std::fabs(d.flip)) * dt;
-  // Slow and let go: within 45 degrees of a clean landing, eased in (the
-  // game's own target first, when it's that close).
+  // Let go and turning slowly: within 45 degrees of a clean landing
+  // (upright, facing either way along the heading), eased in.
   if (!held && std::fabs(d.spin) + std::fabs(d.flip) < 1.2) {
     double ax[3];
-    M3 target = NearestClean(r, d.spin_axis);
-    // (The game's own pose only while it plays a trick's ending: with none
-    // it's only easing ours back upright, a step a time.)
-    if (trick >= 0 && phase == 2 && ToAxisAngle(Mul(game, T(r)), ax) < 0.785) target = game;
+    const M3 target = NearestClean(r, kY);
     const double a = ToAxisAngle(Mul(target, T(r)), ax);
-    if (a < 0.785 && a > 1e-4) {
-      const double step = a * (1 - std::exp(-dt / 0.18));
-      r = Mul(AxisAngle(ax, step), r);
-    }
+    if (a < 0.785 && a > 1e-4) r = Mul(AxisAngle(ax, a * (1 - std::exp(-dt / 0.18))), r);
   }
   r = Ortho(r);
   if (!Finite(r)) return;
-  d.world = Mul(b, r);
+  d.world = Mul(h, r);
+  d.r_last = r;
   StoreRows(base, s + 224, r);
 }

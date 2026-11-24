@@ -931,37 +931,33 @@ that rule against a save that has the pass.
   the poll's hook at 0x82377E00) keeps its last firm direction through a
   dip that short; letting go for longer ends the spin as before. The local
   rider is learned from the tuck, so it applies once you've tucked.
-- Dynamic spins, flips and rolls (`dynamic_spins`, off for now; Options >
+- Dynamic spins, flips and rolls (`dynamic_spins`, on; Options >
   Enhancements > Riding): the game turns a rider in the air by animation,
-  each spin or flip a trick in phases at a fixed rate, ended by an
-  animation to a clean 180 / 360, and with no trick it eases the rider back
-  upright. Now the left stick turns the rider directly: the tilt sets the
-  rate (full tilt the game's own, `dynamic_spin_speed`), left / right spins
-  and up / down flips, both at once on a diagonal (corks, rodeos); letting
-  go coasts to a stop (`dynamic_spin_coast`, 0.35 s). Turning slowly with
-  the stick let go and within 45 degrees of a clean landing (upright, a
-  whole number of 180s, or the pose the game's trick ends on), it eases in;
-  beyond that the game decides the landing. How: the rotate substate's
-  update writes its rotation as a matrix (+ 224, base-relative, from
-  sub_82228FE0), composed onto the rider's base frame ([[+ 8] + 20] + 144);
-  a hook right after (0x82246C94) writes ours over it, kept in world space
-  so the base turning under the rider (its stance flipping as a trick ends)
-  doesn't move it. The game still runs its tricks underneath (scoring, trick
-  names): the spin's axis (in the base frame), the flip's (in the rider's
-  own), their senses and rates are learned from those animations as they
-  play, so the first spin of a session may start the wrong way round for a
-  moment. `trace_dynamic_spins` logs what's learned and each jump's turn.
-  First test: spins turned slowly, then wildly, then crashed. The game's
-  spin was never learned from the trick's rotation (only its flip, 240
-  degrees a second about the rider's own Z), which points at spins being
-  turned in the rider's base frame by its physics (SpinAirAngularDampening,
-  physics + 1368, damps a vector at + 1936 by one at + 2464 in
-  sub_82222A50), not by the trick: kept in world space, ours cancelled the
-  game's spin and turned the trick's rotation against it, far from the base
-  the landing is judged by. Off until that's mapped:
-  `trace_air_rotation` logs, each update in the air, the stick, the trick,
-  how fast the base and the trick's rotation turn and about what, and the
-  physics vectors at + 1936 / 1952 / 1968 / 2464 / 2480.
+  each spin or flip a trick at a fixed rate (about 245 degrees a second),
+  running on after the stick's let go and folded into the rider's heading
+  when it ends (the clean 180 / 360). Now the left stick turns the rider
+  directly: the tilt sets the rate (full tilt the game's,
+  `dynamic_spin_speed`), left / right spins about the heading's up, up /
+  down flips about the rider's own axis, both at once on a diagonal (corks,
+  rodeos); letting go coasts to a stop (`dynamic_spin_coast`, 0.35 s).
+  Turning slowly with the stick let go and within 45 degrees of a clean
+  landing (upright, facing either way), it eases in; beyond that the game
+  decides the landing. The local rider is learned from the tuck.
+  - How (from `trace_air_rotation`, which logs each update in the air: the
+    stick, the trick, how fast the rider's world rotation and the trick's
+    turn and about what): the trick's rotation is a matrix at + 224 (from
+    sub_82228FE0's quaternion); the rider's world rotation, [[+ 8] + 20] +
+    144, is its heading composed with it a frame behind (B = H R, turning
+    together at the same rate about the same axis); when a trick ends the
+    game folds R into H and restarts R upright in the same update. A hook
+    right after the game writes + 224 (0x82246C94) writes R = H^T W for the
+    rotation W wanted, H being B R_last^T (B itself the update a trick
+    ends). Spins are about + Y (the game's trick 23, left on the stick
+    positive), flips about the rider's + Z (trick 13 up on the stick
+    negative, trick 2 down positive).
+  - First try (kept in world space against B as if it were the heading
+    alone) fed back on itself: slow, then wild, then a crash.
+  - `trace_dynamic_spins` logs each jump's turn and each re-based heading.
 - Branch flicker with XeSS: a tree's faded branches close to the camera
   (the branch fade) are drawn as a dither when MSAA is off, and the dither's
   pattern stepped every frame for the upscaler to average. Over a large

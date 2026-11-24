@@ -806,8 +806,8 @@ const std::vector<Tab>& Tabs() {
                        "sets the speed, diagonals mix a spin with a flip (corks, rodeos), and "
                        "letting go coasts to a stop instead of snapping to a clean 180 / 360. "
                        "Landing within 45 degrees of clean straightens out. Tuck once after "
-                       "loading in so it knows which rider is yours. Off by default while "
-                       "it's worked on: off, the game's own fixed tricks."),
+                       "loading in so it knows which rider is yours. Off: the game's own "
+                       "fixed tricks."),
                 SliderF("dynamic_spin_speed", "Dynamic spin speed",
                         "Top rotation speed at full tilt, against the game's own spin and flip "
                         "rates (1 = the same).",
