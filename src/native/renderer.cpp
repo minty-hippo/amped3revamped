@@ -7528,7 +7528,7 @@ void main() {
   vec3 T = abs(Nn.y) < 0.9 ? normalize(cross(Nn, vec3(0.0, 1.0, 0.0))) : vec3(1.0, 0.0, 0.0);
   vec3 Bt = cross(Nn, T);
   float rnd = fract(52.9829189 * fract(dot(vec2(t) + float(frame) * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
-  int rays = int(kSet.x);
+  int rays = fine ? max(int(kSet.x) * 3 / 5, 4) : int(kSet.x);  // (the fine grid: 6 of 10)
   vec3 sum = vec3(0.0);
   for (int i = 0; i < rays; ++i) {
     float u1 = fract((float(i) + 0.5) / float(rays) + rnd * 0.37);
@@ -13539,13 +13539,16 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     Barrier();
     // (The coarse grid's a sixteenth of its rows (one layer), the fine
     // one's an eighth (two).)
-    const uint32_t cb = rows / 16, fb = rows / 8;
+    // (Both a sixteenth: the fine grid's eighth with the coarse one's
+    // sixteenth cost 4.6 ms on an Intel Arc iGPU, twice the coarse grid's
+    // eighth alone.)
+    const uint32_t cb = rows / 16, fb = rows / 16;
     const VkRect2D band{{0, int32_t((frame_number_ % 16) * cb)}, {pw, cb}};
     FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
                    &band, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
                    &gi_params_);
     if (!Diag("ginofine")) {
-      const VkRect2D fband{{0, int32_t(rows + (frame_number_ % 8) * fb)}, {pw, fb}};
+      const VkRect2D fband{{0, int32_t(rows + ((frame_number_ + 8) % 16) * fb)}, {pw, fb}};
       FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
                      &fband, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
                      &gi_params_);

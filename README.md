@@ -693,9 +693,10 @@ that rule against a save that has the pass.
     after the night lights); off screen the eight nearest the camera now
     light what a ray hits too, after dark (no shadows; `ginolamps`).
     A second, finer grid of probes: the same count 2 m apart (64 x 32 x
-    64 m round the camera), in the same texture under the first, an eighth
-    of it traced a frame and the coarse grid a sixteenth (half a band more
-    than before, all told). Within it the shade near by is sharper (under a
+    64 m round the camera), in the same texture under the first, a
+    sixteenth of each grid traced a frame, the fine one's probes with 6
+    rays a face (an eighth of the fine grid at 10 rays cost 4.6 ms on an
+    Intel Arc B390; about what the coarse grid alone cost before now). Within it the shade near by is sharper (under a
     tree, along a wall, by a jump), blended into the coarse grid over its
     last few probes; the riders read it too (`ginofine`: the coarse grid
     alone). With the world light on, the ambient occlusion reaches 1.25 m
