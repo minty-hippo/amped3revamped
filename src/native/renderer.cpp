@@ -2376,6 +2376,7 @@ struct Renderer::Impl {
   float tracks_ = 0.0f;
   static constexpr uint32_t kTracksN = 4096, kTracksW = 1024;
   static constexpr double kTracksTexel = 0.05;
+  static constexpr double kTracksLife = 240.0;  // seconds a track lasts, unworn by wind or snow
   Image tracks_map_, tracks_scratch_, tracks_stamp_, tracks_tmp_;
   Image tracks_stamp_more_[2];  // the trails drawn again where their texture's stronger (its alpha)
   Image tracks_albedo_, tracks_normal_;
@@ -3056,6 +3057,10 @@ float SnowGlint(vec3 P, vec3 N, vec3 h, float foot) {
 )";
 
 static const std::string kTracksClumps = R"(
+// A texel of the tracks' map as it shows: r groove, g heap, b how fresh
+// (1 pressed now, worn to 0 over a few minutes): an old track fading out
+// over the last third of its time, the oldest first.
+vec2 Live(vec4 t) { return t.rg * smoothstep(0.0, 0.35, t.b); }
 float ClumpHash(vec2 c) {
   uvec2 q = uvec2(ivec2(c) + 65536);
   uint h = q.x * 1597334677u ^ q.y * 3812015801u;
@@ -6274,11 +6279,22 @@ float Cov(ivec2 t) {
   }
   return c;
 }
-vec2 Old(ivec2 m) { return texelFetch(tracks, clamp(m, ivec2(0), textureSize(tracks, 0) - 1), 0).rg; }
+vec4 Raw(ivec2 m) { return texelFetch(tracks, clamp(m, ivec2(0), textureSize(tracks, 0) - 1), 0); }
+// (As it shows: an old track fading over the last third of its time.)
+vec2 Live(vec4 t) { return t.rg * smoothstep(0.0, 0.35, t.b); }
+vec2 Old(ivec2 m) { return Live(Raw(m)); }
+// Coverage softened over a few texels: rounded, ramped edges (each frame's
+// piece of a trail pressed in squarely left the edges stepped).
+float CovSoft(ivec2 t) {
+  float c = Cov(t) * 0.2;
+  c += (Cov(t + ivec2(2, 0)) + Cov(t - ivec2(2, 0)) + Cov(t + ivec2(0, 2)) + Cov(t - ivec2(0, 2))) * 0.12;
+  c += (Cov(t + ivec2(3, 3)) + Cov(t - ivec2(3, 3)) + Cov(t + ivec2(3, -3)) + Cov(t - ivec2(3, -3))) * 0.08;
+  return c;
+}
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
   if (pc.a.y < -0.5) {
-    vec2 old = Old(t);
+    vec4 raw = Raw(t);
     // The wind (b.xy: how far the loose snow moved, texels; b.z the heaps
     // scoured, b.w the grooves drifted in): the surface carried downwind
     // (mixed with what's upwind of it: the shapes soften and creep along),
@@ -6289,23 +6305,28 @@ void main() {
       vec2 f = from - 0.5;
       ivec2 i = ivec2(floor(f));
       vec2 w = f - floor(f);
-      vec2 up = mix(mix(Old(i), Old(i + ivec2(1, 0)), w.x), mix(Old(i + ivec2(0, 1)), Old(i + ivec2(1, 1)), w.x), w.y);
-      old = mix(old, up, 0.6);
-      old.g *= 1.0 - pc.b.z;
-      old.r *= 1.0 - pc.b.w;
+      vec4 up = mix(mix(Raw(i), Raw(i + ivec2(1, 0)), w.x), mix(Raw(i + ivec2(0, 1)), Raw(i + ivec2(1, 1)), w.x), w.y);
+      raw = mix(raw, up, 0.6);
+      raw.g *= 1.0 - pc.b.z;
+      raw.r *= 1.0 - pc.b.w;
     }
     // (What's left very faint goes: 8-bit, a faint groove times a little
     // less rounded back up to itself and never filled, and the wind's
     // mixing spread such traces over the whole map - its steps of one
     // 255th, made slopes by the normals, striped the snow everywhere.)
-    vec2 nw = vec2(old.r * (1.0 - pc.a.z), old.g * (1.0 - 0.6 * pc.a.z));
+    vec2 nw = vec2(raw.r * (1.0 - pc.a.z), raw.g * (1.0 - 0.6 * pc.a.z));
     nw = max(nw - vec2(1.5 / 255.0), vec2(0.0)) * step(vec2(0.025), nw);
-    o = vec4(nw, 0.0, 1.0);
+    // Aging (c.x): fresher to older; worn out, gone.
+    float age = max(raw.b - pc.c.x, 0.0);
+    if (age <= 0.0) nw = vec2(0.0);
+    o = vec4(nw, age, 1.0);
     return;
   }
   ivec2 m = t + ivec2(pc.a.xy);
-  vec2 old = Old(m);
+  vec4 raw = Raw(m);
+  vec2 old = Live(raw);
   float cov = Cov(t);
+  float soft = pc.c.z > 0.5 ? cov : CovSoft(t);
   float pushed = 0.0;
   if (cov < 1.0) {
     for (int i = 0; i < 32; ++i) {
@@ -6317,13 +6338,21 @@ void main() {
       if (c <= 0.0) continue;
       vec2 on = Old(m + off);
       // (Pushed up mostly where it's pressed deep: a faint skid's edge
-      // hardly heaps.)
+      // hardly heaps; spread out from it, smaller the farther: a rounded
+      // bank, not a rim.)
       pushed += (max(c - on.r, 0.0) * c + on.g * 2.2) * (1.0 - r / 11.0);
     }
   }
-  float groove = max(old.r, cov);
-  float berm = old.g * (1.0 - cov) + pc.a.w * pushed;
-  o = vec4(groove, clamp(berm, 0.0, 1.0), 0.0, 1.0);
+  float add = pc.a.w * pushed;
+  // Untouched this frame: kept as it is (aging on).
+  if (soft < 0.002 && add < 0.004) {
+    o = raw;
+    return;
+  }
+  float groove = max(old.r, soft);
+  float berm = old.g * (1.0 - soft) + add;
+  // (Touched: fresh again, as it now shows.)
+  o = vec4(groove, clamp(berm, 0.0, 1.0), 1.0, 1.0);
 }
 )", true);
   // Snow tracks, 2: the lighting's albedo (a.w 0) or normals (1) with the
@@ -6341,22 +6370,24 @@ layout(push_constant) uniform Apply {
   vec4 cam; // the camera (parallax), -
 } pc;
 layout(location = 0) out vec4 o;
-float H(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+)" + kTracksClumps + R"(
+// (Hashed as whole numbers: a sine of world-sized numbers is noise of its
+// own on some GPUs.)
+float H(vec2 p) { return ClumpHash(p); }
 vec2 T(vec2 tc) {
   vec2 f = tc - 0.5;
   ivec2 i = ivec2(floor(f));
   vec2 w = f - floor(f);
   ivec2 n = textureSize(tracks, 0) - 1;
-  vec2 a = texelFetch(tracks, clamp(i, ivec2(0), n), 0).rg;
-  vec2 b = texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0).rg;
-  vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
-  vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
+  vec2 a = Live(texelFetch(tracks, clamp(i, ivec2(0), n), 0));
+  vec2 b = Live(texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0));
+  vec2 c = Live(texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0));
+  vec2 d = Live(texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0));
   return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
-)" + kTracksClumps + R"(
 // Height (m): soft over a texel or so; the clumps on the heaps on top.
 float Ht(vec2 tc) {
-  vec2 t = (T(tc + vec2(0.6, 0.6)) + T(tc + vec2(-0.6, 0.6)) + T(tc + vec2(0.6, -0.6)) + T(tc - vec2(0.6))) * 0.25;
+  vec2 t = (T(tc + vec2(1.0, 1.0)) + T(tc + vec2(-1.0, 1.0)) + T(tc + vec2(1.0, -1.0)) + T(tc - vec2(1.0))) * 0.25;
   float heap = t.g * (1.0 - t.r);
   return -pc.s.x * t.r + pc.s.y * heap + Clumps(tc, heap) * pc.s.y;
 }
@@ -8483,17 +8514,17 @@ float Ht(vec2 tc) {
   ivec2 i = ivec2(floor(f));
   vec2 w = f - floor(f);
   ivec2 n = textureSize(tracks, 0) - 1;
-  vec2 a = texelFetch(tracks, clamp(i, ivec2(0), n), 0).rg;
-  vec2 b = texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0).rg;
-  vec2 c = texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0).rg;
-  vec2 d = texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0).rg;
+  vec2 a = Live(texelFetch(tracks, clamp(i, ivec2(0), n), 0));
+  vec2 b = Live(texelFetch(tracks, clamp(i + ivec2(1, 0), ivec2(0), n), 0));
+  vec2 c = Live(texelFetch(tracks, clamp(i + ivec2(0, 1), ivec2(0), n), 0));
+  vec2 d = Live(texelFetch(tracks, clamp(i + ivec2(1, 1), ivec2(0), n), 0));
   vec2 t = mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
   float heap = t.g * (1.0 - t.r);
   return -TB.x * t.r + TB.y * heap + Clumps(tc, heap) * TB.y;
 }
 // (Soft over a texel or so, as the tracks are shaded.)
 float Hs(vec2 tc) {
-  return (Ht(tc + vec2(0.7, 0.7)) + Ht(tc + vec2(-0.7, 0.7)) + Ht(tc + vec2(0.7, -0.7)) + Ht(tc - vec2(0.7))) * 0.25;
+  return (Ht(tc + vec2(1.0, 1.0)) + Ht(tc + vec2(-1.0, 1.0)) + Ht(tc + vec2(1.0, -1.0)) + Ht(tc - vec2(1.0))) * 0.25;
 }
 // The painted map at world x, z (its four nearest texels weighed: it's
 // coarse, a metre or so a texel).
@@ -14073,12 +14104,12 @@ void Renderer::Impl::TracksUpdate() {
     return true;
   };
   EndRendering();
-  bool fresh = make(tracks_map_, kTracksN, VK_FORMAT_R8G8_UNORM, false, "snow_tracks");
-  make(tracks_scratch_, kTracksN, VK_FORMAT_R8G8_UNORM, false, "snow_tracks_scratch");
+  bool fresh = make(tracks_map_, kTracksN, VK_FORMAT_R8G8B8A8_UNORM, false, "snow_tracks");
+  make(tracks_scratch_, kTracksN, VK_FORMAT_R8G8B8A8_UNORM, false, "snow_tracks_scratch");
   make(tracks_stamp_, kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp");
   make(tracks_stamp_more_[0], kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp_2");
   make(tracks_stamp_more_[1], kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp_3");
-  make(tracks_tmp_, kTracksW, VK_FORMAT_R8G8_UNORM, false, "snow_tracks_window");
+  make(tracks_tmp_, kTracksW, VK_FORMAT_R8G8B8A8_UNORM, false, "snow_tracks_window");
   const int64_t tx = std::llround(cam_pos_[0] / kTracksTexel), tz = std::llround(cam_pos_[2] / kTracksTexel);
   const double jx = cam_pos_[0] - tracks_last_cam_[0], jy = cam_pos_[1] - tracks_last_cam_[1],
                jz = cam_pos_[2] - tracks_last_cam_[2];
@@ -14105,7 +14136,7 @@ void Renderer::Impl::TracksUpdate() {
   // every so often.
   {
     static auto last = std::chrono::steady_clock::now();
-    static float pending = 0.0f, scour = 0.0f, drift = 0.0f, waited = 0.0f;
+    static float pending = 0.0f, scour = 0.0f, drift = 0.0f, waited = 0.0f, aged = 0.0f;
     static double carried[2] = {0.0, 0.0};
     const auto now = std::chrono::steady_clock::now();
     const float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.25f);
@@ -14130,13 +14161,20 @@ void Renderer::Impl::TracksUpdate() {
       }
       waited += dt;
     }
-    if (pending > 0.03f || ((scour > 0.02f || drift > 0.02f) && waited > 0.5f)) {
+    // Wind or none, the tracks wear away with time: each texel's freshness
+    // runs down over kTracksLife seconds from when it was last pressed, the
+    // track fading over the last third of that (the oldest parts first).
+    if (!Diag("tracksforever")) aged += dt / float(kTracksLife);
+    // (In whole 255ths: the freshness is 8-bit.)
+    const float age_step = std::floor(aged * 255.0f) / 255.0f;
+    if (pending > 0.03f || ((scour > 0.02f || drift > 0.02f) && waited > 0.5f) || age_step >= 2.0f / 255.0f) {
       // (Carried at most two texels a pass: the rest next time.)
       const float cx = float(std::clamp(carried[0], -2.0, 2.0)), cz = float(std::clamp(carried[1], -2.0, 2.0));
       carried[0] -= cx;
       carried[1] -= cz;
       float pc[12] = {0.0f, -1.0f, std::min(pending, 1.0f), 0.0f,
-                      cx, cz, std::min(scour, 0.5f), std::min(drift, 0.5f)};
+                      cx, cz, std::min(scour, 0.5f), std::min(drift, 0.5f), age_step};
+      aged -= age_step;
       scour = drift = waited = 0.0f;
       Barrier();
       FullscreenPass(CopyKind::kTracksMerge, &tracks_scratch_, &tracks_stamp_, &tracks_map_, nullptr,
@@ -14287,7 +14325,7 @@ void Renderer::Impl::TracksInputs(const Draw& d, const GpuState& st, Image* albe
   pc[17] = float(double(tracks_cz_ - N / 2) * kTracksTexel);
   pc[18] = float(1.0 / kTracksTexel);
   pc[20] = 0.06f * tracks_;  // a groove's depth (m)
-  pc[21] = 0.22f * tracks_;  // a heap's height (all piled up)
+  pc[21] = 0.15f * tracks_;  // a heap's height (all piled up)
   pc[22] = 1.0f / float(a3->width);
   pc[23] = 1.0f / float(a3->height);
   pc[24] = cam_pos_[0];
@@ -14750,7 +14788,7 @@ void Renderer::Impl::TodShadows() {
       f[42] = float(1.0 / kTracksTexel);
       f[43] = 1.0f;
       f[44] = 0.06f * tracks_;  // 11: groove depth, heap height
-      f[45] = 0.22f * tracks_;
+      f[45] = 0.15f * tracks_;
     }
     if (far_off) {
       for (int i = 0; i < 3; ++i) f[48 + i] = float(cam_pos_[i]);  // 12: camera, from (m)

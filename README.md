@@ -948,6 +948,16 @@ that rule against a save that has the pass.
   these traces over the whole map; their steps of a 255th became slopes in
   the normals, fine stripes across the slopes. What's left very faint is
   cleared now, and the faintest traces aren't drawn.
+  Trail outlines: each frame's piece of a trail pressed in squarely left
+  the edges stepped (a sawtooth along a carve's outside), so what's pressed
+  is softened over a few texels (rounded, ramped edges), and the tracks are
+  shaded over twice the width (softer walls). The heaps beside them are
+  lower (15 cm at most, was 22) and only where a cut is pressed deep.
+  Tracks fade with time, wind or none: each spot keeps how fresh it is
+  (pressed again: fresh), running down over four minutes, the track fading
+  over the last third of that, so a trail fades from its oldest end to its
+  newest (`tracksforever`: kept). The tracks' map is 8-bit RGBA now (the
+  freshness in blue).
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,
