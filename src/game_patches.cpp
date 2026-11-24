@@ -1330,7 +1330,7 @@ void Amped3_SpinOut(PPCRegister& r3, PPCRegister& r12) {
 // the rider where it is. The axes and the game's rates are learned from the
 // game's own tricks as they play (the game still runs them underneath).
 
-REXCVAR_DEFINE_BOOL(dynamic_spins, true, "Amped 3/Tuning",
+REXCVAR_DEFINE_BOOL(dynamic_spins, false, "Amped 3/Tuning",
                     "Spins, flips and rolls follow the left stick freely: tilt sets the speed, "
                     "diagonals combine a spin and a flip, letting go coasts to a stop, and a "
                     "landing within 45 degrees of clean straightens out. Off: the game's fixed "
@@ -1341,6 +1341,11 @@ REXCVAR_DEFINE_DOUBLE(dynamic_spin_speed, 1.0, "Amped 3/Tuning",
 REXCVAR_DEFINE_DOUBLE(dynamic_spin_coast, 0.35, "Amped 3/Tuning",
                       "Dynamic spins: seconds the rotation takes to slow after letting go of the "
                       "stick (to about a third)");
+REXCVAR_DEFINE_BOOL(trace_air_rotation, false, "Amped 3/Diagnostics",
+                    "Log the local rider's rotation in the air every update (with dynamic spins "
+                    "off: the game's own): the stick, the trick, how fast the rider's base frame "
+                    "and the trick's own rotation turn and about what, and the physics vectors "
+                    "that may hold its spin. Tuck once first.");
 REXCVAR_DEFINE_BOOL(trace_dynamic_spins, false, "Amped 3/Diagnostics",
                     "Log dynamic spins: each jump's start and end angles, and what's learned of "
                     "the game's spin and flip axes and rates.");
@@ -1472,8 +1477,57 @@ M3 NearestClean(const M3& r, const double* spin_axis) {
 }
 }  // namespace
 
+namespace {
+// trace_air_rotation: the game's rotation in the air, update by update.
+struct AirTrace {
+  uint32_t substate = 0;
+  int64_t last_ms = 0, start_ms = 0;
+  M3 base_prev = Ident(), game_prev = Ident();
+  int lines = 0;
+} g_air;
+void TraceAir(uint8_t* base, uint32_t s, uint32_t phys, const M3& game, const M3& b, double dt) {
+  auto& t = g_air;
+  const int64_t now = SteadyMs();
+  const bool fresh = t.substate != s || now - t.last_ms > 150;
+  if (fresh) {
+    t.substate = s;
+    t.start_ms = now;
+    if (t.lines < 3000) {
+      ++t.lines;
+      REXLOG_INFO("air rotation: in the air (substate {:08X}, physics {:08X})", s, phys);
+    }
+  }
+  t.last_ms = now;
+  if (!fresh && t.lines < 3000 && dt > 1e-4) {
+    ++t.lines;
+    // The base's turn this update, in its own frame (B_prev^T B), and the
+    // trick's (base-relative, R R_prev^T).
+    double bax[3], gax[3];
+    const double ba = ToAxisAngle(Mul(T(t.base_prev), b), bax);
+    const double ga = ToAxisAngle(Mul(game, T(t.game_prev)), gax);
+    auto v3 = [&](uint32_t at) {
+      return fmt::format("{:+.2f} {:+.2f} {:+.2f}", LoadF32(base, at), LoadF32(base, at + 4),
+                         LoadF32(base, at + 8));
+    };
+    const auto pad = amped3::pad::Latest();
+    REXLOG_INFO("air rotation {:.3f}: L {:+.2f} {:+.2f} phase {} trick {} | base {:4.0f} deg/s about "
+                "{:+.2f} {:+.2f} {:+.2f} | trick {:4.0f} deg/s about {:+.2f} {:+.2f} {:+.2f} | "
+                "+1936 {} +1952 {} +1968 {} +2464 {} +2480 {} | base up {:+.2f} {:+.2f} {:+.2f} fwd "
+                "{:+.2f} {:+.2f} {:+.2f}",
+                (now - t.start_ms) / 1000.0, pad.lx / 32767.0, pad.ly / 32767.0,
+                int32_t(Load32(base, s + 100)), int32_t(Load32(base, s + 104)), ba / dt * 57.2958,
+                bax[0], bax[1], bax[2], ga / dt * 57.2958, gax[0], gax[1], gax[2], v3(phys + 1936),
+                v3(phys + 1952), v3(phys + 1968), v3(phys + 2464), v3(phys + 2480), b.m[0][1],
+                b.m[1][1], b.m[2][1], b.m[0][2], b.m[1][2], b.m[2][2]);
+  }
+  t.base_prev = b;
+  t.game_prev = game;
+}
+}  // namespace
+
 void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
-  if (!REXCVAR_GET(dynamic_spins) || !r31.u32) return;
+  const bool air_trace = REXCVAR_GET(trace_air_rotation);
+  if ((!REXCVAR_GET(dynamic_spins) && !air_trace) || !r31.u32) return;
   auto* kernel = rex::system::kernel_state();
   if (!kernel) return;
   uint8_t* base = kernel->memory()->virtual_membase();
@@ -1487,6 +1541,11 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   const M3 game = Ortho(LoadRows(base, s + 224));
   const M3 b = Ortho(LoadRows(base, phys + 144));
   if (!Finite(game) || !Finite(b)) return;
+  if (air_trace) {
+    std::lock_guard lock(g_dyn_mutex);
+    TraceAir(base, s, phys, game, b, dt);
+  }
+  if (!REXCVAR_GET(dynamic_spins)) return;
   const int32_t phase = int32_t(Load32(base, s + 100)), trick = int32_t(Load32(base, s + 104));
   const bool blending = LoadF32(base, s + 140) > 0.0f || base[s + 345] != 0;
   const bool trace = REXCVAR_GET(trace_dynamic_spins);
