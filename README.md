@@ -913,7 +913,20 @@ that rule against a save that has the pass.
   every change of phase or trick is logged with the sticks, and each ending
   with what called it, to see what cuts a spin short and how long a push
   takes to show. Its revert to a clean landing is already frame-rate
-  independent (sub_822289A8 eases by the time step).
+  independent (sub_822289A8 eases by the time step). Each substate (every
+  rider has one) is now tracked on its own, so AI riders' updates no longer
+  flood it; once the tuck has been used the local rider's alone are logged.
+- Spins start sooner (`spin_start_blend`, 0.2 s): a spin or flip blended in
+  over the game's BeginningBlendDuration (0.4 s, the substate's + 140 / +
+  144), gathering pace that long before turning at its rate; the blend is
+  now shortened as it starts (0 keeps the game's).
+- Branch flicker with XeSS: a tree's faded branches close to the camera
+  (the branch fade) are drawn as a dither when MSAA is off, and the dither's
+  pattern stepped every frame for the upscaler to average. Over a large
+  area (riding under a tree, its canopy over the sky) XeSS didn't settle
+  it: its output swapped between the stipple and a haze every other frame.
+  The pattern now holds still (Graphics > Effects: Branch Dither Cycles,
+  `native_dither_cycle`, off; diagnostic `dithercycle` in the replay).
 - Low latency (Graphics > Display: Low Latency, `native_low_latency`, on):
   input felt delayed (jumps late off the lip, spins starting late), and
   worse at 30 fps: the delay was the frames in the pipeline. Each frame was

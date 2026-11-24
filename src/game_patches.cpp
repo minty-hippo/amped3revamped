@@ -1157,17 +1157,27 @@ void Amped3_JumpZoneHeld(PPCRegister& r31) {
 // Each change is logged with the stick, to see what turns a spin into its
 // ending and how long a push takes to show.
 
+REXCVAR_DEFINE_DOUBLE(spin_start_blend, 0.2, "Amped 3/Tuning",
+                      "Seconds a spin or flip takes to blend in from the moment it starts (the "
+                      "game's own is 0.4: the spin gathers pace that long, so it feels late). "
+                      "0 keeps the game's");
 REXCVAR_DEFINE_BOOL(trace_spin, false, "Amped 3/Diagnostics",
                     "Log the spin / flip substate's phases and tricks with the controller's sticks.");
 
 namespace {
-struct SpinTrace {
-  uint32_t substate = 0;
+// Each substate's last phase / trick (every rider has one: AI riders'
+// updates come in between the local rider's).
+struct SpinState {
   int32_t phase = -9, trick = -9;
+  float blend_of = 0.0f;
+};
+struct SpinTrace {
+  std::unordered_map<uint32_t, SpinState> substates;
   std::chrono::steady_clock::time_point start{};
   int lines = 0;
 } g_spin;
 std::mutex g_spin_mutex;
+constexpr int kSpinLines = 6000;
 
 double SpinNow() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_spin.start).count();
@@ -1177,32 +1187,51 @@ std::string Sticks() {
   return fmt::format("L {:+.2f} {:+.2f}  R {:+.2f} {:+.2f}  buttons {:04X}", p.lx / 32767.0,
                      p.ly / 32767.0, p.rx / 32767.0, p.ry / 32767.0, p.buttons);
 }
+// The local rider's substate: its rider (+ 8 or + 12) is the one the tuck
+// delegate names, once known (tuck once to learn it); until then all of
+// them, each only when it changes.
+bool SpinLocal(uint8_t* base, uint32_t s) {
+  const uint32_t local = g_tuck_rider.load();
+  return !local || Load32(base, s + 8) == local || Load32(base, s + 12) == local;
+}
 }  // namespace
 
 void Amped3_SpinUpdate(PPCRegister& r3, PPCRegister& f1) {
-  if (!REXCVAR_GET(trace_spin) || !r3.u32) return;
+  if (!r3.u32) return;
   auto* kernel = rex::system::kernel_state();
   if (!kernel) return;
   uint8_t* base = kernel->memory()->virtual_membase();
   const uint32_t s = r3.u32;
-  // (The local rider's only, when it's known: the substate's rider at + 12
-  // as the other substates have it.)
-  const uint32_t local = g_tuck_rider.load();
-  const uint32_t owner = Load32(base, s + 8);
+  // A spin / flip's start: its blend in (+ 140 left of + 144) shortened,
+  // the time left kept in proportion. (The game's is 0.4 s: the spin
+  // gathers pace over that long before it turns at its rate.)
+  const double start_blend = REXCVAR_GET(spin_start_blend);
+  if (start_blend > 0.0 && int32_t(Load32(base, s + 100)) == 0) {
+    const float of = LoadF32(base, s + 144), left = LoadF32(base, s + 140);
+    const float to = float(start_blend);
+    if (of > to + 1e-4f && of < 2.0f && left >= 0.0f) {
+      StoreGuestF32(base, s + 144, to);
+      StoreGuestF32(base, s + 140, left * to / of);
+    }
+  }
+  if (!REXCVAR_GET(trace_spin)) return;
+  if (!SpinLocal(base, s)) return;
   std::lock_guard lock(g_spin_mutex);
   auto& t = g_spin;
   if (t.start == std::chrono::steady_clock::time_point{}) t.start = std::chrono::steady_clock::now();
   const int32_t phase = int32_t(Load32(base, s + 100)), trick = int32_t(Load32(base, s + 104));
-  if (t.lines > 3000) return;
-  if (s != t.substate || phase != t.phase || trick != t.trick) {
+  const float blend_of = LoadF32(base, s + 144);
+  if (t.lines > kSpinLines) return;
+  SpinState& st = t.substates[s];
+  if (phase != st.phase || trick != st.trick || blend_of != st.blend_of) {
     ++t.lines;
-    REXLOG_INFO("spin {:.3f}: substate {:08X} (owner {:08X}, local rider {:08X}) phase {} trick {} "
-                "blend {:.3f} of {:.3f}, dt {:.4f}; {}",
-                SpinNow(), s, owner, local, phase, trick, LoadF32(base, s + 140),
-                LoadF32(base, s + 144), f1.f64, Sticks());
-    t.substate = s;
-    t.phase = phase;
-    t.trick = trick;
+    REXLOG_INFO("spin {:.3f}: substate {:08X} (+8 {:08X}, +12 {:08X}, local rider {:08X}) phase {} "
+                "trick {} blend {:.3f} of {:.3f}, dt {:.4f}; {}",
+                SpinNow(), s, Load32(base, s + 8), Load32(base, s + 12), g_tuck_rider.load(), phase,
+                trick, LoadF32(base, s + 140), blend_of, f1.f64, Sticks());
+    st.phase = phase;
+    st.trick = trick;
+    st.blend_of = blend_of;
   }
 }
 
@@ -1211,8 +1240,9 @@ void Amped3_SpinOut(PPCRegister& r3, PPCRegister& r12) {
   auto* kernel = rex::system::kernel_state();
   if (!kernel) return;
   uint8_t* base = kernel->memory()->virtual_membase();
+  if (!SpinLocal(base, r3.u32)) return;
   std::lock_guard lock(g_spin_mutex);
-  if (g_spin.lines > 3000) return;
+  if (g_spin.lines > kSpinLines) return;
   ++g_spin.lines;
   REXLOG_INFO("spin {:.3f}: OUT (ending at a clean turn) substate {:08X} phase {} trick {}, called "
               "from {:08X}; {}",

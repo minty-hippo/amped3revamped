@@ -93,6 +93,7 @@ const std::vector<Tab>& Tabs() {
            {"native_snow_cover", "Snow Settles"},
            {"native_drifting_snow", "Drifting Snow"},
            {"native_foliage_fade", "Branch Fade"},
+           {"native_dither_cycle", "Branch Dither Cycles"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
       {"Lighting",

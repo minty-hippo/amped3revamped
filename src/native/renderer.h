@@ -307,6 +307,9 @@ class Renderer {
   void SetShadowSoftness(float softness);
   // Foliage camera fade for the following frames (RendererOptions::foliage_fade).
   void SetFoliageFade(bool on);
+  // With one sample per pixel (MSAA off), the foliage edges' and fade's
+  // dither steps its pattern every frame (on) or holds it (off).
+  void SetDitherCycle(bool on);
   // Revamped Graphics: off, none of the port's own looks that are set when
   // the renderer starts (replaced textures and fonts, smoothed foliage
   // edges) - the textures replaced are dropped from the cache and loaded

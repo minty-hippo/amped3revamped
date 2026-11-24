@@ -1272,6 +1272,7 @@ struct Renderer::Impl {
     smooth_alpha_ = options_.smooth_alpha && !Diag("hardalpha");
     index_cache_ = !Diag("noixcache");
     foliage_fade_ = options_.foliage_fade && !Diag("nofade");
+    dither_cycle_ = Diag("dithercycle");
     {
       VkDeviceSize local = 0;
       for (uint32_t i = 0; i < gpu_.mem_props.memoryHeapCount; ++i) {
@@ -2594,6 +2595,7 @@ struct Renderer::Impl {
   // replaced textures dropped at the frame's end.
   bool replace_on_ = true, drop_replaced_ = false;
   bool foliage_fade_ = true;  // RendererOptions::foliage_fade (with smooth_alpha_)
+  bool dither_cycle_ = false;  // SetDitherCycle: the one-sample dither's phase steps each frame
   Image* fog_result_ = nullptr;  // this frame's fogged / rayed scene
   // Ambient occlusion (SetAmbientOcclusion): strength (0 = off), the
   // occlusion at half size (two images: the estimate and its blur, R = the
@@ -16553,8 +16555,12 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     // in view. Only alpha-to-coverage surfaces: the terrain and riders use a
     // plain alpha test.
     if (foliage_fade_ && tiling_.width && (colorctl & 0x10)) sys.flags |= 1u << 29;
-    // One sample per pixel: the dither's per-frame phase (the shader).
-    if (att0->samples == 1) sys.flags |= uint32_t(frame_number_ & 3) << 30;
+    // One sample per pixel: the dither's per-frame phase (the shader), when
+    // asked for (SetDitherCycle). XeSS doesn't settle a large dithered area
+    // that changes every frame (a near tree's faded branches over the sky):
+    // its output swaps between the stipple and a haze from one frame to the
+    // next. Held still, the jitter spreads it instead.
+    if (att0->samples == 1 && dither_cycle_) sys.flags |= uint32_t(frame_number_ & 3) << 30;
   }
   // Freecam: the scene's depth-tested geometry (on the scene's depth target:
   // not the shadow maps, the lighting pass or other full-screen passes)
@@ -19507,6 +19513,7 @@ void Renderer::SetRevamped(bool on) {
 void Renderer::SetFoliageFade(bool on) {
   impl_->foliage_fade_ = on && !impl_->Diag("nofade");
 }
+void Renderer::SetDitherCycle(bool on) { impl_->dither_cycle_ = on || impl_->Diag("dithercycle"); }
 void Renderer::SetGodRays(float strength) { impl_->rays_strength_ = std::max(strength, 0.0f); }
 
 void Renderer::SetWorldShadows(int detail, bool saved_only) {
