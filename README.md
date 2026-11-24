@@ -693,10 +693,12 @@ that rule against a save that has the pass.
     after the night lights); off screen the eight nearest the camera now
     light what a ray hits too, after dark (no shadows; `ginolamps`).
     A second, finer grid of probes: the same count 2 m apart (64 x 32 x
-    64 m round the camera), in the same texture under the first, a
-    sixteenth of each grid traced a frame, the fine one's probes with 8
-    rays a face (an eighth of the fine grid at 10 rays cost 4.6 ms on an
-    Intel Arc B390; about what the coarse grid alone cost before now).
+    64 m round the camera), in the same texture under the first: a
+    sixteenth of the coarse grid traced a frame and a thirty-second of the
+    fine one, its probes with 8 rays a face and fewer voxel steps (they sit
+    among things, near the ground, and their rays step voxel by voxel
+    along it: four times a coarse probe's work; the fine grid's eighth at
+    10 rays cost 4.6 ms on an Intel Arc B390).
     Each probe face now casts the same rays every time it's traced (turned
     its own way, so neighbours differ and average out when read): with new
     rays each pass every probe's light wandered a little, and the shade on

@@ -7556,7 +7556,10 @@ void main() {
     float r = sqrt(u1);
     vec3 D = normalize(T * (r * cos(ph)) + Bt * (r * sin(ph)) + Nn * sqrt(max(1.0 - u1, 0.0)));
     vec3 n;
-    float tt = Trace(P, D, 2.0 * kBox[0].w, 400.0, 0, ivec2(80, 48), n);
+    // (The fine grid's probes sit among things, near the ground: their rays
+    // step voxel by voxel along it, about four times a coarse probe's work;
+    // fewer steps for them.)
+    float tt = Trace(P, D, 2.0 * kBox[0].w, 400.0, 0, fine ? ivec2(48, 32) : ivec2(80, 48), n);
     if (tt < 0.0) continue;
     vec3 H = P + D * tt;
     float hv = tt < float(N) * kBox[0].w * 0.5 ? kBox[0].w : kBox[1].w;
@@ -13561,16 +13564,16 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     Barrier();
     // (The coarse grid's a sixteenth of its rows (one layer), the fine
     // one's an eighth (two).)
-    // (Both a sixteenth: the fine grid's eighth with the coarse one's
-    // sixteenth cost 4.6 ms on an Intel Arc iGPU, twice the coarse grid's
-    // eighth alone.)
-    const uint32_t cb = rows / 16, fb = rows / 16;
+    // (The coarse grid a sixteenth, the fine one a thirty-second: the fine
+    // grid's eighth with the coarse one's sixteenth cost 4.6 ms on an Intel
+    // Arc iGPU, its probes' rays four times a coarse one's work.)
+    const uint32_t cb = rows / 16, fb = rows / 32;
     const VkRect2D band{{0, int32_t((frame_number_ % 16) * cb)}, {pw, cb}};
     FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
                    &band, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
                    &gi_params_);
     if (!Diag("ginofine")) {
-      const VkRect2D fband{{0, int32_t(rows + ((frame_number_ + 8) % 16) * fb)}, {pw, fb}};
+      const VkRect2D fband{{0, int32_t(rows + ((frame_number_ + 8) % 32) * fb)}, {pw, fb}};
       FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
                      &fband, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
                      &gi_params_);
