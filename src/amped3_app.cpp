@@ -395,7 +395,7 @@ void Amped3App::ToggleRevampedGraphics() {
   const bool on = rex::cvar::GetFlagByName("revamped_graphics") != "true";
   if (!rex::cvar::SetFlagByName("revamped_graphics", on ? "true" : "false")) return;
   if (!config_path_.empty()) rex::cvar::SaveConfig(config_path_);
-  REXLOG_INFO("Revamped Graphics {} (F2)", on ? "on" : "off");
+  REXLOG_INFO("Revamped Graphics {} (F2 / View + RB)", on ? "on" : "off");
   amped3::notice::Show(on ? "Revamped Graphics: on" : "Revamped Graphics: off");
 }
 
@@ -461,6 +461,14 @@ void Amped3App::OnPostSetup() {
         if (!config_path_.empty()) rex::cvar::SaveConfig(config_path_);
       });
     };
+    host.open_graphics = [this] {
+      graphics_panel_open_ = true;  // (at once: the freecam holds still from now)
+      app_context().CallInUIThread([this] {
+        graphics_panel_open_ = false;
+        OpenGraphicsPanel();
+      });
+    };
+    host.graphics_open = [this] { return graphics_panel_open_.load() || options_menu_open_.load(); };
     amped3::freecam::Install(std::move(host));
   }
   // Instant replay (F7, or L3 + R3 held).
@@ -619,6 +627,11 @@ void Amped3App::StartControllerHotkeyWatcher() {
     constexpr uint16_t kCombo = rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
     clock::time_point held_since{};
     bool latched = false;
+    // View + RB held: Revamped Graphics on or off.
+    constexpr uint16_t kRevampedCombo = rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+    constexpr auto kRevampedHold = std::chrono::milliseconds(500);
+    clock::time_point revamped_since{};
+    bool revamped_latched = false;
     bool stick_latched = false;  // the hold's replay done (no freecam on letting go)
     clock::time_point stick_since{};
     while (!hotkey_thread_stop_.load()) {
@@ -652,6 +665,18 @@ void Amped3App::StartControllerHotkeyWatcher() {
         if (!stick_latched) amped3::freecam::Toggle();
         stick_since = {};
         stick_latched = false;
+      }
+      if ((pad.buttons & kRevampedCombo) == kRevampedCombo && !(pad.buttons & rex::input::X_INPUT_GAMEPAD_START) &&
+          !options_menu_open_ && !graphics_panel_open_) {
+        const auto now = clock::now();
+        if (revamped_since == clock::time_point{}) revamped_since = now;
+        if (!revamped_latched && now - revamped_since >= kRevampedHold) {
+          revamped_latched = true;
+          app_context().CallInUIThread([this] { ToggleRevampedGraphics(); });
+        }
+      } else {
+        revamped_since = {};
+        revamped_latched = false;
       }
       if ((pad.buttons & kCombo) == kCombo) {
         const auto now = clock::now();

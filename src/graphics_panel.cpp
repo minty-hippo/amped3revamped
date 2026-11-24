@@ -90,6 +90,8 @@ const std::vector<Tab>& Tabs() {
            {"native_lens_dirt", "Lens Dirt", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_diamond_dust", "Diamond Dust", Kind::kSlider, 0.0, 2.0, 0.1},
            {"native_snow_tracks", "Snow Tracks", Kind::kSlider, 0.0, 2.0, 0.1},
+           {"native_snow_cover", "Snow Settles"},
+           {"native_drifting_snow", "Drifting Snow"},
            {"native_foliage_fade", "Branch Fade"},
            {"native_map_clouds", "Trail Map Clouds"},
        }},
@@ -115,7 +117,18 @@ const std::vector<Tab>& Tabs() {
             {{"0", "Painted"}, {"2", "Baked 2x"}, {"4", "Baked 4x"}}},
            {"native_world_shadows_saved", "Saved Shadows Only"},
        }},
-      // (What needs the clock running: the sky, weather and wind.)
+      // (Its own switch, with the time of day dynamic or held.)
+      {"Weather",
+       {
+           {"native_weather_effects", "Weather Effects"},
+           {"native_weather", "Weather", Kind::kStops, 0, 0, 0,
+            {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"}, {"5", "Blizzard"}}},
+           {"native_weather_minutes", "Weather Spells", Kind::kStops, 0, 0, 0,
+            {{"2", "2 min"}, {"6", "6 min"}, {"15", "15 min"}, {"40", "40 min"}}},
+           {"native_wind_sway", "Wind in the Trees"},
+           {"native_wind_strength", "Wind Strength", Kind::kSlider, 0.0, 3.0, 0.1},
+       }},
+      // (What needs the clock running: the sky and the hour.)
       {"Time of Day",
        {
            {"native_dynamic_time_of_day", "Dynamic Time of Day (experimental)"},
@@ -129,14 +142,6 @@ const std::vector<Tab>& Tabs() {
            {"native_tod_clouds", "Cloud Cover", Kind::kSlider, 0.0, 1.0, 0.05},
            {"native_cloud_shadows", "Cloud Shadows", Kind::kSlider, 0.0, 1.0, 0.1},
            {"native_ice_halo", "Ice Halo", Kind::kSlider, 0.0, 2.0, 0.1},
-           {"native_weather", "Weather", Kind::kStops, 0, 0, 0,
-            {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"}, {"5", "Blizzard"}}},
-           {"native_weather_minutes", "Weather Spells", Kind::kStops, 0, 0, 0,
-            {{"2", "2 min"}, {"6", "6 min"}, {"15", "15 min"}, {"40", "40 min"}}},
-           {"native_snow_cover", "Snow Settles"},
-           {"native_drifting_snow", "Drifting Snow"},
-           {"native_wind_sway", "Wind in the Trees"},
-           {"native_wind_strength", "Wind Strength", Kind::kSlider, 0.0, 3.0, 0.1},
        }},
       {"Display",
        {
@@ -214,6 +219,26 @@ int StopIndex(const Row& r) {
     if (d < best_d) best_d = d, best = int(i);
   }
   return best;
+}
+
+// The hour as a clock ("14:15"); -1: the map's own ("Map Default (09:40)").
+// With dynamic time of day running, the clock now too.
+std::string Clock(double h) {
+  h = std::fmod(std::max(h, 0.0), 24.0);
+  int m = int(std::lround(h * 60.0)) % (24 * 60);
+  return fmt::format("{:02}:{:02}", m / 60, m % 60);
+}
+std::string HourText(double v) {
+  std::string t;
+  if (v < 0.0) {
+    const float mh = live::MountainHour();
+    t = mh >= 0.0f ? "Map Default (" + Clock(mh) + ")" : "Map Default";
+  } else {
+    t = Clock(v);
+  }
+  const float now = live::TimeOfDayHour();
+  if (now >= 0.0f && GetBool("native_dynamic_time_of_day")) t += "  now " + Clock(now);
+  return t;
 }
 
 // The game's menu colors: gold titles and selection, white text.
@@ -301,6 +326,12 @@ void GraphicsPanel::Change(const Row& r, int direction) {
     case Kind::kSlider: {
       double v = GetDouble(r.cvar) + direction * r.step;
       v = std::clamp(std::round(v / r.step) * r.step, r.min, r.max);
+      if (std::string_view(r.cvar) == "native_tod_start_hour") {
+        // (Map Default, then midnight on; down from midnight, Map Default.)
+        const double was = GetDouble(r.cvar);
+        if (was < 0.0) v = direction > 0 ? 0.0 : -1.0;
+        else if (v < 0.0) v = -1.0;
+      }
       rex::cvar::SetFlagByName(r.cvar, r.integer ? fmt::format("{}", int(std::lround(v)))
                                                  : fmt::format("{:.2f}", v));
       break;
@@ -459,7 +490,15 @@ std::string GraphicsPanel::Hint(const Row& r) const {
     return native ? "The game's text and button icons rebuilt at 4x, sharp at any resolution."
                   : "Native renderer only (Options F1 > Native renderer).";
   }
-  if (name == "revamped_graphics") return "Every enhancement at once.";
+  if (name == "revamped_graphics") return "Every enhancement at once (controller: hold View + RB).";
+  if (name == "native_weather_effects") {
+    return "Grey skies, snow and blizzards, wind: with dynamic time of day on or off.";
+  }
+  if (name == "native_tod_start_hour") {
+    return "The clock's hour. Map Default: each mountain's own hour, as the game has it.";
+  }
+  if (name == "native_snow_cover") return "Falling snow settles on boughs, roofs and props; drifts in the wind.";
+  if (name == "native_drifting_snow") return "In a strong wind, loose snow streams along the slopes.";
   if (name == "frame_rate_limit") {
     return "30 is the console's own pacing; Revamped Graphics starts at 60. The game plays "
            "at normal speed at any rate.";
@@ -587,7 +626,11 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     // is off (they keep their settings for when it's back on), the native
     // renderer's settings while it's off, FSR sharpness without FSR.
     bool dim = false;
-    if (tab_ == 0) dim = name != "revamped_graphics" && !revamped;
+    const bool effects_tab = std::string_view(Tabs()[tab_].name) == "Effects";
+    if (effects_tab) dim = name != "revamped_graphics" && !revamped;
+    if (name.substr(0, 14) == "native_weather" || name == "native_wind_sway" || name == "native_wind_strength") {
+      dim = !revamped || (name != "native_weather_effects" && !GetBool("native_weather_effects"));
+    }
     if (name == "native_render_scale" || name == "native_upscaler") dim = !native;
     if (name == "native_upscaler_sharpness") dim = !native || upscaler != "fsr";
     if (name == "native_upscaler_msaa") dim = !native || upscaler == "off";
@@ -600,7 +643,7 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
     const ImU32 color = selected ? kGold : (dim ? kDim : kWhite);
     const float ty = y + (row_h - text_px) * 0.5f;
     const float cy = y + row_h * 0.5f;
-    const float indent = (tab_ == 0 && i > 0) || name == "native_upscaler_sharpness" ||
+    const float indent = (effects_tab && i > 0) || name == "native_upscaler_sharpness" ||
                                  name == "native_upscaler_msaa"
                              ? pad * 0.8f
                              : 0.0f;
@@ -642,6 +685,9 @@ void GraphicsPanel::OnDraw(ImGuiIO& io) {
           live::RenderScaleFor(percent, &w, &h);
           value = w && h ? fmt::format("{}%  {} x {}", percent, w, h) : fmt::format("{}%", percent);
           widest = "100%  0000 x 0000";
+        } else if (name == "native_tod_start_hour") {
+          value = HourText(v);
+          widest = "Map Default (00:00)";
         } else if (r.step < 0.1) {
           value = fmt::format("{:.2f}", v);
           widest = "0.00";

@@ -76,6 +76,8 @@ bool Enabled();
 void SetHideInterface(bool hide);
 // Time of day (setting native_dynamic_time_of_day): the hour now (-1: not known yet).
 float TimeOfDayHour();
+// The mountain's own hour (the game's fixed light), -1 before a mountain.
+float MountainHour();
 // The freecam (native renderer only): the input for the next frame (the
 // steps in it are added up until a frame uses them), and whether the last
 // frame was seen from it (a 3D scene to fly in).

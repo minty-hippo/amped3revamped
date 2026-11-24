@@ -11063,6 +11063,9 @@ void Renderer::Impl::NoteLightingPass(const Draw& d, const GpuState& st) {
         tod_state_.light = tod_layout_.mountain_sun;
         tod_state_.light_scale = tod_state_.ambient_scale = {1.0, 1.0, 1.0};
         tod_state_.away = 0.0;
+        // (The weather, with dynamic time of day off: a grey sky dims the
+        // game's own light and softens its shadows the same way.)
+        if (tod_.overcast > 0.0f) tod::ApplyWeather(&tod_state_, tod_.overcast);
       } else if (tod_.on) {
         tod_state_ = tod::At(tod_layout_, tod_.hour, tod_.moon_phase, tod_.night_light);
         tod::ApplyWeather(&tod_state_, tod_.overcast);

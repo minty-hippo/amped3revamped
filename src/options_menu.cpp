@@ -67,6 +67,8 @@ struct Option {
   bool restart = false;  // needs a relaunch even though the SDK applies it live
   // Integer sliders: the text shown for a value (instead of `format`).
   std::string (*value_text)(int) = nullptr;
+  // Float sliders: the same (instead of `format`).
+  std::string (*float_text)(double) = nullptr;
   // Shown only when this returns true (nullptr: always).
   bool (*visible)() = nullptr;
 };
@@ -108,6 +110,25 @@ bool NativeUpscalerOn() {
 }
 bool NativeFsrOn() {
   return NativeRendererOn() && rex::cvar::GetFlagByName("native_upscaler") == "fsr";
+}
+
+// "14:15", or "Map default (09:40)" (-1), and the clock now with dynamic
+// time of day running.
+std::string HourText(double v) {
+  auto clock = [](double h) {
+    const int m = int(std::lround(std::fmod(std::max(h, 0.0), 24.0) * 60.0)) % (24 * 60);
+    return fmt::format("{:02}:{:02}", m / 60, m % 60);
+  };
+  std::string t;
+  if (v < 0.0) {
+    const float mh = amped3::live::MountainHour();
+    t = mh >= 0.0f ? "Map default (" + clock(mh) + ")" : "Map default";
+  } else {
+    t = clock(v);
+  }
+  const float now = amped3::live::TimeOfDayHour();
+  if (now >= 0.0f && rex::cvar::GetFlagByName("native_dynamic_time_of_day") == "true") t += "  now " + clock(now);
+  return t;
 }
 
 // "75%  (1920 x 1080)": the native renderer's internal resolution at a step.
@@ -438,6 +459,14 @@ const std::vector<Tab>& Tabs() {
                         "they push aside heaped beside them, a pile where a board skids to a "
                         "stop. Falling snow fills them in. 0: off. Native renderer only.",
                         "%.1f", 0.0, 2.0),
+                Toggle("native_snow_cover", "Snow settles",
+                       "With the weather: falling snow settles on tree boughs, roofs, rocks and "
+                       "props, patchy at first, building over a few minutes, melting once it "
+                       "stops; less under cover, drifted against the windward foot of posts and "
+                       "walls."),
+                Toggle("native_drifting_snow", "Drifting snow",
+                       "With the weather: in a strong wind (a blizzard), loose snow streams "
+                       "along the slopes in ribbons and sheets, moving with the wind."),
                 SliderF("native_eye_adaptation", "Eye adaptation",
                         "HDR-style: the lighting brightens in the dark (night, forest) and "
                         "tones down in glare, easing over a second or two like eyes "
@@ -576,7 +605,33 @@ const std::vector<Tab>& Tabs() {
                        "them, instead of every frame. Turn off if geometry ever looks stale "
                        "or out of place."),
             }},
-           // What needs the clock: the sky, weather and wind (the rest of the
+           // The weather: its own switch, with dynamic time of day or without.
+           {"Weather",
+            {
+                Toggle("native_weather_effects", "Weather effects",
+                       "Grey skies (soft light, faint shadows), snow falling (lit by the lamps "
+                       "at night) and blizzards (wind and the fog closing in), with dynamic "
+                       "time of day on or off (off: at each mountain's own hour, its sky as the "
+                       "game has it). Off: always clear and still. Part of Revamped Graphics."),
+                Choices("native_weather", "Weather",
+                        "Grey skies (soft light, faint shadows), snow falling "
+                        "(lit by the lamps at night) and blizzards (wind and the fog closing in). "
+                        "Changing: each spell lasts a few minutes and eases into the next.",
+                        {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"},
+                         {"5", "Blizzard"}}),
+                SliderF("native_weather_minutes", "Weather spells",
+                        "Changing weather: about how many minutes each spell lasts.", "%.0f min",
+                        1.0, 120.0),
+                Toggle("native_wind_sway", "Wind in the trees",
+                       "The trees and their foliage sway in the wind, gently "
+                       "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "
+                       "across)."),
+                SliderF("native_wind_strength", "Wind strength",
+                        "How hard the wind blows, times the weather's own: the trees and "
+                        "banners swaying, loose snow drifting, the tracks worn away. 0: still "
+                        "air.", "%.1f", 0.0, 3.0),
+            }},
+           // What needs the clock: the sky and the hour (the rest of the
            // Revamped effects are above, lit for each mountain's own hour).
            {"Time of day",
             {
@@ -589,9 +644,16 @@ const std::vector<Tab>& Tabs() {
                        "hour it was made for and looks as the game has it then. Shadows follow "
                        "the sun and moon (riders and objects always; the world's with World "
                        "shadows baked). Native renderer only."),
-                SliderF("native_tod_start_hour", "Set the hour",
-                        "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
-                        -1.0, 24.0),
+                [] {
+                  Option o = SliderF("native_tod_start_hour", "Set the hour",
+                                     "Sets the clock to this hour. All the way left: Map default, "
+                                     "each mountain's own hour (as the game has it; shown in "
+                                     "brackets). With dynamic time of day running, the hour now is "
+                                     "shown too.",
+                                     nullptr, -1.0, 24.0);
+                  o.float_text = HourText;
+                  return o;
+                }(),
                 SliderF("native_tod_day_minutes", "Minutes per day",
                         "How many real minutes a whole day takes (0: the clock stands still).",
                         "%.0f min", 0.0, 240.0),
@@ -603,32 +665,12 @@ const std::vector<Tab>& Tabs() {
                 SliderF("native_tod_night_light", "Night brightness",
                         "How light the night is (1: moonlit snow you can ride by).", "%.1f",
                         0.2, 3.0),
-                Choices("native_weather", "Weather",
-                        "With time of day on: grey skies (soft light, faint shadows), snow falling "
-                        "(lit by the lamps at night) and blizzards (wind and the fog closing in). "
-                        "Changing: each spell lasts a few minutes and eases into the next.",
-                        {{"1", "Changing"}, {"2", "Clear"}, {"3", "Overcast"}, {"4", "Snowing"},
-                         {"5", "Blizzard"}}),
-                Toggle("native_snow_cover", "Snow settles",
-                       "With time of day on: falling snow settles on tree boughs, roofs, rocks and "
-                       "props, patchy at first, building over a few minutes, melting once it stops."),
                 SliderF("native_ice_halo", "Ice halo",
                         "With time of day on: a ring round the sun (22 degrees out) and the sun "
                         "dogs either side of it, when thin high cloud drifts over an otherwise "
                         "clear sky with the sun low to middling. Also a sun pillar with the sun "
                         "at the horizon in still air. 0: never.",
                         "%.1f", 0.0, 2.0),
-                Toggle("native_drifting_snow", "Drifting snow",
-                       "With time of day on: in a strong wind (a blizzard), loose snow streams "
-                       "along the slopes in low wisps, moving with the wind."),
-                Toggle("native_wind_sway", "Wind in the trees",
-                       "With time of day on: the trees and their foliage sway in the wind, gently "
-                       "when it's calm, hard in a blizzard (each tree its own way, gusts sweeping "
-                       "across)."),
-                SliderF("native_wind_strength", "Wind strength",
-                        "How hard the wind blows, times the weather's own: the trees and "
-                        "banners swaying, loose snow drifting, the tracks worn away. 0: still "
-                        "air.", "%.1f", 0.0, 3.0),
                 SliderF("native_cloud_shadows", "Cloud shadows",
                         "With time of day on: the clouds' shadows drift across the slopes "
                         "with the wind (the sky's own clouds, where they are). Needs the sun's "
@@ -1128,9 +1170,21 @@ void OptionsMenu::OnDraw(ImGuiIO& io) {
           lo = info->constraints.min.value_or(0.0);
           hi = info->constraints.max.value_or(1.0);
         }
+        std::string ftext;
+        if (o.float_text) {
+          for (char c : o.float_text(v)) {
+            ftext += c;
+            if (c == '%') ftext += '%';
+          }
+        }
         if (ImGui::SliderFloat("##v", &v, static_cast<float>(lo), static_cast<float>(hi),
-                               o.format ? o.format : "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+                               o.float_text ? ftext.c_str() : o.format ? o.format : "%.2f",
+                               ImGuiSliderFlags_AlwaysClamp)) {
           changed = true;
+          // (The hour: in quarter hours, below midnight the map's own.)
+          if (std::string_view(o.cvar) == "native_tod_start_hour") {
+            v = v < 0.0f ? -1.0f : std::round(v * 4.0f) / 4.0f;
+          }
           new_value = fmt::format("{:.3f}", v);
         }
         focused = ImGui::IsItemFocused() || ImGui::IsItemHovered();

@@ -129,6 +129,11 @@ float Stick(int16_t v) {
   return std::copysign(t * t, f);
 }
 
+bool GraphicsOpen() { return g_host.graphics_open && g_host.graphics_open(); }
+void OpenGraphics() {
+  if (g_host.open_graphics && !GraphicsOpen()) g_host.open_graphics();
+}
+
 class Overlay final : public rex::ui::ImGuiDialog {
  public:
   explicit Overlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
@@ -162,6 +167,7 @@ class Overlay final : public rex::ui::ImGuiDialog {
     if (!noclip || paused) items.push_back("LB RB / Z C: zoom");
     items.push_back("Y / R: back to the game's camera");
     items.push_back(noclip ? "D-pad down / N: view mode" : "D-pad down / N: noclip mode");
+    items.push_back("Start / G: graphics settings");
     const bool editor = night_lights::EditorOn();
     if (editor) {
       // The light editor's own controls (the camera's stay as they are).
@@ -231,6 +237,13 @@ class Overlay final : public rex::ui::ImGuiDialog {
 
  private:
   static void ReadKeys(ImGuiIO& io) {
+    // (The Graphics panel open over it: its keys, not the camera's.)
+    if (GraphicsOpen()) {
+      std::lock_guard lock(g_keys_mutex);
+      g_keys = Keys{};
+      return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_G, false)) OpenGraphics();
     auto down = [](ImGuiKey k) { return ImGui::IsKeyDown(k); };
     Keys k;
     k.move[0] = float(down(ImGuiKey_D)) - float(down(ImGuiKey_A));
@@ -510,6 +523,19 @@ void OnPad(const pad::Snapshot& pad) {
     return;
   }
   using namespace rex::input;
+  // The Graphics panel open: the camera holds still (the panel has the
+  // controller); Start (not in the light editor: undo) opens it.
+  if (GraphicsOpen()) {
+    native::Renderer::FreecamInput still;
+    still.active = true;
+    SendRenderer(still);
+    return;
+  }
+  if ((pressed & X_INPUT_GAMEPAD_START) && !night_lights::EditorOn() &&
+      !(pad.buttons & X_INPUT_GAMEPAD_BACK)) {
+    OpenGraphics();
+    return;
+  }
   Keys keys;
   {
     std::lock_guard lock(g_keys_mutex);
@@ -616,7 +642,12 @@ void OnPad(const pad::Snapshot& pad) {
     SetOn(false);  // (the editor with it)
     return;
   }
-  if (pressed & X_INPUT_GAMEPAD_BACK) help_bar::Toggle();
+  // (View with RB held is Revamped Graphics on or off, with Start the
+  // options menu: not the controls bar.)
+  if ((pressed & X_INPUT_GAMEPAD_BACK) &&
+      !(pad.buttons & (X_INPUT_GAMEPAD_RIGHT_SHOULDER | X_INPUT_GAMEPAD_START))) {
+    help_bar::Toggle();
+  }
   // Noclip with the game paused (its camera setup idle for a while): the
   // view mode around the last spot, until it runs again.
   // In a replay or the game's pause menu, too (the camera the game moves

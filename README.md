@@ -881,6 +881,23 @@ that rule against a save that has the pass.
   trees' twigs, drawn apart from their trunks): only a small sway and
   flutter, so the branches no longer break away from the trunk in a strong
   wind (the clustered trees still bend whole from their foot).
+- Weather on its own switch (Graphics > Weather: Weather Effects,
+  `native_weather_effects`, on; Options > Graphics > Weather): grey skies,
+  snowfall, blizzards and wind with dynamic time of day on or off. Off, at
+  each mountain's own hour: the game's sky and light kept, a grey spell
+  dimming its light and softening the sun's shadows near by (the game's own
+  painted shadows far off stay), the snow, wind, fog and settling snow as
+  with the time of day running. Off: always clear and still. Its settings
+  (Weather, Weather Spells, Wind in the Trees, Wind Strength) moved to a
+  Weather tab; Snow Settles and Drifting Snow to Effects.
+- Set the Hour shows the clock time ("14:15"); all the way left is Map
+  Default, the mountain's own hour (shown in brackets), and with dynamic
+  time of day running the hour now beside it. On the Graphics panel it
+  steps in quarter hours, Map Default just below midnight.
+- Graphics settings in the freecam: Start (or G) opens the Graphics panel
+  over the freecam's view; the camera holds still until it's closed.
+- Revamped Graphics from the controller: hold View + RB for half a second
+  (as F2).
 - Map clouds and the save notice: while the clouds part (into or out of
   the trail map) they cover the picture and the interface, but the save
   notice's draws are held back and drawn over them, so it shows whole.
@@ -1219,8 +1236,8 @@ it is. The file is plain text too (`subtitles\amped3.subtitles`, described in
 |---|---|
 | Back + Start (View + Menu), or F1 | Options menu |
 | In menu: D-pad or left stick / A / B / LB-RB | Move / change / close / switch tabs |
-| F2 | Revamped Graphics on or off (every enhancement at once, to compare with the original look; a notice shows which) |
-| F6, or tap both sticks in (L3 + R3) | Freecam: fly the camera around the scene, HUD hidden (native renderer). Two modes, D-pad down / N to switch: **noclip** (the default) moves the game's own camera, so the game draws the whole world around it - explore anywhere; **view** moves only the renderer's view of what the game drew (zoom works there). Pause first (Start) for a photo mode; while riding the game goes on underneath. Left stick / W A S D move (L3 / Shift: faster until the stick returns to neutral), right stick / arrows / right mouse look, LT RT / Q E down and up, LB RB / Z C zoom (view mode), X / Alt slower, Y / R back to the game's camera, View / H hides the controls bar, B / F6 / Esc leave. With the game paused or in a replay, noclip can't move the game's camera, so it flies on as view mode from the same spot until the game runs again. Switching modes keeps the camera where it is (no jump back to the rider). Hiding the controls bar hides it completely. The game only draws what its own camera sees, so flying far from it shows gaps |
+| F2, or hold View + RB (Back + RB) for half a second | Revamped Graphics on or off (every enhancement at once, to compare with the original look; a notice shows which) |
+| F6, or tap both sticks in (L3 + R3) | Freecam: fly the camera around the scene, HUD hidden (native renderer). Two modes, D-pad down / N to switch: **noclip** (the default) moves the game's own camera, so the game draws the whole world around it - explore anywhere; **view** moves only the renderer's view of what the game drew (zoom works there). Pause first (Start) for a photo mode; while riding the game goes on underneath. Left stick / W A S D move (L3 / Shift: faster until the stick returns to neutral), right stick / arrows / right mouse look, LT RT / Q E down and up, LB RB / Z C zoom (view mode), X / Alt slower, Y / R back to the game's camera, Start / G opens the Graphics settings over the scene (the camera holds still while they're open; B closes them), View / H hides the controls bar, B / F6 / Esc leave. With the game paused or in a replay, noclip can't move the game's camera, so it flies on as view mode from the same spot until the game runs again. Switching modes keeps the camera where it is (no jump back to the rider). Hiding the controls bar hides it completely. The game only draws what its own camera sees, so flying far from it shows gaps |
 | F7, or hold both sticks in (L3 + R3) for 0.6 s | Instant replay: the last 20 seconds of riding again (native renderer; setting `replay_seconds`, up to 60, and `replay_memory_mb`). While riding it pauses the game for you and resumes it after; from the pause menu it plays what came before the pause. A / Space play or pause, LB RB / [ ] slower or faster (1/8x to 2x), LT RT / Left Right scrub, Y / Home from the start, View / H hides the controls bar, B / Esc / F7 leave. The freecam works in the replay too (tap L3 + R3), flying around what the replay drew |
 | F8 | Camera scan (diagnostics, for the coming noclip freecam): where the game keeps its camera in memory, written to `logs\amped3_camera_scan_*.txt`. Best with the game paused |
 | F9 | Hang report: every thread's stack, written to `logs\amped3_hang_*.txt` (use when the game is stuck) |

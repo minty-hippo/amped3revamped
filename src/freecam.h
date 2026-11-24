@@ -34,6 +34,10 @@ struct Host {
   std::function<void(bool)> block_game_input;
   // The settings written to amped3.toml (the surface picker's corrections).
   std::function<void()> save_settings;
+  // The Graphics panel: opened over the freecam (Start / G), and whether
+  // it's open (the camera holds still meanwhile).
+  std::function<void()> open_graphics;
+  std::function<bool()> graphics_open;
 };
 
 void Install(Host host);

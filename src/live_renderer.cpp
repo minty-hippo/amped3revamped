@@ -256,6 +256,10 @@ REXCVAR_DEFINE_STRING(native_wind_cloth, "", "GPU",
                       "Time of day: more banners and flags for the wind to move, beyond the "
                       "known ones: their textures' hashes (16 hex digits each, as the texture "
                       "pack names them), separated by commas");
+REXCVAR_DEFINE_BOOL(native_weather_effects, true, "GPU",
+                    "Weather (with Revamped Graphics; with or without dynamic time of day): "
+                    "grey skies, snowfall, blizzards and wind, as native_weather sets them. "
+                    "Off: always clear and still");
 REXCVAR_DEFINE_BOOL(native_snow_cover, true, "GPU",
                     "Time of day: snow that falls settles on things (tree boughs, roofs, rocks, "
                     "props), building over a few minutes of snowfall and melting after");
@@ -803,6 +807,7 @@ std::thread g_prep_thread;
 std::atomic<bool> g_failed{false};
 std::atomic<bool> g_hide_interface{false};  // SetHideInterface
 std::atomic<float> g_tod_hour{-1.0f};        // TimeOfDayHour
+std::atomic<float> g_mountain_hour{-1.0f};   // MountainHour
 // SetFreecam: the input, its steps added up until the worker hands them on.
 std::mutex g_freecam_mutex;
 native::Renderer::FreecamInput g_freecam;
@@ -2544,17 +2549,25 @@ void WorkerMain() {
           // (Northstar before the Night Pass: its own hour, as the game has it.)
           const bool locked = night_pass::Locked();
           if (locked) tod_hour = renderer->MountainHour() >= 0.0f ? renderer->MountainHour() : tod_hour;
-          const bool running = REXCVAR_GET(native_dynamic_time_of_day) && !locked && !f->replay &&
-                               GameState() != 15 && dt > 0.0 && dt < 0.25;
+          g_mountain_hour = renderer->MountainHour();
+          // (The clock runs while the game does: for the hour with dynamic
+          // time of day, and for the weather either way.)
+          const bool ticking = !f->replay && GameState() != 15 && dt > 0.0 && dt < 0.25;
+          const bool dynamic = REXCVAR_GET(native_dynamic_time_of_day) && !locked;
+          // The weather: with Revamped Graphics, whether the time of day is
+          // dynamic or held at the mountain's own hour.
+          const bool weather_on = revamped && REXCVAR_GET(native_weather_effects) &&
+                                  (dynamic ? tod_hour >= 0.0 : renderer->MountainHour() >= 0.0f);
+          const bool running = ticking && (dynamic || weather_on);
           const double minutes = REXCVAR_GET(native_tod_day_minutes);
           if (running) {
             tod_seconds += dt;
-            if (minutes > 0.0 && tod_hour >= 0.0) {
+            if (dynamic && minutes > 0.0 && tod_hour >= 0.0) {
               tod_hour = std::fmod(tod_hour + dt * 24.0 / (minutes * 60.0), 24.0);
             }
           }
           native::Renderer::TimeOfDay tod;
-          tod.on = revamped && REXCVAR_GET(native_dynamic_time_of_day) && !locked && tod_hour >= 0.0;
+          tod.on = revamped && dynamic && tod_hour >= 0.0;
           tod.hour = float(std::max(tod_hour, 0.0));
           // (Off: its effects alone, at the mountain's own hour.)
           // (Always, with Revamped Graphics: the menu's switch for it is gone,
@@ -2564,12 +2577,13 @@ void WorkerMain() {
           tod.clouds = float(REXCVAR_GET(native_tod_clouds));
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));
           tod.seconds = float(std::fmod(tod_seconds, 100000.0));
-          // The weather: on with the time of day (as its clock runs).
+          // The weather: its own switch (as the clock runs), with the time of
+          // day dynamic or not.
           {
-            const int setting = tod.on ? int(REXCVAR_GET(native_weather)) : 0;
+            const int setting = weather_on ? int(REXCVAR_GET(native_weather)) : 0;
             WeatherStep(g_weather, setting, tod_seconds, running ? dt : 0.0,
                         REXCVAR_GET(native_weather_minutes));
-            if (tod.on) {
+            if (weather_on) {
               tod.overcast = g_weather.overcast;
               tod.snow = g_weather.snow;
               tod.snow_cover = REXCVAR_GET(native_snow_cover) ? g_weather.cover : 0.0f;
@@ -2606,7 +2620,8 @@ void WorkerMain() {
             tod.passive = true;
             tod.hour = renderer->MountainHour();
             tod.clouds = 0.0f;
-            tod.sway = false;
+            // (The wind in the trees with the weather; still without it.)
+            if (!weather_on) tod.sway = false;
           }
           renderer->SetTimeOfDay(tod);
           // (Only what the night lights use: copies to follow, the editor.)
@@ -3000,6 +3015,7 @@ bool Enabled() { return REXCVAR_GET(native_renderer) && !g_failed.load(); }
 
 void SetHideInterface(bool hide) { g_hide_interface = hide; }
 float TimeOfDayHour() { return g_tod_hour.load(); }
+float MountainHour() { return g_mountain_hour.load(); }
 void SetFreecam(const native::Renderer::FreecamInput& input) {
   std::lock_guard lock(g_freecam_mutex);
   const native::Renderer::FreecamInput old = g_freecam;
