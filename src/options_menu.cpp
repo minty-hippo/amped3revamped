@@ -830,6 +830,10 @@ const std::vector<Tab>& Tabs() {
                         "Landing leaning further than this from upright (tilted or upside "
                         "down) crashes; facing any way is fine.",
                         "%.0f deg", 20.0, 90.0),
+                SliderF("dynamic_spin_anchor", "Dynamic spin anchor",
+                        "Once you let go, how strongly the rider is drawn toward the nearest "
+                        "clean landing (0: not at all).",
+                        "%.2f", 0.0, 3.0),
                 SliderF("dynamic_spin_coast", "Dynamic spin coast",
                         "How long the rotation takes to slow after you let go (seconds).", "%.2f",
                         0.05, 1.5),

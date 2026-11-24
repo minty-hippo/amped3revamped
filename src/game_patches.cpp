@@ -965,7 +965,7 @@ std::atomic<int64_t> g_spin_active_ms{0};  // when the local rider last spun (st
 // really had (before the scale) and the scale for its next update: the
 // game's trick timed by how far ours has turned (see Amped3_DynamicSpin).
 std::atomic<uint32_t> g_dyn_substate{0};
-std::atomic<double> g_dyn_real_dt{0.0}, g_dyn_scale{1.0};
+std::atomic<double> g_dyn_real_dt{0.0}, g_dyn_scale{1.0}, g_dyn_trick_dt{0.0};
 std::atomic<int64_t> g_dyn_ms{0};
 struct StickHold {
   uint32_t controller = 0;
@@ -1260,9 +1260,6 @@ void Amped3_SpinUpdate(PPCRegister& r3, PPCRegister& f1) {
   // call-outs) advances only as far as ours has turned: this update's time
   // step scaled by our rate over the game's.
   g_dyn_real_dt.store(f1.f64);
-  if (s == g_dyn_substate.load() && SteadyMs() - g_dyn_ms.load() < 150) {
-    f1.f64 = f1.f64 * std::clamp(g_dyn_scale.load(), 0.0, 3.0);
-  }
   // A spin / flip's start: its blend in (+ 140 left of + 144) shortened,
   // the time left kept in proportion. (The game's is 0.4 s: the spin
   // gathers pace over that long before it turns at its rate.)
@@ -1304,6 +1301,25 @@ void Amped3_SpinUpdate(PPCRegister& r3, PPCRegister& f1) {
     st.trick = trick;
     st.blend_of = blend_of;
   }
+}
+
+// The rotate substate's trick timing (sub_82245B68, r3 the substate, f1 the
+// time step: its phases' animation, their events (the stance switch at a
+// 180, the trick's ending) and the 180s it counts): with dynamic spins,
+// scaled by how far ours turns the trick's way (see Amped3_DynamicSpin),
+// once a trick is under way. (The first try scaled the substate's other
+// update, sub_82246AB0, which only blends and poses: the trick still ran
+// at the game's own pace and a tap counted a whole 180.)
+void Amped3_TrickTime(PPCRegister& r3, PPCRegister& f1) {
+  if (!r3.u32 || r3.u32 != g_dyn_substate.load() || SteadyMs() - g_dyn_ms.load() > 150) {
+    g_dyn_trick_dt.store(f1.f64);
+    return;
+  }
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel) return;
+  uint8_t* base = kernel->memory()->virtual_membase();
+  if (int32_t(Load32(base, r3.u32 + 100)) >= 0) f1.f64 = f1.f64 * std::clamp(g_dyn_scale.load(), 0.0, 3.0);
+  g_dyn_trick_dt.store(f1.f64);
 }
 
 void Amped3_SpinOut(PPCRegister& r3, PPCRegister& r12) {
@@ -1356,6 +1372,9 @@ REXCVAR_DEFINE_DOUBLE(dynamic_spin_coast, 0.35, "Amped 3/Tuning",
 REXCVAR_DEFINE_DOUBLE(dynamic_spin_axis_deadzone, 0.25, "Amped 3/Tuning",
                       "Dynamic spins: each axis's own dead zone (share of full tilt), so a spin "
                       "held slightly off straight doesn't also flip; diagonals still combine");
+REXCVAR_DEFINE_DOUBLE(dynamic_spin_anchor, 1.0, "Amped 3/Tuning",
+                      "Dynamic spins: how strongly the rider is drawn toward the nearest clean "
+                      "landing once the stick's let go (0: not at all)");
 REXCVAR_DEFINE_DOUBLE(dynamic_spin_crash_angle, 50.0, "Amped 3/Tuning",
                       "Dynamic spins: landing leaning further than this from upright (degrees: "
                       "tilted or upside down; facing any way is fine) crashes");
@@ -1555,8 +1574,8 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   const uint32_t owner = Load32(base, s + 8);
   const uint32_t phys = owner ? Load32(base, owner + 20) : 0;
   if (!phys) return;
-  // (The update's real time step: with dynamic spins its own is scaled.)
-  const double game_dt = std::clamp(double(f30.f64), 0.0, 0.3);
+  // (The trick's time step this frame, scaled; the update's own is real.)
+  const double game_dt = std::clamp(g_dyn_trick_dt.load(), 0.0, 0.3);
   const double dt = std::clamp(g_dyn_real_dt.load(), 0.0, 0.1);
   const M3 game = Ortho(LoadRows(base, s + 224));
   const M3 b = Ortho(LoadRows(base, phys + 144));
@@ -1675,11 +1694,16 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   // (The easing's own turn, as spin / flip / roll rates, for the game's
   // trick below: easing on round to a clean 180 counts, easing back not.)
   double ease[3] = {0, 0, 0};
-  if (!held && turning < 1.2) {
+  // A soft anchor once the stick's let go: the rider is drawn toward the
+  // nearest clean landing (upright, facing either way) from any angle,
+  // gently while it still turns, firmly once slow and within 45 degrees.
+  const double anchor = std::clamp(REXCVAR_GET(dynamic_spin_anchor), 0.0, 3.0);
+  if (!held && anchor > 0.0) {
     const M3 target = NearestClean(r, kY);
     const double a = ToAxisAngle(Mul(target, T(r)), ax);
-    if (a < 0.785 && a > 1e-4 && dt > 1e-4) {
-      const double step = a * (1 - std::exp(-dt / 0.18));
+    const double tau = (turning < 1.2 && a < 0.785 ? 0.18 : 0.6) / anchor;
+    if (a > 1e-4 && dt > 1e-4) {
+      const double step = a * (1 - std::exp(-dt / tau));
       r = Mul(AxisAngle(ax, step), r);
       // (Its axis in the heading's frame; ours there: the spin + Y, the
       // flip and roll H^T side / forward.)

@@ -937,6 +937,9 @@ that rule against a save that has the pass.
   at, with its spacing scaled to match; Display > Screen > Menu size
   (`options_menu_scale`, 1) makes it bigger or smaller. It was ImGui's
   13-pixel default font in a fixed-size window: tiny at 1440p and up.
+  The F4 settings overlay (the SDK's) scales the same way, by SDK patch
+  `0026-settings-overlay-scale.patch` (`settings_overlay_scale`, 1; run
+  setup again so the SDK is rebuilt with it).
 - Dynamic spins, flips and rolls (`dynamic_spins`, on; Options >
   Enhancements > Riding): the game turns a rider in the air by animation,
   each spin or flip a trick at a fixed rate (about 245 degrees a second),
@@ -986,6 +989,20 @@ that rule against a save that has the pass.
     rider never made. Now only the turn the trick's way counts (the
     stick's direction when it started; the easing on round to a clean
     180 counts, easing back not).
+  - Fourth round: slight turns still scored 180s (and again for 360s): the
+    time scale went to the substate's pose update (sub_82246AB0), but the
+    trick is timed in its other update, sub_82245B68 (r3, f1 the time
+    step; its phases: -1 idle 82245ED0, 0 in 822460D0, 1 cycle 82246280,
+    2 out 822467E0, 3 revert 82246978), where its events (the stance
+    switch at each 180, sub_82246A28; the ending) and its 180s come. It's
+    scaled there now (hook at its start), once a trick is under way; the
+    pose update runs at its real time step. The stance switch firing at the
+    game's pace, ahead of the rider's real turn, is the likely cause of the
+    rider jumping to face the other way.
+  - A soft anchor once the stick's let go (`dynamic_spin_anchor`, 1): the
+    rider is drawn toward the nearest clean landing from any angle, gently
+    (0.6 s) while still turning, firmly (0.18 s) once slow and within 45
+    degrees.
   - How (from `trace_air_rotation`, which logs each update in the air: the
     stick, the trick, how fast the rider's world rotation and the trick's
     turn and about what): the trick's rotation is a matrix at + 224 (from

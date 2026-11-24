@@ -1,0 +1,51 @@
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -22,8 +22,29 @@
+ #include <string>
+ #include <vector>
+ 
++// amped3 patch 0026: the settings overlay sized from the display's height
++// (720p units), its font drawn at that size and its spacing scaled with it.
++REXCVAR_DEFINE_DOUBLE(settings_overlay_scale, 1.0, "UI",
++                      "Size of the settings overlay (F4): 1 fills about the same share of the "
++                      "screen at any resolution");
++
+ namespace rex::ui {
+ 
++namespace {
++// The scale for one draw of the overlay (restored when it goes).
++struct OverlayScale {
++  ImGuiStyle saved;
++  explicit OverlayScale(float unit) : saved(ImGui::GetStyle()) {
++    ImGui::GetStyle().ScaleAllSizes(unit);
++    ImGui::PushFont(nullptr, 15.0f * unit);
++  }
++  ~OverlayScale() {
++    ImGui::PopFont();
++    ImGui::GetStyle() = saved;
++  }
++};
++}  // namespace
++
+ SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
+     : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
+ 
+@@ -199,7 +220,17 @@
+   const std::string search(search_buf_);
+   const bool searching = !search.empty();
+ 
+-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  const float unit = std::max(display.y / 720.0f, 0.5f) *
++                     float(std::clamp(REXCVAR_GET(settings_overlay_scale), 0.5, 3.0));
++  OverlayScale overlay_scale(unit);
++  // (Sized again when the scale changes, else where the user left it.)
++  static float last_unit = 0.0f;
++  const ImGuiCond size_cond = unit != last_unit ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
++  last_unit = unit;
++  ImGui::SetNextWindowSize(ImVec2(std::min(760.0f * unit, display.x * 0.94f),
++                                  std::min(560.0f * unit, display.y * 0.92f)),
++                           size_cond);
+   ImGui::SetNextWindowBgAlpha(0.85f);
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();

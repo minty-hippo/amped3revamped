@@ -266,6 +266,13 @@ name = "Amped3_DynamicLanding"
 address = 0x822410B8
 registers = ["r3", "r31"]
 
+# The rotate substate's trick timing (sub_82245B68: r3 the substate, f1 the
+# time step): dynamic spins scale it by their own rotation.
+[[midasm_hook]]
+name = "Amped3_TrickTime"
+address = 0x82245B68
+registers = ["r3", "f1"]
+
 [[midasm_hook]]
 name = "Amped3_SpinUpdate"
 address = 0x82246AB0
