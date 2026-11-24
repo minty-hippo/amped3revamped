@@ -906,7 +906,9 @@ that rule against a save that has the pass.
   dimming before it stays under the map clouds (diagnostic `noticedbg` logs
   the interface draws' textures; `A3_NOTICE_TEX` adds hashes to try). Closing
   in over the last frame before the cut stays over everything, as before
-  (diagnostic `cloudsontop`: the notice under them too).
+  (diagnostic `cloudsontop`: the notice under them too). While the notice is up the parting clouds
+  hold still, and go on parting once the save is done and it's gone
+  (`noticenofreeze`: they keep parting).
 - Drifting snow: drawn after the upscaler (streaming over the ground with no
   motion of its own, it smeared and broke up through it), only on the
   ground (not riders, trunks or walls), with a smoother pattern (whole-

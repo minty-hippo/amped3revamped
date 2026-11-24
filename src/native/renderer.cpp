@@ -2840,6 +2840,8 @@ struct Renderer::Impl {
   std::vector<std::pair<const Draw*, uint32_t>> notice_draws_;
   bool replaying_notice_ = false;
   bool notice_started_ = false;  // this frame: the notice's draws begun (the rest of the frame is it)
+  bool notice_last_frame_ = false;  // the notice was up last frame: the clouds hold where they are
+  std::chrono::steady_clock::time_point clouds_last_update_{};
   bool IsSaveNotice(const Draw& d, const GpuState& st);
   // The game's own cloud puff (128x128, the pause menu's): found among the
   // textures the game uses (by its contents), or loaded from the file kept
@@ -18418,6 +18420,13 @@ void Renderer::Impl::UpdateClouds() {
   if (clouds_updated_) return;  // (once a frame: under the interface, or at the output)
   clouds_updated_ = true;
   const auto now = std::chrono::steady_clock::now();
+  // The save notice up (last frame): the parting clouds hold still until
+  // it's gone (their clock moved on by the time it was up), then go on.
+  if (notice_last_frame_ && cloud_active_ && !cloud_closing_ && clouds_last_update_ != decltype(now){} &&
+      !Diag("noticenofreeze")) {
+    cloud_start_ += now - clouds_last_update_;
+  }
+  clouds_last_update_ = now;
   if (!light_seen_) {
     // A loading screen (or anything else without the scene) for long enough:
     // what comes next is judged afresh.
@@ -18951,6 +18960,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   composite_seen_ = false;
   clouds_updated_ = clouds_drawn_ = false;
   composite_rt_ = nullptr;
+  notice_last_frame_ = notice_started_;
   notice_started_ = false;
   max_draws_ = max_draws;
   up_done_ = false;
