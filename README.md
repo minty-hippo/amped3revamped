@@ -931,6 +931,12 @@ that rule against a save that has the pass.
   the poll's hook at 0x82377E00) keeps its last firm direction through a
   dip that short; letting go for longer ends the spin as before. The local
   rider is learned from the tuck, so it applies once you've tucked.
+- The F1 options menu is sized from the display's height, like the
+  Graphics panel (720p units: it fills about the same share of the screen
+  at any resolution), in the panel's font baked near the size it's drawn
+  at, with its spacing scaled to match; Display > Screen > Menu size
+  (`options_menu_scale`, 1) makes it bigger or smaller. It was ImGui's
+  13-pixel default font in a fixed-size window: tiny at 1440p and up.
 - Dynamic spins, flips and rolls (`dynamic_spins`, on; Options >
   Enhancements > Riding): the game turns a rider in the air by animation,
   each spin or flip a trick at a fixed rate (about 245 degrees a second),

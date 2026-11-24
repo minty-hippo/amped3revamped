@@ -32,12 +32,17 @@
 #endif
 
 #include "challenges.h"
+#include "graphics_panel.h"
 #include "cutscenes.h"
 #include "live_renderer.h"
 #include "pad_bridge.h"
 #include "version.h"
 
 namespace amped3 {
+
+REXCVAR_DEFINE_DOUBLE(options_menu_scale, 1.0, "Amped 3",
+                      "Size of the F1 options menu (1: the same share of the screen at any "
+                      "resolution)");
 
 namespace {
 
@@ -164,6 +169,10 @@ const std::vector<Tab>& Tabs() {
        {
            {"Screen",
             {
+                SliderF("options_menu_scale", "Menu size",
+                        "The size of this menu: 1 fills about the same share of the screen at "
+                        "any resolution.",
+                        "%.2f", 0.6, 2.0),
                 Toggle("fullscreen", "Fullscreen",
                        "Borderless fullscreen on the current monitor."),
                 Choices("resolution", "Output resolution",
@@ -1079,16 +1088,36 @@ void OptionsMenu::OnClose() {
   }
 }
 
+// Sized from the display's height (720p units, as the Graphics panel), by
+// options_menu_scale: the font baked near the size it's drawn at and the
+// style's spacing scaled with it, for this window only.
+namespace {
+struct MenuScale {
+  ImGuiStyle saved;
+  explicit MenuScale(float unit, float px) : saved(ImGui::GetStyle()) {
+    ImGui::GetStyle().ScaleAllSizes(unit);
+    ImGui::PushFont(amped3::UiFont(px), px);
+  }
+  ~MenuScale() {
+    ImGui::PopFont();
+    ImGui::GetStyle() = saved;
+  }
+};
+}  // namespace
+
 void OptionsMenu::OnDraw(ImGuiIO& io) {
   FeedGamepad(io);
+  const float unit = std::max(io.DisplaySize.y / 720.0f, 0.5f) *
+                     float(std::clamp(REXCVAR_GET(options_menu_scale), 0.5, 3.0));
+  MenuScale scale(unit, 16.0f * unit);
   if (!popup_was_open_ && !ImGui::IsAnyItemActive() &&
       ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
     Close();
   }
 
   const ImVec2 display = io.DisplaySize;
-  const ImVec2 size(std::min(display.x * 0.9f, std::max(720.0f, display.x * 0.5f)),
-                    std::min(display.y * 0.9f, std::max(480.0f, display.y * 0.6f)));
+  const ImVec2 size(std::min(display.x * 0.94f, 820.0f * unit),
+                    std::min(display.y * 0.92f, 560.0f * unit));
   ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always,
                           ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(size, ImGuiCond_Always);
