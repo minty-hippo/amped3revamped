@@ -666,7 +666,15 @@ that rule against a save that has the pass.
     Each quarter-size pixel reads the eight probes round it by its normal,
     probes behind its surface and those inside something left out or
     weighed less. A quarter of the rays per frame of the pixel version,
-    and smooth and steady by construction (`gipixel`: the pixel version). A ray that hits something takes off the sky light
+    and smooth and steady by construction (`gipixel`: the pixel version).
+    Bright spots on open snow came from probes close to the ground: their
+    nearly flat rays met the snow beside them (the voxels' steps) and took
+    it for lit snow; a probe's hits nearer than two voxels are passed
+    through now. Probes under the ground (the voxels are only the surfaces,
+    so beneath the snow is empty) are left out: something above in their
+    column and nothing below. Probes behind a pixel's surface no longer
+    count at all, and a pixel with only a few faint probes round it gets
+    less of the light instead of theirs scaled up. A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps

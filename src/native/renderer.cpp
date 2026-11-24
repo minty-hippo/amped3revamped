@@ -7482,6 +7482,24 @@ void main() {
   ivec3 v = ivec3(floor(rel));
   bool inside = all(greaterThanEqual(v, ivec3(0))) && all(lessThan(v, ivec3(N))) &&
                 (((k0Col(v.xz)[v.y >> 5]) >> uint(v.y & 31)) & 1u) != 0u;
+  // Or under the ground: the voxels are only the surfaces, so beneath the
+  // snow is empty too, and such a probe's rays meet the snow's underside
+  // and take it for lit snow (bright spots on the ground above). Told by
+  // its column: something above it and nothing below.
+  if (!inside && all(greaterThanEqual(v, ivec3(0))) && all(lessThan(v, ivec3(N)))) {
+    uvec4 cw = k0Col(v.xz);
+    bool below = false, above = false;
+    for (int w = 0; w < 4; ++w) {
+      int b0 = w * 32;
+      uint m = cw[w];
+      if (m == 0u) continue;
+      uint lowm = v.y > b0 + 31 ? 0xFFFFFFFFu : v.y <= b0 ? 0u : ((1u << uint(v.y - b0)) - 1u);
+      uint highm = v.y < b0 ? 0xFFFFFFFFu : v.y >= b0 + 31 ? 0u : ~((2u << uint(v.y - b0)) - 1u);
+      below = below || (m & lowm) != 0u;
+      above = above || (m & highm) != 0u;
+    }
+    inside = above && !below;
+  }
   if (inside) {
     o = vec4(0.0, 0.0, 0.0, -tag);
     return;
@@ -7497,7 +7515,7 @@ void main() {
     float r = sqrt(u1);
     vec3 D = normalize(T * (r * cos(ph)) + Bt * (r * sin(ph)) + Nn * sqrt(max(1.0 - u1, 0.0)));
     vec3 n;
-    float tt = Trace(P, D, 0.0, 400.0, 0, ivec2(80, 48), n);
+    float tt = Trace(P, D, 2.0 * kBox[0].w, 400.0, 0, ivec2(80, 48), n);
     if (tt < 0.0) continue;
     vec3 H = P + D * tt;
     float hv = tt < float(N) * kBox[0].w * 0.5 ? kBox[0].w : kBox[1].w;
@@ -7649,11 +7667,12 @@ void main() {
     vec3 dir = (vec3(wi) + 0.5) * g.w - P;
     float dl = length(dir);
     float facing = dl > 1e-3 ? dot(dir / dl, Nn) * 0.5 + 0.5 : 1.0;
-    w *= max(0.05, facing * facing);
+    w *= facing * facing;
     sum += val * w;
     ws += w;
   }
-  vec3 e = ws > 1e-4 ? sum / ws : vec3(0.0);
+  // (Few or faint probes to go by: less of it, not theirs blown up.)
+  vec3 e = sum / max(ws, 0.3);
   float dist = length(P - cam.xyz);
   e *= 1.0 - smoothstep(float(dims.x) * g.w * 0.35, float(dims.x) * g.w * 0.5, dist);
   o = vec4(e, d);
