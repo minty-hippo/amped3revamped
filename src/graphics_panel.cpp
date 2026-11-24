@@ -146,6 +146,7 @@ const std::vector<Tab>& Tabs() {
       {"Display",
        {
            {"fullscreen", "Fullscreen", Kind::kFullscreen},
+           {"native_low_latency", "Low Latency"},
            {"native_precompile", "Precompile on Loading"},
            {"native_load_continue", "Press X After Loading"},
            {"frame_rate_limit", "Frame Rate", Kind::kStops, 0, 0, 0,
@@ -491,6 +492,9 @@ std::string GraphicsPanel::Hint(const Row& r) const {
                   : "Native renderer only (Options F1 > Native renderer).";
   }
   if (name == "revamped_graphics") return "Every enhancement at once (controller: hold View + RB).";
+  if (name == "native_low_latency") {
+    return "When the GPU is the limit: the freshest frame, shown as soon as it's done (less input lag).";
+  }
   if (name == "native_weather_effects") {
     return "Grey skies, snow and blizzards, wind: with dynamic time of day on or off.";
   }

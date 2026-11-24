@@ -600,6 +600,12 @@ const std::vector<Tab>& Tabs() {
                         "air round them. Thicker in mist, under a grey sky and in falling snow. "
                         "Replaces the god rays while on. 0: off.",
                         "%.1f", 0.0, 2.0),
+                Toggle("native_low_latency", "Low latency",
+                       "When the GPU is the bottleneck: the renderer takes the game's next "
+                       "frame just in time for the GPU to start on it as the last one finishes "
+                       "(the freshest controller input, nothing waiting in the GPU's queue), "
+                       "and shows each frame as soon as it's done. Cuts the delay from a button "
+                       "press to the screen. The log reports the latency every few seconds."),
                 Toggle("native_vertex_cache", "Reuse unchanged vertex data",
                        "Copies the game's vertex buffers only when the game has written to "
                        "them, instead of every frame. Turn off if geometry ever looks stale "

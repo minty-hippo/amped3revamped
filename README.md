@@ -898,6 +898,17 @@ that rule against a save that has the pass.
   over the freecam's view; the camera holds still until it's closed.
 - Revamped Graphics from the controller: hold View + RB for half a second
   (as F2).
+- Low latency (Graphics > Display: Low Latency, `native_low_latency`, on):
+  input felt delayed (jumps late off the lip, spins starting late), and
+  worse at 30 fps: the delay was the frames in the pipeline. Each frame was
+  shown only after the next one had been recorded, and with the GPU the
+  bottleneck (about 17 ms a frame on an Arc iGPU) a recorded frame waited
+  in the GPU's queue behind the last. Now, when the GPU is the limit, the
+  worker waits and takes the game's newest frame just in time for its work
+  to reach the GPU as the last frame's finishes (the freshest input; the
+  same frame rate), and that last frame is shown as soon as it's done. The
+  log reports the latency, game frame to window, every few seconds
+  ("latency, the game's frame to the window").
 - Map clouds and the save notice: while the clouds part (into or out of
   the trail map) they cover the picture and the interface, but the save
   notice's draws are held back and drawn over them, so it shows whole.

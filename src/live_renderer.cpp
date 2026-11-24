@@ -256,6 +256,11 @@ REXCVAR_DEFINE_STRING(native_wind_cloth, "", "GPU",
                       "Time of day: more banners and flags for the wind to move, beyond the "
                       "known ones: their textures' hashes (16 hex digits each, as the texture "
                       "pack names them), separated by commas");
+REXCVAR_DEFINE_BOOL(native_low_latency, true, "GPU",
+                    "Native renderer: low latency. When the GPU is the bottleneck, the next "
+                    "frame is taken from the game just in time for the GPU to start on it as "
+                    "the last one finishes (the freshest controller input, no frame waiting in "
+                    "the GPU's queue), and each finished frame is shown at once.");
 REXCVAR_DEFINE_BOOL(native_weather_effects, true, "GPU",
                     "Weather (with Revamped Graphics; with or without dynamic time of day): "
                     "grey skies, snowfall, blizzards and wind, as native_weather sets them. "
@@ -2026,6 +2031,10 @@ bool GammaLut(uint32_t front_format, uint8_t lut[768]) {
 struct Timings {
   double record = 0;  // game thread: the recording hooks
   double states = 0, prepass = 0, draw = 0, gpu = 0, output = 0, present = 0, total = 0;
+  // From the game's swap of a frame to its picture handed to the window (ms
+  // summed, frames, the worst), and the low-latency wait before a frame.
+  double latency = 0, latency_worst = 0, paced = 0;
+  uint32_t latency_frames = 0;
   uint32_t frames = 0, recorded = 0;
   // Hitches: worker frames over kSlowFrameMs, and the worst one's cause.
   uint32_t slow = 0;
@@ -2093,6 +2102,11 @@ void LogTimings(bool shared) {
       t.recorded ? g_draw_ms_total[4] / t.recorded : 0.0, t.total / n, t.states / n,
       t.prepass / n, t.draw / n, t.gpu / n, t.present / n,
       shared ? "shared image" : "through the CPU");
+  if (t.latency_frames) {
+    REXLOG_INFO("Native renderer: latency, the game's frame to the window: {:.1f} ms average, "
+                "{:.1f} worst; low-latency wait {:.2f} ms a frame",
+                t.latency / t.latency_frames, t.latency_worst, t.paced / n);
+  }
   const uint64_t hit = g_vcache_stats.hit_bytes.exchange(0);
   const uint64_t copied = g_vcache_stats.copy_bytes.exchange(0);
   if (hit + copied) {
@@ -2256,7 +2270,12 @@ void WorkerMain() {
     bool valid = false;
     uint64_t ticket = 0;
     native::OutputInfo info;
+    Clock::time_point swap_time{};    // when the game swapped it
+    Clock::time_point submit_time{};  // when its GPU work was submitted
   } pending;
+  // Low latency (native_low_latency): the worker's recording time and the
+  // GPU's time per frame (smoothed), for taking the next frame just in time.
+  double est_record_ms = 0.0, est_gpu_ms = 0.0;
 
   double last_gpu_wait = 0;  // the last WaitFrame (ms)
   auto present_pending = [&]() {
@@ -2264,7 +2283,11 @@ void WorkerMain() {
     pending.valid = false;
     const double gpu_ms = renderer->WaitFrame(pending.ticket);
     last_gpu_wait = gpu_ms;
-    perf::ReportGpuFrame(renderer->GpuFrameMs(pending.ticket));
+    {
+      const double g = renderer->GpuFrameMs(pending.ticket);
+      perf::ReportGpuFrame(g);
+      if (g > 0.0 && g < 200.0) est_gpu_ms = est_gpu_ms > 0.0 ? est_gpu_ms * 0.9 + g * 0.1 : g;
+    }
     {
       const auto parts = renderer->GpuParts(pending.ticket);
       if (!parts.empty()) {
@@ -2296,6 +2319,15 @@ void WorkerMain() {
     }
     if (ok) {
       perf::ReportPresented();
+      if (pending.swap_time != Clock::time_point{}) {
+        const double lat = std::chrono::duration<double, std::milli>(Clock::now() - pending.swap_time).count();
+        if (lat > 0.0 && lat < 1000.0) {
+          std::lock_guard lock(g_timing_mutex);
+          g_timings.latency += lat;
+          ++g_timings.latency_frames;
+          g_timings.latency_worst = std::max(g_timings.latency_worst, lat);
+        }
+      }
       if (!presenting) {
         presenting = true;
         SetMessage("");
@@ -2325,6 +2357,24 @@ void WorkerMain() {
         if (f) RecycleBlobs(*f);
       }
     } recycle{f};
+    // Low latency: the GPU the bottleneck, the next frame taken just in time
+    // for its work to reach the GPU as the last frame's finishes (the
+    // freshest frame, its input the newest; none waiting in the GPU's queue).
+    // The last frame is shown as soon as it's done meanwhile.
+    if (pending.valid && renderer && REXCVAR_GET(native_low_latency) && est_gpu_ms > 0.0 && est_record_ms > 0.0) {
+      const double margin = 1.5;  // (ms: the estimates' error, the submit)
+      const double lead = est_gpu_ms - est_record_ms - margin;
+      if (lead > 0.5) {
+        const auto start_at = pending.submit_time + std::chrono::microseconds(int64_t(lead * 1000.0));
+        const auto t_wait = Clock::now();
+        if (start_at > t_wait) {
+          native::PhaseScope phase("low latency: waiting to take the game's freshest frame");
+          std::this_thread::sleep_until(start_at);
+          std::lock_guard lock(g_timing_mutex);
+          g_timings.paced += since(t_wait);
+        }
+      }
+    }
     {
       std::unique_lock lock(g_work_mutex);
       auto ready = [] { return g_stop.load() || g_work != nullptr; };
@@ -2779,12 +2829,19 @@ void WorkerMain() {
           REXLOG_WARN("Native renderer: {} ({} in the first frame showing it)", why, n);
         }
       }
+      // (The worker's time to this frame's submit, for the low-latency pacing.)
+      {
+        const double rec = since(t0) - last_gpu_wait;
+        if (rec > 0.0 && rec < 200.0) est_record_ms = est_record_ms > 0.0 ? est_record_ms * 0.9 + rec * 0.1 : rec;
+      }
       // Show the previous frame (its GPU work ran while this one was recorded).
       present_pending();
       if (stats.output_drawn) {
         pending.valid = true;
         pending.ticket = stats.ticket;
         pending.info = info;
+        pending.swap_time = f->swap_time;
+        pending.submit_time = Clock::now();
       } else {
         // No front-buffer picture (what a resolve put there, this frame or an
         // earlier one, or what the CPU wrote): the emulated image is shown
