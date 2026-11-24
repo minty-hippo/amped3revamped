@@ -1357,8 +1357,8 @@ REXCVAR_DEFINE_DOUBLE(dynamic_spin_axis_deadzone, 0.25, "Amped 3/Tuning",
                       "Dynamic spins: each axis's own dead zone (share of full tilt), so a spin "
                       "held slightly off straight doesn't also flip; diagonals still combine");
 REXCVAR_DEFINE_DOUBLE(dynamic_spin_crash_angle, 50.0, "Amped 3/Tuning",
-                      "Dynamic spins: landing further than this from clean (degrees: tilted, "
-                      "upside down or sideways) crashes");
+                      "Dynamic spins: landing leaning further than this from upright (degrees: "
+                      "tilted or upside down; facing any way is fine) crashes");
 REXCVAR_DEFINE_BOOL(trace_air_rotation, false, "Amped 3/Diagnostics",
                     "Log the local rider's rotation in the air every update (with dynamic spins "
                     "off: the game's own): the stick, the trick, how fast the rider's base frame "
@@ -1475,6 +1475,8 @@ struct DynSpin {
   M3 game_prev = Ident();
   bool game_ok = false;
   double game_rate = 4.28;  // the game's trick animation (radians a second)
+  int32_t dir_trick = -1;   // the trick its direction is for
+  double dir[3] = {0, 0, 0};  // the game's trick's way, in spin / flip / roll
 } g_dyn;
 std::mutex g_dyn_mutex;
 
@@ -1670,16 +1672,35 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   // (upright, facing either way along the heading), eased in.
   static const double kY[3] = {0, 1, 0};
   double ax[3];
+  // (The easing's own turn, as spin / flip / roll rates, for the game's
+  // trick below: easing on round to a clean 180 counts, easing back not.)
+  double ease[3] = {0, 0, 0};
   if (!held && turning < 1.2) {
     const M3 target = NearestClean(r, kY);
     const double a = ToAxisAngle(Mul(target, T(r)), ax);
-    if (a < 0.785 && a > 1e-4) r = Mul(AxisAngle(ax, a * (1 - std::exp(-dt / 0.18))), r);
+    if (a < 0.785 && a > 1e-4 && dt > 1e-4) {
+      const double step = a * (1 - std::exp(-dt / 0.18));
+      r = Mul(AxisAngle(ax, step), r);
+      // (Its axis in the heading's frame; ours there: the spin + Y, the
+      // flip and roll H^T side / forward.)
+      const M3 ht = T(h);
+      double sh[3], fh[3];
+      for (int i = 0; i < 3; ++i) {
+        sh[i] = ht.m[i][0] * side_ax[0] + ht.m[i][1] * side_ax[1] + ht.m[i][2] * side_ax[2];
+        fh[i] = ht.m[i][0] * fwd[0] + ht.m[i][1] * fwd[1] + ht.m[i][2] * fwd[2];
+      }
+      const double w = step / dt;
+      ease[0] = w * ax[1];
+      ease[1] = w * (ax[0] * sh[0] + ax[1] * sh[1] + ax[2] * sh[2]);
+      ease[2] = w * (ax[0] * fh[0] + ax[1] * fh[1] + ax[2] * fh[2]);
+    }
   }
   r = Ortho(r);
   if (!Finite(r)) return;
-  // How far off a clean landing (for the landing's crash, see
-  // Amped3_DynamicLanding).
-  d.off_clean = ToAxisAngle(Mul(NearestClean(r, kY), T(r)), ax);
+  // How far the rider leans from upright (its up against the heading's:
+  // the game's own test, CrashThreshold; facing any way is fine), for the
+  // landing's crash (Amped3_DynamicLanding).
+  d.off_clean = std::acos(std::clamp(r.m[1][1], -1.0, 1.0));
 
   // The game's trick timed by ours: its animation's rate (measured in the
   // cycle, once blended in: there + 224 is its pose alone) against how fast
@@ -1692,7 +1713,23 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   }
   d.game_prev = game;
   d.game_ok = pure;
-  g_dyn_scale.store(d.game_rate > 0.5 ? turning / d.game_rate : 1.0);
+  // Only the turn the way the trick goes counts (its direction: the stick's
+  // when it started), so a tap that turns a little and eases back doesn't
+  // run the trick on to a 180 the rider never made.
+  if (trick < 0) {
+    d.dir_trick = -1;
+  } else if (trick != d.dir_trick) {
+    d.dir_trick = trick;
+    double u[3] = {spin_target, flip_target, roll_target};
+    double n = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    if (n < 1e-6) {
+      u[0] = d.spin, u[1] = d.flip, u[2] = d.roll;
+      n = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    }
+    for (int i = 0; i < 3; ++i) d.dir[i] = n > 1e-6 ? u[i] / n : 0.0;
+  }
+  const double along = (d.spin + ease[0]) * d.dir[0] + (d.flip + ease[1]) * d.dir[1] + (d.roll + ease[2]) * d.dir[2];
+  g_dyn_scale.store(d.game_rate > 0.5 ? std::max(along, 0.0) / d.game_rate : 1.0);
   g_dyn_substate.store(s);
   g_dyn_ms.store(now);
 
@@ -1721,7 +1758,7 @@ void Amped3_DynamicLanding(PPCRegister& r3, PPCRegister& r31) {
   }
   const bool crash = off > std::clamp(REXCVAR_GET(dynamic_spin_crash_angle), 5.0, 180.0) / 57.2958;
   if (REXCVAR_GET(trace_dynamic_spins)) {
-    REXLOG_INFO("dynamic spins: landing {:.0f} degrees off clean: {} (the game's own: {})", off * 57.2958,
+    REXLOG_INFO("dynamic spins: landing leaning {:.0f} degrees: {} (the game's own: {})", off * 57.2958,
                 crash ? "crash" : "landed", (r3.u32 & 0xFF) ? "crash" : "landed");
   }
   r3.u64 = crash ? 1 : 0;

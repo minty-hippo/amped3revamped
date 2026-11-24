@@ -818,8 +818,8 @@ const std::vector<Tab>& Tabs() {
                         "flip also spins). Diagonals past it still combine.",
                         "%.2f", 0.0, 0.6),
                 SliderF("dynamic_spin_crash_angle", "Dynamic spin crash angle",
-                        "Landing further than this from clean (tilted, upside down or "
-                        "sideways) crashes.",
+                        "Landing leaning further than this from upright (tilted or upside "
+                        "down) crashes; facing any way is fine.",
                         "%.0f deg", 20.0, 90.0),
                 SliderF("dynamic_spin_coast", "Dynamic spin coast",
                         "How long the rotation takes to slow after you let go (seconds).", "%.2f",

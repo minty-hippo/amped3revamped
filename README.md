@@ -972,8 +972,14 @@ that rule against a save that has the pass.
     sub_822481F8: in a trick the trick decides, after one the rotation's
     up against CrashThreshold, otherwise never) let odd angles through.
     Hooked after both asks (0x82241060, 0x822410B8), dynamic spins answer:
-    further than `dynamic_spin_crash_angle` (50 degrees) from a clean
-    landing (tilted, upside down or sideways) crashes.
+    leaning further than `dynamic_spin_crash_angle` (50 degrees) from
+    upright crashes (tilted or upside down; the first version also counted
+    facing sideways, against the heading, and crashed upright landings).
+  - Taps: a tap started the game's trick, and its timing counted any turn,
+    the easing back to clean included, so the trick ran on to a 180 the
+    rider never made. Now only the turn the trick's way counts (the
+    stick's direction when it started; the easing on round to a clean
+    180 counts, easing back not).
   - How (from `trace_air_rotation`, which logs each update in the air: the
     stick, the trick, how fast the rider's world rotation and the trick's
     turn and about what): the trick's rotation is a matrix at + 224 (from
