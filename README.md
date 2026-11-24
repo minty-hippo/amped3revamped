@@ -907,6 +907,13 @@ that rule against a save that has the pass.
   MinSpeedSquaredForJumpZone, + 476), a held jump (+ 608) fires only once
   the zone (+ 612) is left (+ 609); now it fires at once, the zone kept for
   the jump. `trace_jump_zone` logs each one.
+- Spin trace (diagnostic `trace_spin`): the air state's rotate substate
+  (spins and flips) runs each trick as animations in phases (in, cycle, out;
+  sub_82246AB0 its update, sub_82246580 its ending at a clean 180 / 360);
+  every change of phase or trick is logged with the sticks, and each ending
+  with what called it, to see what cuts a spin short and how long a push
+  takes to show. Its revert to a clean landing is already frame-rate
+  independent (sub_822289A8 eases by the time step).
 - Low latency (Graphics > Display: Low Latency, `native_low_latency`, on):
   input felt delayed (jumps late off the lip, spins starting late), and
   worse at 30 fps: the delay was the frames in the pipeline. Each frame was

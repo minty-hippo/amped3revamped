@@ -243,3 +243,16 @@ registers = ["r3", "f1"]
 name = "Amped3_JumpZoneHeld"
 address = 0x82232EA4
 registers = ["r31"]
+
+# --- Diagnostics (src/game_patches.cpp, trace_spin): the rotate substate's
+# update (sub_82246AB0, at its start: r3 = the substate, f1 = the time step)
+# and its trick ending (sub_82246580, after "mflr r12": r12 = the caller) ----
+[[midasm_hook]]
+name = "Amped3_SpinUpdate"
+address = 0x82246AB0
+registers = ["r3", "f1"]
+
+[[midasm_hook]]
+name = "Amped3_SpinOut"
+address = 0x82246584
+registers = ["r3", "r12"]

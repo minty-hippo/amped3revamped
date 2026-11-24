@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1144,4 +1145,77 @@ void Amped3_JumpZoneHeld(PPCRegister& r31) {
   if (!REXCVAR_GET(jump_zone_immediate)) return;
   base[ground + 608] = 0;
   base[ground + 609] = 1;
+}
+
+// ---- Spin trace (setting trace_spin, diagnostics) -------------------------
+//
+// The air state's rotate substate (spins and flips) runs a trick as
+// animations in phases (+ 100: 0 in, 1 cycle, 2 out; + 104 the trick, -1
+// none; + 140 / + 144 the blend into it, left / of). Its update is
+// sub_82246AB0 (r3 = the substate, f1 = the time step); sub_82246580 (the
+// trick's "out", ending it at a clean 180 / 360) is logged with its caller.
+// Each change is logged with the stick, to see what turns a spin into its
+// ending and how long a push takes to show.
+
+REXCVAR_DEFINE_BOOL(trace_spin, false, "Amped 3/Diagnostics",
+                    "Log the spin / flip substate's phases and tricks with the controller's sticks.");
+
+namespace {
+struct SpinTrace {
+  uint32_t substate = 0;
+  int32_t phase = -9, trick = -9;
+  std::chrono::steady_clock::time_point start{};
+  int lines = 0;
+} g_spin;
+std::mutex g_spin_mutex;
+
+double SpinNow() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_spin.start).count();
+}
+std::string Sticks() {
+  const auto p = amped3::pad::Latest();
+  return fmt::format("L {:+.2f} {:+.2f}  R {:+.2f} {:+.2f}  buttons {:04X}", p.lx / 32767.0,
+                     p.ly / 32767.0, p.rx / 32767.0, p.ry / 32767.0, p.buttons);
+}
+}  // namespace
+
+void Amped3_SpinUpdate(PPCRegister& r3, PPCRegister& f1) {
+  if (!REXCVAR_GET(trace_spin) || !r3.u32) return;
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel) return;
+  uint8_t* base = kernel->memory()->virtual_membase();
+  const uint32_t s = r3.u32;
+  // (The local rider's only, when it's known: the substate's rider at + 12
+  // as the other substates have it.)
+  const uint32_t local = g_tuck_rider.load();
+  const uint32_t owner = Load32(base, s + 8);
+  std::lock_guard lock(g_spin_mutex);
+  auto& t = g_spin;
+  if (t.start == std::chrono::steady_clock::time_point{}) t.start = std::chrono::steady_clock::now();
+  const int32_t phase = int32_t(Load32(base, s + 100)), trick = int32_t(Load32(base, s + 104));
+  if (t.lines > 3000) return;
+  if (s != t.substate || phase != t.phase || trick != t.trick) {
+    ++t.lines;
+    REXLOG_INFO("spin {:.3f}: substate {:08X} (owner {:08X}, local rider {:08X}) phase {} trick {} "
+                "blend {:.3f} of {:.3f}, dt {:.4f}; {}",
+                SpinNow(), s, owner, local, phase, trick, LoadF32(base, s + 140),
+                LoadF32(base, s + 144), f1.f64, Sticks());
+    t.substate = s;
+    t.phase = phase;
+    t.trick = trick;
+  }
+}
+
+void Amped3_SpinOut(PPCRegister& r3, PPCRegister& r12) {
+  if (!REXCVAR_GET(trace_spin) || !r3.u32) return;
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel) return;
+  uint8_t* base = kernel->memory()->virtual_membase();
+  std::lock_guard lock(g_spin_mutex);
+  if (g_spin.lines > 3000) return;
+  ++g_spin.lines;
+  REXLOG_INFO("spin {:.3f}: OUT (ending at a clean turn) substate {:08X} phase {} trick {}, called "
+              "from {:08X}; {}",
+              SpinNow(), r3.u32, int32_t(Load32(base, r3.u32 + 100)),
+              int32_t(Load32(base, r3.u32 + 104)), r12.u32, Sticks());
 }
