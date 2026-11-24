@@ -7527,8 +7527,12 @@ void main() {
   }
   vec3 T = abs(Nn.y) < 0.9 ? normalize(cross(Nn, vec3(0.0, 1.0, 0.0))) : vec3(1.0, 0.0, 0.0);
   vec3 Bt = cross(Nn, T);
-  float rnd = fract(52.9829189 * fract(dot(vec2(t) + float(frame) * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
-  int rays = fine ? max(int(kSet.x) * 3 / 5, 4) : int(kSet.x);  // (the fine grid: 6 of 10)
+  // (Each probe face's rays the same every time it's traced, turned its own
+  // way: new rays each time made every probe's light wander a little at
+  // each pass, and the shade on open snow swam and pulsed with the camera
+  // still. Its neighbours' different rays average out in the reading.)
+  float rnd = fract(52.9829189 * fract(dot(vec2(t), vec2(0.06711056, 0.00583715))));
+  int rays = fine ? max(int(kSet.x) * 4 / 5, 4) : int(kSet.x);  // (the fine grid: 8 of 10)
   vec3 sum = vec3(0.0);
   for (int i = 0; i < rays; ++i) {
     float u1 = fract((float(i) + 0.5) / float(rays) + rnd * 0.37);
@@ -7543,7 +7547,9 @@ void main() {
     sum += Radiance(H, n, hv) * kSet.z - Sky(D) * kSet.y;
   }
   vec3 e = sum / float(rays);
-  o = vec4(same && old.a > 0.0 ? mix(old.rgb, e, 0.12) : e, tag);
+  // (Blended in still, for the light changing: the sun moving, the voxels
+  // updated.)
+  o = vec4(same && old.a > 0.0 ? mix(old.rgb, e, 0.2) : e, tag);
 }
 )", true);
   // World-space light, 3: its half-size result blurred one way (9 taps,
