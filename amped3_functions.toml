@@ -254,6 +254,18 @@ name = "Amped3_DynamicSpin"
 address = 0x82246C94
 registers = ["r31", "f30"]
 
+# The landing's crash test (sub_82241040), right after each of its two asks
+# of the rotate substate (sub_822481F8): dynamic spins answer instead (r3).
+[[midasm_hook]]
+name = "Amped3_DynamicLanding"
+address = 0x82241060
+registers = ["r3", "r31"]
+
+[[midasm_hook]]
+name = "Amped3_DynamicLanding"
+address = 0x822410B8
+registers = ["r3", "r31"]
+
 [[midasm_hook]]
 name = "Amped3_SpinUpdate"
 address = 0x82246AB0

@@ -961,6 +961,12 @@ REXCVAR_DEFINE_INT32(spin_stick_grace, 70, "Amped 3/Tuning",
 
 namespace {
 std::atomic<int64_t> g_spin_active_ms{0};  // when the local rider last spun (steady ms)
+// Dynamic spins: the local substate they run on, the time step its update
+// really had (before the scale) and the scale for its next update: the
+// game's trick timed by how far ours has turned (see Amped3_DynamicSpin).
+std::atomic<uint32_t> g_dyn_substate{0};
+std::atomic<double> g_dyn_real_dt{0.0}, g_dyn_scale{1.0};
+std::atomic<int64_t> g_dyn_ms{0};
 struct StickHold {
   uint32_t controller = 0;
   float x = 0, y = 0;
@@ -1250,6 +1256,13 @@ void Amped3_SpinUpdate(PPCRegister& r3, PPCRegister& f1) {
   if (!kernel) return;
   uint8_t* base = kernel->memory()->virtual_membase();
   const uint32_t s = r3.u32;
+  // Dynamic spins: the game's trick (its animation, so its 180s and their
+  // call-outs) advances only as far as ours has turned: this update's time
+  // step scaled by our rate over the game's.
+  g_dyn_real_dt.store(f1.f64);
+  if (s == g_dyn_substate.load() && SteadyMs() - g_dyn_ms.load() < 150) {
+    f1.f64 = f1.f64 * std::clamp(g_dyn_scale.load(), 0.0, 3.0);
+  }
   // A spin / flip's start: its blend in (+ 140 left of + 144) shortened,
   // the time left kept in proportion. (The game's is 0.4 s: the spin
   // gathers pace over that long before it turns at its rate.)
@@ -1343,6 +1356,9 @@ REXCVAR_DEFINE_DOUBLE(dynamic_spin_coast, 0.35, "Amped 3/Tuning",
 REXCVAR_DEFINE_DOUBLE(dynamic_spin_axis_deadzone, 0.25, "Amped 3/Tuning",
                       "Dynamic spins: each axis's own dead zone (share of full tilt), so a spin "
                       "held slightly off straight doesn't also flip; diagonals still combine");
+REXCVAR_DEFINE_DOUBLE(dynamic_spin_crash_angle, 50.0, "Amped 3/Tuning",
+                      "Dynamic spins: landing further than this from clean (degrees: tilted, "
+                      "upside down or sideways) crashes");
 REXCVAR_DEFINE_BOOL(trace_air_rotation, false, "Amped 3/Diagnostics",
                     "Log the local rider's rotation in the air every update (with dynamic spins "
                     "off: the game's own): the stick, the trick, how fast the rider's base frame "
@@ -1453,6 +1469,12 @@ struct DynSpin {
   int32_t trick_last = -1;
   double spin = 0, flip = 0, roll = 0;  // rates now (radians a second)
   double turned = 0;                    // this jump's total turn (radians)
+  double pos[3] = {}, fwd[3] = {1, 0, 0};  // where the rider was, which way it travels
+  bool fwd_ok = false;
+  double off_clean = 0;  // radians from a clean landing
+  M3 game_prev = Ident();
+  bool game_ok = false;
+  double game_rate = 4.28;  // the game's trick animation (radians a second)
 } g_dyn;
 std::mutex g_dyn_mutex;
 
@@ -1531,7 +1553,9 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   const uint32_t owner = Load32(base, s + 8);
   const uint32_t phys = owner ? Load32(base, owner + 20) : 0;
   if (!phys) return;
-  const double dt = std::clamp(double(f30.f64), 0.0, 0.1);
+  // (The update's real time step: with dynamic spins its own is scaled.)
+  const double game_dt = std::clamp(double(f30.f64), 0.0, 0.3);
+  const double dt = std::clamp(g_dyn_real_dt.load(), 0.0, 0.1);
   const M3 game = Ortho(LoadRows(base, s + 224));
   const M3 b = Ortho(LoadRows(base, phys + 144));
   if (!Finite(game) || !Finite(b)) return;
@@ -1572,9 +1596,7 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
   d.trick_last = trick;
 
   // The stick, past a dead zone; its tilt the rate. Full tilt is the
-  // game's own rate (about 245 degrees a second both ways). Left on the
-  // stick spins about the heading's up (+ Y), up flips about the rider's
-  // own + Z the other way (as the game's tricks 23 / 13 / 2 turn).
+  // game's own rate (about 245 degrees a second).
   const auto pad = amped3::pad::Latest();
   const double sx = pad.lx / 32767.0, sy = pad.ly / 32767.0;
   const double mag = std::sqrt(sx * sx + sy * sy);
@@ -1590,13 +1612,10 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
     return a <= axis_dead ? 0.0 : std::copysign((a - axis_dead) / (1 - axis_dead), v);
   };
   const double rate = 4.28 * std::max(REXCVAR_GET(dynamic_spin_speed), 0.0);
-  // (Up on the stick a front flip: the opposite way to the game's trick 13
-  // as first read.)
-  // LB held: left / right on the stick rolls (a barrel roll about the
-  // rider's own X) instead of spinning.
+  // Left / right spins (LB held: rolls), up a front flip, down a back flip.
   const bool lb = (pad.buttons & 0x0100) != 0;
-  const double side = -axis(sx) * rate;
-  const double spin_target = lb ? 0.0 : side, roll_target = lb ? side : 0.0;
+  const double spin_target = lb ? 0.0 : -axis(sx) * rate;
+  const double roll_target = lb ? axis(sx) * rate : 0.0;
   const double flip_target = axis(sy) * rate;
   if (held) {
     const double e = 1 - std::exp(-dt / 0.06);
@@ -1609,25 +1628,102 @@ void Amped3_DynamicSpin(PPCRegister& r31, PPCRegister& f30) {
     d.flip *= e;
     d.roll *= e;
   }
-  static const double kX[3] = {1, 0, 0}, kY[3] = {0, 1, 0}, kZ[3] = {0, 0, 1};
-  // Relative to the heading: the spin on the left (about its up), the flip
-  // and roll on the right (the rider's own axes).
-  M3 r = Mul(T(h), d.world);
-  r = Mul(AxisAngle(kY, d.spin * dt), r);
-  r = Mul(r, AxisAngle(kZ, d.flip * dt));
-  r = Mul(r, AxisAngle(kX, d.roll * dt));
-  const double turning = std::fabs(d.spin) + std::fabs(d.flip) + std::fabs(d.roll);
+  // The axes in the world, from the way the rider travels (not its own
+  // axes, which face the other way in a switch stance: a front flip was a
+  // back flip after an odd number of 180s): the spin about the heading's
+  // up, the flip about up x forward (its top toward the way it goes), the
+  // roll about forward. Forward: the travel, level with the heading (its
+  // position over the last update), else the heading's own.
+  double up[3] = {h.m[0][1], h.m[1][1], h.m[2][1]};
+  double fwd[3] = {h.m[0][0], h.m[1][0], h.m[2][0]};
+  {
+    const double p[3] = {LoadF32(base, phys + 64), LoadF32(base, phys + 68), LoadF32(base, phys + 72)};
+    if (!fresh && dt > 1e-4 && std::isfinite(p[0] + p[1] + p[2])) {
+      double v[3] = {(p[0] - d.pos[0]) / dt, (p[1] - d.pos[1]) / dt, (p[2] - d.pos[2]) / dt};
+      const double vu = v[0] * up[0] + v[1] * up[1] + v[2] * up[2];
+      for (int i = 0; i < 3; ++i) v[i] -= vu * up[i];
+      const double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+      if (n > 1.0) {
+        for (int i = 0; i < 3; ++i) d.fwd[i] = v[i] / n;
+        d.fwd_ok = true;
+      }
+    }
+    for (int i = 0; i < 3; ++i) d.pos[i] = p[i];
+    if (fresh) d.fwd_ok = false;
+    if (d.fwd_ok)
+      for (int i = 0; i < 3; ++i) fwd[i] = d.fwd[i];
+  }
+  double side_ax[3] = {up[1] * fwd[2] - up[2] * fwd[1], up[2] * fwd[0] - up[0] * fwd[2],
+                       up[0] * fwd[1] - up[1] * fwd[0]};
+  {
+    const double n = std::sqrt(side_ax[0] * side_ax[0] + side_ax[1] * side_ax[1] + side_ax[2] * side_ax[2]);
+    for (double& v : side_ax) v /= std::max(n, 1e-9);
+  }
+  M3 w = d.world;
+  w = Mul(AxisAngle(up, d.spin * dt), w);
+  w = Mul(AxisAngle(side_ax, d.flip * dt), w);
+  w = Mul(AxisAngle(fwd, d.roll * dt), w);
+  M3 r = Mul(T(h), w);
+  const double turning = std::sqrt(d.spin * d.spin + d.flip * d.flip + d.roll * d.roll);
   d.turned += turning * dt;
   // Let go and turning slowly: within 45 degrees of a clean landing
   // (upright, facing either way along the heading), eased in.
+  static const double kY[3] = {0, 1, 0};
+  double ax[3];
   if (!held && turning < 1.2) {
-    double ax[3];
     const M3 target = NearestClean(r, kY);
     const double a = ToAxisAngle(Mul(target, T(r)), ax);
     if (a < 0.785 && a > 1e-4) r = Mul(AxisAngle(ax, a * (1 - std::exp(-dt / 0.18))), r);
   }
   r = Ortho(r);
   if (!Finite(r)) return;
+  // How far off a clean landing (for the landing's crash, see
+  // Amped3_DynamicLanding).
+  d.off_clean = ToAxisAngle(Mul(NearestClean(r, kY), T(r)), ax);
+
+  // The game's trick timed by ours: its animation's rate (measured in the
+  // cycle, once blended in: there + 224 is its pose alone) against how fast
+  // ours turns. Its 180s then come as ours reach them.
+  const int32_t phase = int32_t(Load32(base, s + 100));
+  const bool pure = phase == 1 && LoadF32(base, s + 140) <= 0.0f && base[s + 345] == 0 && trick >= 0;
+  if (pure && d.game_ok && game_dt > 1e-3) {
+    const double a = ToAxisAngle(Mul(game, T(d.game_prev)), ax);
+    if (a > 1e-3 && a < 0.6) d.game_rate += (std::clamp(a / game_dt, 1.0, 12.0) - d.game_rate) * 0.2;
+  }
+  d.game_prev = game;
+  d.game_ok = pure;
+  g_dyn_scale.store(d.game_rate > 0.5 ? turning / d.game_rate : 1.0);
+  g_dyn_substate.store(s);
+  g_dyn_ms.store(now);
+
   d.world = Mul(h, r);
   StoreRows(base, s + 224, r);
 }
+
+// The landing's crash test (sub_82241040 asks the rotate substate,
+// sub_822481F8: in a trick the trick decides, after one the rotation's up
+// below CrashThreshold, else never): with dynamic spins it's how far the
+// rider is from a clean landing (upright, facing either way along its
+// heading), past dynamic_spin_crash_angle a crash, whatever the game's
+// trick underneath thinks. Hooked right after both calls (r3 the answer,
+// r31 the air state, its rotate substate at + 240).
+void Amped3_DynamicLanding(PPCRegister& r3, PPCRegister& r31) {
+  if (!REXCVAR_GET(dynamic_spins) || !r31.u32) return;
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel) return;
+  uint8_t* base = kernel->memory()->virtual_membase();
+  const uint32_t s = Load32(base, r31.u32 + 240);
+  if (!s || s != g_dyn_substate.load() || SteadyMs() - g_dyn_ms.load() > 300) return;
+  double off;
+  {
+    std::lock_guard lock(g_dyn_mutex);
+    off = g_dyn.off_clean;
+  }
+  const bool crash = off > std::clamp(REXCVAR_GET(dynamic_spin_crash_angle), 5.0, 180.0) / 57.2958;
+  if (REXCVAR_GET(trace_dynamic_spins)) {
+    REXLOG_INFO("dynamic spins: landing {:.0f} degrees off clean: {} (the game's own: {})", off * 57.2958,
+                crash ? "crash" : "landed", (r3.u32 & 0xFF) ? "crash" : "landed");
+  }
+  r3.u64 = crash ? 1 : 0;
+}
+

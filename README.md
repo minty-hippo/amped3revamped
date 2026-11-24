@@ -957,6 +957,23 @@ that rule against a save that has the pass.
     crashes past CrashThreshold 0.71, 45 degrees); now + 160 is read
     directly. Flips were the wrong way round (up on the stick is a front
     flip now).
+  - Third round: flips still swapped direction partway through a run (they
+    turned about the rider's own axis, which faces the other way in a
+    switch stance), so the axes are now taken from the way the rider
+    travels: the spin about the heading's up, the flip about up x forward
+    (front: its top toward the way it goes), the roll about forward;
+    forward is the rider's travel over the last update (physics + 64, its
+    position), levelled.
+  - The game's trick (its animation, so its 180 / 360 call-outs) is timed
+    by ours: the rotate substate's update gets its time step scaled by how
+    fast ours turns over the game's animation rate (measured in its cycle),
+    so a 180 counts only when the rider has turned 180.
+  - Landings: the game's test (sub_82241040 asks the substate,
+    sub_822481F8: in a trick the trick decides, after one the rotation's
+    up against CrashThreshold, otherwise never) let odd angles through.
+    Hooked after both asks (0x82241060, 0x822410B8), dynamic spins answer:
+    further than `dynamic_spin_crash_angle` (50 degrees) from a clean
+    landing (tilted, upside down or sideways) crashes.
   - How (from `trace_air_rotation`, which logs each update in the air: the
     stick, the trick, how fast the rider's world rotation and the trick's
     turn and about what): the trick's rotation is a matrix at + 224 (from
