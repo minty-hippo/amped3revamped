@@ -884,8 +884,10 @@ that rule against a save that has the pass.
 - Map clouds and the save notice: while the clouds part (into or out of
   the trail map) they cover the picture and the interface, but the save
   notice's draws are held back and drawn over them, so it shows whole.
-  The notice is told by its texture (diagnostic `noticedbg` logs the
-  interface draws' textures; `A3_NOTICE_TEX` adds hashes to try). Closing
+  The notice is told by its own puffs of cloud (its first draws: from them
+  on, the rest of the frame is the notice, its box and text); the screen's
+  dimming before it stays under the map clouds (diagnostic `noticedbg` logs
+  the interface draws' textures; `A3_NOTICE_TEX` adds hashes to try). Closing
   in over the last frame before the cut stays over everything, as before
   (diagnostic `cloudsontop`: the notice under them too).
 - Drifting snow: drawn after the upscaler (streaming over the ground with no

@@ -2839,6 +2839,7 @@ struct Renderer::Impl {
   // its draws held back while they part, drawn again after them.
   std::vector<std::pair<const Draw*, uint32_t>> notice_draws_;
   bool replaying_notice_ = false;
+  bool notice_started_ = false;  // this frame: the notice's draws begun (the rest of the frame is it)
   bool IsSaveNotice(const Draw& d, const GpuState& st);
   // The game's own cloud puff (128x128, the pause menu's): found among the
   // textures the game uses (by its contents), or loaded from the file kept
@@ -18304,11 +18305,15 @@ void Renderer::Impl::UploadCloudSprite() {
 // The save notice's draws (identified by their texture; the hashes logged
 // with diagnostic "noticedbg" or the A3_NOTICE_TEX list, hex).
 bool Renderer::Impl::IsSaveNotice(const Draw& d, const GpuState& st) {
-  static const uint64_t kNoticeTextures[] = {0};  // (filled in from a capture)
+  // The notice's own puffs of cloud (its first draws; not the HUD's): from
+  // them on, all of it (the puffs, its black box, the text). The screen's
+  // dimming just before them stays under the map clouds.
+  static const uint64_t kNoticeTextures[] = {0xd3694399f575a068ull};
+  if (notice_started_) return true;
   const uint64_t h = DrawTextureHash(d, st, 0);
   if (Diag("noticedbg")) std::fprintf(stderr, "notice? texture %016llx count %u\n", (unsigned long long)h, d.count);
   for (uint64_t k : kNoticeTextures) {
-    if (k && h == k) return true;
+    if (k && h == k) return notice_started_ = true;
   }
   if (static const char* env = std::getenv("A3_NOTICE_TEX"); env) {
     char hx[24];
@@ -18943,6 +18948,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   composite_seen_ = false;
   clouds_updated_ = clouds_drawn_ = false;
   composite_rt_ = nullptr;
+  notice_started_ = false;
   max_draws_ = max_draws;
   up_done_ = false;
   up_result_ = nullptr;
