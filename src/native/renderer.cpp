@@ -13459,20 +13459,20 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   // 26 + 2 i (where, how far it reaches), 27 + 2 i (its light), up to 8.
   {
     const double dark = LightsDark();
-    std::vector<std::pair<double, size_t>> near;
+    std::vector<std::pair<double, size_t>> close_by;
     if (dark > 0.001 && !Diag("ginolamps")) {
       for (size_t i = 0; i < lights_.size(); ++i) {
         const Renderer::NightLight& l = lights_[i];
         if (l.preview) continue;
         double d2 = 0;
         for (int k = 0; k < 3; ++k) d2 += (l.pos[k] - cam_pos_[k]) * (l.pos[k] - cam_pos_[k]);
-        if (d2 < 150.0 * 150.0) near.push_back({d2, i});
+        if (d2 < 150.0 * 150.0) close_by.push_back({d2, i});
       }
-      std::sort(near.begin(), near.end());
+      std::sort(close_by.begin(), close_by.end());
     }
-    const int n = int(std::min<size_t>(near.size(), 8));
+    const int n = int(std::min<size_t>(close_by.size(), 8));
     for (int j = 0; j < n; ++j) {
-      const Renderer::NightLight& l = lights_[near[size_t(j)].second];
+      const Renderer::NightLight& l = lights_[close_by[size_t(j)].second];
       for (int k = 0; k < 3; ++k) {
         f[(26 + 2 * j) * 4 + k] = l.pos[k];
         f[(27 + 2 * j) * 4 + k] = float(l.color[k] * l.intensity * dark);
