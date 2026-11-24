@@ -657,7 +657,12 @@ that rule against a save that has the pass.
     it moves (each slot holds the probe whose world index matches it,
     tagged, so one scrolled in starts afresh), each with six faces (the
     light onto a surface facing +x, -x, +y, -y, +z, -z), 12 rays a face,
-    an eighth of them traced again each frame and blended in (a fifth new).
+    an eighth of them traced again each frame and blended in (a fifth new):
+    an eighth of the probe texture's rows (two layers of probes), the rest
+    copied over. (Picking the due probes texel by texel, spread through
+    the texture, cost 12-15 ms on an Intel Arc iGPU: every group of
+    texels the GPU runs together held one, so every group waited on a
+    full trace every frame.)
     Each quarter-size pixel reads the eight probes round it by its normal,
     probes behind its surface and those inside something left out or
     weighed less. A quarter of the rays per frame of the pixel version,

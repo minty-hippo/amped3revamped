@@ -7471,11 +7471,9 @@ void main() {
   float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
   vec4 old = texelFetch(b2, t, 0);
   bool same = abs(abs(old.a) - tag) < 0.25;
-  bool due = !same || ((wi.x + wi.y * 3 + wi.z * 5 + face) & 7) == (frame & 7);
-  if (!due) {
-    o = old;
-    return;
-  }
+  // (Only this frame's band of rows is drawn: the rest copied as they were.
+  // Picking the due ones per texel instead left every wave of the GPU's
+  // waiting on its slowest, all of them busy every frame.)
   vec3 P = (vec3(wi) + 0.5) * g.w;
   vec3 Nn = vec3(0.0);
   Nn[face >> 1] = (face & 1) == 0 ? 1.0 : -1.0;
@@ -13130,7 +13128,7 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   f[21 * 4 + 3] = float(kProbeSpacing);
   f[22 * 4 + 3] = float(frame_number_ % 4096);
   f[20 * 4 + 1] = temporal ? 1.0f : 0.0f;
-  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : probes ? 12.0f : temporal ? 6.0f : 8.0f;  // rays
+  f[19 * 4 + 0] = Diag("gimany") ? 32.0f : probes ? 10.0f : temporal ? 6.0f : 8.0f;  // rays
   f[19 * 4 + 1] = Diag("ginosky") ? 0.0f : 1.0f;    // the sky's light taken off
   f[19 * 4 + 2] = Diag("ginoput") ? 0.0f : 1.0f;    // the hits' light put on
   f[19 * 4 + 3] = float(frame_number_ % 64);
@@ -13172,9 +13170,19 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     }
     const int nxt = 1 - gi_probe_cur_;
     float pp[8] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), 1.0f, 0, 0, 0, 0};
+    // An eighth of the rows (two layers of probes) traced again a frame, the
+    // rest copied over.
     Barrier();
+    VkImageCopy all{};
+    all.srcSubresource = all.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    all.extent = {pw, ph, 1};
+    vk::vkCmdCopyImage(cb_, gi_probe_[gi_probe_cur_].image, VK_IMAGE_LAYOUT_GENERAL, gi_probe_[nxt].image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &all);
+    Barrier();
+    const uint32_t bands = 8, band_h = ph / bands;
+    const VkRect2D band{{0, int32_t((frame_number_ % bands) * band_h)}, {pw, band_h}};
     FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
-                   nullptr, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
+                   &band, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
                    &gi_params_);
     Barrier();
     gi_probe_cur_ = nxt;
