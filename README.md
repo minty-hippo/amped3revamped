@@ -587,8 +587,14 @@ that rule against a save that has the pass.
   what's in front of them.
   Drifting snow (Drifting Snow, `native_drifting_snow`): in a strong wind
   (from about 5 m/s, a blizzard's gale at its thickest) loose snow streams
-  along the slopes in low wisps, stretched along the wind and moving with it,
-  gusts coming and going, veiling the slope's texture under them.
+  along the slopes: broad streaky sheets with thin, winding ribbons and
+  finer threads over them, each racing downwind at its own speed (the
+  lowest slowest), bending, splitting and merging as they go, thick in the
+  gusts that sweep through and thin between. They soften the slope's
+  texture under them and catch the light; farther off and at a glancing
+  view they thicken into a low pale haze, and ribbons too fine to draw fade
+  into it rather than shimmer. Only on smooth snowy ground (not the trees'
+  needles, riders or walls).
   Lamps, fires and other small bright things glow (Time of Day: Light Glow,
   `native_bloom`, 0.5): a soft bloom, strongest at night and faint by day.
   Only what's brighter than its surroundings glows, so broad lit snow and

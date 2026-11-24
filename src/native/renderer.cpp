@@ -8119,8 +8119,9 @@ void main() {
 }
 )", true);
   // Drifting snow: in a strong wind the loose snow streams along the slopes
-  // in low wisps (stretched along the wind, moving with it), a pale veil
-  // over the snowy ground, thicker in a gale.
+  // in thin, winding ribbons a hand's height off the ground (spindrift),
+  // racing with the wind, splitting and merging as they go, coming in gusts;
+  // far off, where the ribbons are too fine to see, a low pale haze.
   copy_fs_[52] = CompileBuiltin("builtin_drift", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D depth;  // (the render's size: the scene may be upscaled)
@@ -8132,24 +8133,47 @@ layout(push_constant) uniform Drift {
 layout(location = 0) out vec4 o;
 // (Whole-number cells hashed as integers: the same pattern however far out
 // on the mountain, no float hash breaking up into blocks.)
-float hash(ivec2 c) {
+uint hashu(ivec2 c) {
   uvec2 q = uvec2(c) * uvec2(1597334673u, 3812015801u);
   uint n = (q.x ^ q.y) * 1597334673u;
   n ^= n >> 16;
   n *= 2246822519u;
   n ^= n >> 13;
-  return float(n & 0xFFFFFFu) / 16777216.0;
+  return n;
 }
-float noise(vec2 p) {
+vec2 grad(ivec2 c) {
+  float a = float(hashu(c) & 0xFFFFu) * (6.2831853 / 65536.0);
+  return vec2(cos(a), sin(a));
+}
+// Gradient noise, -0.7..0.7 or so (smooth ridges where it crosses zero, no
+// value noise's diagonal blocks).
+float gnoise(vec2 p) {
   vec2 fl = floor(p);
   ivec2 i = ivec2(fl);
   vec2 f = p - fl;
-  vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + ivec2(1, 0)), u.x), mix(hash(i + ivec2(0, 1)), hash(i + ivec2(1, 1)), u.x), u.y);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  float a = dot(grad(i), f), b = dot(grad(i + ivec2(1, 0)), f - vec2(1, 0));
+  float c = dot(grad(i + ivec2(0, 1)), f - vec2(0, 1)), d = dot(grad(i + ivec2(1, 1)), f - vec2(1, 1));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 vec3 World(vec2 uv, float d) {
   vec4 wp = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - d, 1.0);
   return wp.xyz / wp.w;
+}
+// One layer of ribbons: thin lines where a stretched noise crosses zero
+// (long along the wind, narrow across it), carried along at its speed,
+// bent by a slower, broader noise so they wind and change as they go. Fades
+// to its average where its ribbons get finer than a few pixels.
+float Ribbons(float u, float v, float t, float speed, float across, float along, float fp, float seed) {
+  float bend = gnoise(vec2((u - t * speed * 0.55) * 0.045, v * 0.09 + seed)) * 2.2 +
+               gnoise(vec2((u - t * speed * 0.8) * 0.11, v * 0.25 + seed * 1.7)) * 0.7;
+  float n = gnoise(vec2((u - t * speed) * along, (v + bend) * across + seed * 3.1));
+  // (A ribbon's width: about a sixth of the spacing; softened by the pixel's
+  // size so it doesn't shimmer.)
+  float wdt = 0.14 + fp * across * 0.6;
+  float r = 1.0 - smoothstep(0.0, wdt, abs(n));
+  float seen = smoothstep(1.2, 4.0, 1.0 / (across * fp));
+  return mix(0.3, r, seen);
 }
 void main() {
   ivec2 ip = ivec2(gl_FragCoord.xy);
@@ -8170,30 +8194,61 @@ void main() {
   vec3 n = cross(Px - P, Py - P);
   float nl = length(n);
   if (nl < 1e-8) return;
-  float level = smoothstep(0.3, 0.55, abs(n.y) / nl);  // (steep slopes too; not walls, riders, trunks)
-  float dist = length(P - pc.cam.xyz);
+  n /= nl;
+  float level = smoothstep(0.3, 0.55, abs(n.y));  // (steep slopes too; not walls, riders, trunks)
+  // (And smooth: the ground a pixel to the other side in line with this
+  // one, not the broken depth of a tree's needles or a rider's edge.)
+  float dmx = texelFetch(depth, max(dp - ivec2(1, 0), ivec2(0)), 0).r;
+  if (dmx <= 0.0) return;
+  vec3 Pmx = World(duv - vec2(1.0 / float(ds.x), 0.0), dmx);
+  level *= smoothstep(0.35, 0.15, length((Px - P) - (P - Pmx)) / max(length(Px - P), 1e-4));
+  vec3 toP = P - pc.cam.xyz;
+  float dist = length(toP);
   float lum = dot(c.rgb, vec3(0.3, 0.59, 0.11));
-  // (On the snow: light, grey ground; not too near or far.)
-  float snowy = smoothstep(0.2, 0.4, lum) * smoothstep(0.25, 0.1, max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)));
-  float fade = smoothstep(3.0, 8.0, dist) * smoothstep(130.0, 60.0, dist);
+  // (On the snow: light, grey ground; not right underfoot or out at the haze.)
+  float snowy = smoothstep(0.15, 0.35, lum) * smoothstep(0.25, 0.1, max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)));
+  float fade = smoothstep(1.5, 5.0, dist) * smoothstep(180.0, 90.0, dist);
   float where = snowy * fade * level;
   if (where <= 0.0) return;
+  // (The ground a pixel covers, in metres, across the screen: the finest
+  // ribbon worth drawing.)
+  float fp = max(length(Px - P), length(Py - P));
   vec2 wd = pc.w.xy;
   vec2 wn = vec2(-wd.y, wd.x);
   float t = pc.cam.w;
-  // Along the wind (moving with it, a little slower than the air) and
-  // across it (long, soft streaks), two scales; patches that come and go.
   float u = dot(P.xz, wd), v = dot(P.xz, wn);
-  float sp = pc.w.z * 0.6;
-  float n1 = noise(vec2((u - t * sp) * 0.22, v * 1.3)) * 0.6 +
-             noise(vec2((u - t * sp * 1.25) * 0.55, v * 3.1 + 7.0)) * 0.4;
-  float g = noise(vec2((u - t * sp * 0.4) * 0.03, v * 0.03 + 3.0));
-  float wisp = smoothstep(0.5 - 0.2 * pc.w.w, 0.9, n1) * smoothstep(0.25, 0.75, g);
-  float a = wisp * where * min(1.0, 0.35 + pc.w.w) * 0.75;
-  // (The streaming snow hides the slope's texture under it: its own even,
-  // light color, a little brighter than the ground's.)
-  vec3 veil = vec3(0.97, 0.98, 1.0) * min(lum * 1.22 + 0.07, 1.05);
-  o = vec4(mix(c.rgb, veil, a), c.a);
+  float sp = pc.w.z;
+  // Three layers: broad slow sheets, ribbons, and fine fast threads (the
+  // grains nearest the ground hop slower than the air; the ones higher up
+  // move nearer its speed).
+  // (Under them, broad streaky sheets of it, thick and thin.)
+  float sb = gnoise(vec2((u - t * sp * 0.3) * 0.03, v * 0.06 + 2.0)) * 1.6;
+  float sheet = smoothstep(-0.15, 0.45, gnoise(vec2((u - t * sp * 0.45) * 0.06, (v + sb) * 0.45)));
+  float r1 = Ribbons(u, v, t, sp * 0.6, 1.1, 0.13, fp, 11.0);
+  float r2 = Ribbons(u, v, t, sp * 0.75, 3.0, 0.3, fp, 23.0);
+  float rib = sheet * 0.55 + r1 * 0.45 * (0.4 + sheet) + r2 * 0.3;
+  // Gusts: broad patches sweeping through at the wind's speed, the ribbons
+  // thick in them and thin between.
+  float gust = gnoise(vec2((u - t * sp) * 0.012, v * 0.02 + 5.0)) + 0.5 * gnoise(vec2((u - t * sp * 0.9) * 0.03, v * 0.05 + 9.0));
+  gust = smoothstep(-0.5 + 0.25 * pc.w.w, 0.45, gust);
+  float k = min(1.0, 0.35 + pc.w.w);
+  float a = rib * mix(0.4, 1.0, gust) * k * 1.4;
+  // (Seen along the ground, the drift layer's depth piles up: denser low
+  // over the slope farther off and at a glancing view.)
+  float glance = 1.0 - abs(dot(n, toP / max(dist, 1e-3)));
+  a *= 0.55 + 0.6 * glance * glance;
+  a = clamp(a * where, 0.0, 0.8);
+  // (Lit as the snow is here and brighter: airborne grains catching the
+  // light, the slope's texture softened under them (the scene a few pixels
+  // round, blurred) but not painted over.)
+  ivec2 ss = textureSize(scene, 0) - 1;
+  vec3 soft = (texelFetch(scene, clamp(ip + ivec2(3, 1), ivec2(0), ss), 0).rgb +
+               texelFetch(scene, clamp(ip + ivec2(-1, 3), ivec2(0), ss), 0).rgb +
+               texelFetch(scene, clamp(ip + ivec2(-3, -1), ivec2(0), ss), 0).rgb +
+               texelFetch(scene, clamp(ip + ivec2(1, -3), ivec2(0), ss), 0).rgb + c.rgb) * 0.2;
+  float sl = max(dot(soft, vec3(0.3, 0.59, 0.11)), 1e-3);
+  vec3 veil = mix(soft, vec3(sl), 0.5) * (1.2 + 0.1 * a) + vec3(0.07, 0.075, 0.08) * (0.3 + sl);
+  o = vec4(mix(c.rgb, min(veil, vec3(max(lum * 1.35, 1.0))), a), c.a);
 }
 )", true);
   // The clouds' shadows: the sky's own cloud layer (the same noise, drifting
