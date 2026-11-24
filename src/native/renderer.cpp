@@ -2573,6 +2573,15 @@ struct Renderer::Impl {
   Image* snow_result_ = nullptr;
   Image snow_img_;
   Image snow_params_;  // builtin_snow's settings past the push constants
+  // Smooth noise of time (-1..1), and the wind's gusts by it: a factor on
+  // its speed, about 0.4 .. 1.6.
+  static double TimeNoise(double x) {
+    const double i = std::floor(x), f = x - i;
+    auto h = [](double n) { double v = std::sin(n * 12.9898) * 43758.5453; return (v - std::floor(v)) * 2.0 - 1.0; };
+    const double u = f * f * (3.0 - 2.0 * f);
+    return h(i) * (1.0 - u) + h(i + 1.0) * u;
+  }
+  static double WindGust(double t) { return 1.0 + 0.45 * TimeNoise(t * 0.35) + 0.2 * TimeNoise(t * 1.3 + 17.0); }
   Image* SnowScene(Image* scene);
   // God rays (SetGodRays): strength, the light mask and its shafts (half
   // size) and the scene with them.
@@ -13141,16 +13150,10 @@ Image* Renderer::Impl::SnowScene(Image* scene) {
     double dt = last < 0.0 ? 0.0 : now - last;
     if (dt < 0.0 || dt > 0.5) dt = 0.0;
     last = now;
-    auto vn = [](double x) {  // smooth noise of time, -1..1
-      const double i = std::floor(x), f = x - i;
-      auto h = [](double n) { double v = std::sin(n * 12.9898) * 43758.5453; return (v - std::floor(v)) * 2.0 - 1.0; };
-      const double u = f * f * (3.0 - 2.0 * f);
-      return h(i) * (1.0 - u) + h(i + 1.0) * u;
-    };
     const double ws = std::hypot(double(tod_.wind[0]), double(tod_.wind[1]));
     const bool still = Diag("nogusts");
-    const double gust = still ? 1.0 : 1.0 + 0.45 * vn(now * 0.35) + 0.2 * vn(now * 1.3 + 17.0);
-    const double turn = still ? 0.0 : 0.3 * vn(now * 0.15 + 5.0);
+    const double gust = still ? 1.0 : WindGust(now);
+    const double turn = still ? 0.0 : 0.3 * TimeNoise(now * 0.15 + 5.0);
     const double cs = std::cos(turn), sn = std::sin(turn);
     const double wx = (tod_.wind[0] * cs - tod_.wind[1] * sn) * gust, wz = (tod_.wind[0] * sn + tod_.wind[1] * cs) * gust;
     travel[0] += wx * dt;
@@ -14171,7 +14174,17 @@ Image* Renderer::Impl::DriftScene(Image* scene) {
   pc[16] = cam_pos_[0];
   pc[17] = cam_pos_[1];
   pc[18] = cam_pos_[2];
-  pc[19] = float(std::fmod(double(tod_.seconds), 3600.0));
+  // (The clock the streams move by runs faster in a gust, slower between:
+  // the same gusts as the falling snow's.)
+  {
+    static double gust_clock = 0.0, last = -1.0;
+    const double now = double(tod_.seconds);
+    double dt = last < 0.0 ? 0.0 : now - last;
+    if (dt < 0.0 || dt > 0.5) dt = 0.0;
+    last = now;
+    gust_clock = std::fmod(gust_clock + dt * (Diag("nogusts") ? 1.0 : WindGust(now)), 3600.0);
+    pc[19] = float(gust_clock);
+  }
   pc[20] = tod_.wind[0] / speed;
   pc[21] = tod_.wind[1] / speed;
   pc[22] = speed;

@@ -487,7 +487,7 @@ that rule against a save that has the pass.
   behind what's in front of them, lit by the sky and by the night lights
   near them); and now and then a blizzard (strong wind streaking the snow
   sideways, the fog closing in to a few dozen metres). Or one of them fixed.
-  The falling snow follows the wind in gusts (its speed rising and falling
+  The falling snow (and the drifting snow over the ground) follows the wind in gusts (its speed rising and falling
   by about half, its direction wandering a little; the flakes' travel is
   the gusts summed, so a gust carries them faster without the fall
   jumping), swirled in eddies that grow with the wind, and draped over the
