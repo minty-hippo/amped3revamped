@@ -589,12 +589,6 @@ const std::vector<Tab>& Tabs() {
                        "hour it was made for and looks as the game has it then. Shadows follow "
                        "the sun and moon (riders and objects always; the world's with World "
                        "shadows baked). Native renderer only."),
-                Toggle("native_tod_effects", "Effects with time of day off",
-                       "With dynamic time of day off, its effects still on for each "
-                       "mountain's own hour: the sharper shadows near you, the sun's sheen, "
-                       "lens flare, light glow, diamond dust and contact shadows (as their "
-                       "settings have them). The light and sky stay as the game has them. "
-                       "Native renderer only."),
                 SliderF("native_tod_start_hour", "Set the hour",
                         "Sets the clock to this hour (-1: each mountain's own hour).", "%.2f",
                         -1.0, 24.0),

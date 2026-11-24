@@ -2557,8 +2557,9 @@ void WorkerMain() {
           tod.on = revamped && REXCVAR_GET(native_dynamic_time_of_day) && !locked && tod_hour >= 0.0;
           tod.hour = float(std::max(tod_hour, 0.0));
           // (Off: its effects alone, at the mountain's own hour.)
-          const bool tod_passive = !tod.on && revamped && REXCVAR_GET(native_tod_effects) &&
-                                   renderer->MountainHour() >= 0.0f;
+          // (Always, with Revamped Graphics: the menu's switch for it is gone,
+          // and a config that had turned it off would leave them all dark.)
+          const bool tod_passive = !tod.on && revamped && renderer->MountainHour() >= 0.0f;
           tod.moon_phase = float(REXCVAR_GET(native_tod_moon_phase));
           tod.clouds = float(REXCVAR_GET(native_tod_clouds));
           tod.night_light = float(REXCVAR_GET(native_tod_night_light));

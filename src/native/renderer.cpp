@@ -2020,7 +2020,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68, kGiMovers = 69
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2148,7 +2148,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[69] = {};  // by CopyKind
+  VkShaderModule copy_fs_[70] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2539,6 +2539,8 @@ struct Renderer::Impl {
   static constexpr double kProbeSpacing = 4.0;
   Image gi_probe_[2];
   int gi_probe_cur_ = 0;
+  bool gi_probes_now_ = false;  // this frame's probes (and gi_params_) up to date
+  Image gi_movers_;             // the riders' factor from them (half size)
   int gi_hist_cur_ = 0;
   bool gi_hist_ok_ = false;
   double gi_prev_vp_[16] = {};
@@ -7362,6 +7364,16 @@ vec3 Radiance(vec3 H, vec3 n, float vs) {
   // (Facing up: snow; else darker: rock, wood, trees.)
   float alb = mix(0.3, 0.75, smoothstep(0.3, 0.8, n.y));
   vec3 e = Sky(n);
+  // The night lights near it (no shadows: what's in the way left out).
+  int lamps = int(Param(20).z);
+  for (int i = 0; i < lamps; ++i) {
+    vec4 lp = Param(26 + 2 * i);
+    vec3 L = lp.xyz - H;
+    float d = length(L);
+    if (d >= lp.w) continue;
+    float fall = 1.0 - d / lp.w;
+    e += Param(27 + 2 * i).rgb * max(dot(n, L / max(d, 1e-3)), 0.0) * fall * fall;
+  }
   float nl = dot(n, kSun.xyz);
   if (nl > 0.0) {
     vec3 nn;
@@ -7676,6 +7688,63 @@ void main() {
   float dist = length(P - cam.xyz);
   e *= 1.0 - smoothstep(float(dims.x) * g.w * 0.35, float(dims.x) * g.w * 0.5, dist);
   o = vec4(e, d);
+}
+)", true);
+  // World-space light, 6 (half size): the riders' (and characters') share,
+  // as a factor on their light: the probes round each one (all six faces:
+  // they face every way), what they put on or take off against the sky's
+  // light and a share of the sun's that the game gave them.
+  copy_fs_[69] = CompileBuiltin("builtin_gi_movers", R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D pos;  // the riders' points (w > 0)
+layout(set = 0, binding = 2) uniform sampler2D probes;
+layout(set = 0, binding = 5) uniform sampler2D params;
+layout(push_constant) uniform GM { vec4 a; } pc;  // strength
+layout(location = 0) out vec4 o;
+vec4 Param(int i) { return texelFetch(params, ivec2(i, 0), 0); }
+vec3 Sky(vec3 n) {
+  vec4 n4 = vec4(n, 1.0);
+  vec4 q = n.xyzz * n.yzzx;
+  vec3 r = vec3(dot(Param(12), n4), dot(Param(13), n4), dot(Param(14), n4)) +
+           vec3(dot(Param(15), q), dot(Param(16), q), dot(Param(17), q)) + Param(18).xyz * (n.x * n.x - n.y * n.y);
+  return max(r, vec3(0.0));
+}
+void main() {
+  vec4 P4 = texelFetch(pos, ivec2(gl_FragCoord.xy), 0);
+  o = vec4(1.0, 1.0, 1.0, 0.0);
+  if (P4.w <= 0.0) return;
+  vec3 P = P4.xyz;
+  vec4 g = Param(21);
+  ivec3 dims = ivec3(Param(22).xyz);
+  ivec3 lo = ivec3(g.xyz);
+  vec3 q = P / g.w - 0.5;
+  ivec3 base = ivec3(floor(q));
+  vec3 f = q - vec3(base);
+  vec3 sum = vec3(0.0);
+  float ws = 0.0;
+  for (int k = 0; k < 8; ++k) {
+    ivec3 o3 = ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+    ivec3 wi = base + o3;
+    if (any(lessThan(wi, lo)) || any(greaterThanEqual(wi, lo + dims))) continue;
+    ivec3 slot = ((wi % dims) + dims) % dims;
+    ivec2 t0 = ivec2(slot.x * 6, slot.y * dims.z + slot.z);
+    float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
+    vec4 a0 = texelFetch(probes, t0, 0);
+    if (a0.a < 0.0 || abs(a0.a - tag) > 0.25) continue;
+    vec3 v = a0.rgb;
+    for (int fc = 1; fc < 6; ++fc) v += texelFetch(probes, t0 + ivec2(fc, 0), 0).rgb;
+    vec3 tw = mix(1.0 - f, f, vec3(o3));
+    float w = tw.x * tw.y * tw.z;
+    sum += v / 6.0 * w;
+    ws += w;
+  }
+  vec3 e = sum / max(ws, 0.3);
+  vec3 sky = (Sky(vec3(1, 0, 0)) + Sky(vec3(-1, 0, 0)) + Sky(vec3(0, 1, 0)) + Sky(vec3(0, -1, 0)) +
+              Sky(vec3(0, 0, 1)) + Sky(vec3(0, 0, -1))) / 6.0;
+  // (The sun's share of their light, about: a quarter of it, averaged over
+  // a body's sides.)
+  vec3 lit = sky + vec3(0.25 * Param(10).w);
+  vec3 fac = clamp(1.0 + pc.a.x * e / max(lit, vec3(0.05)), vec3(0.5), vec3(1.6));
+  o = vec4(fac, 1.0);
 }
 )", true);
   copy_fs_[50] = CompileBuiltin("builtin_spec_add", R"(#version 450
@@ -9707,14 +9776,27 @@ layout(set = 0, binding = 0) uniform sampler2D shade;  // linear, half size
 layout(set = 0, binding = 1) uniform sampler2D scene;
 layout(set = 0, binding = 2) uniform sampler2D late;
 layout(set = 0, binding = 3) uniform sampler2D world;
+layout(set = 0, binding = 4) uniform sampler2D gi;  // the world light's factor (half size), if pc.a.x
+layout(push_constant) uniform MA { vec4 a; } pc;
 layout(location = 0) out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 c = texelFetch(scene, p, 0);
   float l = texelFetch(late, p, 0).r;
-  float f = (l > 0.0 && l != texelFetch(world, p, 0).r)
-                ? textureLod(shade, gl_FragCoord.xy / vec2(textureSize(scene, 0)), 0.0).r : 1.0;
-  o = vec4(c.rgb * f, c.a);
+  bool mover = l > 0.0 && l != texelFetch(world, p, 0).r;
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(scene, 0));
+  float f = mover ? textureLod(shade, uv, 0.0).r : 1.0;
+  vec3 g = vec3(1.0);
+  if (mover && pc.a.x > 0.5) {
+    // (Its half-size pixel's, or a neighbour's where that one missed it.)
+    ivec2 h = ivec2(gl_FragCoord.xy) / 2;
+    ivec2 hs = textureSize(gi, 0);
+    vec4 b = texelFetch(gi, min(h, hs - 1), 0);
+    for (int k = 0; k < 4 && b.a <= 0.0; ++k)
+      b = texelFetch(gi, clamp(h + ivec2(k == 0 ? 1 : k == 1 ? -1 : 0, k == 2 ? 1 : k == 3 ? -1 : 0), ivec2(0), hs - 1), 0);
+    if (b.a > 0.0) g = b.rgb;
+  }
+  o = vec4(c.rgb * f * g, c.a);
 }
 )", true);
   // Sun shadows, 2: the map filtered with penumbras that widen with the
@@ -12076,8 +12158,20 @@ Image* Renderer::Impl::ShadedMovers(Image* scene) {
   const float bx[4] = {1, 0, 0, 0}, by[4] = {0, 1, 0, 0};
   FullscreenPass(CopyKind::kMoverBlur, &movers_blur_, &movers_shade_, &movers_pos_, nullptr, false, bx, 4);
   FullscreenPass(CopyKind::kMoverBlur, &movers_shade_, &movers_blur_, &movers_pos_, nullptr, false, by, 4);
-  FullscreenPass(CopyKind::kMoverApply, &movers_out_, &movers_shade_, scene, late, true, nullptr, 0,
-                 nullptr, &ao_depth_);
+  // The world light on them too (from the probes where they are: the snow's
+  // light from below, the sky's taken off under a roof or the trees), as a
+  // factor on their light.
+  const bool gi = gi_probes_now_ && GiReady() && gi_probe_[gi_probe_cur_].image && !Diag("nogimovers");
+  if (gi) {
+    ensure(gi_movers_, hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, "world_light_riders");
+    float gp[4] = {gi_, 0, 0, 0};
+    FullscreenPass(CopyKind::kGiMovers, &gi_movers_, &movers_pos_, nullptr, &gi_probe_[gi_probe_cur_], false,
+                   gp, 4, nullptr, nullptr, nullptr, &gi_params_);
+    Barrier();
+  }
+  float ap[4] = {gi ? 1.0f : 0.0f, 0, 0, 0};
+  FullscreenPass(CopyKind::kMoverApply, &movers_out_, &movers_shade_, scene, late, true, ap, 4,
+                 nullptr, &ao_depth_, gi ? &gi_movers_ : nullptr);
   dyn_ = DynState{};
   movers_result_ = &movers_out_;
   return movers_result_;
@@ -13107,9 +13201,10 @@ void Renderer::Impl::GiVoxelize(std::vector<CasterDraw>& env, bool start, bool d
 // a ray toward it gets out). Each hit takes off the sky's light the game
 // gave from that way and puts its own on.
 void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
+  gi_probes_now_ = false;
   if (Diag("gidbg")) std::fprintf(stderr, "gi: trace\n");
   const uint32_t* blk = lm_on_ ? tod_new_ : tod_ref_;
-  float f[26 * 4] = {};
+  float f[42 * 4] = {};
   f[20 * 4] = Diag("giview") ? 1.0f : 0.0f;
   double vp[16];
   if (!Invert4(inv_vp_, vp)) return;
@@ -13145,6 +13240,33 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     f[22 * 4 + i] = float(kProbeDims[i]);
   }
   f[21 * 4 + 3] = float(kProbeSpacing);
+  // The night lights nearest the camera (after dark), for what the rays hit
+  // off screen (on screen their light is in the picture already): texels
+  // 26 + 2 i (where, how far it reaches), 27 + 2 i (its light), up to 8.
+  {
+    const double dark = LightsDark();
+    std::vector<std::pair<double, size_t>> near;
+    if (dark > 0.001 && !Diag("ginolamps")) {
+      for (size_t i = 0; i < lights_.size(); ++i) {
+        const Renderer::NightLight& l = lights_[i];
+        if (l.preview) continue;
+        double d2 = 0;
+        for (int k = 0; k < 3; ++k) d2 += (l.pos[k] - cam_pos_[k]) * (l.pos[k] - cam_pos_[k]);
+        if (d2 < 150.0 * 150.0) near.push_back({d2, i});
+      }
+      std::sort(near.begin(), near.end());
+    }
+    const int n = int(std::min<size_t>(near.size(), 8));
+    for (int j = 0; j < n; ++j) {
+      const Renderer::NightLight& l = lights_[near[size_t(j)].second];
+      for (int k = 0; k < 3; ++k) {
+        f[(26 + 2 * j) * 4 + k] = l.pos[k];
+        f[(27 + 2 * j) * 4 + k] = float(l.color[k] * l.intensity * dark);
+      }
+      f[(26 + 2 * j) * 4 + 3] = std::max(l.radius, 0.5f);
+    }
+    f[20 * 4 + 2] = float(n);
+  }
   f[22 * 4 + 3] = float(frame_number_ % 4096);
   f[20 * 4 + 1] = temporal ? 1.0f : 0.0f;
   f[19 * 4 + 0] = Diag("gimany") ? 32.0f : probes ? 10.0f : temporal ? 6.0f : 8.0f;  // rays
@@ -13152,14 +13274,14 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   f[19 * 4 + 2] = Diag("ginoput") ? 0.0f : 1.0f;    // the hits' light put on
   f[19 * 4 + 3] = float(frame_number_ % 64);
   if (!gi_params_.image) {
-    gi_params_ = gpu_.CreateImage(26, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "gi_params");
+    gi_params_ = gpu_.CreateImage(42, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "gi_params");
     ToGeneral(cb_, gi_params_);
   }
   Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
   std::memcpy(staging.mapped, f, sizeof(f));
   VkBufferImageCopy region{};
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {26, 1, 1};
+  region.imageExtent = {42, 1, 1};
   Barrier();
   vk::vkCmdCopyBufferToImage(cb_, staging.buffer, gi_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
   staging_.push_back(staging);
@@ -13215,6 +13337,7 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     std::memcpy(gi_prev_vp_, vp, sizeof(vp));
     gi_prev_frame_ = frame_number_;
     ++stats_.gi_traces;
+    gi_probes_now_ = true;
     return;
   }
   float pc[4] = {1.0f / float(scene->width), 1.0f / float(scene->height), float(kGiN), float(qs)};
@@ -16495,6 +16618,14 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
       }
     }
   }
+  // The game's own trail, drawn over the lit snow round the rider (it fades
+  // a few metres back, and the game culls it farther out): flat, it covered
+  // the pressed grooves near the rider (they went flat as the camera turned
+  // close by). Pressed into the snow already, its colored pass is left out.
+  if (tracks_ > 0.0f && tracks_valid_ && light_seen_ && max_draws_ == UINT32_MAX &&
+      vs->info.ucode_hash == kTrailVertexShader && (st.reg(0x2104) & 7u) != 0 && !Diag("gametrails")) {
+    return;
+  }
   if (SunShadowsOn() && max_draws_ == UINT32_MAX && depth && d.up_vertices.empty() &&
       (d.prim == 4 || d.prim == 5 || d.prim == 6 || d.prim == 13)) {
     auto keep = [&](VkPipeline pl, std::vector<CasterDraw>& to, bool alpha_test) {
@@ -17979,6 +18110,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(gi_img_);
   for (Image& im : gi_hist_) gpu_.DestroyImage(im);
   for (Image& im : gi_probe_) gpu_.DestroyImage(im);
+  gpu_.DestroyImage(gi_movers_);
   for (GiCascade& g : gi_c_) {
     for (Image& im : g.maps) gpu_.DestroyImage(im);
     for (Image& im : g.occ) gpu_.DestroyImage(im);

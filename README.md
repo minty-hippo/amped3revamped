@@ -677,7 +677,15 @@ that rule against a save that has the pass.
     less of the light instead of theirs scaled up. The probes are read at
     every pixel (full size; a quarter-size pixel's one sample of a tree was
     leaf one frame and sky the next: the trees flickered), and blended in
-    more slowly (an eighth new) for less mottling in the shade. A ray that hits something takes off the sky light
+    more slowly (an eighth new) for less mottling in the shade.
+    The riders and characters take it too (they're drawn after the
+    lighting, so the probes are read where each one is, all six faces
+    averaged, as a factor on its light against the sky's and a share of the
+    sun's that the game gave it: brighter from the snow below, darker under
+    a roof or the trees; `nogimovers` leaves them out). Lamps: on screen
+    their light was already in what the rays meet (the world light comes
+    after the night lights); off screen the eight nearest the camera now
+    light what a ray hits too, after dark (no shadows; `ginolamps`). A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps
@@ -883,7 +891,11 @@ that rule against a save that has the pass.
   heaps and clumps blown off first (a gale: in a minute or so), the grooves
   drifting in more slowly, the shapes softening and creeping downwind as the
   loose snow moves.
-  (From the game's trail draws, drawn again from above each frame.)
+  (From the game's trail draws, drawn again from above each frame.) The
+  game's own trail, drawn flat over the lit snow round the rider (culled
+  farther out), is left out while they're on: it covered the pressed
+  grooves near the rider, so they went flat as the camera turned close by
+  (diagnostic `gametrails` keeps it).
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,
