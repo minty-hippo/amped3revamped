@@ -674,7 +674,10 @@ that rule against a save that has the pass.
     so beneath the snow is empty) are left out: something above in their
     column and nothing below. Probes behind a pixel's surface no longer
     count at all, and a pixel with only a few faint probes round it gets
-    less of the light instead of theirs scaled up. A ray that hits something takes off the sky light
+    less of the light instead of theirs scaled up. The probes are read at
+    every pixel (full size; a quarter-size pixel's one sample of a tree was
+    leaf one frame and sky the next: the trees flickered), and blended in
+    more slowly (an eighth new) for less mottling in the shade. A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps

@@ -7522,7 +7522,7 @@ void main() {
     sum += Radiance(H, n, hv) * kSet.z - Sky(D) * kSet.y;
   }
   vec3 e = sum / float(rays);
-  o = vec4(same && old.a > 0.0 ? mix(old.rgb, e, 0.2) : e, tag);
+  o = vec4(same && old.a > 0.0 ? mix(old.rgb, e, 0.12) : e, tag);
 }
 )", true);
   // World-space light, 3: its half-size result blurred one way (9 taps,
@@ -7667,7 +7667,7 @@ void main() {
     vec3 dir = (vec3(wi) + 0.5) * g.w - P;
     float dl = length(dir);
     float facing = dl > 1e-3 ? dot(dir / dl, Nn) * 0.5 + 0.5 : 1.0;
-    w *= facing * facing;
+    w *= facing * facing + 0.02;
     sum += val * w;
     ws += w;
   }
@@ -13168,7 +13168,9 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
   const GiCascade& c1 = gi_c_[1];
   // (A quarter of the size each way: the light round a point changes slowly;
   // blurred, then read with its depth when added.)
-  const uint32_t qs = Diag("gihalf") ? 2u : 4u;
+  // (The probes read at every pixel: cheap, and a quarter-size pixel's one
+  // sample of a tree, leaf one frame and sky behind the next, flickered.)
+  const uint32_t qs = probes ? (Diag("gihalf") ? 2u : 1u) : Diag("gihalf") ? 2u : 4u;
   const uint32_t qw = std::max(scene->width / qs, 1u), qh = std::max(scene->height / qs, 1u);
   if (!gi_img_.image || gi_img_.width != qw || gi_img_.height != qh) {
     if (gi_img_.image) Retire(gi_img_);
