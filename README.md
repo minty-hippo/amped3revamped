@@ -936,8 +936,9 @@ that rule against a save that has the pass.
   pattern stepped every frame for the upscaler to average. Over a large
   area (riding under a tree, its canopy over the sky) XeSS didn't settle
   it: its output swapped between the stipple and a haze every other frame.
-  The pattern now holds still (Graphics > Effects: Branch Dither Cycles,
-  `native_dither_cycle`, off; diagnostic `dithercycle` in the replay).
+  A setting holds the pattern still (Graphics > Effects: Branch Dither
+  Cycles, `native_dither_cycle`); it stays on by default (the cycling
+  pattern looked better; the flicker remains with XeSS and FSR).
 - Low latency (Graphics > Display: Low Latency, `native_low_latency`, on):
   input felt delayed (jumps late off the lip, spins starting late), and
   worse at 30 fps: the delay was the frames in the pipeline. Each frame was

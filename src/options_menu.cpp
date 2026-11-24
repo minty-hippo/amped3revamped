@@ -435,8 +435,7 @@ const std::vector<Tab>& Tabs() {
                 Toggle("native_dither_cycle", "Branch dither changes every frame",
                        "With MSAA off, see-through branches are drawn as a fine dither. On, "
                        "its pattern changes every frame for the upscaler to blend; off, it "
-                       "holds still (XeSS can flicker every other frame between the dither "
-                       "and a haze when it changes). Native renderer only."),
+                       "holds still as a fixed stipple. Native renderer only."),
                 Toggle("native_map_clouds", "Trail map cloud transition",
                        "Choosing the trail map from the pause menu, the pause menu's cartoon "
                        "clouds close in, then disperse from the middle out over the map (loading "

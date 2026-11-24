@@ -309,11 +309,10 @@ REXCVAR_DEFINE_BOOL(native_foliage_fade, true, "GPU",
                     "camera fade out smoothly toward the middle of the screen, keeping your "
                     "rider and the way ahead in view; trees the game fades near the camera "
                     "turn evenly see-through instead of breaking into ragged holes");
-REXCVAR_DEFINE_BOOL(native_dither_cycle, false, "GPU",
+REXCVAR_DEFINE_BOOL(native_dither_cycle, true, "GPU",
                     "Native renderer, MSAA off: the dither that draws see-through foliage "
                     "(soft branch edges, faded branches) changes its pattern every frame for "
-                    "the upscaler to average. Off, the pattern holds still: XeSS can flicker "
-                    "between the dither and a haze every other frame when it changes");
+                    "the upscaler to average. Off, the pattern holds still (a fixed stipple)");
 REXCVAR_DEFINE_BOOL(native_god_rays, true, "GPU",
                     "Native renderer: light shafts from the sun (or moon) while it's in or near "
                     "view, broken up by clouds, trees and terrain in front of it");
