@@ -2548,7 +2548,15 @@ struct Renderer::Impl {
   int gi_probe_cur_ = 0;
   bool gi_probes_now_ = false;  // this frame's probes (and gi_params_) up to date
   Image gi_movers_;             // the riders' factor from them (half size)
-  Image gi_sun_;                // the sun mask with the far shadows from the voxels (builtin_gi_sun)
+  Image gi_sun_;
+  Image uint_dummy_;  // 1 x 1 RGBA32UI, bound where a voxel map would be (none)
+  Image* UintDummy() {
+    if (!uint_dummy_.image) {
+      uint_dummy_ = gpu_.CreateImage(1, 1, VK_FORMAT_R32G32B32A32_UINT, false, "uint_dummy");
+      ToGeneral(cb_, uint_dummy_);
+    }
+    return &uint_dummy_;
+  }                // the sun mask with the far shadows from the voxels (builtin_gi_sun)
   int gi_hist_cur_ = 0;
   bool gi_hist_ok_ = false;
   double gi_prev_vp_[16] = {};
@@ -2564,6 +2572,7 @@ struct Renderer::Impl {
   bool snow_done_ = false;
   Image* snow_result_ = nullptr;
   Image snow_img_;
+  Image snow_params_;  // builtin_snow's settings past the push constants
   Image* SnowScene(Image* scene);
   // God rays (SetGodRays): strength, the light mask and its shafts (half
   // size) and the scene with them.
@@ -9395,6 +9404,11 @@ void main() {
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D depth;
 layout(set = 0, binding = 2) uniform sampler2D lights;  // the night lights' (tiles of 32 px)
+layout(set = 0, binding = 3) uniform sampler2D heights;  // the ground from above (the sun maps' height map): depth, 1 = nothing
+layout(set = 0, binding = 4) uniform usampler2D occ;     // the world light's fine voxels (1 m), if on
+layout(set = 0, binding = 5) uniform sampler2D prm;      // 0: the flakes' travel (gusts summed), turbulence (m);
+                                                          // 1, 2: the height map's rows, its depth span, on, the ground under the camera;
+                                                          // 3: the voxels' corner, size (0: none); 4: the wind's direction (x, z), speed
 layout(push_constant) uniform Snow {
   mat4 m;     // ndc (x, y, 1 - depth, 1) -> world, from the camera
   vec4 t;     // seconds, how much snow (0..1), a pixel's angle (radians), flake size scale
@@ -9405,6 +9419,33 @@ layout(push_constant) uniform Snow {
 } pc;
 layout(location = 0) out vec4 o;
 
+vec4 Prm(int i) { return texelFetch(prm, ivec2(i, 0), 0); }
+// The ground's height at x, z (the height map softened over a couple of
+// metres: the flakes' layers drape over it), or the ground under the camera.
+float Ground(vec2 xz) {
+  vec4 hm = Prm(1), h2 = Prm(2);
+  if (h2.y < 0.5) return h2.z;
+  ivec2 hn = textureSize(heights, 0);
+  float sum = 0.0, wsum = 0.0;
+  for (int i = 0; i < 5; ++i) {
+    vec2 o = i == 0 ? vec2(0.0) : vec2(i == 1 ? 1.5 : (i == 2 ? -1.5 : 0.0), i == 3 ? 1.5 : (i == 4 ? -1.5 : 0.0));
+    vec2 ht = (0.5 + 0.5 * ((xz + o) * hm.x + hm.yz)) * vec2(hn);
+    if (any(lessThan(ht, vec2(0.0))) || any(greaterThanEqual(ht, vec2(hn)))) continue;
+    float hz = texelFetch(heights, ivec2(ht), 0).r;
+    if (hz >= 1.0) continue;
+    sum += hm.w + (0.5 - hz) * h2.x;
+    wsum += 1.0;
+  }
+  return wsum > 0.0 ? sum / wsum : h2.z;
+}
+bool Solid(vec3 w) {
+  vec4 vb = Prm(3);
+  if (vb.w <= 0.0) return false;
+  ivec3 v = ivec3(floor((w - vb.xyz) / vb.w));
+  if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, ivec3(128)))) return false;
+  uvec4 c = texelFetch(occ, v.xz, 0);
+  return ((c[v.y >> 5] >> uint(v.y & 31)) & 1u) != 0u;
+}
 vec3 Hash3(vec3 p) {
   p = fract(p * vec3(0.1031, 0.1030, 0.0973));
   p += dot(p, p.yxz + 33.33);
@@ -9436,13 +9477,21 @@ void main() {
   tile_base.y = 8 + (ivec2(gl_FragCoord.xy) / 32).y * 9;
   int tile_n = lit_by_lamps ? int(texelFetch(lights, tile_base, 0).x + 0.5) : 0;
   float dark = lit_by_lamps ? texelFetch(lights, ivec2(4, 3), 0).x : 0.0;
+  vec4 p0 = Prm(0), wv = Prm(4);
+  vec3 travel = p0.xyz;  // (how far the snow has moved: the wind's gusts summed)
+  float turb = p0.w;
+  vec3 wd = vec3(wv.x, 0.0, wv.y);
   for (int k = 0; k < 16; ++k) {
     float r = 0.5 * pow(1.25, float(k));  // 0.5 m .. about 14 m
     float cell = r * 0.16;
     if (r - cell > scene_dist) break;
-    // The cell (in the snow's own frame, moving with it) where the ray is r
-    // out, and the flake in it (if any: fewer in light snow).
-    vec3 pm = cam + dir * r - vel * tt;
+    // The cell (in the snow's own frame, moving with it, its layers draped
+    // over the ground: the snow carried along the slopes, up over a rise
+    // and down behind it) where the ray is r out, and the flake in it (if
+    // any: fewer in light snow).
+    vec3 W0 = cam + dir * r;
+    float lift = Ground(W0.xz);
+    vec3 pm = W0 - travel - vec3(0.0, lift, 0.0);
     vec3 ci = floor(pm / cell);
     vec3 h = Hash3(ci + float(k) * 31.7);
     // (Fewer up close: a few big flakes, not a curtain.)
@@ -9452,7 +9501,13 @@ void main() {
     // (Fluttering as it falls.)
     cm.x += 0.12 * cell * sin(tt * 1.7 + h.y * 40.0);
     cm.z += 0.12 * cell * cos(tt * 1.3 + h.z * 40.0);
-    vec3 B = cm + vel * tt - cam;  // from the camera
+    // (Eddies: the flakes of a patch swirled together, more in a strong
+    // wind, the patches changing as they go.)
+    vec3 sw = vec3(sin(cm.z * 0.45 + tt * 1.3 + 2.0 * sin(cm.y * 0.3 + tt * 0.5)),
+                   0.6 * sin(cm.x * 0.5 - tt * 1.1),
+                   cos(cm.x * 0.4 - tt * 0.9 + 2.0 * sin(cm.z * 0.25 - tt * 0.4)));
+    cm += sw * turb;
+    vec3 B = cm + travel + vec3(0.0, lift, 0.0) - cam;  // from the camera
     vec3 A = B - streak;
     // The nearest point of its streak to the ray.
     vec3 u = B - A;
@@ -9464,6 +9519,20 @@ void main() {
     vec3 X = A + u * sseg;
     float tc = dot(X, dir);
     if (tc < 0.4 || abs(tc - r) > cell * 0.5 || tc > scene_dist) continue;
+    // Out of the snow: under something (a roof, a tree's crown) or in the
+    // lee of what stands upwind (the voxels, with the world light on).
+    if (Prm(3).w > 0.0) {
+      vec3 Wf = cam + X;
+      bool roof = Solid(Wf + vec3(0.0, 2.0, 0.0)) || Solid(Wf + vec3(0.0, 5.0, 0.0)) || Solid(Wf + vec3(0.0, 9.0, 0.0));
+      if (roof && h.z < 0.85) continue;
+      if (wv.z > 2.0) {
+        float lee = 0.0;
+        for (int j = 1; j <= 3; ++j) {
+          if (Solid(Wf - wd * float(j) * 1.3)) lee = max(lee, 1.0 - float(j - 1) * 0.25);
+        }
+        if (h.z < lee * smoothstep(2.0, 10.0, wv.z) * 0.9) continue;
+      }
+    }
     float perp = length(X - dir * tc);
     float size = (0.006 + 0.006 * h.y) * abs(pc.t.w);
     // At least most of a pixel across (dimmer for it: as bright overall).
@@ -9509,19 +9578,36 @@ void main() {
 layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D normals;
 layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(set = 0, binding = 3) uniform usampler2D occ;  // the world light's fine voxels (1 m), if on
 layout(push_constant) uniform Cover {
   mat4 m;   // ndc (x, y, 1 - depth, 1) -> world
   vec4 a;   // how much (0..1), 1 / width, 1 / height, -
   vec4 b;   // the wind (m/s, x / z), the camera's x, z
+  vec4 v;   // the voxels' corner (world), their size (0: none)
 } pc;
 layout(location = 0) out vec4 o;
-float H(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// (Hashed as whole numbers: a sine of world-sized numbers is noise of its own
+// on some GPUs - stripes.)
+uint Hu(uvec3 q) {
+  uint h = q.x * 1597334677u ^ q.y * 3812015801u ^ q.z * 2654435761u;
+  h = (h ^ (h >> 15)) * 2246822519u;
+  return h ^ (h >> 13);
+}
+float H(vec2 p) { return float(Hu(uvec3(ivec2(p) + 1048576, 7)) >> 8) * (1.0 / 16777216.0); }
+// Something in the voxel at w (world).
+bool Solid(vec3 w) {
+  if (pc.v.w <= 0.0) return false;
+  ivec3 v = ivec3(floor((w - pc.v.xyz) / pc.v.w));
+  if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, ivec3(128)))) return false;
+  uvec4 c = texelFetch(occ, v.xz, 0);
+  return ((c[v.y >> 5] >> uint(v.y & 31)) & 1u) != 0u;
+}
 float N(vec2 p) {
   vec2 i = floor(p), f = fract(p);
   f = f * f * (3.0 - 2.0 * f);
   return mix(mix(H(i), H(i + vec2(1, 0)), f.x), mix(H(i + vec2(0, 1)), H(i + vec2(1, 1)), f.x), f.y);
 }
-float H3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float H3(vec3 p) { return float(Hu(uvec3(ivec3(p) + 1048576)) >> 8) * (1.0 / 16777216.0); }
 float N3(vec3 p) {
   vec3 i = floor(p), f = fract(p);
   f = f * f * (3.0 - 2.0 * f);
@@ -9599,6 +9685,57 @@ void main() {
   float lie = mix(solid, bough, foliage);
   float amount = clamp(lie, 0.0, 1.0) * smoothstep(0.0, 0.35, k + 0.3 * (big - 0.5)) *
                  min(0.92, k * 1.4);
+  // Where the snow blows in (from the world light's voxels, when on): less
+  // under a roof or a tree's crown, less in an obstacle's lee; drifted up
+  // against the windward foot of whatever stands in the wind (a post, a
+  // trunk, a wall), the drift deepening as it snows.
+  if (pc.v.w > 0.0 && foliage < 0.5) {
+    float vs = pc.v.w;
+    // (Off the surface: out of its own voxel for a wall or a post.)
+    vec3 Q = P + n * (n.y > 0.6 ? 0.3 : 1.2 * vs);
+    // (Covered: something within 2..14 m above.)
+    float roof = 0.0;
+    for (int i = 0; i < 4; ++i) {
+      if (Solid(Q + vec3(0.0, 2.0 + 4.0 * float(i), 0.0))) roof = 1.0;
+    }
+    amount *= 1.0 - 0.6 * roof;
+    if (wind_v > 1.0) {
+      vec3 wd = -wdir;  // (where the wind goes)
+      // In the lee: something just upwind at this height.
+      float lee = 0.0;
+      for (int i = 1; i <= 3; ++i) {
+        if (Solid(Q + vec3(0.0, 0.6, 0.0) - wd * (float(i) * 1.2 * vs))) lee = max(lee, 1.0 - float(i - 1) * 0.3);
+      }
+      amount *= 1.0 - 0.45 * lee * smoothstep(2.0, 10.0, wind_v);
+      // At the windward foot of something: ground just upwind of it (or its
+      // own windward side, low down). How high: the ground under the
+      // windward side found down the column.
+      float foot = 0.0;
+      float deep = (0.25 + 0.9 * k) * smoothstep(1.5, 8.0, wind_v);
+      if (n.y > 0.6) {
+        for (int i = 1; i <= 3; ++i) {
+          if (Solid(Q + vec3(0.0, 0.5, 0.0) + wd * (float(i) * 0.8 * vs))) foot = max(foot, 1.0 - float(i - 1) * 0.3);
+        }
+      } else if (windward > 0.15) {
+        // (Its own side: how far above the ground just out in front of it.)
+        vec3 F = P + wdir * 0.8 * vs;
+        float above = 99.0;
+        for (int i = 0; i < 4; ++i) {
+          if (Solid(F - vec3(0.0, float(i) * vs, 0.0))) {
+            above = float(i) * vs;
+            break;
+          }
+        }
+        foot = smoothstep(deep + 0.6, deep * 0.4, above) * smoothstep(0.15, 0.5, windward);
+      }
+      float pile = foot * deep * (0.7 + 0.6 * big);
+      amount = max(amount, min(pile * 1.6, 0.95) * smoothstep(0.0, 0.2, k));
+      if (pc.a.w < -0.5) {  // (diagnostics: the drifts red, the lee green, under cover blue)
+        o = vec4(pile, lee, roof, 1.0);
+        return;
+      }
+    }
+  }
   // The snow itself: not flat white: shaded with the texture's detail, a
   // little blue in its hollows, brighter clumps.
   vec3 snow = vec3(0.86, 0.89, 0.93) * (0.9 + 0.12 * clump);
@@ -12993,7 +13130,82 @@ Image* Renderer::Impl::SnowScene(Image* scene) {
   // The night lights (their tiles), when drawn this frame.
   const bool lamps = lights_result_ != nullptr && lights_img_.image && lights_img_.width >= 256;
   if (lamps) pc[19] = -pc[19];
-  FullscreenPass(CopyKind::kSnow, &snow_img_, scene, depth, lamps ? &lights_img_ : &dummy_, false, pc, 32);
+  // The flakes' travel: the wind summed over time, in gusts (its speed
+  // rising and falling, its direction wandering a little), so a gust
+  // carries them faster without the whole fall jumping; eddies by the wind.
+  float prm[20] = {};
+  {
+    static double travel[3] = {0, 0, 0};
+    static double last = -1.0;
+    const double now = double(tod_.seconds);
+    double dt = last < 0.0 ? 0.0 : now - last;
+    if (dt < 0.0 || dt > 0.5) dt = 0.0;
+    last = now;
+    auto vn = [](double x) {  // smooth noise of time, -1..1
+      const double i = std::floor(x), f = x - i;
+      auto h = [](double n) { double v = std::sin(n * 12.9898) * 43758.5453; return (v - std::floor(v)) * 2.0 - 1.0; };
+      const double u = f * f * (3.0 - 2.0 * f);
+      return h(i) * (1.0 - u) + h(i + 1.0) * u;
+    };
+    const double ws = std::hypot(double(tod_.wind[0]), double(tod_.wind[1]));
+    const bool still = Diag("nogusts");
+    const double gust = still ? 1.0 : 1.0 + 0.45 * vn(now * 0.35) + 0.2 * vn(now * 1.3 + 17.0);
+    const double turn = still ? 0.0 : 0.3 * vn(now * 0.15 + 5.0);
+    const double cs = std::cos(turn), sn = std::sin(turn);
+    const double wx = (tod_.wind[0] * cs - tod_.wind[1] * sn) * gust, wz = (tod_.wind[0] * sn + tod_.wind[1] * cs) * gust;
+    travel[0] += wx * dt;
+    travel[1] += double(pc[21]) * dt;
+    travel[2] += wz * dt;
+    // (Kept within a few kilometres: float precision.)
+    for (double& v : travel) v = std::fmod(v, 4000.0);
+    for (int i = 0; i < 3; ++i) prm[i] = float(travel[i]);
+    prm[3] = float(std::min(0.05 * ws * gust, 0.9));  // turbulence (m)
+    pc[20] = float(wx);  // (the streaks along the gust)
+    pc[22] = float(wz);
+    const double wl = std::hypot(wx, wz);
+    if (wl > 0.1) {
+      prm[16] = float(wx / wl);
+      prm[17] = float(wz / wl);
+    }
+    prm[18] = float(wl);
+  }
+  Image* heights = &dummy_;
+  prm[8] = float(kSunDepth);
+  prm[10] = cam_pos_[1] - 1.5f;
+  if (sun_map_ok_ && sun_height_.image && sun_r_ > 0.0 && !Diag("nosnowground")) {
+    const double R = sun_r_, texel = 2.0 * R / double(sun_height_.width);
+    const double hx = sun_c0_[0] + double(sun_hi_) * texel, hz = sun_c0_[2] + double(sun_hj_) * texel;
+    prm[4] = float(1.0 / R);
+    prm[5] = float(-hx / R);
+    prm[6] = float(-hz / R);
+    prm[7] = float(sun_href_);
+    prm[9] = 1.0f;
+    heights = &sun_height_;
+  }
+  Image* occ = UintDummy();
+  if (GiReady() && !Diag("nosnowvox")) {
+    const GiCascade& g = gi_c_[0];
+    for (int i = 0; i < 3; ++i) prm[12 + i] = float(double(g.org[i]) * g.voxel);
+    prm[15] = float(g.voxel);
+    occ = const_cast<Image*>(&g.occ[g.cur]);
+  }
+  if (!snow_params_.image) {
+    snow_params_ = gpu_.CreateImage(5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "snow_params");
+    ToGeneral(cb_, snow_params_);
+  }
+  {
+    Buffer staging = gpu_.CreateBuffer(sizeof(prm), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memcpy(staging.mapped, prm, sizeof(prm));
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {5, 1, 1};
+    Barrier();
+    vk::vkCmdCopyBufferToImage(cb_, staging.buffer, snow_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    staging_.push_back(staging);
+    Barrier();
+  }
+  FullscreenPass(CopyKind::kSnow, &snow_img_, scene, depth, lamps ? &lights_img_ : &dummy_, false, pc, 32, nullptr,
+                 heights, occ, &snow_params_);
   Barrier();
   dyn_ = DynState{};
   snow_result_ = &snow_img_;
@@ -14368,20 +14580,28 @@ void Renderer::Impl::SceneInputs(const Draw& d, const GpuState& st) {
         snow_albedo_ = gpu_.CreateImage(a3->width, a3->height, a3->format, false, "snow_cover_albedo");
         ToGeneral(cb_, snow_albedo_);
       }
-      float pc[24] = {};
+      float pc[28] = {};
       for (int c = 0; c < 4; ++c) {
         for (int r = 0; r < 4; ++r) pc[c * 4 + r] = float(inv_vp_[r * 4 + c]);
+      }
+      // (The world light's fine voxels: where the snow blows in, drifts.)
+      Image* occ = UintDummy();
+      if (GiReady() && !Diag("nosnowvox")) {
+        const GiCascade& g = gi_c_[0];
+        for (int i = 0; i < 3; ++i) pc[24 + i] = float(double(g.org[i]) * g.voxel);
+        pc[27] = float(g.voxel);
+        occ = const_cast<Image*>(&g.occ[g.cur]);
       }
       pc[16] = std::clamp(tod_.snow_cover, 0.0f, 1.0f);
       pc[17] = 1.0f / float(a3->width);
       pc[18] = 1.0f / float(a3->height);
-      pc[19] = Diag("matid") ? 1.0f : 0.0f;
+      pc[19] = Diag("matid") ? 1.0f : Diag("snowdrifts") ? -1.0f : 0.0f;
       pc[20] = tod_.wind[0];
       pc[21] = tod_.wind[1];
       pc[22] = float(cam_pos_[0]);
       pc[23] = float(cam_pos_[2]);
       Barrier();
-      FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 24);
+      FullscreenPass(CopyKind::kSnowCover, &snow_albedo_, a3, n4, &dit->second, false, pc, 28, nullptr, occ);
       Barrier();
       dyn_ = DynState{};
       snow_albedo_src_ = a3;
@@ -18452,6 +18672,8 @@ Renderer::Impl::~Impl() {
   for (Image& im : gi_hist_) gpu_.DestroyImage(im);
   for (Image& im : gi_probe_) gpu_.DestroyImage(im);
   gpu_.DestroyImage(gi_sun_);
+  gpu_.DestroyImage(uint_dummy_);
+  gpu_.DestroyImage(snow_params_);
   gpu_.DestroyImage(gi_movers_);
   for (GiCascade& g : gi_c_) {
     for (Image& im : g.maps) gpu_.DestroyImage(im);

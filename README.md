@@ -487,6 +487,23 @@ that rule against a save that has the pass.
   behind what's in front of them, lit by the sky and by the night lights
   near them); and now and then a blizzard (strong wind streaking the snow
   sideways, the fog closing in to a few dozen metres). Or one of them fixed.
+  The falling snow follows the wind in gusts (its speed rising and falling
+  by about half, its direction wandering a little; the flakes' travel is
+  the gusts summed, so a gust carries them faster without the fall
+  jumping), swirled in eddies that grow with the wind, and draped over the
+  ground: its layers follow the slope (the height map from the sun maps),
+  so the snow blows along a slope, up over a rise and down behind it
+  rather than in one flat sheet. With the world light on its voxels block
+  it: little falls under a roof or a tree's crown, and less in the lee of
+  whatever stands upwind (`nogusts`, `nosnowground`, `nosnowvox`).
+  The snow lying on things follows the wind too (with the world light's
+  voxels): less under a roof or a crown, less in an obstacle's lee, and
+  drifted up against the windward foot of what stands in the wind (a post,
+  a trunk, a wall: its lower part and the ground just upwind of it), the
+  drift deeper the longer it snows (diagnostic `snowdrifts`: the drifts
+  red, the lee green, the covered blue). Its patchiness is hashed as whole
+  numbers now (a sine of world-sized numbers striped the snow on some
+  GPUs).
   As the weather turns it's announced in the game's own song popup (the XM
   Radio box: "Weather Alert / Gusts 55 km/h / Whiteout"), with a forecast a
   minute ahead ("Forecast / Snow on the way / Next hour"), or a notice where
