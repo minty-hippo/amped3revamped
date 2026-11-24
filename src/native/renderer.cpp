@@ -2835,6 +2835,11 @@ struct Renderer::Impl {
   bool clouds_drawn_ = false;      // drawn under the interface this frame
   Image* composite_rt_ = nullptr;  // where the composite drew (this frame)
   void CloudsUnderInterface();
+  // The save notice (on the way into the trail map) kept over the clouds:
+  // its draws held back while they part, drawn again after them.
+  std::vector<std::pair<const Draw*, uint32_t>> notice_draws_;
+  bool replaying_notice_ = false;
+  bool IsSaveNotice(const Draw& d, const GpuState& st);
   // The game's own cloud puff (128x128, the pause menu's): found among the
   // textures the game uses (by its contents), or loaded from the file kept
   // from an earlier session; until then the puffs are drawn procedurally.
@@ -16236,9 +16241,17 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     prof_t = t;
   };
   const GpuState& st = *d.state;
-  // The first draw after the composite (the HUD, a menu, the save notice):
-  // the map clouds go under it.
-  if (composite_rt_ && !clouds_drawn_ && !clouds_updated_) CloudsUnderInterface();
+  // After the composite (the HUD, menus, the save notice) while the map
+  // clouds part: the save notice held back, drawn over the clouds once the
+  // rest is drawn (the clouds cover the rest).
+  if (composite_rt_ && !replaying_notice_ && !clouds_drawn_) {
+    UpdateClouds();
+    if (map_clouds_ && cloud_active_ && !cloud_closing_ && !hold_picture_ && !Diag("cloudsontop") &&
+        IsSaveNotice(d, *d.state)) {
+      notice_draws_.push_back({&d, number});
+      return;
+    }
+  }
   const bool composite_before = composite_seen_;
   if ((hide_interface_ || fc_on_ || fc_in_.hide_hud) && composite_seen_) return;  // the HUD / menus, left out
   if (d.vs.empty() || d.ps.empty()) {
@@ -18288,22 +18301,54 @@ void Renderer::Impl::UploadCloudSprite() {
   cloud_sprite_pending_.clear();
 }
 
+// The save notice's draws (identified by their texture; the hashes logged
+// with diagnostic "noticedbg" or the A3_NOTICE_TEX list, hex).
+bool Renderer::Impl::IsSaveNotice(const Draw& d, const GpuState& st) {
+  static const uint64_t kNoticeTextures[] = {0};  // (filled in from a capture)
+  const uint64_t h = DrawTextureHash(d, st, 0);
+  if (Diag("noticedbg")) std::fprintf(stderr, "notice? texture %016llx count %u\n", (unsigned long long)h, d.count);
+  for (uint64_t k : kNoticeTextures) {
+    if (k && h == k) return true;
+  }
+  if (static const char* env = std::getenv("A3_NOTICE_TEX"); env) {
+    char hx[24];
+    std::snprintf(hx, sizeof(hx), "%016llx", (unsigned long long)h);
+    if (std::strstr(env, hx)) return true;
+  }
+  return false;
+}
+
 // The map clouds under the interface: at the first draw after the composite
 // (the HUD, menus, the save notice on the way into the trail map), drawn
 // into the composite's picture while they part, so what's drawn after them
 // shows over them. (Closing in over the held frame: at the output, over it
 // all, as before.)
 void Renderer::Impl::CloudsUnderInterface() {
+  auto flush_notice = [&] {
+    // (Not drawn under the interface after all: the held draws as they were.)
+    clouds_drawn_ = true;
+    replaying_notice_ = true;
+    for (const auto& nd : notice_draws_) DoDraw(*nd.first, nd.second);
+    replaying_notice_ = false;
+    notice_draws_.clear();
+  };
   if (Diag("cloudsontop") || !map_clouds_ || hold_picture_) {
-    clouds_updated_ = false;
     composite_rt_ = nullptr;
+    flush_notice();
+    clouds_drawn_ = false;
     return;
   }
   UpdateClouds();
-  if (!cloud_active_ || cloud_closing_ || !composite_rt_ || !composite_rt_->image || composite_rt_->depth) return;
+  if (!cloud_active_ || cloud_closing_ || !composite_rt_ || !composite_rt_->image || composite_rt_->depth) {
+    flush_notice();
+    clouds_drawn_ = false;
+    composite_rt_ = nullptr;
+    return;
+  }
   Image* rt = composite_rt_;
   EndRendering();
   UploadCloudSprite();
+  if (Diag("cloudsdbg")) std::fprintf(stderr, "clouds: under the interface at %.2f, %zu notice draws held\n", cloud_p_, notice_draws_.size());
   Barrier();
   VkDescriptorSet set;
   VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -18351,6 +18396,11 @@ void Renderer::Impl::CloudsUnderInterface() {
   Barrier();
   dyn_ = DynState{};
   clouds_drawn_ = true;
+  // The save notice over them.
+  replaying_notice_ = true;
+  for (const auto& nd : notice_draws_) DoDraw(*nd.first, nd.second);
+  replaying_notice_ = false;
+  notice_draws_.clear();
 }
 
 // The map clouds' state at this frame's output: a cut between riding and the
@@ -19067,6 +19117,9 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
         break;
       case EventType::kResolve:
         if (draw_events > max_draws) break;
+        // (The picture after the composite resolved out: the clouds over it
+        // first, the save notice over them.)
+        if (composite_rt_ && !clouds_drawn_) CloudsUnderInterface();
         DoResolve(frame.resolves[e.index], e.number);
         break;
       case EventType::kBeginTiling:
@@ -19083,6 +19136,7 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
         break;
     }
   }
+  if (composite_rt_ && !clouds_drawn_) CloudsUnderInterface();
   // Output: the front buffer's picture, else the last render target. Found
   // before submitting: a front buffer decoded from memory is uploaded here.
   final_front_ = max_draws == UINT32_MAX ? FrontBuffer(frame) : nullptr;
