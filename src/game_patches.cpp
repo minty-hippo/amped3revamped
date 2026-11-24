@@ -1104,3 +1104,44 @@ void Amped3_TuckCrouch(PPCRegister& r31) {
   StoreGuestF32(base, param + 4, value);
   StoreGuestF32(base, param + 12, target);
 }
+
+// ---- Jump straight away on a ramp (setting jump_zone_immediate) ------------
+//
+// The trick challenges' ramps and ledges are "jump zones" (the boarding
+// properties' MinSpeedSquaredForJumpZone: above about 9 m/s). A jump asked
+// for inside one is held (the ground state's + 608 set instead of + 609)
+// until the board leaves the zone at the lip (the zone at + 612 cleared by
+// sub_82233578), so the rider rides over the lip's curve first and then
+// jumps: sticky, late. Hooked in the ground state's update (sub_82232DA0)
+// right after that zone check: a held jump fires now (+ 609), as off the
+// zone. The zone (+ 612, + 620) is kept for the jump's own use.
+
+REXCVAR_DEFINE_BOOL(jump_zone_immediate, true, "Amped 3/Patches",
+                    "Jump the moment it's asked for on a ramp or ledge (a trick challenge's "
+                    "jump zone): the original holds the jump until the board leaves the lip, "
+                    "riding over its curve first.");
+
+REXCVAR_DEFINE_BOOL(trace_jump_zone, false, "Amped 3/Diagnostics",
+                    "Log each jump held for a jump zone, and when it fires.");
+
+void Amped3_JumpZoneHeld(PPCRegister& r31) {
+  const uint32_t ground = r31.u32;
+  if (!ground) return;
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel) return;
+  uint8_t* base = kernel->memory()->virtual_membase();
+  const bool held = base[ground + 608] != 0;
+  const uint32_t zone = Load32(base, ground + 612);
+  if (!held || !zone) return;
+  // (The local rider's only, when it's known.)
+  const uint32_t rider = Load32(base, ground + 12);
+  const uint32_t local = g_tuck_rider.load();
+  if (local && rider != local) return;
+  if (REXCVAR_GET(trace_jump_zone)) {
+    REXLOG_INFO("jump zone: jump held in zone {:08X} (ground state {:08X}, rider {:08X}){}", zone,
+                ground, rider, REXCVAR_GET(jump_zone_immediate) ? ": fired now" : "");
+  }
+  if (!REXCVAR_GET(jump_zone_immediate)) return;
+  base[ground + 608] = 0;
+  base[ground + 609] = 1;
+}

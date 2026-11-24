@@ -898,6 +898,15 @@ that rule against a save that has the pass.
   over the freecam's view; the camera holds still until it's closed.
 - Revamped Graphics from the controller: hold View + RB for half a second
   (as F2).
+- Jumps on ramps and ledges fire when asked for (`jump_zone_immediate`, on):
+  the trick challenges' ramps are jump zones, and the original holds a jump
+  asked for in one until the board leaves the zone at the lip, so the rider
+  rides over the lip's curve and then jumps (sticky, late; the same at 30
+  fps). Found with the property scan (F8): the ground state's update
+  (sub_82232DA0) checks the zone (sub_82233578, the speed squared over
+  MinSpeedSquaredForJumpZone, + 476), a held jump (+ 608) fires only once
+  the zone (+ 612) is left (+ 609); now it fires at once, the zone kept for
+  the jump. `trace_jump_zone` logs each one.
 - Low latency (Graphics > Display: Low Latency, `native_low_latency`, on):
   input felt delayed (jumps late off the lip, spins starting late), and
   worse at 30 fps: the delay was the frames in the pipeline. Each frame was

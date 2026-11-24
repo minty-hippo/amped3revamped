@@ -235,3 +235,11 @@ registers = ["r3", "f1"]
 name = "Amped3_AnimParamStep"
 address = 0x823C5C10
 registers = ["r3", "f1"]
+
+# --- Jump straight away on a ramp (src/game_patches.cpp, setting
+# jump_zone_immediate): the ground state's update (sub_82232DA0) just after
+# its jump-zone check (bl sub_82233578), r31 = the ground state ----
+[[midasm_hook]]
+name = "Amped3_JumpZoneHeld"
+address = 0x82232EA4
+registers = ["r31"]
