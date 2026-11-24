@@ -691,7 +691,29 @@ that rule against a save that has the pass.
     a roof or the trees; `nogimovers` leaves them out). Lamps: on screen
     their light was already in what the rays meet (the world light comes
     after the night lights); off screen the eight nearest the camera now
-    light what a ray hits too, after dark (no shadows; `ginolamps`). A ray that hits something takes off the sky light
+    light what a ray hits too, after dark (no shadows; `ginolamps`).
+    A second, finer grid of probes: the same count 2 m apart (64 x 32 x
+    64 m round the camera), in the same texture under the first, an eighth
+    of it traced a frame and the coarse grid a sixteenth (half a band more
+    than before, all told). Within it the shade near by is sharper (under a
+    tree, along a wall, by a jump), blended into the coarse grid over its
+    last few probes; the riders read it too (`ginofine`: the coarse grid
+    alone). With the world light on, the ambient occlusion reaches 1.25 m
+    (was 2.5 m): the larger shade is the probes' now, the occlusion only the
+    close-up shade under that (`gifullao` keeps 2.5 m).
+    Far shadows from the voxels (with time of day on): past the sun maps,
+    each point casts two rays toward the sun (jittered over a little of the
+    sky, eased frame to frame into a soft edge) through the voxels, the
+    coarse ones out to the edge of their 512 m, so what's off screen shades
+    too (a ridge behind the camera, a peak above the picture, buildings
+    seen before and still in the voxels), which the march through the
+    depth on screen can't see; both are used. At the mountain's own hour
+    the game's painted shadows still rule, as before. Rays toward a low sun
+    skip the first few voxels (more the lower it is over the slope) so a
+    slope doesn't shade itself through its voxels' staircase. Timed as
+    "world light: sun" (`nogisun`: off; `gisunview`: what it shades;
+    `gisunall`: everywhere the voxels reach, to compare with the sun maps).
+    A ray that hits something takes off the sky light
     the game gave from that way (its ambient is the lighting's own
     spherical harmonics, which assume an open sky) and puts on the light
     of what it hit: as lit on screen where the hit shows there (so lamps

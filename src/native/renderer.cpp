@@ -2020,7 +2020,7 @@ struct Renderer::Impl {
     kMoverShade = 28, kMoverApply = 29, kBakeMin = 30, kSunSeen = 31, kSunTiles = 32,
     kMoverBlur = 33, kTodSky = 34, kTodTint = 35, kEyeMeasure = 36, kTodShadow = 37, kTodLights = 38,
     kSnow = 39, kSnowCover = 40, kBloom = 41, kCloudShadow = 42,
-    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68, kGiMovers = 69
+    kTracksMerge = 43, kTracksApply = 44, kVolume = 45, kVolumeAdd = 46, kFogVolume = 47, kCloudMap = 48, kSunSpec = 49, kSpecAdd = 50, kTracksShadow = 51, kDrift = 52, kFlare = 53, kDust = 54, kContactShadow = 55, kMaskEase = 56, kTodFade = 57, kKeepIcons = 58, kAoPrep = 59, kMaskFinish = 60, kSunSpecMs = 61, kBounce = 62, kGiOcc = 63, kGiTrace = 64, kGiBlur = 65, kGiTemporal = 66, kGiProbes = 67, kGiApply = 68, kGiMovers = 69, kGiSun = 70
   };
   VkPipeline CopyPipeline(CopyKind kind, VkFormat format);
   void CopyPass(CopyKind kind, Image* src, Image* dst, uint32_t mode, bool float_depth,
@@ -2148,7 +2148,7 @@ struct Renderer::Impl {
   VkPipelineLayout copy_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout copy_set_layout_ = VK_NULL_HANDLE;
   VkShaderModule copy_vs_ = VK_NULL_HANDLE;
-  VkShaderModule copy_fs_[70] = {};  // by CopyKind
+  VkShaderModule copy_fs_[71] = {};  // by CopyKind
   // Map clouds: one quad per puff (instanced), placed by its vertex shader,
   // with push constants in both stages (a layout of their own).
   VkShaderModule clouds_vs_ = VK_NULL_HANDLE;
@@ -2535,12 +2535,18 @@ struct Renderer::Impl {
   // index matches it, modulo the grid), each probe six faces (the light onto
   // a surface facing +x, -x, +y, -y, +z, -z), an eighth of them traced
   // again each frame and blended in. Texture: 6 x 32 wide, 16 x 32 high.
+  // Under it in the same texture (rows 16 x 32 on) a finer grid, the same
+  // count 2 m apart (64 x 32 x 64 m round the camera): the shade near by
+  // (under a tree, by a wall) sharper; an eighth of it traced a frame, the
+  // coarse grid a sixteenth.
   static constexpr int kProbeDims[3] = {32, 16, 32};
   static constexpr double kProbeSpacing = 4.0;
+  static constexpr double kProbeFine = 2.0;
   Image gi_probe_[2];
   int gi_probe_cur_ = 0;
   bool gi_probes_now_ = false;  // this frame's probes (and gi_params_) up to date
   Image gi_movers_;             // the riders' factor from them (half size)
+  Image gi_sun_;                // the sun mask with the far shadows from the voxels (builtin_gi_sun)
   int gi_hist_cur_ = 0;
   bool gi_hist_ok_ = false;
   double gi_prev_vp_[16] = {};
@@ -7470,12 +7476,15 @@ void main() {
   kCam = Param(11);
   for (int i = 0; i < 7; ++i) kSh[i] = Param(12 + i);
   kSet = Param(19);
-  vec4 g = Param(21);  // the grid's lowest probe (world index), spacing (m)
   ivec3 dims = ivec3(Param(22).xyz);
   int frame = int(Param(22).w);
   ivec2 t = ivec2(gl_FragCoord.xy);
+  // (Rows past the coarse grid's: the fine one's.)
+  bool fine = t.y >= dims.y * dims.z;
+  vec4 g = fine ? Param(23) : Param(21);  // the grid's lowest probe (world index), spacing (m)
+  int row = fine ? t.y - dims.y * dims.z : t.y;
   int face = t.x % 6;
-  ivec3 slot = ivec3(t.x / 6, t.y / dims.z, t.y % dims.z);
+  ivec3 slot = ivec3(t.x / 6, row / dims.z, row % dims.z);
   ivec3 lo = ivec3(g.xyz);
   ivec3 wi = lo + ((slot - lo) % dims + dims) % dims;
   // (Which probe this slot holds: tagged in alpha, so one scrolled in is
@@ -7624,6 +7633,76 @@ void main() {
   o = vec4(r, d);
 }
 )", true);
+  // World-space light, 7: the sun's shadows far off (past the sun maps)
+  // from the voxels: toward the sun from each far point, through the coarse
+  // cascade (4 m voxels, 512 m round the camera). What's off screen (a ridge
+  // behind the camera, above the picture) shades too, which the march
+  // through the depth on screen can't see; kept where the voxels reach, on
+  // the mask before builtin_mask_finish (which marches the screen too).
+  // Binding 0 (scene): the mask so far; 5 (params): the mask's settings
+  // (builtin_mask_finish's), with 16, 17 the cascades and 18 strength,
+  // frame.
+  copy_fs_[70] = CompileBuiltin("builtin_gi_sun", kGiCommon + R"(void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  float lit = texelFetch(scene, ip, 0).r;
+  o = vec4(lit);
+  float d = texelFetch(depth, ip, 0).r;
+  vec2 size = vec2(textureSize(depth, 0));
+  vec2 uv = gl_FragCoord.xy / size;
+  M = mat4(Param(0), Param(1), Param(2), Param(3));
+  vec4 wp = M * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0 - max(d, 1e-7), 1.0);
+  vec3 P = wp.xyz / (abs(wp.w) < 1e-9 ? 1.0 : wp.w);
+  // (The surface's facing, from the depth: before anything branches.)
+  vec3 Nf = cross(dFdx(P), dFdy(P));
+  if (d <= 0.0 || abs(wp.w) < 1e-9 || lit < 0.02) return;
+  N = int(pc.a.z);
+  kBox[0] = Param(16);
+  kBox[1] = Param(17);
+  vec4 st = Param(18);  // strength, -, frame
+  vec3 L = Param(7).xyz;
+  vec4 f0 = Param(12), f1 = Param(13);  // camera, from (m); over (m)
+  float k = st.w > 0.5 ? 1.0 : smoothstep(f0.w, f0.w + f1.x, length(P.xz - f0.xz));
+  // (Diagnostic "gisunall": everywhere the voxels reach, not only far off.
+  // Well inside the coarse cascade: fading out over its last voxels.)
+  float vs = kBox[1].w;
+  vec3 q = (P - kBox[1].xyz) / vs;
+  vec3 m3 = min(q, vec3(float(N)) - q);
+  float edge = smoothstep(2.0, 10.0, min(min(m3.x, m3.z), m3.y + 8.0));
+  k *= edge * st.x;
+  if (k <= 0.0) return;
+  vec3 Nn = normalize(Nf);
+  if (dot(Nn, P - f0.xyz) > 0.0) Nn = -Nn;  // (toward the camera)
+  // (No skipping what faces away from the sun, dark by its light already:
+  // the depth's facing is grainy, and single pixels of it left lit.)
+  // Two rays, their directions jittered over a little of the sky round the
+  // sun frame to frame (the mask's easing softens it into a penumbra; one
+  // alone left single pixels of shade speckling the far slopes).
+  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy + st.z * vec2(5.588, 3.142), vec2(0.06711056, 0.00583715))));
+  vec3 T = normalize(cross(L, abs(L.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+  vec3 Bt = cross(L, T);
+  // (From the fine cascade if it's in it (nearer than its edge by a few
+  // voxels); off the surface by a voxel and more, the slope's own voxels
+  // left.)
+  vec3 q0 = (P - kBox[0].xyz) / kBox[0].w;
+  int k0 = all(greaterThan(q0, vec3(4.0))) && all(lessThan(q0, vec3(float(N) - 4.0))) ? 0 : 1;
+  float v0 = kBox[k0].w;
+  vec3 S = P + Nn * v0 * 1.5;
+  // (Toward a sun low over the slope the ray runs along the slope's own
+  // voxels, a staircase it would meet: nothing counted nearer than a few
+  // voxels, more the lower the sun is over it.)
+  float nl = dot(Nn, L);
+  float tmin = v0 * (2.0 + 1.5 / max(nl, 0.15));
+  float shade = 0.0;
+  for (int i = 0; i < 2; ++i) {
+    float ph = 6.2831853 * fract(jit * 7.31 + st.z * 0.618034 + float(i) * 0.5);
+    vec3 D = normalize(L + (T * cos(ph) + Bt * sin(ph)) * 0.015 * sqrt(fract(jit + float(i) * 0.5)));
+    vec3 hn;
+    if (Trace(S, D, tmin, 900.0, k0, ivec2(96, 140), hn) >= 0.0) shade += 0.5;
+  }
+  o = vec4(lit * (1.0 - k * shade));
+  if (st.y > 0.5) o = vec4(0.5 - 0.5 * shade);  // (diagnostic "gisunview": where it reaches, what it shades)
+}
+)", true);
   // World-space light, 5: the probes read at each quarter-size pixel
   // (trilinear, the six faces by its normal, probes behind its surface
   // weighed less, those inside something or not yet traced left out).
@@ -7635,6 +7714,68 @@ layout(set = 0, binding = 5) uniform sampler2D params;
 layout(push_constant) uniform A { vec4 a; } pc;  // 1 / width, 1 / height (full size), pixels a texel
 layout(location = 0) out vec4 o;
 vec4 Param(int i) { return texelFetch(params, ivec2(i, 0), 0); }
+// The probes round P in one grid (its lowest probe and spacing g, its rows
+// from row0): trilinear, for a surface facing Nn (each face by Nn squared,
+// the probes it faces weighted up), or all six faces averaged (all6: a body
+// facing every way). The weighted sum, the weights' total.
+vec4 Gather(vec4 g, ivec3 dims, int row0, vec3 P, vec3 Nn, bool all6) {
+  ivec3 lo = ivec3(g.xyz);
+  vec3 q = P / g.w - 0.5;
+  ivec3 base = ivec3(floor(q));
+  vec3 f = q - vec3(base);
+  vec3 n2 = Nn * Nn;
+  ivec3 fc = ivec3(Nn.x >= 0.0 ? 0 : 1, Nn.y >= 0.0 ? 2 : 3, Nn.z >= 0.0 ? 4 : 5);
+  vec3 sum = vec3(0.0);
+  float ws = 0.0;
+  for (int k = 0; k < 8; ++k) {
+    ivec3 o3 = ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+    ivec3 wi = base + o3;
+    if (any(lessThan(wi, lo)) || any(greaterThanEqual(wi, lo + dims))) continue;
+    ivec3 slot = ((wi % dims) + dims) % dims;
+    ivec2 t0 = ivec2(slot.x * 6, row0 + slot.y * dims.z + slot.z);
+    float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
+    vec3 tw = mix(1.0 - f, f, vec3(o3));
+    float w = tw.x * tw.y * tw.z;
+    vec3 val;
+    if (all6) {
+      vec4 a0 = texelFetch(probes, t0, 0);
+      if (a0.a < 0.0 || abs(a0.a - tag) > 0.25) continue;
+      val = a0.rgb;
+      for (int c = 1; c < 6; ++c) val += texelFetch(probes, t0 + ivec2(c, 0), 0).rgb;
+      val /= 6.0;
+    } else {
+      vec4 a = texelFetch(probes, t0 + ivec2(fc.x, 0), 0);
+      if (a.a < 0.0 || abs(a.a - tag) > 0.25) continue;
+      vec4 b = texelFetch(probes, t0 + ivec2(fc.y, 0), 0);
+      vec4 cz = texelFetch(probes, t0 + ivec2(fc.z, 0), 0);
+      val = a.rgb * n2.x + b.rgb * n2.y + cz.rgb * n2.z;
+      vec3 dir = (vec3(wi) + 0.5) * g.w - P;
+      float dl = length(dir);
+      float facing = dl > 1e-3 ? dot(dir / dl, Nn) * 0.5 + 0.5 : 1.0;
+      w *= facing * facing + 0.02;
+    }
+    sum += val * w;
+    ws += w;
+  }
+  return vec4(sum, ws);
+}
+// Both grids: the fine one's where P is well inside it and it has probes
+// round P (blended into the coarse one's over its last few), else the
+// coarse one's. (Few or faint probes to go by: less of it, not theirs
+// blown up.)
+vec3 Probes(vec3 P, vec3 Nn, bool all6) {
+  ivec3 dims = ivec3(Param(22).xyz);
+  vec4 C = Gather(Param(21), dims, 0, P, Nn, all6);
+  vec3 e = C.rgb / max(C.a, 0.3);
+  vec4 gf = Param(23);
+  if (gf.w <= 0.0) return e;
+  vec3 q = P / gf.w - 0.5 - gf.xyz;
+  vec3 m = min(q, vec3(dims) - 1.0 - q);
+  float edge = smoothstep(1.0, 4.0, min(min(m.x, m.y), m.z));
+  if (edge <= 0.0) return e;
+  vec4 F = Gather(gf, dims, dims.y * dims.z, P, Nn, all6);
+  return mix(e, F.rgb / max(F.a, 0.3), edge * smoothstep(0.1, 0.4, F.a));
+}
 void main() {
   mat4 M;
   for (int i = 0; i < 4; ++i) M[i] = Param(i);
@@ -7654,37 +7795,7 @@ void main() {
   float nl = length(Nn);
   if (abs(nl - 1.0) > 0.2) return;
   Nn /= nl;
-  ivec3 lo = ivec3(g.xyz);
-  vec3 q = P / g.w - 0.5;
-  ivec3 base = ivec3(floor(q));
-  vec3 f = q - vec3(base);
-  vec3 n2 = Nn * Nn;
-  ivec3 fc = ivec3(Nn.x >= 0.0 ? 0 : 1, Nn.y >= 0.0 ? 2 : 3, Nn.z >= 0.0 ? 4 : 5);
-  vec3 sum = vec3(0.0);
-  float ws = 0.0;
-  for (int k = 0; k < 8; ++k) {
-    ivec3 o3 = ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
-    ivec3 wi = base + o3;
-    if (any(lessThan(wi, lo)) || any(greaterThanEqual(wi, lo + dims))) continue;
-    ivec3 slot = ((wi % dims) + dims) % dims;
-    ivec2 t0 = ivec2(slot.x * 6, slot.y * dims.z + slot.z);
-    float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
-    vec4 a = texelFetch(probes, t0 + ivec2(fc.x, 0), 0);
-    if (a.a < 0.0 || abs(a.a - tag) > 0.25) continue;
-    vec4 b = texelFetch(probes, t0 + ivec2(fc.y, 0), 0);
-    vec4 cz = texelFetch(probes, t0 + ivec2(fc.z, 0), 0);
-    vec3 val = a.rgb * n2.x + b.rgb * n2.y + cz.rgb * n2.z;
-    vec3 tw = mix(1.0 - f, f, vec3(o3));
-    float w = tw.x * tw.y * tw.z;
-    vec3 dir = (vec3(wi) + 0.5) * g.w - P;
-    float dl = length(dir);
-    float facing = dl > 1e-3 ? dot(dir / dl, Nn) * 0.5 + 0.5 : 1.0;
-    w *= facing * facing + 0.02;
-    sum += val * w;
-    ws += w;
-  }
-  // (Few or faint probes to go by: less of it, not theirs blown up.)
-  vec3 e = sum / max(ws, 0.3);
+  vec3 e = Probes(P, Nn, false);
   float dist = length(P - cam.xyz);
   e *= 1.0 - smoothstep(float(dims.x) * g.w * 0.35, float(dims.x) * g.w * 0.5, dist);
   o = vec4(e, d);
@@ -7708,17 +7819,17 @@ vec3 Sky(vec3 n) {
            vec3(dot(Param(15), q), dot(Param(16), q), dot(Param(17), q)) + Param(18).xyz * (n.x * n.x - n.y * n.y);
   return max(r, vec3(0.0));
 }
-void main() {
-  vec4 P4 = texelFetch(pos, ivec2(gl_FragCoord.xy), 0);
-  o = vec4(1.0, 1.0, 1.0, 0.0);
-  if (P4.w <= 0.0) return;
-  vec3 P = P4.xyz;
-  vec4 g = Param(21);
-  ivec3 dims = ivec3(Param(22).xyz);
+// The probes round P in one grid (its lowest probe and spacing g, its rows
+// from row0): trilinear, for a surface facing Nn (each face by Nn squared,
+// the probes it faces weighted up), or all six faces averaged (all6: a body
+// facing every way). The weighted sum, the weights' total.
+vec4 Gather(vec4 g, ivec3 dims, int row0, vec3 P, vec3 Nn, bool all6) {
   ivec3 lo = ivec3(g.xyz);
   vec3 q = P / g.w - 0.5;
   ivec3 base = ivec3(floor(q));
   vec3 f = q - vec3(base);
+  vec3 n2 = Nn * Nn;
+  ivec3 fc = ivec3(Nn.x >= 0.0 ? 0 : 1, Nn.y >= 0.0 ? 2 : 3, Nn.z >= 0.0 ? 4 : 5);
   vec3 sum = vec3(0.0);
   float ws = 0.0;
   for (int k = 0; k < 8; ++k) {
@@ -7726,18 +7837,56 @@ void main() {
     ivec3 wi = base + o3;
     if (any(lessThan(wi, lo)) || any(greaterThanEqual(wi, lo + dims))) continue;
     ivec3 slot = ((wi % dims) + dims) % dims;
-    ivec2 t0 = ivec2(slot.x * 6, slot.y * dims.z + slot.z);
+    ivec2 t0 = ivec2(slot.x * 6, row0 + slot.y * dims.z + slot.z);
     float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
-    vec4 a0 = texelFetch(probes, t0, 0);
-    if (a0.a < 0.0 || abs(a0.a - tag) > 0.25) continue;
-    vec3 v = a0.rgb;
-    for (int fc = 1; fc < 6; ++fc) v += texelFetch(probes, t0 + ivec2(fc, 0), 0).rgb;
     vec3 tw = mix(1.0 - f, f, vec3(o3));
     float w = tw.x * tw.y * tw.z;
-    sum += v / 6.0 * w;
+    vec3 val;
+    if (all6) {
+      vec4 a0 = texelFetch(probes, t0, 0);
+      if (a0.a < 0.0 || abs(a0.a - tag) > 0.25) continue;
+      val = a0.rgb;
+      for (int c = 1; c < 6; ++c) val += texelFetch(probes, t0 + ivec2(c, 0), 0).rgb;
+      val /= 6.0;
+    } else {
+      vec4 a = texelFetch(probes, t0 + ivec2(fc.x, 0), 0);
+      if (a.a < 0.0 || abs(a.a - tag) > 0.25) continue;
+      vec4 b = texelFetch(probes, t0 + ivec2(fc.y, 0), 0);
+      vec4 cz = texelFetch(probes, t0 + ivec2(fc.z, 0), 0);
+      val = a.rgb * n2.x + b.rgb * n2.y + cz.rgb * n2.z;
+      vec3 dir = (vec3(wi) + 0.5) * g.w - P;
+      float dl = length(dir);
+      float facing = dl > 1e-3 ? dot(dir / dl, Nn) * 0.5 + 0.5 : 1.0;
+      w *= facing * facing + 0.02;
+    }
+    sum += val * w;
     ws += w;
   }
-  vec3 e = sum / max(ws, 0.3);
+  return vec4(sum, ws);
+}
+// Both grids: the fine one's where P is well inside it and it has probes
+// round P (blended into the coarse one's over its last few), else the
+// coarse one's. (Few or faint probes to go by: less of it, not theirs
+// blown up.)
+vec3 Probes(vec3 P, vec3 Nn, bool all6) {
+  ivec3 dims = ivec3(Param(22).xyz);
+  vec4 C = Gather(Param(21), dims, 0, P, Nn, all6);
+  vec3 e = C.rgb / max(C.a, 0.3);
+  vec4 gf = Param(23);
+  if (gf.w <= 0.0) return e;
+  vec3 q = P / gf.w - 0.5 - gf.xyz;
+  vec3 m = min(q, vec3(dims) - 1.0 - q);
+  float edge = smoothstep(1.0, 4.0, min(min(m.x, m.y), m.z));
+  if (edge <= 0.0) return e;
+  vec4 F = Gather(gf, dims, dims.y * dims.z, P, Nn, all6);
+  return mix(e, F.rgb / max(F.a, 0.3), edge * smoothstep(0.1, 0.4, F.a));
+}
+void main() {
+  vec4 P4 = texelFetch(pos, ivec2(gl_FragCoord.xy), 0);
+  o = vec4(1.0, 1.0, 1.0, 0.0);
+  if (P4.w <= 0.0) return;
+  vec3 P = P4.xyz;
+  vec3 e = Probes(P, vec3(0.0, 1.0, 0.0), true);
   vec3 sky = (Sky(vec3(1, 0, 0)) + Sky(vec3(-1, 0, 0)) + Sky(vec3(0, 1, 0)) + Sky(vec3(0, -1, 0)) +
               Sky(vec3(0, 0, 1)) + Sky(vec3(0, 0, -1))) / 6.0;
   // (The sun's share of their light, about: a quarter of it, averaged over
@@ -12395,6 +12544,9 @@ Image* Renderer::Impl::OccludedScene(Image* scene) {
   pc[18] = cam_pos_[2];
   // A few metres: where the snow meets trees, rails, jumps and buildings.
   pc[19] = 2.5f;
+  // (With the world light on, the shade from what's near by is in its
+  // probes: the occlusion kept to the small, close-up shade under that.)
+  if (GiReady() && !Diag("gifullao")) pc[19] = 1.25f;
   pc[20] = 1.0f / float(w);
   pc[21] = 1.0f / float(h);
   pc[22] = px_per_unit;
@@ -13295,6 +13447,13 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     f[22 * 4 + i] = float(kProbeDims[i]);
   }
   f[21 * 4 + 3] = float(kProbeSpacing);
+  // (The fine grid: texels 23, 24.)
+  for (int i = 0; i < 3; ++i) {
+    f[23 * 4 + i] = float(int64_t(std::floor(cam_pos_[i] / kProbeFine)) -
+                          (i == 1 ? kProbeDims[i] * 3 / 8 : kProbeDims[i] / 2));
+    f[24 * 4 + i] = float(kProbeDims[i]);
+  }
+  f[23 * 4 + 3] = Diag("ginofine") ? 0.0f : float(kProbeFine);
   // The night lights nearest the camera (after dark), for what the rays hit
   // off screen (on screen their light is in the picture already): texels
   // 26 + 2 i (where, how far it reaches), 27 + 2 i (its light), up to 8.
@@ -13355,7 +13514,8 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     ToGeneral(cb_, gi_img_);
   }
   if (probes) {
-    const uint32_t pw = uint32_t(6 * kProbeDims[0]), ph = uint32_t(kProbeDims[1] * kProbeDims[2]);
+    const uint32_t pw = uint32_t(6 * kProbeDims[0]), rows = uint32_t(kProbeDims[1] * kProbeDims[2]),
+                   ph = rows * 2;
     for (Image& im : gi_probe_) {
       if (!im.image || im.width != pw || im.height != ph) {
         if (im.image) Retire(im);
@@ -13377,11 +13537,19 @@ void Renderer::Impl::GiTrace(Image* scene, Image* depth) {
     vk::vkCmdCopyImage(cb_, gi_probe_[gi_probe_cur_].image, VK_IMAGE_LAYOUT_GENERAL, gi_probe_[nxt].image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &all);
     Barrier();
-    const uint32_t bands = 8, band_h = ph / bands;
-    const VkRect2D band{{0, int32_t((frame_number_ % bands) * band_h)}, {pw, band_h}};
+    // (The coarse grid's a sixteenth of its rows (one layer), the fine
+    // one's an eighth (two).)
+    const uint32_t cb = rows / 16, fb = rows / 8;
+    const VkRect2D band{{0, int32_t((frame_number_ % 16) * cb)}, {pw, cb}};
     FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
                    &band, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
                    &gi_params_);
+    if (!Diag("ginofine")) {
+      const VkRect2D fband{{0, int32_t(rows + (frame_number_ % 8) * fb)}, {pw, fb}};
+      FullscreenPass(CopyKind::kGiProbes, &gi_probe_[nxt], scene, depth, &gi_probe_[gi_probe_cur_], true, pp, 8,
+                     &fband, const_cast<Image*>(&c0.occ[c0.cur]), const_cast<Image*>(&c1.occ[c1.cur]),
+                     &gi_params_);
+    }
     Barrier();
     gi_probe_cur_ = nxt;
     MarkPart("world light: probes");
@@ -14479,7 +14647,7 @@ void Renderer::Impl::TodShadows() {
   Barrier();
   if (finish) {
     // Its settings, a row of texels (more than the push constants hold).
-    float f[16 * 4] = {};
+    float f[20 * 4] = {};
     for (int c = 0; c < 4; ++c) {
       for (int r = 0; r < 4; ++r) f[c * 4 + r] = float(inv_vp_[r * 4 + c]);  // 0-3: ndc -> world
     }
@@ -14547,20 +14715,54 @@ void Renderer::Impl::TodShadows() {
       f[55] = float(frame_number_ % 64);
       for (int i = 0; i < 4; ++i) f[56 + i] = bake_c5_[i];  // 14: the painted map's world x, z -> u, v
     }
-    if (!tod_params_.image) {
-      tod_params_ = gpu_.CreateImage(16, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "tod_mask_settings");
+    // (16, 17: the world light's cascades, 18: their strength here, the
+    // frame; for builtin_gi_sun.)
+    const bool vox_sun = far_off && GiReady() && !Diag("nogisun");
+    if (vox_sun) {
+      for (int k = 0; k < 2; ++k) {
+        const GiCascade& g = gi_c_[k];
+        for (int i = 0; i < 3; ++i) f[(16 + k) * 4 + i] = float(double(g.org[i]) * g.voxel);
+        f[(16 + k) * 4 + 3] = float(g.voxel);
+      }
+      f[18 * 4 + 0] = painted ? float(std::clamp(tod_state_.away, 0.0, 1.0)) : 1.0f;
+      f[18 * 4 + 1] = Diag("gisunview") ? 1.0f : 0.0f;
+      f[18 * 4 + 2] = float(frame_number_ % 64);
+      f[18 * 4 + 3] = Diag("gisunall") ? 1.0f : 0.0f;  // (everywhere it reaches, not only far off)
+    }
+    if (!tod_params_.image || tod_params_.width != 20) {
+      if (tod_params_.image) Retire(tod_params_);
+      tod_params_ = gpu_.CreateImage(20, 1, VK_FORMAT_R32G32B32A32_SFLOAT, false, "tod_mask_settings");
       ToGeneral(cb_, tod_params_);
     }
     Buffer staging = gpu_.CreateBuffer(sizeof(f), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     std::memcpy(staging.mapped, f, sizeof(f));
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {16, 1, 1};
+    region.imageExtent = {20, 1, 1};
     Barrier();
     vk::vkCmdCopyBufferToImage(cb_, staging.buffer, tod_params_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     staging_.push_back(staging);
     Barrier();
-    FullscreenPass(CopyKind::kMaskFinish, finished, depth, sun_out, clouds ? &cloud_map_ : nullptr, false, nullptr,
+    // The sun's shadows far off from the world light's voxels (what's off
+    // screen too), on the mask before the rest.
+    Image* masked = sun_out;
+    if (vox_sun) {
+      if (!gi_sun_.image || gi_sun_.width != sun_out->width || gi_sun_.height != sun_out->height ||
+          gi_sun_.format != sun_out->format) {
+        if (gi_sun_.image) Retire(gi_sun_);
+        gi_sun_ = gpu_.CreateImage(sun_out->width, sun_out->height, sun_out->format, false, "world_light_sun");
+        ToGeneral(cb_, gi_sun_);
+      }
+      MarkPart("lighting: sun mask");
+      float gp[8] = {0, 0, float(kGiN), 0, 0, 0, 0, 0};
+      FullscreenPass(CopyKind::kGiSun, &gi_sun_, sun_out, depth, nullptr, false, gp, 8, nullptr,
+                     const_cast<Image*>(&gi_c_[0].occ[gi_c_[0].cur]),
+                     const_cast<Image*>(&gi_c_[1].occ[gi_c_[1].cur]), &tod_params_);
+      Barrier();
+      masked = &gi_sun_;
+      MarkPart("world light: sun");
+    }
+    FullscreenPass(CopyKind::kMaskFinish, finished, depth, masked, clouds ? &cloud_map_ : nullptr, false, nullptr,
                    0, nullptr, tracks ? &tracks_map_ : nullptr, &tod_params_, painted ? baked_src_ : nullptr);
     Barrier();
   }
@@ -18165,6 +18367,7 @@ Renderer::Impl::~Impl() {
   gpu_.DestroyImage(gi_img_);
   for (Image& im : gi_hist_) gpu_.DestroyImage(im);
   for (Image& im : gi_probe_) gpu_.DestroyImage(im);
+  gpu_.DestroyImage(gi_sun_);
   gpu_.DestroyImage(gi_movers_);
   for (GiCascade& g : gi_c_) {
     for (Image& im : g.maps) gpu_.DestroyImage(im);
