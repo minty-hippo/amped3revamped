@@ -2828,6 +2828,13 @@ struct Renderer::Impl {
     fog_anim_start_ = now;
   }
   void UpdateClouds();  // at the output: this frame's riding state
+  // The map clouds drawn under the interface: into the picture right after
+  // the composite (before the HUD, menus and the save notice draw over it),
+  // while they part; at the output otherwise (closing over the held frame).
+  bool clouds_updated_ = false;    // UpdateClouds run this frame
+  bool clouds_drawn_ = false;      // drawn under the interface this frame
+  Image* composite_rt_ = nullptr;  // where the composite drew (this frame)
+  void CloudsUnderInterface();
   // The game's own cloud puff (128x128, the pause menu's): found among the
   // textures the game uses (by its contents), or loaded from the file kept
   // from an earlier session; until then the puffs are drawn procedurally.
@@ -16229,6 +16236,10 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
     prof_t = t;
   };
   const GpuState& st = *d.state;
+  // The first draw after the composite (the HUD, a menu, the save notice):
+  // the map clouds go under it.
+  if (composite_rt_ && !clouds_drawn_ && !clouds_updated_) CloudsUnderInterface();
+  const bool composite_before = composite_seen_;
   if ((hide_interface_ || fc_on_ || fc_in_.hide_hud) && composite_seen_) return;  // the HUD / menus, left out
   if (d.vs.empty() || d.ps.empty()) {
     Skip(number, "no microcode recorded (capture from an older build)");
@@ -17133,6 +17144,7 @@ void Renderer::Impl::DoDraw(const Draw& d, uint32_t number) {
   }
   ds.valid = true;
   if (!colors.empty()) last_color_ = colors[0];
+  if (!composite_before && composite_seen_ && !colors.empty() && colors[0]->samples == 1) composite_rt_ = colors[0];
   ++stats_.draws_done;
   mark(7);
   struct AfterMark {
@@ -18276,10 +18288,77 @@ void Renderer::Impl::UploadCloudSprite() {
   cloud_sprite_pending_.clear();
 }
 
+// The map clouds under the interface: at the first draw after the composite
+// (the HUD, menus, the save notice on the way into the trail map), drawn
+// into the composite's picture while they part, so what's drawn after them
+// shows over them. (Closing in over the held frame: at the output, over it
+// all, as before.)
+void Renderer::Impl::CloudsUnderInterface() {
+  if (Diag("cloudsontop") || !map_clouds_ || hold_picture_) {
+    clouds_updated_ = false;
+    composite_rt_ = nullptr;
+    return;
+  }
+  UpdateClouds();
+  if (!cloud_active_ || cloud_closing_ || !composite_rt_ || !composite_rt_->image || composite_rt_->depth) return;
+  Image* rt = composite_rt_;
+  EndRendering();
+  UploadCloudSprite();
+  Barrier();
+  VkDescriptorSet set;
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = pool_;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &copy_set_layout_;
+  vk::Check(vk::vkAllocateDescriptorSets(gpu_.device, &ai, &set), "clouds set");
+  const bool sprite = cloud_sprite_.image != VK_NULL_HANDLE;
+  VkDescriptorImageInfo ii[3] = {{point_sampler_, dummy_.sample_view, VK_IMAGE_LAYOUT_GENERAL},
+                                 {point_sampler_, dummy_.sample_view, VK_IMAGE_LAYOUT_GENERAL},
+                                 {linear_sampler_, sprite ? cloud_sprite_.view : dummy_.view, VK_IMAGE_LAYOUT_GENERAL}};
+  VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  wr.dstSet = set;
+  wr.descriptorCount = 3;
+  wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  wr.pImageInfo = ii;
+  vk::vkUpdateDescriptorSets(gpu_.device, 1, &wr, 0, nullptr);
+  const uint32_t w = rt->width, h = rt->height;
+  VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  att.imageView = rt->view;
+  att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {w, h}};
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &att;
+  vk::vkCmdBeginRendering(cb_, &ri);
+  vk::vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, CopyPipeline(CopyKind::kClouds, rt->format));
+  vk::vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, clouds_layout_, 0, 1, &set, 0, nullptr);
+  VkViewport v{0, 0, float(w), float(h), 0, 1};
+  vk::vkCmdSetViewport(cb_, 0, 1, &v);
+  VkRect2D sc{{0, 0}, {w, h}};
+  vk::vkCmdSetScissor(cb_, 0, 1, &sc);
+  // (As at the output: the puffs' grid, rows by the sprite, columns across.)
+  const float aspect = float(w) / float(h);
+  const int rows = sprite ? 10 : 7;
+  const int cols = int(std::ceil(aspect / (sprite ? 0.14f : 0.2f))) + 2;
+  const float cpc[8] = {cloud_p_, aspect, 1.0f / float(h), sprite ? 1.0f : 0.0f, float(cols), 0.0f, 0.0f, 0.0f};
+  vk::vkCmdPushConstants(cb_, clouds_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(cpc), cpc);
+  vk::vkCmdDraw(cb_, 6, uint32_t(rows * cols), 0, 0);
+  vk::vkCmdEndRendering(cb_);
+  Barrier();
+  dyn_ = DynState{};
+  clouds_drawn_ = true;
+}
+
 // The map clouds' state at this frame's output: a cut between riding and the
 // trail map (judged as EndFrame does, from this frame's characters) starts
 // them, covering the screen, and they part over kCloudSeconds.
 void Renderer::Impl::UpdateClouds() {
+  if (clouds_updated_) return;  // (once a frame: under the interface, or at the output)
+  clouds_updated_ = true;
   const auto now = std::chrono::steady_clock::now();
   if (!light_seen_) {
     // A loading screen (or anything else without the scene) for long enough:
@@ -18446,7 +18525,8 @@ bool Renderer::Impl::RecordOutput(Image* src, const uint8_t* lut, bool share, ui
   // Map clouds: their state this frame; while they close in on leaving the
   // map, its last frame is shown (already through the gamma table) instead.
   if (!(hold_picture_ && light_seen_ && hold_valid_)) UpdateClouds();
-  const bool clouds = map_clouds_ && cloud_active_ && !(hold_picture_ && light_seen_ && hold_valid_);
+  const bool clouds = map_clouds_ && cloud_active_ && !(hold_picture_ && light_seen_ && hold_valid_) &&
+                      !(clouds_drawn_ && !cloud_closing_);
   if (cloud_closing_ && (!cloud_held_valid_ || cloud_held_.width != w || cloud_held_.height != h)) {
     cloud_closing_ = false;  // nothing to show: part over the riding view now
     StartCloudsParting(std::chrono::steady_clock::now());
@@ -18811,6 +18891,8 @@ RenderStats Renderer::Impl::Render(const Frame& frame, FrameResources& resources
   last_resolve_.clear();
   blur_done_ = false;
   composite_seen_ = false;
+  clouds_updated_ = clouds_drawn_ = false;
+  composite_rt_ = nullptr;
   max_draws_ = max_draws;
   up_done_ = false;
   up_result_ = nullptr;

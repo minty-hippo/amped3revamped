@@ -881,6 +881,12 @@ that rule against a save that has the pass.
   trees' twigs, drawn apart from their trunks): only a small sway and
   flutter, so the branches no longer break away from the trunk in a strong
   wind (the clustered trees still bend whole from their foot).
+- Map clouds under the interface: while they part (into or out of the
+  trail map) they're drawn into the picture right after the game's
+  composite, before its HUD, menus and notices, so the save notice on the
+  way into the trail map shows over them rather than half hidden. Closing
+  in over the last frame before the cut stays over everything, as before
+  (diagnostic `cloudsontop`: over everything throughout).
 - Drifting snow: drawn after the upscaler (streaming over the ground with no
   motion of its own, it smeared and broke up through it), only on the
   ground (not riders, trunks or walls), with a smoother pattern (whole-
