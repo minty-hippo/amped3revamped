@@ -2377,6 +2377,7 @@ struct Renderer::Impl {
   static constexpr uint32_t kTracksN = 4096, kTracksW = 1024;
   static constexpr double kTracksTexel = 0.05;
   Image tracks_map_, tracks_scratch_, tracks_stamp_, tracks_tmp_;
+  Image tracks_stamp_more_[2];  // the trails drawn again where their texture's stronger (its alpha)
   Image tracks_albedo_, tracks_normal_;
   Image* tracks_albedo_src_ = nullptr;
   Image* tracks_normal_src_ = nullptr;
@@ -6250,10 +6251,12 @@ void main() {
   copy_fs_[43] = CompileBuiltin("builtin_tracks_merge", R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D stamp;   // 1: nothing
 layout(set = 0, binding = 1) uniform sampler2D tracks;  // r groove, g pushed up
+layout(set = 0, binding = 2) uniform sampler2D stamp2;  // again, where the trail's alpha is 0.15 and up
+layout(set = 0, binding = 3) uniform sampler2D stamp3;  // 0.3 and up
 layout(push_constant) uniform Merge {
   vec4 a;  // the window's corner in the map, filled, push
   vec4 b;  // (test, A3_TEST_TRACKS: a board instead of the stamp) its middle (window texels), along it
-  vec4 c;  // half its length and width (texels), on
+  vec4 c;  // half its length and width (texels), on, graded (stamp2, stamp3)
 } pc;
 layout(location = 0) out vec4 o;
 float Cov(ivec2 t) {
@@ -6264,7 +6267,12 @@ float Cov(ivec2 t) {
   }
   ivec2 n = textureSize(stamp, 0);
   if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, n))) return 0.0;
-  return texelFetch(stamp, t, 0).r < 1.0 ? 1.0 : 0.0;
+  float c = texelFetch(stamp, t, 0).r < 1.0 ? 1.0 : 0.0;
+  // (As deep as the game's mark is strong: a fifth where it's faint.)
+  if (pc.c.w > 0.5 && c > 0.0) {
+    c = 0.2 + 0.4 * (texelFetch(stamp2, t, 0).r < 1.0 ? 1.0 : 0.0) + 0.4 * (texelFetch(stamp3, t, 0).r < 1.0 ? 1.0 : 0.0);
+  }
+  return c;
 }
 vec2 Old(ivec2 m) { return texelFetch(tracks, clamp(m, ivec2(0), textureSize(tracks, 0) - 1), 0).rg; }
 void main() {
@@ -14057,6 +14065,8 @@ void Renderer::Impl::TracksUpdate() {
   bool fresh = make(tracks_map_, kTracksN, VK_FORMAT_R8G8_UNORM, false, "snow_tracks");
   make(tracks_scratch_, kTracksN, VK_FORMAT_R8G8_UNORM, false, "snow_tracks_scratch");
   make(tracks_stamp_, kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp");
+  make(tracks_stamp_more_[0], kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp_2");
+  make(tracks_stamp_more_[1], kTracksW, VK_FORMAT_D32_SFLOAT_S8_UINT, true, "snow_tracks_stamp_3");
   make(tracks_tmp_, kTracksW, VK_FORMAT_R8G8_UNORM, false, "snow_tracks_window");
   const int64_t tx = std::llround(cam_pos_[0] / kTracksTexel), tz = std::llround(cam_pos_[2] / kTracksTexel);
   const double jx = cam_pos_[0] - tracks_last_cam_[0], jy = cam_pos_[1] - tracks_last_cam_[1],
@@ -14147,6 +14157,7 @@ void Renderer::Impl::TracksUpdate() {
   const double span = double(W) * kTracksTexel;
   const float far_depth[4] = {0, 0, 0, 0};
   ClearImage(&tracks_stamp_, far_depth, 1.0f, 0, false, true, true);
+  for (Image& im : tracks_stamp_more_) ClearImage(&im, far_depth, 1.0f, 0, false, true, true);
   FlushPendingClears();
   float tb[8] = {};
   if (test) {
@@ -14193,11 +14204,26 @@ void Renderer::Impl::TracksUpdate() {
                         0, -1.0 / 1000.0, 0, 0.5 + cam_pos_[1] / 1000.0,
                         0, 0, 0, 1};
   DrawIntoSunMap(draws, &tracks_stamp_, O, nullptr);
+  // (Again where the trail's texture is stronger: pressed deeper there. The
+  // whole of a trail's strip pressed alike made wide flat patches with hard
+  // edges where the game's mark is faint, heaps lit all along them.)
+  const bool graded = !Diag("tracksflat");
+  if (graded && !draws.empty()) {
+    for (int k = 0; k < 2; ++k) {
+      std::vector<CasterDraw> more = draws;
+      for (CasterDraw& c : more) {
+        if (c.sys.alpha_func == 6) c.sys.alpha_ref = k == 0 ? 0.15f : 0.3f;
+      }
+      DrawIntoSunMap(more, &tracks_stamp_more_[k], O, nullptr);
+    }
+  }
   // (How much each cut pushes up beside it.)
   float pc[12] = {float(ox), float(oz), 0.0f, 0.045f};
   std::memcpy(pc + 4, tb, sizeof(tb));
   Barrier();
-  FullscreenPass(CopyKind::kTracksMerge, &tracks_tmp_, &tracks_stamp_, &tracks_map_, nullptr, false, pc, 12);
+  pc[11] = graded && !test ? 1.0f : 0.0f;
+  FullscreenPass(CopyKind::kTracksMerge, &tracks_tmp_, &tracks_stamp_, &tracks_map_, graded ? &tracks_stamp_more_[0] : nullptr,
+                 false, pc, 12, nullptr, graded ? &tracks_stamp_more_[1] : nullptr);
   Barrier();
   VkImageCopy r{};
   r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -18367,7 +18393,7 @@ Renderer::Impl::~Impl() {
   if (pick_rb_.buffer) gpu_.DestroyBuffer(pick_rb_);
   for (Image* im : {&tod_lut_, &tod_white_, &tod_colors_, &tod_sky_img_, &eye_img_,
                     &tod_movers_map_, &tod_mask_, &lights_img_, &lights_out_,
-                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &icons_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_,
+                    &lights_albedo_, &lights_wdepth_, &snow_img_, &snow_albedo_, &bloom_a_, &bloom_b_, &bloom_out_, &pillar_img_, &flare_img_, &flare_tmp_, &flare_out_, &dust_out_, &fade_img_, &fade_out_, &icons_out_, &flare_vis_[0], &flare_vis_[1], &tod_mask_raw_, &tod_mask_prev_, &tracks_map_, &tracks_scratch_, &tracks_stamp_, &tracks_stamp_more_[0], &tracks_stamp_more_[1],
                     &tracks_tmp_, &tracks_albedo_, &tracks_normal_, &vol_img_, &vol_params_, &vol_out_, &cloud_map_, &spec_img_, &spec_out_, &drift_out_, &relight_params_, &tod_params_, &spec_stencil_dummy_}) {
     gpu_.DestroyImage(*im);
   }

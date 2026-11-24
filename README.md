@@ -930,6 +930,14 @@ that rule against a save that has the pass.
   farther out), is left out while they're on: it covered the pressed
   grooves near the rider, so they went flat as the camera turned close by
   (diagnostic `gametrails` keeps it).
+  Pressed as deep as the game's mark is strong: the trails are drawn into
+  the stamp three times, keeping more of their texture each time (its
+  alpha from 5%, 15% and 30% up), a fifth of the groove where only the
+  faintest pass covers and all of it where all three do. A skid or carve
+  is a wide strip whose texture is faint over most of it; pressed alike all
+  over, it made a wide flat patch with hard edges and lit heaps all round
+  it (and at night in a snowfall a dark band behind the rider). `tracksflat`:
+  the old way.
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,
