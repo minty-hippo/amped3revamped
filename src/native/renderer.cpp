@@ -6294,7 +6294,13 @@ void main() {
       old.g *= 1.0 - pc.b.z;
       old.r *= 1.0 - pc.b.w;
     }
-    o = vec4(old.r * (1.0 - pc.a.z), old.g * (1.0 - 0.6 * pc.a.z), 0.0, 1.0);
+    // (What's left very faint goes: 8-bit, a faint groove times a little
+    // less rounded back up to itself and never filled, and the wind's
+    // mixing spread such traces over the whole map - its steps of one
+    // 255th, made slopes by the normals, striped the snow everywhere.)
+    vec2 nw = vec2(old.r * (1.0 - pc.a.z), old.g * (1.0 - 0.6 * pc.a.z));
+    nw = max(nw - vec2(1.5 / 255.0), vec2(0.0)) * step(vec2(0.025), nw);
+    o = vec4(nw, 0.0, 1.0);
     return;
   }
   ivec2 m = t + ivec2(pc.a.xy);
@@ -6310,7 +6316,9 @@ void main() {
       float c = Cov(t + off);
       if (c <= 0.0) continue;
       vec2 on = Old(m + off);
-      pushed += (max(c - on.r, 0.0) + on.g * 2.2) * (1.0 - r / 11.0);
+      // (Pushed up mostly where it's pressed deep: a faint skid's edge
+      // hardly heaps.)
+      pushed += (max(c - on.r, 0.0) * c + on.g * 2.2) * (1.0 - r / 11.0);
     }
   }
   float groove = max(old.r, cov);
@@ -6382,7 +6390,7 @@ void main() {
       vec2 k = D.xz / max(-D.y, 0.12) * pc.g.z;  // texels a metre down
       float top = pc.s.y * 1.4, bot = -pc.s.x;
       vec2 near_t = T(tc) + T(tc - k * top) + T(tc - k * bot) + T(tc - k * 0.5 * top);
-      if (near_t.r + near_t.g > 0.002) {
+      if (near_t.r + near_t.g > 0.02) {
         float h_prev = top, h = top;
         bool hit = false;
         for (int i = 1; i <= 12; ++i) {
@@ -6416,7 +6424,7 @@ void main() {
     o = vec4(t.r, t.g, 0.0, 1.0);
     return;
   }
-  if (t.r + t.g < 0.003) return;
+  if (t.r + t.g < 0.02) return;
   if (pc.g.w < 0.5) {
     // Packed in the groove (a little greyer, bluer); the heaps grainy, the
     // clumps' tops a touch brighter (loose, fresh-broken).
@@ -14218,7 +14226,7 @@ void Renderer::Impl::TracksUpdate() {
     }
   }
   // (How much each cut pushes up beside it.)
-  float pc[12] = {float(ox), float(oz), 0.0f, 0.045f};
+  float pc[12] = {float(ox), float(oz), 0.0f, 0.035f};
   std::memcpy(pc + 4, tb, sizeof(tb));
   Barrier();
   pc[11] = graded && !test ? 1.0f : 0.0f;

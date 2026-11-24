@@ -938,6 +938,14 @@ that rule against a save that has the pass.
   over, it made a wide flat patch with hard edges and lit heaps all round
   it (and at night in a snowfall a dark band behind the rider). `tracksflat`:
   the old way.
+  The heaps pushed up beside a cut grow with how deep it's pressed (a faint
+  skid's edge hardly heaps; they were a hard white rim round every trail),
+  and a little lower all told. Striped snow with the tracks on, in a
+  snowfall or wind: the map is 8-bit, so a faint groove filled in a little
+  rounded back up to itself and never went, and the wind's mixing spread
+  these traces over the whole map; their steps of a 255th became slopes in
+  the normals, fine stripes across the slopes. What's left very faint is
+  cleared now, and the faintest traces aren't drawn.
 - Eye adaptation (Effects: Eye Adaptation, `native_eye_adaptation`, 0.6; part
   of Revamped Graphics; works with time of day off too): HDR-style, like
   Half-Life 2's. The lighting is brightened in the dark (night, forest,
