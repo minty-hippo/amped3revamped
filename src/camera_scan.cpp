@@ -20,6 +20,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,6 +58,7 @@ struct Hit {
   float sign;  // the vector as found (1) or negated (-1)
 };
 
+void ScanProperties(const char* stamp);
 void Scan(const float cam[9]) {
   auto* memory = GuestMemory();
   if (!memory) return;
@@ -160,7 +162,117 @@ void Scan(const float cam[9]) {
   }
   REXLOG_INFO("Camera scan: {} places ({} MB scanned) written to {}", hits.size(),
               scanned >> 20, path.string());
+  ScanProperties(stamp);
   notice::Show("Camera scan: " + std::to_string(hits.size()) + " places written to logs");
+}
+
+// Property scan (with the camera scan, F8): where the game keeps the names of
+// its riding tunables (the jump zone, the ground's hold, the spins' revert),
+// and what points at each name (a reflection table entry: name, type, member
+// offset), for finding the code that reads them. To
+// logs\amped3_property_scan_<time>.txt.
+void ScanProperties(const char* stamp) {
+  auto* memory = GuestMemory();
+  if (!memory) return;
+  static const char* kNames[] = {
+      "MinSpeedSquaredForJumpZone", "MaxSpeedForNonJumpZone", "MaxSpeedForPerfectJump",
+      "MaxSpeedForHorribleJump", "PerfectJumpTime", "HorribleJumpTime", "PerfectHangTimeModifier",
+      "m_noJumpTime", "JumpZone", "StickyGround", "MinGroundDistanceOnGround",
+      "MinGroundDistanceInAir", "StickyDistance", "MinDownwardVelocity", "EnterAirVelocityScalar",
+      "AdditionalNoJumpVelocityScalar", "JumpSpeedRange", "JumpSpeedScalarRange", "MaxJumpHeight",
+      "RevertRotationSlerpSpeed", "RotationAmountStyleThreshold", "CrashThreshold",
+      "SpinAirAngularDampening", "TimeToBeginLandPose", "LandingPlanning", "XLerpAlpha",
+      "InAirBlendAwayAlpha", "MaxTimePerIntegrationStep"};
+  struct Region {
+    uint32_t start, size;
+  };
+  std::vector<Region> regions;
+  uint32_t address = 0x10000;
+  while (address < 0xC0000000u) {
+    auto* heap = memory->LookupHeap(address);
+    if (!heap) {
+      address = (address + 0x10000) & ~0xFFFFu;
+      if (!address) break;
+      continue;
+    }
+    rex::memory::HeapAllocationInfo info{};
+    if (!heap->QueryRegionInfo(address, &info) || !info.region_size) {
+      address = (address + heap->page_size()) & ~(heap->page_size() - 1);
+      continue;
+    }
+    const uint32_t start = info.base_address, size = info.region_size;
+    if ((info.state & rex::memory::kMemoryAllocationCommit) != 0 && size >= 16 &&
+        heap->QueryRangeAccess(start, start + size - 1) != rex::memory::PageAccess::kNoAccess) {
+      regions.push_back({start, size});
+    }
+    const uint32_t next = start + size;
+    if (next <= address) break;
+    address = next;
+  }
+  const auto path = g_dir / (std::string("amped3_property_scan_") + stamp + ".txt");
+  std::ofstream out(path);
+  out << "# Amped 3 property scan " << stamp << "\n";
+  char line[512];
+  auto dump = [&](uint32_t at) {
+    const uint32_t from = at >= 32 ? at - 32 : 0;
+    for (uint32_t a = from; a < at + 48; a += 16) {
+      auto* heap = memory->LookupHeap(a);
+      if (!heap || heap->QueryRangeAccess(a, a + 15) == rex::memory::PageAccess::kNoAccess) continue;
+      const uint8_t* q = memory->TranslateVirtual(a);
+      std::snprintf(line, sizeof(line), "    %08X: %08X %08X %08X %08X  %12.5g %12.5g %12.5g %12.5g\n", a,
+                    rex::memory::load_and_swap<uint32_t>(q), rex::memory::load_and_swap<uint32_t>(q + 4),
+                    rex::memory::load_and_swap<uint32_t>(q + 8), rex::memory::load_and_swap<uint32_t>(q + 12),
+                    F(q), F(q + 4), F(q + 8), F(q + 12));
+      out << line;
+    }
+  };
+  // The names, then (one pass) what points at each.
+  std::vector<std::pair<const char*, uint32_t>> strings;
+  for (const char* name : kNames) {
+    const size_t n = std::strlen(name);
+    size_t found = 0;
+    for (const Region& r : regions) {
+      const uint8_t* p = memory->TranslateVirtual(r.start);
+      const uint8_t* end = p + r.size;
+      for (const uint8_t* q = p; q + n + 1 <= end && found < 64;) {
+        q = static_cast<const uint8_t*>(std::memchr(q, name[0], size_t(end - q)));
+        if (!q || q + n + 1 > end) break;
+        // (Whole: a terminating zero, and not the tail of a longer name.)
+        if (std::memcmp(q, name, n) == 0 && q[n] == 0 && (q == p || q[-1] < 'A')) {
+          strings.push_back({name, r.start + uint32_t(q - p)});
+          ++found;
+        }
+        ++q;
+      }
+    }
+  }
+  std::map<uint32_t, std::vector<uint32_t>> refs;
+  for (const auto& st : strings) refs[st.second];
+  for (const Region& r : regions) {
+    const uint8_t* p = memory->TranslateVirtual(r.start);
+    for (uint32_t off = 0; off + 4 <= r.size; off += 4) {
+      const uint32_t v = rex::memory::load_and_swap<uint32_t>(p + off);
+      if (v < 0x10000) continue;
+      auto it = refs.find(v);
+      if (it != refs.end() && it->second.size() < 16) it->second.push_back(r.start + off);
+    }
+  }
+  const char* last = nullptr;
+  for (const auto& [name, at] : strings) {
+    if (name != last) {
+      out << "\n" << name << "\n";
+      last = name;
+    }
+    std::snprintf(line, sizeof(line), "  string at %08X\n", at);
+    out << line;
+    for (uint32_t ptr : refs[at]) {
+      std::snprintf(line, sizeof(line), "   pointer at %08X\n", ptr);
+      out << line;
+      dump(ptr);
+    }
+  }
+  const size_t total = strings.size();
+  REXLOG_INFO("Property scan: {} names found, written to {}", total, path.string());
 }
 
 }  // namespace
