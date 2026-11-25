@@ -931,6 +931,17 @@ that rule against a save that has the pass.
   the poll's hook at 0x82377E00) keeps its last firm direction through a
   dip that short; letting go for longer ends the spin as before. The local
   rider is learned from the tuck, so it applies once you've tucked.
+- World light (voxel probes): the ground's shade near the rider was mottled.
+  The fine probe grid (2 m, round the camera) traces 8 rays a probe face,
+  the same 8 every pass (new ones each pass had made the shade swim), so
+  each probe's light carried its own few rays' error and the ground's
+  shade went patchy between neighbouring probes; and as the rider moves,
+  the probes ahead are new to the grid all the time, with one pass each.
+  Now each pass turns the rays on by a set step (the same sequence every
+  time) and is averaged in at 1 / passes, up to seven (the count rides in
+  the probe's alpha with its tag, 258 a pass), so a probe settles on the
+  mean of 56 rays and then holds still; a probe new to the grid gets three
+  times the rays on its first pass. Applies to the coarse grid too.
 - The F1 options menu is sized from the display's height, like the
   Graphics panel (720p units: it fills about the same share of the screen
   at any resolution), in the panel's font baked near the size it's drawn

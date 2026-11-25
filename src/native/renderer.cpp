@@ -7580,8 +7580,11 @@ void main() {
   // (Which probe this slot holds: tagged in alpha, so one scrolled in is
   // started afresh.)
   float tag = float((wi.x & 7) + 8 * (wi.y & 3) + 32 * (wi.z & 7)) + 1.0;
+  // (Alpha also counts the passes it's had, 258 a pass, up to 6: see the
+  // blend below.)
   vec4 old = texelFetch(b2, t, 0);
-  bool same = abs(abs(old.a) - tag) < 0.25;
+  bool same = abs(mod(abs(old.a), 258.0) - tag) < 0.25;
+  float passes = same && old.a > 0.0 ? floor(old.a / 258.0) : 0.0;
   // (Only this frame's band of rows is drawn: the rest copied as they were.
   // Picking the due ones per texel instead left every wave of the GPU's
   // waiting on its slowest, all of them busy every frame.)
@@ -7621,8 +7624,17 @@ void main() {
   // way: new rays each time made every probe's light wander a little at
   // each pass, and the shade on open snow swam and pulsed with the camera
   // still. Its neighbours' different rays average out in the reading.)
-  float rnd = fract(52.9829189 * fract(dot(vec2(t), vec2(0.06711056, 0.00583715))));
+  // Each pass turns them on by a set step (the same sequence every time,
+  // so a probe that's had them all holds still, give or take the light
+  // changing) and is averaged in at 1 / passes: a probe's light is the
+  // mean of up to seven passes' rays, not one pass's few, which left
+  // neighbouring probes' light a little different each and the ground's
+  // shade mottled between them. A probe new to the grid (the ones ahead
+  // of the rider, coming in all the time) gets three times the rays first.
+  float rnd = fract(52.9829189 * fract(dot(vec2(t), vec2(0.06711056, 0.00583715))) +
+                    0.618034 * float(int(passes) % 7));
   int rays = fine ? max(int(kSet.x) * 4 / 5, 4) : int(kSet.x);  // (the fine grid: 8 of 10)
+  if (passes == 0.0) rays *= 3;
   vec3 sum = vec3(0.0);
   for (int i = 0; i < rays; ++i) {
     float u1 = fract((float(i) + 0.5) / float(rays) + rnd * 0.37);
@@ -7640,9 +7652,10 @@ void main() {
     sum += Radiance(H, n, hv) * kSet.z - Sky(D) * kSet.y;
   }
   vec3 e = sum / float(rays);
-  // (Blended in still, for the light changing: the sun moving, the voxels
-  // updated.)
-  o = vec4(same && old.a > 0.0 ? mix(old.rgb, e, 0.2) : e, tag);
+  // (The running mean over the passes, a seventh at most once it has had
+  // them all: still following the light changing, the sun moving, the
+  // voxels updated.)
+  o = vec4(passes > 0.0 ? mix(old.rgb, e, 1.0 / (passes + 1.0)) : e, tag + 258.0 * min(passes + 1.0, 6.0));
 }
 )", true);
   // World-space light, 3: its half-size result blurred one way (9 taps,
@@ -7871,13 +7884,13 @@ vec4 Gather(vec4 g, ivec3 dims, int row0, vec3 P, vec3 Nn, bool all6) {
     vec3 val;
     if (all6) {
       vec4 a0 = texelFetch(probes, t0, 0);
-      if (a0.a < 0.0 || abs(a0.a - tag) > 0.25) continue;
+      if (a0.a < 0.0 || abs(mod(a0.a, 258.0) - tag) > 0.25) continue;
       val = a0.rgb;
       for (int c = 1; c < 6; ++c) val += texelFetch(probes, t0 + ivec2(c, 0), 0).rgb;
       val /= 6.0;
     } else {
       vec4 a = texelFetch(probes, t0 + ivec2(fc.x, 0), 0);
-      if (a.a < 0.0 || abs(a.a - tag) > 0.25) continue;
+      if (a.a < 0.0 || abs(mod(a.a, 258.0) - tag) > 0.25) continue;
       vec4 b = texelFetch(probes, t0 + ivec2(fc.y, 0), 0);
       vec4 cz = texelFetch(probes, t0 + ivec2(fc.z, 0), 0);
       val = a.rgb * n2.x + b.rgb * n2.y + cz.rgb * n2.z;
@@ -7976,13 +7989,13 @@ vec4 Gather(vec4 g, ivec3 dims, int row0, vec3 P, vec3 Nn, bool all6) {
     vec3 val;
     if (all6) {
       vec4 a0 = texelFetch(probes, t0, 0);
-      if (a0.a < 0.0 || abs(a0.a - tag) > 0.25) continue;
+      if (a0.a < 0.0 || abs(mod(a0.a, 258.0) - tag) > 0.25) continue;
       val = a0.rgb;
       for (int c = 1; c < 6; ++c) val += texelFetch(probes, t0 + ivec2(c, 0), 0).rgb;
       val /= 6.0;
     } else {
       vec4 a = texelFetch(probes, t0 + ivec2(fc.x, 0), 0);
-      if (a.a < 0.0 || abs(a.a - tag) > 0.25) continue;
+      if (a.a < 0.0 || abs(mod(a.a, 258.0) - tag) > 0.25) continue;
       vec4 b = texelFetch(probes, t0 + ivec2(fc.y, 0), 0);
       vec4 cz = texelFetch(probes, t0 + ivec2(fc.z, 0), 0);
       val = a.rgb * n2.x + b.rgb * n2.y + cz.rgb * n2.z;
